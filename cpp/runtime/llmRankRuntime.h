@@ -659,6 +659,17 @@ private:
     bool runBaseModelPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest = nullptr,
         bool sampleOutput = true);
 
+    //! True when a prefill longer than the engine's max input length may run as several passes: one text-only
+    //! sequence on an attention-only backbone. The engine's max input length then bounds the tokens of one pass
+    //! (and its activation memory), and the prompt is bounded by the KV-cache capacity instead.
+    bool canChunkPrefill(DecodingInferenceContext const& context, DecodingStrategy const& strategy) const noexcept;
+
+    //! Base prefill in passes of at most the engine's max input length. Each pass appends to the KV cache written
+    //! by the previous ones (as a context-reuse suffix prefill does); only the last pass samples, so the result
+    //! equals one prefill over the whole suffix. Restores tokenIds/effectivePrefillLengths to the whole suffix.
+    //! @throws std::runtime_error if a CUDA error occurs
+    bool runChunkedBaseModelPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest);
+
     //! Hybrid+MTP endpoint-reuse prefill. Mirrors the reference llmInferenceRuntime.cpp::runHybridMtpPrefill: a
     //! two-chunk base prefill publishing at the stable predecessor boundary, folding the reused checkpoint's boundary
     //! hidden into the draft prefill on a cache hit, and driving the coordinator's dedicated MTP publish entrypoint.

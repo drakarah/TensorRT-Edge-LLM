@@ -158,6 +158,8 @@ struct DecodingInferenceContext
     std::vector<std::vector<int32_t>> tokenIds;           //!< Token IDs for each sequence: [batch_size][seq_length]
     std::vector<int32_t> currentGenerateLengths;          //!< Current generation length for each sequence
     std::vector<int32_t> effectivePrefillLengths;         //!< Prefill length after system prompt cache reuse
+    //! Tokens in the last pass of a chunked prefill (0 = single pass): the base outputs hold that pass's rows only.
+    int32_t prefillLastPassLength{0};
     std::vector<int32_t> prefillStartLengths;             //!< Persistent frontier captured at prefill invocation entry
     std::vector<int32_t> committedLengths;                //!< Per-sequence persistent state length before next step
     std::vector<RequestId> requestIds;                    //!< Stable identities assigned by the blocking adapter
