@@ -36,6 +36,9 @@
 using namespace nvinfer1;
 using namespace trt_edgellm;
 
+//! Split-KV (multi-block) count for the next TestXQAAttentionDecodingAccuracy call; 1 = single block.
+uint32_t gMultiBlockSplits = 1;
+
 void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t kvCacheCapacity, bool useFp8Cache = false, int32_t slidingWindowSize = 0,
     std::optional<float> attentionScale = std::nullopt, int32_t fixedContextLen = 0,
@@ -168,6 +171,18 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         = attentionSinks.has_value() ? thrust::raw_pointer_cast(attentionSinksDevice.data()) : nullptr;
     params.attentionScale = resolvedAttentionScale;
     params.slidingWinSize = slidingWindowSize > 0 ? static_cast<uint32_t>(slidingWindowSize) : 0U;
+    thrust::device_vector<int32_t> semaphoresDevice(gMultiBlockSplits > 1 ? batchSize * numKVHeads : 0, 0);
+    size_t const scratchBytes = gMultiBlockSplits > 1
+        ? trt_edgellm::xqaMultiBlockScratchUpperBound(headSize, static_cast<size_t>(batchSize) * numKVHeads * gMultiBlockSplits)
+        : 0;
+    thrust::device_vector<int8_t> scratchDevice(scratchBytes, 0);
+    if (gMultiBlockSplits > 1)
+    {
+        params.nbSubSeqPerSeq = gMultiBlockSplits;
+        params.semaphores = thrust::raw_pointer_cast(semaphoresDevice.data());
+        params.scratch = thrust::raw_pointer_cast(scratchDevice.data());
+        params.scratchBytes = scratchBytes;
+    }
 
     // Use default stream .
     cudaStream_t stream{nullptr};
@@ -586,6 +601,19 @@ TEST(XQAAttentionDecodingTest, slidingWindowAccuracy)
     TestXQAAttentionDecodingAccuracy(2, 24, 4, 256, 384, false, 129);
     TestXQAAttentionDecodingAccuracy(2, 16, 2, 512, 192, false, 64);
     TestXQAAttentionDecodingAccuracy(2, 32, 4, 128, 96, false, 256);
+}
+
+TEST(XQAAttentionDecodingTest, multiBlockAccuracyGemma4Shapes)
+{
+    // Gemma 4 E4B: 8 Q / 2 KV heads, head dim 256 (sliding 512) and 512 (global).
+    for (uint32_t splits : {2U, 8U})
+    {
+        gMultiBlockSplits = splits;
+        TestXQAAttentionDecodingAccuracy(1, 8, 2, 256, 4096, false, 0, std::nullopt, 3300);
+        TestXQAAttentionDecodingAccuracy(1, 8, 2, 256, 4096, false, 512, std::nullopt, 3300);
+        TestXQAAttentionDecodingAccuracy(1, 8, 2, 256, 4096, false, 512, std::nullopt, 300);
+    }
+    gMultiBlockSplits = 1;
 }
 
 TEST(XQAAttentionDecodingTest, configurableAttentionScale)

@@ -2862,7 +2862,18 @@ CUBIN_EXPORT __global__
 #endif
                 rescaleAcc(warp, acc, fullRescaleMask, sinkRowScales);
             }
-            ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
+            ThrdRegRowMax rcpRowSum = __frcp_rn(globalRowSum);
+            if (isMultiBlock)
+            {
+                // A sub-sequence can hold tiles yet no unmasked key for some rows (contiguous-query SWA masks
+                // the start of the window per draft token). Such rows have rowSum 0: write 0, not 0 * inf,
+                // so the merge gives them zero weight like an empty sub-sequence.
+#pragma unroll
+                for (uint32_t i = 0; i < ThrdRegRowMax::size; i++)
+                {
+                    rcpRowSum[i] = globalRowSum[i] > 0.F ? rcpRowSum[i] : 0.F;
+                }
+            }
 #if LOW_PREC_OUTPUT
             voScale *= rcpOutScale[0];
 #endif

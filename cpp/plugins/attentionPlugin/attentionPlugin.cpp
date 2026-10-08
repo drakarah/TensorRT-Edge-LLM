@@ -1333,6 +1333,9 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
     // Packed QKV: max batch/seq derived from packed input's first two dims (same as Q).
     int64_t const maxBatchSize = inputs[kIN_QUERY_LENGTH_IDX].max.d[0];
     int64_t const maxSeqLen = inputs[kIN_QKV_IDX].max.d[0] / maxBatchSize;
+    // Carved after the attention tensors before every XQA dispatch, on both the bounded-SWA and the
+    // full-cache path, so both workspace sizes must include it.
+    size_t const xqaScratchBytes = xqaMultiBlockScratchBound(mXqaMultiBlock, mNumKVHeads, mHeadSize, maxBatchSize);
     if (mSupportsBoundedKVCache)
     {
         // Both runtime policies use FMHA-v2/XQA. Full-cache mode stays native-paged, while the bounded path and
@@ -1340,8 +1343,9 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
         // max-sequence KV workspace.
         size_t const workspaceSize = getSwaKVCacheWorkspaceSize(maxBatchSize, maxSeqLen, mSlidingWindowSize, mNumQHeads,
             mNumKVHeads, mHeadSize, mEnableVisionBlockAttention != 0);
-        LOG_DEBUG("AttentionPlugin dual-mode SWA workspace size: %zu bytes", workspaceSize);
-        return workspaceSize;
+        LOG_DEBUG("AttentionPlugin dual-mode SWA workspace size: %zu bytes (+%zu XQA multi-block scratch)",
+            workspaceSize, xqaScratchBytes);
+        return workspaceSize + xqaScratchBytes;
     }
     // KV binding is the paged pool [2, numPages, 128, Hkv, D]; the per-slot padded capacity is the
     // page-table width times the page size (kv_page_table is [batch, 2, maxPagesPerSeq]).
@@ -1350,7 +1354,6 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
         mNumKVHeads, mHeadSize, mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, mEnableFp8KVCache,
         mEnableVisionBlockAttention != 0);
 
-    size_t const xqaScratchBytes = xqaMultiBlockScratchBound(mXqaMultiBlock, mNumKVHeads, mHeadSize, maxBatchSize);
     LOG_DEBUG("AttentionPlugin workspace size: %zu bytes (+%zu XQA multi-block scratch)", workspaceSize,
         xqaScratchBytes);
     return workspaceSize + xqaScratchBytes;
