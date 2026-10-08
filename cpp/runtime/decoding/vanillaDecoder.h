@@ -39,6 +39,11 @@ public:
         return "vanilla";
     }
 
+    //! Samples from the last prompt position only.
+    bool supportsChunkedPrefill() const noexcept override
+    {
+        return true;
+    }
     bool isSpeculative() const noexcept override
     {
         return false;

@@ -501,7 +501,9 @@ bool Gemma4MTPDecoder::prepareSeed(DecodingInferenceContext& context)
         {
             check::check(context.effectivePrefillLengths[batchIdx] > 0,
                 "Gemma4 MTP requires positive effective prefill length.");
-            sourceTokenIdx = context.effectivePrefillLengths[batchIdx] - 1;
+            sourceTokenIdx = (context.prefillLastPassLength > 0 ? context.prefillLastPassLength
+                                                                : context.effectivePrefillLengths[batchIdx])
+                - 1;
         }
         else
         {

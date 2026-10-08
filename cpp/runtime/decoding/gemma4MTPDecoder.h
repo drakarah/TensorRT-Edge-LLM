@@ -63,6 +63,12 @@ public:
             /*.maxSamplingSupport=*/0, /*.fallbackToVanillaForNonGreedySampling=*/false};
     }
 
+    //! The assistant attends the target's KV cache and seeds from the last prompt position only.
+    bool supportsChunkedPrefill() const noexcept override
+    {
+        return true;
+    }
+
     DecodingKvHeadroom requiredKvHeadroom() const override;
 
     bool decodeStep(DecodingInferenceContext& context) override;

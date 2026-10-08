@@ -169,6 +169,13 @@ public:
         return {};
     }
 
+    //! True when the strategy reads only the last prefill position of the base outputs (hidden states, logits),
+    //! so a long prefill may run as several passes (see LLMRankRuntime::runChunkedBaseModelPrefill). Strategies
+    //! that consume the hidden states of every prompt position (draft-model prefill) keep the default.
+    virtual bool supportsChunkedPrefill() const noexcept
+    {
+        return false;
+    }
     virtual DecodingKvHeadroom requiredKvHeadroom() const
     {
         return {/*.baseExtraTokens=*/1, /*.draftExtraTokens=*/0};

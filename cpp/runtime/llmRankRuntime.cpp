@@ -2153,12 +2153,18 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     }
 
     // Prefill from the base model; subsequent iterations are delegated to the selected strategy.
+    context.prefillLastPassLength = 0;
     bool prefillStatus;
     if (hybridMtpContextReuse)
     {
         context.hybridMtpEndpointReuse = true;
         context.contextCacheReplayTailLength = request.contextCacheReplayTailLength;
         prefillStatus = runHybridMtpPrefill(context, decodingStrategy, *managedRequest);
+    }
+    else if (canChunkPrefill(context, decodingStrategy)
+        && context.effectivePrefillLengths[0] > mDeployment.base.maxSupportedInputLength)
+    {
+        prefillStatus = runChunkedBaseModelPrefill(context, managedRequest);
     }
     else
     {
@@ -3026,6 +3032,46 @@ bool LLMRankRuntime::runHybridMtpPrefill(
     return true;
 }
 
+bool LLMRankRuntime::canChunkPrefill(
+    DecodingInferenceContext const& context, DecodingStrategy const& strategy) const noexcept
+{
+    return strategy.supportsChunkedPrefill() && context.activeBatchSize == 1 && mVisionRunner == nullptr && mAudioRunner == nullptr
+        && mDeployment.base.numLinearAttnLayers == 0 && !mDeployment.base.isDiffusionBackbone;
+}
+
+bool LLMRankRuntime::runChunkedBaseModelPrefill(
+    DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest)
+{
+    std::vector<int32_t> const completeSuffix = context.tokenIds[0];
+    int32_t const suffixLength = context.effectivePrefillLengths[0];
+    int32_t const maxPassLength = mDeployment.base.maxSupportedInputLength;
+    ELLM_CHECK(maxPassLength > 0 && suffixLength <= static_cast<int32_t>(completeSuffix.size()),
+        "Chunked prefill: invalid suffix or max input length");
+    LOG_DEBUG("Chunked prefill: %d tokens in passes of at most %d", suffixLength, maxPassLength);
+    for (int32_t begin = 0; begin < suffixLength; begin += maxPassLength)
+    {
+        int32_t const length = std::min(maxPassLength, suffixLength - begin);
+        bool const lastPass = begin + length == suffixLength;
+        context.tokenIds[0].assign(completeSuffix.begin() + begin, completeSuffix.begin() + begin + length);
+        context.effectivePrefillLengths[0] = length;
+        if (!runBaseModelPrefill(context, lastPass ? managedKVCacheRequest : nullptr, /*sampleOutput=*/lastPass))
+        {
+            return false;
+        }
+        if (!lastPass)
+        {
+            // The next pass restages the shared pinned token buffer.
+            CUDA_CHECK(cudaStreamSynchronize(context.stream));
+        }
+    }
+    int32_t const sampledToken = context.tokenIds[0].back();
+    context.tokenIds[0] = completeSuffix;
+    context.tokenIds[0].push_back(sampledToken);
+    context.prefillLastPassLength = suffixLength - (suffixLength - 1) / maxPassLength * maxPassLength;
+    context.effectivePrefillLengths[0] = suffixLength;
+    return true;
+}
+
 bool LLMRankRuntime::runBaseModelPrefill(
     DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest, bool sampleOutput)
 {
@@ -3707,7 +3753,7 @@ bool LLMRankRuntime::setUpForPrefillExecution(DecodingInferenceContext& context,
 
     int32_t const maxInputLength
         = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
-    if (maxInputLength > mDeployment.base.maxSupportedInputLength)
+    if (maxInputLength > mDeployment.base.maxSupportedInputLength && !canChunkPrefill(context, strategy))
     {
         LOG_ERROR(
             "Prefill length after context reuse (%d) exceeds engine max input length (%d). "
