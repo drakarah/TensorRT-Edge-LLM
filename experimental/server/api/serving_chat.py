@@ -324,7 +324,11 @@ class OpenAIServingChat:
                 reasoning_parser=prepared.reasoning_parser,
                 prepared=engine_request,
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        except ValueError as exc:
+            # The request was already validated and rendered above, so the
+            # client error left is the native layer rejecting its input
+            # (std::invalid_argument surfaces as ValueError). KeyError and
+            # TypeError here are server faults and must reach the 500 handler.
             raise InvalidRequestError(str(exc)) from exc
 
         output.text = output.text.replace(IM_END_TOKEN, "")

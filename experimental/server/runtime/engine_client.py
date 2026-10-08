@@ -23,8 +23,9 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence, Union
 
-from ..api.errors import (EngineError, ServerError, ServerOverloadedError,
-                          ServerUnavailableError, UnsupportedFeatureError)
+from ..api.errors import (EngineError, PayloadTooLargeError, ServerError,
+                          ServerOverloadedError, ServerUnavailableError,
+                          UnsupportedFeatureError)
 from ..config import ApiConfig
 from ..parsing.tool_calling import ToolConfig, validate_tool_request
 from .engine import (LLM, TTS, AudioParams, CompletionOutput, SamplingParams,
@@ -520,10 +521,60 @@ class EngineClient:
         except getattr(self, "_submit_errors", ()) as exc:
             raise ServerOverloadedError(str(exc)) from exc
         except Exception as exc:
-            raise EngineError(str(exc)) from exc
+            raise await self._generation_error(exc, owned,
+                                               sampling_params) from exc
         finally:
             if owned is not None:
                 owned.release()
+
+    async def _generation_error(
+        self,
+        exc: Exception,
+        prepared: Optional[PreparedRequest],
+        sampling_params: SamplingParams,
+    ) -> ServerError:
+        """Classify a failed native generation as a client or engine error.
+
+        The runtime refuses a prompt that leaves no KV-cache room for even one
+        generation step (``clampMaxGenerateLengthForKVCapacity`` clamps the
+        budget to zero) with a generic failure instead of a typed error. To
+        keep the success path free of a second tokenization, the prompt is
+        counted here, on the failure path only and while the caller still
+        holds the request's admission lease. A prompt that fills the cache is
+        answered like ``EDGELLM_INPUT_TOO_LONG``; anything else, including a
+        failed count, stays an engine error.
+        """
+        message = str(exc)
+        limit = self._capabilities.max_model_len
+        if prepared is None or limit is None or "EDGELLM_" in message:
+            return EngineError(message)
+        try:
+            count = await _run_sync(
+                partial(self._llm._count_prepared_prompt_tokens,
+                        prepared.request))
+        except Exception:  # The original failure is the one to report.
+            return EngineError(message)
+        if count is None or count + self._kv_headroom(sampling_params) < limit:
+            return EngineError(message)
+        return PayloadTooLargeError(
+            f"prompt has {count} tokens, which leaves no room to generate "
+            f"within the model's maximum context length of {limit} tokens; "
+            f"shorten the prompt or rebuild the engine with a larger "
+            f"--maxKVCacheCapacity",
+            param="messages")
+
+    def _kv_headroom(self, sampling_params: SamplingParams) -> int:
+        """KV slots the runtime keeps free beyond the prompt.
+
+        Plain decoding reserves one token and speculative decoding one verify
+        tree, as the native decoders' ``requiredKvHeadroom`` does.
+        """
+        if (getattr(self._llm, "has_draft_model", False)
+                and not sampling_params.disable_spec_decode):
+            verify_tree_size = getattr(self._llm, "_verify_tree_size", None)
+            if isinstance(verify_tree_size, int) and verify_tree_size > 1:
+                return verify_tree_size
+        return 1
 
     async def prepare_request(
         self,
@@ -587,7 +638,8 @@ class EngineClient:
         except getattr(self, "_submit_errors", ()) as exc:
             raise ServerOverloadedError(str(exc)) from exc
         except Exception as exc:
-            raise EngineError(str(exc)) from exc
+            raise await self._generation_error(exc, owned,
+                                               sampling_params) from exc
         finally:
             if iterator is not None:
                 await asyncio.to_thread(_close_stream, iterator)

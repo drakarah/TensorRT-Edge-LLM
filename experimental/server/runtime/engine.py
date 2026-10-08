@@ -1342,7 +1342,7 @@ class LLM:
         return request
 
     def _count_prepared_prompt_tokens(self, request) -> Optional[int]:
-        """Count tokens only for an explicit token-count API request."""
+        """Count prompt tokens for the token-count API or a failed request."""
         counter = getattr(self, "_engine", None) or self._runtime
         if not hasattr(counter, "count_prompt_tokens"):
             return None
