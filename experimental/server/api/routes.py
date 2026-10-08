@@ -112,7 +112,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             },
         )
     response = await handler.create_chat_completion(body)
-    return JSONResponse(response.model_dump(exclude_none=True))
+    payload = response.model_dump(exclude_none=True)
+    # OpenAI always sends message.content, as null on a tool-call-only reply,
+    # and clients index it unguarded. Other unset optional fields stay omitted.
+    for choice in payload["choices"]:
+        choice["message"].setdefault("content", None)
+    return JSONResponse(payload)
 
 
 def _anthropic_error(exc: Exception) -> JSONResponse:

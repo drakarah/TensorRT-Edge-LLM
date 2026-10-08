@@ -758,6 +758,29 @@ def test_openai_tools_and_reasoning_fields(client_and_llm):
         "get_weather")
 
 
+def test_tool_call_only_reply_returns_null_content(client_and_llm):
+    client, _ = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_tool()],
+                               "tool_choice": "required",
+                           })
+
+    assert response.status_code == 200, response.text
+    choice = response.json()["choices"][0]
+    # OpenAI sends the key with a null value; clients index it directly.
+    assert "content" in choice["message"]
+    assert choice["message"]["content"] is None
+    assert choice["message"]["tool_calls"]
+    # Other unset optional fields are still omitted.
+    assert "audio" not in choice["message"]
+    assert "logprobs" not in choice
+
+
 def test_streaming_usage_and_done_marker(client_and_llm):
     client, _ = client_and_llm
     response = client.post("/v1/chat/completions",

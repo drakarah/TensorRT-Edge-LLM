@@ -302,7 +302,8 @@ Requests use OpenAI `tools`, `tool_choice`, assistant `tool_calls`, and matching
 the request sets `enable_thinking=true` or
 `chat_template_kwargs.enable_thinking=true`.
 Streaming responses emit indexed tool-call deltas as soon as each generated
-call is complete and end with `finish_reason="tool_calls"`.
+call is complete and end with `finish_reason="tool_calls"`. A non-streaming
+reply that contains only tool calls returns `"content": null`, as OpenAI does.
 
 Qwen3.8's provider template accepts `reasoning_effort` values `xhigh` (the
 provider default), `medium`, and `low` when thinking is enabled. Edge-LLM
