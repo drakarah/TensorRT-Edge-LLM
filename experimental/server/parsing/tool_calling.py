@@ -659,6 +659,256 @@ def stream_assistant_output(
                                           reasoning_parser)
 
 
+# Gemma 4 marks every tool call with dedicated special tokens and writes it
+# in a compact syntax of its own:
+#   <|tool_call>call:NAME{key:<|"|>text<|"|>,n:3,tags:[...],opt:{...}}<tool_call|>
+# Strings are delimited by the <|"|> token and taken verbatim; object keys
+# are bare; other scalars are JSON literals.
+_GEMMA4_CALL_OPEN = "<|tool_call>"
+_GEMMA4_CALL_CLOSE = "<tool_call|>"
+_GEMMA4_STRING = '<|"|>'
+_GEMMA4_CALL_HEAD_RE = re.compile(r"\s*call:([A-Za-z0-9_][\w.\-]*)\{")
+
+
+class _Gemma4ToolParser:
+    """Tool parser for Gemma 4's ``<|tool_call>...<tool_call|>`` blocks.
+
+    Only text inside those blocks can become a tool call. Unlike the generic
+    parser there is no markerless fallback, so a plain JSON answer that
+    happens to name a tool (for example a structured-output reply) stays
+    content. Like the generic parser's ``[TOOL_CALLS]`` family, end of
+    output also closes a block; a block that does not parse completely, or
+    that names a tool the request does not allow, is kept verbatim as
+    content.
+    """
+
+    def stream(self,
+               tool_config: ToolConfig) -> "_Gemma4StreamingToolParser":
+        """Create independent streaming state for one response."""
+        return _Gemma4StreamingToolParser(self, tool_config)
+
+    def parse(self, text: str,
+              tool_config: ToolConfig) -> Tuple[List[Dict[str, Any]], bool]:
+        events: List[Dict[str, Any]] = []
+        malformed = False
+        pos = 0
+        while True:
+            start = text.find(_GEMMA4_CALL_OPEN, pos)
+            if start < 0:
+                break
+            close = text.find(_GEMMA4_CALL_CLOSE,
+                              start + len(_GEMMA4_CALL_OPEN))
+            end = len(text) if close < 0 else close + len(_GEMMA4_CALL_CLOSE)
+            if start > pos:
+                events.append({"type": "content", "text": text[pos:start]})
+            block = text[start:end]
+            calls = _parse_gemma4_block(block, tool_config)
+            if calls:
+                events.extend({
+                    "type": "tool_call",
+                    "tool_call": call
+                } for call in calls)
+            else:
+                malformed = True
+                events.append({"type": "content", "text": block})
+            pos = end
+        if pos < len(text) or not events:
+            events.append({"type": "content", "text": text[pos:]})
+        return events, malformed
+
+
+class _Gemma4StreamingToolParser:
+    """Streaming counterpart of ``_Gemma4ToolParser``.
+
+    Content streams through immediately, holding back only a possible
+    partial ``<|tool_call>`` marker. Each call block is buffered until its
+    close marker (or flush) and then parsed by the whole-text parser, so
+    streaming and non-streaming output agree for any chunking.
+    """
+
+    def __init__(self, whole_text_parser: _Gemma4ToolParser,
+                 tool_config: ToolConfig) -> None:
+        self._whole = whole_text_parser
+        self._config = tool_config
+        self._buffer = ""
+        self._in_block = False
+        self._next_index = 0
+
+    def feed(self, text: str) -> Iterable["ToolStreamEvent"]:
+        self._buffer += text
+        while True:
+            if not self._in_block:
+                start = self._buffer.find(_GEMMA4_CALL_OPEN)
+                if start < 0:
+                    hold = _longest_partial_token(self._buffer,
+                                                  (_GEMMA4_CALL_OPEN, ))
+                    emit_len = len(self._buffer) - hold
+                    if emit_len > 0:
+                        yield ToolStreamEvent("content",
+                                              self._buffer[:emit_len])
+                        self._buffer = self._buffer[emit_len:]
+                    return
+                if start > 0:
+                    yield ToolStreamEvent("content", self._buffer[:start])
+                    self._buffer = self._buffer[start:]
+                self._in_block = True
+            close = self._buffer.find(_GEMMA4_CALL_CLOSE,
+                                      len(_GEMMA4_CALL_OPEN))
+            if close < 0:
+                return
+            end = close + len(_GEMMA4_CALL_CLOSE)
+            block, self._buffer = self._buffer[:end], self._buffer[end:]
+            self._in_block = False
+            yield from self._emit(block)
+
+    def flush(self) -> Iterable["ToolStreamEvent"]:
+        withheld, self._buffer = self._buffer, ""
+        self._in_block = False
+        if withheld:
+            yield from self._emit(withheld)
+
+    def _emit(self, text: str) -> Iterable["ToolStreamEvent"]:
+        events, _ = self._whole.parse(text, self._config)
+        for event in events:
+            if event["type"] == "content":
+                if event["text"]:
+                    yield ToolStreamEvent("content", event["text"])
+                continue
+            call = event["tool_call"]
+            index = self._next_index
+            self._next_index += 1
+            yield ToolStreamEvent("tool_head",
+                                  index=index,
+                                  call_id=call.id,
+                                  name=call.name)
+            yield ToolStreamEvent("tool_args", call.arguments, index=index)
+            yield ToolStreamEvent("tool_done", index=index)
+
+
+class _Gemma4SyntaxError(ValueError):
+    pass
+
+
+def _parse_gemma4_block(block: str,
+                        tool_config: ToolConfig) -> List[ToolCall]:
+    """Parse one ``<|tool_call>`` block; [] unless every call in it is valid."""
+    body = block[len(_GEMMA4_CALL_OPEN):]
+    if body.endswith(_GEMMA4_CALL_CLOSE):
+        body = body[:-len(_GEMMA4_CALL_CLOSE)]
+    calls: List[ToolCall] = []
+    pos = 0
+    try:
+        while True:
+            pos = _gemma4_skip_space(body, pos)
+            if pos == len(body):
+                return calls
+            head = _GEMMA4_CALL_HEAD_RE.match(body, pos)
+            if head is None or not _tool_name_allowed(head.group(1),
+                                                      tool_config):
+                return []
+            arguments, pos = _gemma4_object(body, head.end())
+            calls.append(
+                ToolCall(id=_new_call_id(),
+                         name=head.group(1),
+                         arguments=json.dumps(arguments,
+                                              ensure_ascii=False)))
+    except (_Gemma4SyntaxError, RecursionError):
+        return []
+
+
+def _gemma4_skip_space(text: str, pos: int) -> int:
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    return pos
+
+
+def _gemma4_value(text: str, pos: int) -> Tuple[Any, int]:
+    """Parse one argument value starting at ``pos``; return it and the end."""
+    pos = _gemma4_skip_space(text, pos)
+    if text.startswith(_GEMMA4_STRING, pos):
+        start = pos + len(_GEMMA4_STRING)
+        end = text.find(_GEMMA4_STRING, start)
+        if end < 0:
+            raise _Gemma4SyntaxError("unterminated string")
+        return text[start:end], end + len(_GEMMA4_STRING)
+    if pos == len(text):
+        raise _Gemma4SyntaxError("missing value")
+    if text[pos] == "{":
+        return _gemma4_object(text, pos + 1)
+    if text[pos] == "[":
+        return _gemma4_array(text, pos + 1)
+    if text[pos] == '"':
+        try:
+            return json.JSONDecoder().raw_decode(text, pos)
+        except ValueError as exc:
+            raise _Gemma4SyntaxError("invalid JSON string") from exc
+    end = pos
+    while end < len(text) and text[end] not in ",}]":
+        end += 1
+    raw = text[pos:end].strip()
+    if not raw:
+        raise _Gemma4SyntaxError("missing value")
+    try:
+        # Numbers, true, false, null; NaN/Infinity would not survive
+        # serialization as strict JSON, so they stay text.
+        return json.loads(raw, parse_constant=_gemma4_reject_constant), end
+    except ValueError:
+        return raw, end
+
+
+def _gemma4_reject_constant(name: str) -> Any:
+    raise ValueError(name)
+
+
+def _gemma4_key(text: str, pos: int) -> Tuple[str, int]:
+    pos = _gemma4_skip_space(text, pos)
+    if text.startswith(_GEMMA4_STRING, pos) or text.startswith('"', pos):
+        key, pos = _gemma4_value(text, pos)
+        if isinstance(key, str):
+            return key, pos
+        raise _Gemma4SyntaxError("invalid key")
+    colon = text.find(":", pos)
+    key = text[pos:colon].strip() if colon >= 0 else ""
+    if not key or any(ch in key for ch in "{}[],") or _GEMMA4_STRING in key:
+        raise _Gemma4SyntaxError("invalid key")
+    return key, colon
+
+
+def _gemma4_object(text: str, pos: int) -> Tuple[Dict[str, Any], int]:
+    """Parse ``key:value,...}`` with ``pos`` just past the opening brace."""
+    result: Dict[str, Any] = {}
+    while True:
+        pos = _gemma4_skip_space(text, pos)
+        if text.startswith("}", pos):
+            return result, pos + 1
+        key, pos = _gemma4_key(text, pos)
+        pos = _gemma4_skip_space(text, pos)
+        if not text.startswith(":", pos):
+            raise _Gemma4SyntaxError("missing ':'")
+        result[key], pos = _gemma4_value(text, pos + 1)
+        pos = _gemma4_skip_space(text, pos)
+        if text.startswith(",", pos):
+            pos += 1
+        elif not text.startswith("}", pos):
+            raise _Gemma4SyntaxError("unterminated object")
+
+
+def _gemma4_array(text: str, pos: int) -> Tuple[List[Any], int]:
+    """Parse ``value,...]`` with ``pos`` just past the opening bracket."""
+    items: List[Any] = []
+    while True:
+        pos = _gemma4_skip_space(text, pos)
+        if text.startswith("]", pos):
+            return items, pos + 1
+        value, pos = _gemma4_value(text, pos)
+        items.append(value)
+        pos = _gemma4_skip_space(text, pos)
+        if text.startswith(",", pos):
+            pos += 1
+        elif not text.startswith("]", pos):
+            raise _Gemma4SyntaxError("unterminated array")
+
+
 class _ToolParserRegistry:
 
     def __init__(self):
@@ -669,6 +919,7 @@ class _ToolParserRegistry:
             "qwen3_xml": parser,
             "nemotron": parser,
             "openai": parser,
+            "gemma4": _Gemma4ToolParser(),
         }
 
     def names(self) -> List[str]:
@@ -1091,6 +1342,8 @@ def _parser_name_for_model(model_dir: str) -> str:
             model_type = str(json.load(f).get("model_type", "")).lower()
     except (OSError, ValueError):
         pass
+    if "gemma4" in model_type or _uses_gemma4_tool_tokens(model_dir):
+        return "gemma4"
     name = f"{model_type} {os.path.basename(model_dir).lower()}"
     if "qwen3" in name and "coder" in name:
         return "qwen3_xml"
@@ -1101,6 +1354,30 @@ def _parser_name_for_model(model_dir: str) -> str:
     if "openai" in name or "gpt-oss" in name:
         return "openai"
     return "generic"
+
+
+def _uses_gemma4_tool_tokens(model_dir: str) -> bool:
+    """Whether the tokenizer marks tool calls with Gemma 4's special tokens.
+
+    Engine bundles ship tokenizer_config.json and chat_template.jinja but no
+    HF config.json, so detection keys off the tokenizer's start-of-tool-call
+    token, with the chat template as fallback.
+    """
+    try:
+        with open(os.path.join(model_dir, "tokenizer_config.json"),
+                  encoding="utf-8") as handle:
+            config = json.load(handle)
+        if (isinstance(config, dict)
+                and config.get("stc_token") == _GEMMA4_CALL_OPEN):
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(os.path.join(model_dir, "chat_template.jinja"),
+                  encoding="utf-8") as handle:
+            return _GEMMA4_CALL_OPEN in handle.read()
+    except (OSError, ValueError):
+        return False
 
 
 def _parse_tool_block(block: str, tool_config: ToolConfig) -> List[ToolCall]:

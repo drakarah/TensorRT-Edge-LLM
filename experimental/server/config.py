@@ -300,7 +300,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     api.add_argument(
         "--tool-call-parser",
         choices=("auto", "generic", "hermes", "qwen3_xml", "nemotron",
-                 "openai"),
+                 "openai", "gemma4"),
         default="auto",
     )
     api.add_argument("--enable-auto-tool-choice", action="store_true")
