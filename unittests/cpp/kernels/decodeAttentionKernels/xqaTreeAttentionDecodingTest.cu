@@ -1246,6 +1246,9 @@ TEST(XQATreeAttentionDecodingFP8Test, slidingWindowAccuracy)
 //! The output is checked (1) against the reference on the dequantized INT8 K/V with the FP16-path tolerances and
 //! (2) against the FP16 reference on the original K/V within one V quantization step (see
 //! TestXQAAttentionDecodingInt8Accuracy in xqaAttentionDecodingTest.cu for the bound).
+//! Split-KV (multi-block) count for the next TestXQATreeAttentionDecodingInt8Accuracy call; 1 = single block.
+uint32_t gTreeMultiBlockSplits = 1;
+
 void TestXQATreeAttentionDecodingInt8Accuracy(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads,
     int32_t headSize, int32_t kvSequenceLength, int32_t qSequenceLength, int32_t tokensPerPage)
 {
@@ -1376,6 +1379,20 @@ void TestXQATreeAttentionDecodingInt8Accuracy(int32_t batchSize, int32_t numQHea
     params.attentionScale = attentionScale;
     params.kScale = kScaleQuantOrig;
     params.vScale = vScaleQuantOrig;
+    // Spec-decode grids have numKVHeads * tokenBlocksPerGroup sequences per request (at most 8 token blocks).
+    size_t const nbMultiBlockSeqs = static_cast<size_t>(batchSize) * numKVHeads * 8;
+    thrust::device_vector<int32_t> semaphoresDevice(gTreeMultiBlockSplits > 1 ? nbMultiBlockSeqs : 0, 0);
+    size_t const scratchBytes = gTreeMultiBlockSplits > 1
+        ? trt_edgellm::xqaMultiBlockScratchUpperBound(headSize, nbMultiBlockSeqs * gTreeMultiBlockSplits)
+        : 0;
+    thrust::device_vector<int8_t> scratchDevice(scratchBytes, 0);
+    if (gTreeMultiBlockSplits > 1)
+    {
+        params.nbSubSeqPerSeq = gTreeMultiBlockSplits;
+        params.semaphores = thrust::raw_pointer_cast(semaphoresDevice.data());
+        params.scratch = thrust::raw_pointer_cast(scratchDevice.data());
+        params.scratchBytes = scratchBytes;
+    }
 
     cudaStream_t stream{nullptr};
     runner.dispatchSpecDecodeXQAKernel(params, stream);
@@ -1412,6 +1429,116 @@ void TestXQATreeAttentionDecodingInt8Accuracy(int32_t batchSize, int32_t numQHea
               << " tokens_per_page: " << tokensPerPage << " pass_rate_1e-3: " << passRate1E_3
               << " max_abs_diff_vs_fp16_ref: " << maxAbsDiffFp16 << std::endl;
     EXPECT_GT(passRate1E_3, 0.9);
+}
+
+//! Multi-block vs single-block output of the same sliding-window spec-decode kernel (paged INT8 pool,
+//! contiguous page list, causal 8-token draft). The window makes most sub-sequences of a long cache empty.
+void TestXQATreeMultiBlockMatchesSingleBlockSwa(int32_t headSize, int32_t kvSequenceLength, int32_t slidingWindowSize,
+    bool contiguousQuerySwa, uint32_t splits)
+{
+    constexpr int32_t kQ_HEADS = 8;
+    constexpr int32_t kKV_HEADS = 2;
+    constexpr int32_t kQ_LEN = 8;
+    constexpr int32_t kTOKENS_PER_PAGE = 128;
+    initializeCudaContextForXQATest();
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    int32_t const nbPages = kvSequenceLength / kTOKENS_PER_PAGE;
+    std::vector<half> qInput(static_cast<size_t>(kQ_LEN) * kQ_HEADS * headSize);
+    uniformFloatInitialization(qInput, -1.0F, 1.0F);
+    std::vector<int8_t> pool(static_cast<size_t>(2) * nbPages * kTOKENS_PER_PAGE * kKV_HEADS * headSize);
+    for (size_t i = 0; i < pool.size(); ++i)
+    {
+        pool[i] = static_cast<int8_t>(static_cast<int32_t>((i * 2654435761U) >> 24) % 255 - 127);
+    }
+    std::vector<int32_t> pageList(2 * nbPages);
+    for (int32_t p = 0; p < 2 * nbPages; ++p)
+    {
+        pageList[p] = p;
+    }
+    std::vector<int32_t> packedMask(kQ_LEN, 0);
+    for (int32_t q = 0; q < kQ_LEN; ++q)
+    {
+        packedMask[q] = static_cast<int32_t>((1U << (q + 1)) - 1U);
+    }
+    thrust::device_vector<half> qDevice(qInput);
+    thrust::device_vector<int8_t> poolDevice(pool);
+    thrust::device_vector<int32_t> lengthDevice(1, kvSequenceLength);
+    thrust::device_vector<int32_t> pageListDevice(pageList);
+    thrust::device_vector<int32_t> maskDevice(packedMask);
+    ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kINT8, headSize, kQ_HEADS,
+        kKV_HEADS, /*slidingWindow=*/true, /*specDecode=*/true, kTOKENS_PER_PAGE, contiguousQuerySwa));
+    auto run = [&](uint32_t nbSplits) {
+        thrust::device_vector<half> outDevice(qInput.size(), __float2half(0.0F));
+        size_t const nbSeqs = static_cast<size_t>(kKV_HEADS) * 8;
+        thrust::device_vector<int32_t> semaphores(nbSeqs, 0);
+        size_t const scratchBytes = trt_edgellm::xqaMultiBlockScratchUpperBound(headSize, nbSeqs * nbSplits);
+        thrust::device_vector<int8_t> scratch(scratchBytes, 0);
+        trt_edgellm::DecoderXQARunner runner(
+            DataType::kHALF, DataType::kINT8, 1, kQ_HEADS, kKV_HEADS, headSize, smVersion);
+        auto params = runner.initXQAParams();
+        params.qSeqLen = kQ_LEN;
+        params.qInputPtr = thrust::raw_pointer_cast(qDevice.data());
+        params.kvCache.data = thrust::raw_pointer_cast(poolDevice.data());
+        params.kvCache.sequence_lengths = thrust::raw_pointer_cast(lengthDevice.data());
+        params.kvCache.capacity = kvSequenceLength;
+        params.kvCache.pageList = thrust::raw_pointer_cast(pageListDevice.data());
+        params.kvCache.tokensPerPage = kTOKENS_PER_PAGE;
+        params.output = thrust::raw_pointer_cast(outDevice.data());
+        params.treeAttnMask = thrust::raw_pointer_cast(maskDevice.data());
+        params.attentionScale = 1.0F / std::sqrt(static_cast<float>(headSize));
+        params.kScale = 0.01F;
+        params.vScale = 0.01F;
+        params.slidingWinSize = static_cast<uint32_t>(slidingWindowSize);
+        params.contiguousQuerySwa = contiguousQuerySwa;
+        if (nbSplits > 1)
+        {
+            params.nbSubSeqPerSeq = nbSplits;
+            params.semaphores = thrust::raw_pointer_cast(semaphores.data());
+            params.scratch = thrust::raw_pointer_cast(scratch.data());
+            params.scratchBytes = scratchBytes;
+        }
+        runner.dispatchSpecDecodeXQAKernel(params, nullptr);
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        CUDA_CHECK(cudaGetLastError());
+        return thrust::host_vector<half>(outDevice);
+    };
+    auto const single = run(1);
+    auto const multi = run(splits);
+    float maxDiff = 0.0F;
+    for (size_t i = 0; i < single.size(); ++i)
+    {
+        float const a = __half2float(single[i]);
+        float const b = __half2float(multi[i]);
+        ASSERT_TRUE(std::isfinite(b)) << "non-finite multi-block output at " << i;
+        maxDiff = std::max(maxDiff, std::fabs(a - b));
+    }
+    std::cout << "XQA tree multi-block vs single-block (SWA " << slidingWindowSize << ", contiguous "
+              << contiguousQuerySwa << ") head " << headSize << " kv " << kvSequenceLength << " splits " << splits
+              << " max_abs_diff " << maxDiff << std::endl;
+    EXPECT_LE(maxDiff, 2e-3F);
+}
+
+TEST(XQATreeAttentionDecodingINT8Test, multiBlockMatchesSingleBlockSlidingWindow)
+{
+    for (bool contiguous : {false, true})
+    {
+        for (int32_t kvLength : {384, 3328, 7168})
+        {
+            TestXQATreeMultiBlockMatchesSingleBlockSwa(256, kvLength, 512, contiguous, 8);
+        }
+    }
+}
+
+TEST(XQATreeAttentionDecodingINT8Test, multiBlockPagedGemma4)
+{
+    for (uint32_t splits : {2U, 8U})
+    {
+        gTreeMultiBlockSplits = splits;
+        TestXQATreeAttentionDecodingInt8Accuracy(1, 8, 2, 256, 3328, 8, 128);
+        TestXQATreeAttentionDecodingInt8Accuracy(1, 8, 2, 256, 256, 8, 128);
+    }
+    gTreeMultiBlockSplits = 1;
 }
 
 // INT8 converts are native on every XQA SM, so unlike FP8 these run on SM80+ including SM87.
