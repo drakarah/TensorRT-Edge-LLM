@@ -43,13 +43,15 @@ import sys
 import threading
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
                     Optional, Sequence, Tuple, Union)
 
 from ..config import DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig
 from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
                                     validate_tool_request)
-from .engine_layout import BundleLayout, EngineType, inspect_bundle
+from .engine_layout import (BundleLayout, EngineType, detect_engine_type,
+                            inspect_bundle)
 
 logger = logging.getLogger("edgellm.server")
 
@@ -645,6 +647,35 @@ _GUIDE_TYPE_ENUM = {
 }
 
 
+def _canonical_schema_value(value: Any, ordered_keys: bool = False) -> Any:
+    """Canonicalise a JSON-schema value for the compiled-grammar cache key.
+
+    Object keys are sorted so that two spellings of one schema share a compiled
+    grammar, except the property names inside a ``properties`` map: XGrammar emits
+    an object's properties in the order the schema lists them, so that order is
+    part of the output format (a client that asks for ``answer`` before
+    ``verdict`` gets them generated in that order) and must survive.
+    """
+    if isinstance(value, dict):
+        keys = list(value) if ordered_keys else sorted(value)
+        return {
+            key:
+            _canonical_schema_value(
+                value[key],
+                ordered_keys=(not ordered_keys and key == "properties"
+                              and isinstance(value[key], dict)))
+            for key in keys
+        }
+    if isinstance(value, list):
+        return [_canonical_schema_value(item) for item in value]
+    return value
+
+
+def _canonical_schema_json(schema: Dict[str, Any]) -> str:
+    """Serialise a schema canonically; see ``_canonical_schema_value``."""
+    return json.dumps(_canonical_schema_value(schema))
+
+
 def _normalize_response_format(
         response_format: Optional[Dict[str,
                                        Any]]) -> Optional[Tuple[str, str]]:
@@ -672,7 +703,7 @@ def _normalize_response_format(
         if not isinstance(schema, dict):
             raise ValueError(
                 "'response_format.json_schema.schema' must be an object")
-        return ("json_schema", json.dumps(schema, sort_keys=True))
+        return ("json_schema", _canonical_schema_json(schema))
     raise ValueError(
         f"'response_format.type' must be text, json_object or json_schema, got {kind!r}"
     )
@@ -724,7 +755,7 @@ def _normalize_guided_decoding(
             guide = value
         elif name in ("json_schema", "structural_tag") and isinstance(
                 value, dict):
-            guide = json.dumps(value, sort_keys=True)
+            guide = _canonical_schema_json(value)
         else:
             raise ValueError(f"'guided_decoding.{name}' must be a string")
 
@@ -955,13 +986,30 @@ class LLM:
                 profile_options["max_draft_tree_size"] = profile_draft_size
             options = replace(options, **profile_options)
 
-        prepared = prepare_model(
-            model,
-            cache_dir,
-            options,
-            max_cache_size_bytes=int(engine_cache_max_size_gb * (1 << 30)),
-            clear_cache=clear_engine_cache,
-        )
+        if _is_prebuilt_bundle(model):
+            # Engine bundle from tensorrt-edgellm-export + llm_build (weights
+            # externalised next to the engines): load it as llm_inference does,
+            # without a checkpoint. The bundle doubles as the metadata dir.
+            bundle = os.path.abspath(model)
+            prepared = SimpleNamespace(bundle_dir=bundle, model_dir=bundle,
+                                       draft_model_dir="")
+            self._checkpoint_dir = ""
+            self._draft_checkpoint_dir = ""
+            if spec_method == "none" and detect_engine_type(
+                    bundle) == EngineType.SPEC_DECODE:
+                spec_method = _read_json(
+                    os.path.join(bundle, "base_config.json")).get(
+                        "spec_decode_type", "mtp")
+        else:
+            prepared = prepare_model(
+                model,
+                cache_dir,
+                options,
+                max_cache_size_bytes=int(engine_cache_max_size_gb * (1 << 30)),
+                clear_cache=clear_engine_cache,
+            )
+            self._checkpoint_dir = prepared.model_dir
+            self._draft_checkpoint_dir = prepared.draft_model_dir
         self._cache_dir = cache_root(cache_dir)
         self._model_dir = prepared.model_dir
         self._draft_model_dir = prepared.draft_model_dir
@@ -1037,8 +1085,8 @@ class LLM:
                 self._draft_top_k,
                 self._draft_step,
                 self._verify_tree_size,
-                self._model_dir,
-                self._draft_model_dir,
+                self._checkpoint_dir,
+                self._draft_checkpoint_dir,
                 context_cache_config,
                 self._dflash_block_size,
             )
@@ -1054,7 +1102,7 @@ class LLM:
                     self._bundle_dir,
                     self._media_dir,
                     {},
-                    self._model_dir,
+                    self._checkpoint_dir,
                     context_cache_config,
                     max_batch_size=self._max_batch_size,
                 )
@@ -1084,7 +1132,7 @@ class LLM:
                 self._bundle_dir,
                 self._media_dir,
                 {},
-                self._model_dir,
+                self._checkpoint_dir,
                 context_cache_config,
             )
         if getattr(self, "_runtime", None) is not None:
@@ -1492,7 +1540,8 @@ class LLM:
         ``on_handle`` receives the engine's RequestHandle as soon as the
         request is submitted, so a caller that gives up on the result (a
         disconnected client) can cancel it instead of leaving it decoding in
-        its batch seat until ``max_tokens``.
+        its batch seat until ``max_tokens``. On the blocking path it receives
+        a StreamChannel instead, whose cancel() has the same effect.
         """
         engine = getattr(self, "_engine", None)
         if engine is not None:
@@ -1502,8 +1551,22 @@ class LLM:
                 on_handle(handle)
             response = handle.get()
         else:
+            channel = None
+            if on_handle is not None and not request.stream_channels:
+                # The blocking runtime has no request handle, but its decode
+                # loop retires a slot whose StreamChannel is cancelled (the
+                # streaming path relies on this). Attach an unread channel and
+                # publish it as the handle, so a disconnected client's
+                # cancel() stops decoding instead of running to max_tokens.
+                channel = self._rt.StreamChannel.create()
+                channel.set_skip_special_tokens(request.skip_special_tokens)
+                request.stream_channels = [channel]
+                on_handle(channel)
             with self._infer_guard():
                 self._ensure_open()
+                if channel is not None and channel.is_cancelled():
+                    # Cancelled while queued for the lock: skip the prefill.
+                    raise RuntimeError("request cancelled before it started")
                 response = self._runtime.handle_request(request)
         # Callable on duck-typed non-LLM objects in the server tests, which have
         # no config to inherit a class default from.
@@ -2162,11 +2225,21 @@ class TTS:
         run_http_server(EngineClient(self, config), config)
 
 
+def _is_prebuilt_bundle(model: str) -> bool:
+    """Whether ``model`` is a ready-built engine bundle rather than a checkpoint."""
+    from .engine_layout import classify_model_source
+    return os.path.isdir(model) and classify_model_source(model) == "engine_dir"
+
+
 def load_model(**kwargs):
     """Select the model-specific runtime from provider checkpoint metadata."""
     from .engine_build import resolve_model_dir
 
     original_model = kwargs["model"]
+    if _is_prebuilt_bundle(original_model):
+        runtime = LLM(**kwargs)
+        runtime._model_id = _derive_model_id(original_model)
+        return runtime
     resolved = resolve_model_dir(original_model, kwargs.get("cache_dir", ""))
     with open(os.path.join(resolved, "config.json"), encoding="utf-8") as file:
         model_type = json.load(file).get("model_type")
@@ -2253,17 +2326,19 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
             call.type = str(raw_call.get("type") or "function")
             call.name = str(function.get("name") or "")
             arguments = function.get("arguments", {})
-            arguments_is_string = isinstance(arguments, str)
-            if arguments_is_string:
+            if isinstance(arguments, str):
+                # OpenAI clients send arguments as JSON text. Hand the template the parsed
+                # object, as vLLM does: provider templates such as Gemma 4's iterate the
+                # arguments and raise on a string ("must be a JSON object (mapping)").
                 try:
-                    json.loads(arguments) if arguments else {}
+                    arguments = json.loads(arguments) if arguments else {}
                 except json.JSONDecodeError as error:
                     raise ValueError(
                         f"Invalid JSON in assistant tool-call arguments: "
                         f"{error.msg}") from error
-            call.arguments_is_string = arguments_is_string
-            call.arguments = (arguments if arguments_is_string else json.dumps(
-                arguments, ensure_ascii=False, separators=(",", ":")))
+            call.arguments_is_string = False
+            call.arguments = json.dumps(arguments, ensure_ascii=False,
+                                        separators=(",", ":"))
             cpp_tool_calls.append(call)
         cpp_msg.tool_calls = cpp_tool_calls
 

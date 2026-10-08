@@ -30,6 +30,7 @@ from ...config import (QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
 from ..default.modeling_default import (MLP, Attention, CausalLM, DecoderLayer,
                                         OnnxSpec, RMSNorm,
                                         _concat_hidden_in_provider_order)
+from ..int8_kv_cache import int8_kv_qkv_scales, kv_cache_torch_dtype
 from ..linear import TPMode, make_linear
 from ..ops import (KV_PAGE_SIZE, attention_plugin, int4_moe_plugin,
                    nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
@@ -135,7 +136,7 @@ def _gemma4_uses_swa_kv_cache(config: ModelConfig) -> bool:
         return False
 
     quant = getattr(config, "quant", None)
-    if getattr(quant, "kv_cache_quant", None) == "fp8":
+    if getattr(quant, "kv_cache_quant", None) in ("fp8", "int8"):
         return False
 
     spec_flags = (
@@ -515,6 +516,7 @@ class Gemma4Attention(Attention):
         self.head_dim = _head_dim_for_attention_type(config,
                                                      self.attention_type)
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
+        self.enable_int8_kv_cache = config.quant.kv_cache_quant == "int8"
         hidden_size = int(config.hidden_size)
         qkv_in_features = int(in_features or hidden_size)
         module_prefix = f"layers.{layer_idx}.self_attn"
@@ -562,6 +564,10 @@ class Gemma4Attention(Attention):
         first_shared = (config.num_hidden_layers - num_kv_shared
                         if num_kv_shared > 0 else config.num_hidden_layers)
         self.is_kv_shared = layer_idx >= first_shared
+        if self.enable_int8_kv_cache:
+            # A KV-sharing layer reads its donor's cache, so it dequantizes with the donor's scales.
+            storage_layer = _compute_kv_donor_indices(config).get(layer_idx, layer_idx)
+            self._qkv_scales_float = int8_kv_qkv_scales(storage_layer)
 
         # KV-shared layers don't use k_proj/v_proj/k_norm — remove them
         # so their weights are not loaded from the checkpoint.
@@ -590,6 +596,24 @@ class Gemma4Attention(Attention):
                                           if self.attention_type
                                           != "sliding_attention" else 0.0)
 
+    def _tree_swa_kwargs(self) -> dict:
+        """Sliding-window kwargs for the spec-decode (tree verify) plugin.
+
+        The default XQA spec-decode kernel anchors every query's window at the
+        LAST verify slot, so a node at slot i of an n-node tree loses its
+        n-1-depth(i) oldest in-window keys. The contiguous-query variant anchors
+        query i at first_query_position + i instead. That is exact for a linear
+        chain, and for a tree it can only over-mask by i - depth(i) keys (never
+        under-mask): the DDTree builder appends a node only after its parent, so
+        i >= depth(i). It is therefore exact for the root (whose argmax is always
+        emitted) and for every node with i == depth(i), and never worse than the
+        default for any node. Exact parity for the remaining tree nodes needs the
+        kernel to anchor at the node's depth (e.g. ancestor-mask popcount - 1).
+        """
+        if self.sliding_window_size > 0:
+            return {"enable_contiguous_query_swa": 1}
+        return {}
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -614,7 +638,13 @@ class Gemma4Attention(Attention):
                | None]:
         batch_size, seq_len, _ = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states)
+        fused_qkv = getattr(self, "qkv_proj_fused", None)
+        if fused_qkv is not None:
+            # One INT4 GEMV for q, k and v (see fuse_gemma4_int4_projections).
+            query_states, key_states, value_states = fused_qkv(hidden_states).split(
+                self.qkv_fused_split, dim=-1)
+        else:
+            query_states = self.q_proj(hidden_states)
 
         if self.is_kv_shared:
             # Bounded SWA consumers carry the donor's current K/V transiently so
@@ -625,7 +655,7 @@ class Gemma4Attention(Attention):
             else:
                 key_states = None
                 value_states = None
-        else:
+        elif fused_qkv is None:
             key_states = self.k_proj(hidden_states)
             if self.attention_k_eq_v:
                 value_states = key_states
@@ -685,12 +715,15 @@ class Gemma4Attention(Attention):
         if enable_tree:
             kwargs["attention_mask"] = attention_mask
             kwargs["attention_pos_id"] = attention_pos_id
+            kwargs.update(self._tree_swa_kwargs())
         elif enable_vision_block:
             # The optional attention-mask input carries vision block IDs;
             # the static plugin attribute disambiguates its semantics.
             kwargs["attention_mask"] = vision_block_ids
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
+        if self.enable_int8_kv_cache:
+            kwargs["enable_int8_kv_cache"] = 1
         if uses_bounded_swa:
             if swa_kv_cache_mode is None:
                 raise ValueError(
@@ -747,14 +780,19 @@ class Gemma4Attention(Attention):
         valid_tree_counts: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]
                | None]:
-        query_states = self.q_proj(hidden_states)
+        fused_qkv = getattr(self, "qkv_proj_fused", None)
+        if fused_qkv is not None:
+            query_states, key_states, value_states = fused_qkv(hidden_states).split(
+                self.qkv_fused_split, dim=-1)
+        else:
+            query_states = self.q_proj(hidden_states)
         if self.is_kv_shared:
             if self.use_swa_pool and shared_key_value is not None:
                 key_states, value_states = shared_key_value
             else:
                 key_states = None
                 value_states = None
-        else:
+        elif fused_qkv is None:
             key_states = self.k_proj(hidden_states)
             value_states = (key_states if self.attention_k_eq_v else
                             self.v_proj(hidden_states))
@@ -793,6 +831,7 @@ class Gemma4Attention(Attention):
             "enable_vision_block_attention": vision_block_ids is not None,
             "skip_softmax_scale_factor": 0.0,
             "qkv_scales": getattr(self, "_qkv_scales_float", [1.0, 1.0, 1.0]),
+            "enable_int8_kv_cache": int(self.enable_int8_kv_cache),
             "query_start_offsets": query_start_offsets,
             "attention_sequence_lengths": attention_sequence_lengths,
             "execution_phase_marker": execution_phase_marker,
@@ -805,6 +844,7 @@ class Gemma4Attention(Attention):
         if enable_tree:
             kwargs.update(attention_mask=packed_attention_mask,
                           attention_pos_id=attention_position_ids)
+            kwargs.update(self._tree_swa_kwargs())
         if self.use_swa_pool and not enable_tree:
             if swa_kv_cache_mode is None:
                 raise ValueError(
@@ -861,8 +901,14 @@ class Gemma4MLP(MLP):
         # Without this clamp, the fp16 down_proj MatMul can produce Inf
         # (dot product of 21504 elements at +/-65504 overflows fp16 output range),
         # which then causes NaN in the subsequent RMSNorm (Inf*0=NaN).
-        gate = self.act_fn(self.gate_proj(hidden_states).to(torch.float32))
-        up = self.up_proj(hidden_states).to(torch.float32)
+        fused_gate_up = getattr(self, "gate_up_proj", None)
+        if fused_gate_up is not None:
+            # One INT4 GEMV for gate and up (see fuse_gemma4_int4_projections).
+            gate, up = fused_gate_up(hidden_states).to(torch.float32).split(self.gate_up_split, dim=-1)
+            gate = self.act_fn(gate)
+        else:
+            gate = self.act_fn(self.gate_proj(hidden_states).to(torch.float32))
+            up = self.up_proj(hidden_states).to(torch.float32)
         intermediate = (gate * up).clamp(-2048.0, 2048.0)
         return self.down_proj(intermediate.to(hidden_states.dtype))
 
@@ -1948,8 +1994,8 @@ class Gemma4ForCausalLM(CausalLM):
         num_sequences = 2
         query_length = 2
         physical_tokens = num_sequences * query_length
-        kv_dtype = (torch.float8_e4m3fn
-                    if config.quant.kv_cache_quant == "fp8" else torch.float16)
+        kv_dtype = kv_cache_torch_dtype(config.quant.kv_cache_quant,
+                                        torch.float16)
         inputs_embeds = torch.zeros(physical_tokens,
                                     config.hidden_size,
                                     dtype=torch.float16,
@@ -2431,3 +2477,68 @@ def GEMMA4_FUSED_BF16_KEY_REMAP(key: str) -> "str | None":
     key = _ROUTER_RE.sub(r"\1moe_block.router.", key)
     key = _FUSED_EXPERTS_RE.sub(r"\1moe_block.experts.\2", key)
     return key
+
+
+def _concat_gptq_linears(linears: list) -> nn.Module:
+    """Concatenate GPTQLinear modules that share an input along the output axis.
+
+    Works in the checkpoint's GPTQ layout (before repacking): qweight [in/8, out],
+    qzeros [in/G, out/8] and scales [in/G, out] all concatenate on dim 1; g_idx is shared.
+    """
+    from ..linear import GPTQLinear
+    first = linears[0]
+    fused = GPTQLinear(first.in_features, sum(lin.out_features for lin in linears),
+                       group_size=first.group_size, zero_point_offset=first.zero_point_offset,
+                       bias=False)
+    for name in ("qweight", "qzeros", "scales"):
+        fused._buffers[name] = torch.cat([lin._buffers[name] for lin in linears], dim=1)
+    fused._buffers["g_idx"] = first._buffers["g_idx"]
+    fused._buffers["int4_act_perm"] = first._buffers["int4_act_perm"]
+    return fused
+
+
+def fuse_gemma4_int4_projections(model: nn.Module) -> int:
+    """Fuse q/k/v and gate/up GPTQ INT4 projections into single GEMMs (opt-in).
+
+    Enabled by EDGELLM_FUSE_GEMMA4_INT4=1. Must run after checkpoint load and before
+    ``_repack_gptq_weights``. Decode on Orin is weight-streaming bound and the small
+    k/v projections (512 rows) reach only ~37% of bandwidth per call; one fused call per
+    layer streams the same bytes with fewer, larger kernels. Layers whose projections are
+    not all unrepacked GPTQ int32 (or that share KV / have no v_proj) are left unchanged.
+    Returns the number of fused modules.
+    """
+    import os
+    from ..linear import GPTQLinear
+    if os.environ.get("EDGELLM_FUSE_GEMMA4_INT4") != "1":
+        return 0
+
+    def fusible(linears):
+        return all(isinstance(lin, GPTQLinear) and lin.bias is None
+                   and lin._buffers.get("qweight") is not None
+                   and lin._buffers["qweight"].dtype == torch.int32 for lin in linears)
+
+    fused_count = 0
+    for module in model.modules():
+        if isinstance(module, Gemma4Attention) and not module.is_kv_shared \
+                and not module.attention_k_eq_v and module.v_proj is not None \
+                and not module.enable_fp8_kv_cache:
+            parts = [module.q_proj, module.k_proj, module.v_proj]
+            if fusible(parts):
+                module.qkv_proj_fused = _concat_gptq_linears(parts)
+                module.qkv_fused_split = [lin.out_features for lin in parts]
+                module.k_proj = None
+                module.v_proj = None
+                module.q_proj = None
+                fused_count += 1
+        elif isinstance(module, Gemma4MLP):
+            parts = [module.gate_proj, module.up_proj]
+            if fusible(parts):
+                module.gate_up_proj = _concat_gptq_linears(parts)
+                module.gate_up_split = [lin.out_features for lin in parts]
+                module.gate_proj = None
+                module.up_proj = None
+                fused_count += 1
+    import logging
+    logging.getLogger(__name__).info("Fused %d Gemma4 INT4 projection groups (q/k/v, gate/up)",
+                                     fused_count)
+    return fused_count

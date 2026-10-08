@@ -61,8 +61,9 @@ public:
     /*!
      * @brief Allocate reusable buffers and record the vocabulary geometry.
      *
-     * The tokenizer info is built on the first guided request instead: it costs one
-     * `idToPiece` call per output-vocabulary entry.
+     * Also builds the tokenizer info and grammar compiler (one `idToPiece` call per
+     * output-vocabulary entry, ~260 ms for 262k entries on Orin) so the first guided request
+     * does not pay for it. EDGELLM_GUIDED_PREWARM=0 defers that to the first guided request.
      *
      * @param maxRowsPerSlot    Logits rows each slot can own in one step: 1 for vanilla decode,
      *                          the speculative verify size otherwise. Sizes the bitmask buffers.

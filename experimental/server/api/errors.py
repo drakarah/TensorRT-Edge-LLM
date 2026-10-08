@@ -90,7 +90,9 @@ class EngineError(ServerError):
 
     def __init__(self, message: str) -> None:
         if "EDGELLM_INPUT_TOO_LONG" in message:
-            status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            # 400, as llama-server and vLLM answer a context overflow; clients
+            # key their "prompt too long" handling off that status.
+            status = HTTPStatus.BAD_REQUEST
             error_type = "invalid_request_error"
         elif "EDGELLM_BAD_MEDIA_COUNT" in message:
             status = HTTPStatus.BAD_REQUEST

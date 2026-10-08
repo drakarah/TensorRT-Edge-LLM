@@ -25,6 +25,7 @@ import torch.nn.functional as F
 
 from ...config import ModelConfig
 from ..default.modeling_default import OnnxSpec, RMSNorm
+from ..int8_kv_cache import int8_kv_qkv_scales, kv_cache_torch_dtype
 from ..linear import TPMode, make_linear
 from ..ops import KV_PAGE_SIZE, attention_plugin
 from .modeling_gemma4_text import Gemma4MLP, _rotary_dim_from_rope_config
@@ -104,6 +105,15 @@ class Gemma4SharedKVAttention(nn.Module):
                                   tp_mode=TPMode.ROW)
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
+        self.enable_int8_kv_cache = config.quant.kv_cache_quant == "int8"
+        self._qkv_scales = [1.0, 1.0, 1.0]
+        if self.enable_int8_kv_cache:
+            # The assistant reads the target's cache: dequantize with the target layer's scales.
+            target = [entry for entry in (getattr(config, "kv_sharing_map", None) or [])
+                      if int(entry["assistant_layer"]) == layer_idx]
+            if len(target) != 1:
+                raise ValueError(f"INT8 KV cache: no unique target layer for assistant layer {layer_idx}")
+            self._qkv_scales = int8_kv_qkv_scales(int(target[0]["target_layer"]))
         layer_type = self._layer_type_for_layer(config, layer_idx)
         self.attention_type = layer_type
         if layer_type == "full_attention":
@@ -185,7 +195,8 @@ class Gemma4SharedKVAttention(nn.Module):
             skip_softmax_scale_factor=0.0,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
-            qkv_scales=[1.0, 1.0, 1.0],
+            qkv_scales=self._qkv_scales,
+            enable_int8_kv_cache=int(self.enable_int8_kv_cache),
             enable_kv_shared=1,
         )
         return self.o_proj(
@@ -219,7 +230,8 @@ class Gemma4SharedKVAttention(nn.Module):
             enable_context_mask_selector=False,
             enable_vision_block_attention=False,
             skip_softmax_scale_factor=0.0,
-            qkv_scales=[1.0, 1.0, 1.0],
+            qkv_scales=self._qkv_scales,
+            enable_int8_kv_cache=int(self.enable_int8_kv_cache),
             enable_kv_shared=1,
             query_start_offsets=metadata["query_start_offsets"],
             attention_sequence_lengths=metadata["attention_sequence_lengths"],
@@ -317,6 +329,14 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
 
     def prepare_for_export(self) -> None:
         token_ordering = self.token_ordering.detach().to(torch.long).cpu()
+        # forward() scatters candidate logits by token id; that is only
+        # equivalent to the per-token centroid mask if every token belongs to
+        # exactly one centroid.
+        if not torch.equal(torch.sort(token_ordering).values,
+                           torch.arange(self.vocab_size, dtype=torch.long)):
+            raise ValueError(
+                "Gemma4 ordered embeddings require token_ordering to be a "
+                "permutation of the vocabulary.")
         cluster_ids = torch.arange(self.num_centroids,
                                    dtype=torch.long).repeat_interleave(
                                        self.vocab_size_per_centroid)
@@ -327,20 +347,31 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor,
                 lm_head_weight: torch.Tensor) -> torch.Tensor:
-        full_logits = F.linear(hidden_states,
-                               lm_head_weight.to(hidden_states.dtype))
+        # Only the top-k centroids' tokens (k * vocab/num_centroids, 4096 of
+        # 262144 for E4B) can survive the mask, so gather just those LM-head
+        # rows instead of streaming the whole tied embedding table every draft
+        # step. The output keeps the full-vocab, -65504-filled contract that the
+        # C++ drafter (outputVocabSize) and the tree builder consume.
         centroid_logits = self.centroids(hidden_states)
         _, top_k_indices = torch.topk(centroid_logits,
                                       k=self.centroid_intermediate_top_k,
                                       dim=-1)
 
-        token_to_centroid = self.token_to_centroid.view(
-            *([1] * (full_logits.ndim - 1)), self.vocab_size, 1)
-        selected_centroids = top_k_indices.unsqueeze(-2)
-        selected_mask = (token_to_centroid == selected_centroids).any(dim=-1)
+        # token_ordering lists each centroid's tokens contiguously (the same
+        # layout prepare_for_export inverts into token_to_centroid).
+        centroid_tokens = self.token_ordering.view(
+            self.num_centroids, self.vocab_size_per_centroid)
+        candidate_ids = centroid_tokens[top_k_indices].flatten(-2)
+        candidate_rows = F.embedding(candidate_ids,
+                                     lm_head_weight.to(hidden_states.dtype))
+        candidate_logits = torch.matmul(
+            candidate_rows, hidden_states.unsqueeze(-1)).squeeze(-1)
 
-        mask_value = torch.full_like(full_logits, -65504.0)
-        return torch.where(selected_mask, full_logits, mask_value)
+        logits = hidden_states.new_full(
+            (*hidden_states.shape[:-1], self.vocab_size), -65504.0)
+        # Candidate ids are unique (distinct centroids, disjoint token sets),
+        # so the scatter has no write conflicts.
+        return logits.scatter(-1, candidate_ids, candidate_logits)
 
 
 class Gemma4AssistantForCausalLM(nn.Module):
@@ -462,8 +493,7 @@ class Gemma4AssistantForCausalLM(nn.Module):
                                                full_rotary_dim,
                                                dtype=torch.float32,
                                                device=device)
-        kv_dtype = (torch.float8_e4m3fn
-                    if config.quant.kv_cache_quant == "fp8" else dtype16)
+        kv_dtype = kv_cache_torch_dtype(config.quant.kv_cache_quant, dtype16)
         # Target paged KV pool binding: [2, num_pages, KV_PAGE_SIZE, num_kv_heads,
         # head_dim] — the assistant reads the TARGET model's pool, so the dummy
         # mirrors the target's per-layer pool shape.

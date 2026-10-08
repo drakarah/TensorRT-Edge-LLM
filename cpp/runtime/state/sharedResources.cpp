@@ -157,6 +157,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.numPages=*/cfg.kvPoolPages,
         /*.numSwaPages=*/cfg.numSwaPages,
         /*.useBoundedSwaKVCache=*/cfg.usesBoundedSwaKVCache(),
+        /*.kvSharingDonors=*/cfg.kvSharingDonors,
     };
     rt::MambaCacheManager::Config mambaCfg{
         /*.numRecurrentLayers=*/cfg.numLinearAttnLayers,
@@ -259,6 +260,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.numPages=*/bundle.base.kvPoolPages,
             /*.numSwaPages=*/bundle.base.numSwaPages,
             /*.useBoundedSwaKVCache=*/bundle.base.usesBoundedSwaKVCache(),
+            /*.kvSharingDonors=*/bundle.base.kvSharingDonors,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/bundle.base.numLinearAttnLayers,

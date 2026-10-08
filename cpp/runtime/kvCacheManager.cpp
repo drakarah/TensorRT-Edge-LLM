@@ -51,7 +51,8 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     : mConfig(config)
 {
     (void) stream;
-    check::check(mConfig.kvCacheType == nvinfer1::DataType::kHALF || mConfig.kvCacheType == nvinfer1::DataType::kFP8,
+    check::check(mConfig.kvCacheType == nvinfer1::DataType::kHALF || mConfig.kvCacheType == nvinfer1::DataType::kFP8
+            || mConfig.kvCacheType == nvinfer1::DataType::kINT8,
         "Unsupported KV cache dtype.");
     check::check(mConfig.numAttentionLayers >= 0, "numAttentionLayers must be non-negative.");
     check::check(mConfig.maxBatchSize > 0, "maxBatchSize must be positive.");
@@ -94,8 +95,8 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
             boundedCapability = resolvedCapacity;
         }
     }
-    check::check(!boundedCapability.has_value() || mConfig.kvCacheType != nvinfer1::DataType::kFP8,
-        "KVCacheManager: SWA-capable KV configurations do not support FP8 KV cache.");
+    check::check(!boundedCapability.has_value() || mConfig.kvCacheType == nvinfer1::DataType::kHALF,
+        "KVCacheManager: SWA-capable KV configurations do not support a quantized (FP8/INT8) KV cache.");
     if (boundedCapability.has_value())
     {
         int64_t const minimumSwaPages = computeMinimumSwaPoolPages(mConfig.maxBatchSize, *boundedCapability);
@@ -121,7 +122,9 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     }
 
     size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
-    char const* kvCacheTypeStr = (mConfig.kvCacheType == nvinfer1::DataType::kHALF) ? "kHALF" : "kFP8";
+    char const* kvCacheTypeStr = (mConfig.kvCacheType == nvinfer1::DataType::kHALF) ? "kHALF"
+        : (mConfig.kvCacheType == nvinfer1::DataType::kINT8)                         ? "kINT8"
+                                                                                      : "kFP8";
 
     // Determine uniformity: check if all layers share the same numKVHeads and headDim.
     mIsUniform = true;
@@ -140,9 +143,30 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     mLayerCaches.reserve(mConfig.numAttentionLayers);
     mLayerCapPadded.reserve(mConfig.numAttentionLayers);
     mLayerNumPages.reserve(mConfig.numAttentionLayers);
+    check::check(mConfig.kvSharingDonors.empty()
+            || static_cast<int32_t>(mConfig.kvSharingDonors.size()) == mConfig.numAttentionLayers,
+        "KVCacheManager: kvSharingDonors must be empty or have one entry per attention layer.");
+    size_t sharedBytesSkipped = 0;
     for (int32_t i = 0; i < mConfig.numAttentionLayers; ++i)
     {
         KVLayerConfig const& lc = mConfig.layerConfigs[i];
+        if (isKVSharingRecipient(i))
+        {
+            // The recipient reads its donor's pool (pipelineIO binds the donor's tensor), so a
+            // pool of its own would never be read or written. Keep the donor's geometry for the
+            // per-layer accessors and store an empty placeholder.
+            int32_t const donor = mConfig.kvSharingDonors[i];
+            check::check(donor >= 0 && donor < i && !isKVSharingRecipient(donor),
+                "KVCacheManager: a KV-sharing donor must be an earlier layer that owns its pool.");
+            KVLayerConfig const& dc = mConfig.layerConfigs[donor];
+            check::check(dc.numKVHeads == lc.numKVHeads && dc.headDim == lc.headDim,
+                "KVCacheManager: KV-sharing recipient and donor head shapes must match.");
+            mLayerNumPages.push_back(mLayerNumPages[donor]);
+            mLayerCapPadded.push_back(mLayerCapPadded[donor]);
+            sharedBytesSkipped += computeLayerBytes(mLayerNumPages[donor], lc, elemSize);
+            mLayerCaches.emplace_back();
+            continue;
+        }
         bool const isReduced
             = mConfig.useBoundedSwaKVCache && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.maxSequenceLength);
         int32_t const layerNumPages = isReduced ? mConfig.numSwaPages : mNumPages;
@@ -162,6 +186,11 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     LOG_INFO("KVCacheManager(dtype=%s, layers=%d, uniform=%s) KV cache pool allocation: %zu bytes (%.2f MiB)",
         kvCacheTypeStr, mConfig.numAttentionLayers, mIsUniform ? "true" : "false", totalBytes,
         static_cast<float>(totalBytes) / (1024.0f * 1024.0f));
+    if (sharedBytesSkipped > 0)
+    {
+        LOG_INFO("KVCacheManager: %zu bytes (%.2f MiB) not allocated for KV-sharing recipient layers.",
+            sharedBytesSkipped, static_cast<float>(sharedBytesSkipped) / (1024.0f * 1024.0f));
+    }
 }
 
 KVCacheManager::~KVCacheManager() noexcept {}
@@ -206,14 +235,24 @@ KVCacheManager& KVCacheManager::operator=(KVCacheManager&& other) noexcept
     return *this;
 }
 
+int32_t KVCacheManager::storageLayer(int32_t attnLayerIdx) const noexcept
+{
+    return isKVSharingRecipient(attnLayerIdx) ? mConfig.kvSharingDonors[attnLayerIdx] : attnLayerIdx;
+}
+
+bool KVCacheManager::isKVSharingRecipient(int32_t attnLayerIdx) const noexcept
+{
+    return !mConfig.kvSharingDonors.empty() && mConfig.kvSharingDonors[attnLayerIdx] >= 0;
+}
+
 rt::Tensor& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx) noexcept
 {
-    return mLayerCaches[attnLayerIdx];
+    return mLayerCaches[storageLayer(attnLayerIdx)];
 }
 
 rt::Tensor const& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx) const noexcept
 {
-    return mLayerCaches[attnLayerIdx];
+    return mLayerCaches[storageLayer(attnLayerIdx)];
 }
 
 std::pair<rt::Tensor, rt::Tensor> KVCacheManager::getSeparateKVCache(int32_t attnLayerIdx) const noexcept
@@ -269,7 +308,7 @@ std::optional<int32_t> KVCacheManager::reducedKVCacheCapacity() const noexcept
 
 void* KVCacheManager::kPoolPtr(int32_t attnLayerIdx) const noexcept
 {
-    return const_cast<void*>(mLayerCaches[attnLayerIdx].rawPointer());
+    return const_cast<void*>(mLayerCaches[storageLayer(attnLayerIdx)].rawPointer());
 }
 
 void* KVCacheManager::vPoolPtr(int32_t attnLayerIdx) const noexcept

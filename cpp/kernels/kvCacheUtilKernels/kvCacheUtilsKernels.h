@@ -78,6 +78,14 @@ void saveKVCacheBatched(KVLayerInfo const* srcLayerInfos, KVLayerInfo const* dst
 void instantiateKVCacheBatched(KVLayerInfo const* dstLayerInfos, KVLayerInfo const* srcLayerInfos, int32_t numLayers,
     int32_t headDim, int32_t kvPoolPages, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
 
+//! Storage of a paged KV pool as seen by the split-K/V gather.
+enum class KVPoolQuant
+{
+    kNONE, //!< FP16 pool: bytes are copied
+    kFP8,  //!< FP8 e4m3 pool: dequantized to FP16
+    kINT8, //!< INT8 pool: dequantized to FP16
+};
+
 //! \brief Gathers logical pages 0..ceil(seqLen/128) of every slot from a paged K/V page pool into dense
 //! split K/V workspaces, for FMHA-v2 FP8, padding, and vision-block consumers that require a contiguous
 //! [B, seqLen, H, D] FP16 view. The destination is ALWAYS FP16 (half): an FP8 pool is dequantized with the
@@ -107,14 +115,15 @@ void instantiateKVCacheBatched(KVLayerInfo const* dstLayerInfos, KVLayerInfo con
 //! \param[in]  headDim        Head dimension.
 //! \param[in]  elemSize       Size in bytes of one POOL element (2 for FP16, 1 for FP8) -- ignored when
 //!                            dequantFp8 is true (pool is FP8, dst is FP16).
-//! \param[in]  dequantFp8     If true, treat the pool as FP8 e4m3 and dequantize to FP16 with kScale/vScale.
-//! \param[in]  kScale         K dequant scale (dequant value = fp8 * kScale). Unused when dequantFp8 false.
-//! \param[in]  vScale         V dequant scale. Unused when dequantFp8 false.
+//! \param[in]  poolQuant      Storage of the pool: kNONE copies bytes, kFP8 / kINT8 dequantize to FP16
+//!                            with kScale/vScale.
+//! \param[in]  kScale         K dequant scale (dequant value = stored * kScale). Unused for kNONE.
+//! \param[in]  vScale         V dequant scale. Unused for kNONE.
 //! \param[in]  stream         CUDA stream to launch the kernel on.
 //! \throws std::runtime_error if ceil(seqLen/128) exceeds maxPagesPerSeq.
 void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t const* pageTable, int32_t const* kvSeqLens,
     int32_t maxPagesPerSeq, int32_t batchSize, int32_t seqLen, int32_t numKVHeads, int32_t headDim, size_t elemSize,
-    bool dequantFp8, float kScale, float vScale, cudaStream_t stream);
+    KVPoolQuant poolQuant, float kScale, float vScale, cudaStream_t stream);
 
 //! Gather a paged NHD K/V pool into the head-major [B,H,S,D] layout consumed by action engines.
 //! Tokens at or beyond each slot's live length are zero-filled, including the tail of a partial page.

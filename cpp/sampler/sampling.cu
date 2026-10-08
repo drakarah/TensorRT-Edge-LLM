@@ -879,12 +879,18 @@ void applyLogitBiasRepeatedRows(rt::Tensor& logits, rt::Tensor const& tokenIds, 
         rowsPerSlot);
 }
 
-//! One block per logits row. A set bit means the token is grammar-legal; every
-//! cleared bit is driven to kMaskedLogitValue so sampling can never pick it.
-__global__ void applyTokenBitmaskKernel(
-    float* logits, int32_t const* bitmask, int32_t const* rowNeedsMask, int32_t vocabSize, int32_t bitmaskStride)
+//! Words of the packed mask each warp visits per launch; sizes the grid's x dimension.
+constexpr int32_t kTOKEN_BITMASK_WORDS_PER_WARP = 8;
+
+//! Grid is (vocab chunks, rows), so every SM takes part even when only a handful of rows are
+//! masked. Each warp owns one 32-bit mask word at a time, lane `i` owning token `32 * word + i`,
+//! which keeps the logits stores coalesced. A set bit means the token is grammar-legal; every
+//! cleared bit is driven to kMaskedLogitValue so sampling can never pick it. An all-ones word
+//! (the common case inside a JSON string) is skipped without touching the logits.
+__global__ void applyTokenBitmaskKernel(float* logits, int32_t const* bitmask, int32_t const* rowNeedsMask,
+    int32_t vocabSize, int32_t numWords, int32_t bitmaskStride)
 {
-    int32_t const rowId = static_cast<int32_t>(blockIdx.x);
+    int32_t const rowId = static_cast<int32_t>(blockIdx.y);
     // Unconstrained rows (no grammar, finished slot, or terminated matcher) cost
     // one predictable branch and no memory traffic.
     if (rowNeedsMask[rowId] == 0)
@@ -895,11 +901,20 @@ __global__ void applyTokenBitmaskKernel(
     float* rowLogits = logits + static_cast<int64_t>(rowId) * vocabSize;
     int32_t const* rowMask = bitmask + static_cast<int64_t>(rowId) * bitmaskStride;
 
-    for (int32_t tokenId = static_cast<int32_t>(threadIdx.x); tokenId < vocabSize;
-        tokenId += static_cast<int32_t>(blockDim.x))
+    int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;
+    int32_t const warpsPerBlock = static_cast<int32_t>(blockDim.x) >> 5;
+    int32_t const totalWarps = static_cast<int32_t>(gridDim.x) * warpsPerBlock;
+    for (int32_t wordId = static_cast<int32_t>(blockIdx.x) * warpsPerBlock + (static_cast<int32_t>(threadIdx.x) >> 5);
+        wordId < numWords; wordId += totalWarps)
     {
-        int32_t const word = rowMask[tokenId >> 5];
-        if (((word >> (tokenId & 31)) & 1) == 0)
+        // Same address across the warp, so one broadcast load; the skip is warp-uniform.
+        uint32_t const word = static_cast<uint32_t>(rowMask[wordId]);
+        if (word == 0xFFFFFFFFU)
+        {
+            continue;
+        }
+        int32_t const tokenId = (wordId << 5) + lane;
+        if (tokenId < vocabSize && ((word >> lane) & 1U) == 0U)
         {
             rowLogits[tokenId] = kMaskedLogitValue;
         }
@@ -934,9 +949,14 @@ void applyTokenBitmask(
         return;
     }
 
+    check::check(numRows <= 65535, "Token bitmask row count exceeds the grid's y-dimension limit");
+
     constexpr int32_t kBLOCK_SIZE = 256;
-    applyTokenBitmaskKernel<<<numRows, kBLOCK_SIZE, 0, stream>>>(logits.dataPointer<float>(),
-        bitmask.dataPointer<int32_t>(), rowNeedsMask.dataPointer<int32_t>(), vocabSize, bitmaskStride);
+    constexpr int32_t kWORDS_PER_BLOCK = (kBLOCK_SIZE / 32) * kTOKEN_BITMASK_WORDS_PER_WARP;
+    int32_t const numWords = (vocabSize + 31) / 32;
+    dim3 const grid((numWords + kWORDS_PER_BLOCK - 1) / kWORDS_PER_BLOCK, numRows);
+    applyTokenBitmaskKernel<<<grid, kBLOCK_SIZE, 0, stream>>>(logits.dataPointer<float>(),
+        bitmask.dataPointer<int32_t>(), rowNeedsMask.dataPointer<int32_t>(), vocabSize, numWords, bitmaskStride);
 }
 
 // Initialize ID values and offsets for top-p sampling

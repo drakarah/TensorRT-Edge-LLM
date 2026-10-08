@@ -109,8 +109,10 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
     check::check(mRuntime.deployment.specConfig.has_value(), "Gemma4 MTP requires a drafting config.");
     check::check(runtime.deployment.base.specDecodeType == SpecDecodeMode::kGemma4MTP,
         "Gemma4 MTP decoding requires a base engine exported with spec_decode_type=gemma4_mtp and engine_role=base.");
-    check::check(runtime.deployment.base.reducedVocabSize == 0,
-        "Gemma4 MTP currently requires a full-vocabulary base engine for greedy verification.");
+    // A reduced-vocabulary base is supported for tree verification (eagleAccept maps reduced
+    // argmax ids back to full ids through the base vocab map); the linear path's
+    // sequentialAccept has no mapping input, so it still needs a full-vocabulary base
+    // (checked in acceptAndCommit).
     check::check(runtime.deployment.draft->sharesTargetKV && !runtime.deployment.draft->hasOwnKVCache,
         "Gemma4 MTP assistant must share target KV and must not own draft KV cache.");
 
@@ -809,12 +811,18 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
     {
         check::check(mRuntime.base.pipelineIO.outputLogits.reshape({activeBatchSize * verifySize, vocabSize}),
             "Tensor reshape failed");
+        OptionalInputTensor vocabMappingTable = (mRuntime.deployment.base.reducedVocabSize > 0)
+            ? std::optional{std::ref(mRuntime.sampling.baseVocabMappingTable)}
+            : std::nullopt;
         kernel::eagleAccept(mRuntime.base.pipelineIO.outputLogits, mTreeTokenIds, mVerifyTreeMask, mAcceptedTokenIds,
-            mAcceptedTokenIndices, mAcceptLength, std::nullopt, mRuntime.sampling.workspace.rawPointer(),
+            mAcceptedTokenIndices, mAcceptLength, vocabMappingTable, mRuntime.sampling.workspace.rawPointer(),
             mRuntime.sampling.workspace.getMemoryCapacity(), context.stream);
     }
     else
     {
+        check::check(mRuntime.deployment.base.reducedVocabSize == 0,
+            "Gemma4 MTP linear drafting requires a full-vocabulary base engine; use tree drafting "
+            "(specDraftTopK > 1) with a reduced-vocabulary base.");
         check::check(mArgmaxScratch.reshape({activeBatchSize * verifySize}), "Tensor reshape failed");
         kernel::sequentialAccept(mRuntime.base.pipelineIO.outputLogits, mVerifyTokenIds, mAcceptedTokenIds,
             mAcceptLength, mArgmaxScratch, activeBatchSize, verifySize, vocabSize, context.stream);

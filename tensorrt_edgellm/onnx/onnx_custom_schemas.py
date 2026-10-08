@@ -224,6 +224,13 @@ _attention_plugin_schema = OpSchema(
             required=False,
         ),
         OpSchema.Attribute(
+            name="enable_int8_kv_cache",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether to use an INT8 KV cache with qkv_scales K/V scales (0(false), 1(true)). Optional.",
+            required=False,
+        ),
+        OpSchema.Attribute(
             name="enable_context_mask_selector",
             type=OpSchema.AttrType.INT,
             description=(

@@ -85,6 +85,12 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
         std::unordered_map<int32_t, size_t> headDimToGroupIdx;
         for (int32_t i = 0; i < mKVCache.numLayers(); ++i)
         {
+            // A KV-sharing recipient holds no data of its own (its accessors resolve to the
+            // donor), so copying it would only repeat the donor's copy.
+            if (mKVCache.isKVSharingRecipient(i))
+            {
+                continue;
+            }
             auto const& lc = mKVCache.getLayerConfig(i);
             if (mKVCache.hasReducedKVCache()
                 && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.kvConfig.maxSequenceLength))

@@ -92,6 +92,10 @@ public:
         int32_t numSwaPages{0};
         //! Runtime policy. False keeps capability markers but allocates every layer from the full page budget.
         bool useBoundedSwaKVCache{true};
+        //! Per attention layer: index of the donor layer whose KV it reads (cross-layer KV sharing,
+        //! e.g. Gemma 4), or -1. Empty means no sharing. A recipient owns no pool: its accessors
+        //! resolve to the donor's, which is what the attention plugins bind anyway.
+        std::vector<int32_t> kvSharingDonors{};
     };
     //! \endcond
 
@@ -131,6 +135,12 @@ public:
     //! @param attnLayerIdx The index of the attention layer.
     //! @return A reference to the tensor with shape
     //!         [2, numPages(attnLayerIdx), kTOKENS_PER_PAGE, numKVHeads_i, headDim_i].
+    //! Layer whose pool backs @p attnLayerIdx: its KV-sharing donor, or the layer itself.
+    int32_t storageLayer(int32_t attnLayerIdx) const noexcept;
+
+    //! True when @p attnLayerIdx reads a donor's KV and owns no pool of its own.
+    bool isKVSharingRecipient(int32_t attnLayerIdx) const noexcept;
+
     rt::Tensor& getCombinedKVCache(int32_t attnLayerIdx) noexcept;
     rt::Tensor const& getCombinedKVCache(int32_t attnLayerIdx) const noexcept;
 

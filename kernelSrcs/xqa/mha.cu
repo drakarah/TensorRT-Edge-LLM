@@ -437,6 +437,15 @@ struct alignas(128) SharedMem
 
 constexpr uint32_t kSmemSize = sizeof(SharedMem);
 CUBIN_EXPORT __device__ uint32_t smemSize = kSmemSize;
+
+// Multi-block (split-KV) merge scratch, per sub-sequence: a row-max and a row-sum buffer
+// (SMemWarpRowMax each) followed by one output tile per GEMM-1 warp. The merge step below and the
+// host-side scratch sizing share these types; the host reads the sizes from the module, the same
+// way it reads smemSize, so it can replay the MemSegmenter layout exactly.
+using MultiBlockScratchBuf = Array2D<LdGrain, nbValidRows, SharedMem::XSmemBuffer::cols>;
+using MultiBlockScratchTile = Vec<MultiBlockScratchBuf, gemm1WarpsPerGrp>;
+CUBIN_EXPORT __device__ uint32_t multiBlockRowStatBytes = sizeof(SMemWarpRowMax);
+CUBIN_EXPORT __device__ uint32_t multiBlockScratchTileBytes = sizeof(MultiBlockScratchTile);
 #ifdef __CUDA_ARCH__
 static_assert(kSmemSize < kMAX_SMEM_SIZE);
 #endif
@@ -2919,9 +2928,8 @@ CUBIN_EXPORT __global__
                 rowMaxBuffers[idxBuf].storeFromReg<false>(warp, globalRowMax);
                 rowSumBuffers[idxBuf].storeFromReg<false>(warp, globalRowSum);
             }
-            using ScratchBuf = Array2D<LdGrain, nbValidRows, SharedMem::XSmemBuffer::cols>;
-            TinyPtr<Vec<ScratchBuf, gemm1WarpsPerGrp>> const scratchBuffers
-                = segmenter.newSeg<Vec<ScratchBuf, gemm1WarpsPerGrp>>(nbSubSeq);
+            using ScratchBuf = MultiBlockScratchBuf;
+            TinyPtr<MultiBlockScratchTile> const scratchBuffers = segmenter.newSeg<MultiBlockScratchTile>(nbSubSeq);
             // copy output to scratch
             copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
                 warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp](0, 0), &(*smemOutTile)(0, 0));

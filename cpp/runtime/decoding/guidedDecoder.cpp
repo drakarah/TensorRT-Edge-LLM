@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <nlohmann/json.hpp>
 
@@ -452,8 +453,44 @@ namespace
 //! Threads XGrammar may use to compile one grammar.
 constexpr int kCOMPILER_THREADS = 8;
 
-//! Compiled-grammar LRU budget; XGrammar leaves it unlimited by default.
-constexpr int64_t kCACHE_LIMIT_BYTES = 64LL * 1024 * 1024;
+//! Default compiled-grammar LRU budget; XGrammar leaves it unlimited by default.
+constexpr int64_t kDEFAULT_CACHE_LIMIT_MB = 64;
+
+//! Compiled-grammar LRU budget in bytes. EDGELLM_GRAMMAR_CACHE_MB overrides the default for
+//! deployments whose schemas do not fit: a miss costs a full compile (~80 ms on Orin), a hit
+//! almost nothing. Unset, empty or non-positive values keep the default.
+int64_t grammarCacheLimitBytes()
+{
+    int64_t limitMb = kDEFAULT_CACHE_LIMIT_MB;
+    char const* value = std::getenv("EDGELLM_GRAMMAR_CACHE_MB");
+    if (value != nullptr && *value != '\0')
+    {
+        long long const parsed = std::atoll(value);
+        if (parsed > 0)
+        {
+            limitMb = static_cast<int64_t>(parsed);
+        }
+        else
+        {
+            LOG_WARNING("Guided decoding: ignoring EDGELLM_GRAMMAR_CACHE_MB='%s'; using %lld MB", value,
+                static_cast<long long>(kDEFAULT_CACHE_LIMIT_MB));
+        }
+    }
+    return limitMb * 1024 * 1024;
+}
+
+//! Placeholder pieces of the form `<unusedN>`. Gemma keeps thousands of them in the base vocabulary
+//! rather than as added tokens, so no `special` flag marks them, yet they are never text.
+bool isUnusedPlaceholderPiece(std::string const& piece)
+{
+    constexpr char kPREFIX[] = "<unused";
+    constexpr size_t kPREFIX_LEN = sizeof(kPREFIX) - 1;
+    if (piece.size() <= kPREFIX_LEN + 1 || piece.compare(0, kPREFIX_LEN, kPREFIX) != 0 || piece.back() != '>')
+    {
+        return false;
+    }
+    return std::all_of(piece.begin() + kPREFIX_LEN, piece.end() - 1, [](char c) { return c >= '0' && c <= '9'; });
+}
 
 //! Lower the alternatives onto XGrammar's EBNF. JSON string escaping is a subset of the
 //! EBNF literal escaping, so a `dump()` of each choice is already a valid literal.
@@ -535,8 +572,8 @@ struct GuidedDecoder::Impl
         return ((static_cast<uint32_t>(row[outputToken >> 5]) >> (outputToken & 31)) & 1U) != 0U;
     }
 
-    //! Built on first use: one idToPiece call per output-vocabulary entry is too
-    //! expensive to pay for runs that never use guided decoding.
+    //! Built by \ref ensureCompiler, eagerly in initialize() unless EDGELLM_GUIDED_PREWARM=0,
+    //! else on the first guided request.
     std::optional<xgrammar::TokenizerInfo> tokenizerInfo;
     std::optional<xgrammar::GrammarCompiler> compiler;
     std::vector<std::optional<xgrammar::GrammarMatcher>> matchers;
@@ -576,11 +613,25 @@ void GuidedDecoder::Impl::ensureCompiler()
 
     // Null when the engine does not prune; output space is then the identity.
     int32_t const* const outputToFull = outputToFullVocab.dataPointer<int32_t>();
+    // XGrammar treats an empty piece as a special token and never admits it; any other piece is
+    // matched as text, so a control token such as `<|channel>` would be legal inside a JSON
+    // string. Blank every token the tokenizer flags as special (idToPiece with skipping returns
+    // "" for those) plus Gemma's unflagged `<unusedN>` placeholders. EOS ids keep their piece;
+    // XGrammar classifies them by the stop-token list below before looking at the piece anyway.
+    // Byte-fallback and ordinary pieces are not flagged, so they come through unchanged.
     std::vector<std::string> encodedVocab(static_cast<size_t>(outputVocabSize));
+    int32_t blankedSpecial = 0;
     for (int32_t outputId = 0; outputId < outputVocabSize; ++outputId)
     {
         int32_t const fullId = hasReducedVocab ? outputToFull[outputId] : outputId;
-        encodedVocab[static_cast<size_t>(outputId)] = tokenizer->idToPiece(fullId, /*skipSpecialTokens=*/false);
+        bool const isEos = tokenizer->isEosToken(fullId);
+        std::string piece = tokenizer->idToPiece(fullId, /*skipSpecialTokens=*/!isEos);
+        if (!isEos && isUnusedPlaceholderPiece(piece))
+        {
+            piece.clear();
+        }
+        blankedSpecial += piece.empty() ? 1 : 0;
+        encodedVocab[static_cast<size_t>(outputId)] = std::move(piece);
     }
 
     // Must come from the same source the runtime uses to detect EOS; XGrammar's own
@@ -619,11 +670,14 @@ void GuidedDecoder::Impl::ensureCompiler()
     tokenizerInfo.emplace(encodedVocab, xgrammar::VocabType::RAW, outputVocabSize, stopTokenIds,
         /*add_prefix_space=*/false);
 
-    compiler.emplace(*tokenizerInfo, kCOMPILER_THREADS, /*cache_enabled=*/true, kCACHE_LIMIT_BYTES);
+    int64_t const cacheLimitBytes = grammarCacheLimitBytes();
+    compiler.emplace(*tokenizerInfo, kCOMPILER_THREADS, /*cache_enabled=*/true, cacheLimitBytes);
 
     auto const elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    LOG_INFO("Guided decoding: built tokenizer info over %d output-vocab entries in %.1f ms (cache limit %lld bytes)",
-        outputVocabSize, elapsedMs, static_cast<long long>(kCACHE_LIMIT_BYTES));
+    LOG_INFO(
+        "Guided decoding: built tokenizer info over %d output-vocab entries (%d special/empty) in %.1f ms (cache "
+        "limit %lld bytes)",
+        outputVocabSize, blankedSpecial, elapsedMs, static_cast<long long>(cacheLimitBytes));
 }
 
 xgrammar::CompiledGrammar GuidedDecoder::Impl::compile(GuidedDecodingParams const& params)
@@ -632,16 +686,29 @@ xgrammar::CompiledGrammar GuidedDecoder::Impl::compile(GuidedDecodingParams cons
     // after </think> legal, strict_mode forbids properties the schema does not mention.
     constexpr bool kANY_WHITESPACE = true;
     constexpr bool kSTRICT_MODE = true;
+    // EDGELLM_JSON_MAX_WHITESPACE caps each whitespace run inside JSON (XGrammar
+    // max_whitespace_cnt). Unset keeps XGrammar's unlimited default. With it unset some models
+    // fall into emitting indentation until max_tokens (Gemma 4 E4B: "    \n" repeated); llama.cpp's
+    // JSON-schema grammar caps a run at about 20 characters.
+    static std::optional<int> const kMaxWhitespace = []() -> std::optional<int> {
+        char const* value = std::getenv("EDGELLM_JSON_MAX_WHITESPACE");
+        if (value == nullptr || *value == '\0')
+        {
+            return std::nullopt;
+        }
+        int const parsed = std::atoi(value);
+        return parsed > 0 ? std::optional<int>(parsed) : std::nullopt;
+    }();
 
     switch (params.type)
     {
     case GuideType::kJsonObject:
         // Not CompileBuiltinJSONGrammar(): that admits any JSON value, not just an object.
         return compiler->CompileJSONSchema(
-            R"({"type":"object"})", kANY_WHITESPACE, std::nullopt, std::nullopt, kSTRICT_MODE, std::nullopt);
+            R"({"type":"object"})", kANY_WHITESPACE, std::nullopt, std::nullopt, kSTRICT_MODE, kMaxWhitespace);
     case GuideType::kJsonSchema:
         return compiler->CompileJSONSchema(
-            params.guide, kANY_WHITESPACE, std::nullopt, std::nullopt, kSTRICT_MODE, std::nullopt);
+            params.guide, kANY_WHITESPACE, std::nullopt, std::nullopt, kSTRICT_MODE, kMaxWhitespace);
     case GuideType::kRegex: return compiler->CompileRegex(params.guide);
     case GuideType::kEbnf: return compiler->CompileGrammar(params.guide, "root");
     case GuideType::kStructuralTag: return compiler->CompileStructuralTag(params.guide);
@@ -746,6 +813,25 @@ void GuidedDecoder::initialize(int32_t maxBatchSize, int32_t maxRowsPerSlot, int
         mImpl->firstChild.resize(static_cast<size_t>(maxRowsPerSlot));
         mImpl->nextSibling.resize(static_cast<size_t>(maxRowsPerSlot));
         CUDA_CHECK(cudaEventCreateWithFlags(&mImpl->draftCopyReady, cudaEventDisableTiming | cudaEventBlockingSync));
+    }
+
+    // Build the tokenizer info and compiler now rather than on the first guided request, which
+    // would otherwise pay ~260 ms (262k-entry Gemma vocabulary on Orin) inside its TTFT. Startup
+    // already takes seconds, so the cost is invisible there; the price for runs that never use
+    // guided decoding is that time plus the host copy of the vocabulary. EDGELLM_GUIDED_PREWARM=0
+    // restores the lazy build. A failure here must not stop a runtime that may never see a guided
+    // request; the lazy path retries and reports it per request, as before.
+    char const* const prewarm = std::getenv("EDGELLM_GUIDED_PREWARM");
+    if (prewarm == nullptr || std::strcmp(prewarm, "0") != 0)
+    {
+        try
+        {
+            mImpl->ensureCompiler();
+        }
+        catch (std::exception const& e)
+        {
+            LOG_WARNING("Guided decoding: prewarm failed, deferring to the first guided request: %s", e.what());
+        }
     }
 
     LOG_INFO(

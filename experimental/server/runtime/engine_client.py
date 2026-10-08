@@ -23,8 +23,9 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence, Union
 
-from ..api.errors import (EngineError, ServerError, ServerOverloadedError,
-                          ServerUnavailableError, UnsupportedFeatureError)
+from ..api.errors import (EngineError, InvalidRequestError, ServerError,
+                          ServerOverloadedError, ServerUnavailableError,
+                          UnsupportedFeatureError)
 from ..config import ApiConfig
 from ..parsing.tool_calling import ToolConfig, validate_tool_request
 from .engine import (LLM, TTS, AudioParams, CompletionOutput, SamplingParams,
@@ -520,10 +521,45 @@ class EngineClient:
         except getattr(self, "_submit_errors", ()) as exc:
             raise ServerOverloadedError(str(exc)) from exc
         except Exception as exc:
-            raise EngineError(str(exc)) from exc
+            raise await self._engine_failure(exc, owned) from exc
         finally:
             if owned is not None:
                 owned.release()
+
+    async def _engine_failure(
+            self, exc: Exception,
+            prepared: Optional[PreparedRequest]) -> ServerError:
+        """Classify a native generation failure as a client or server error.
+
+        A prompt that leaves no KV room for generation (the runtime clamps
+        ``max_tokens`` to the room left, and refuses when none is) comes back
+        only as "Failed to handle generation request": the reason is logged,
+        not raised. Counting the prompt up front would tokenize every request
+        twice, so it is counted here, on the failure path only, while the
+        request still holds its admission lease; a prompt at the capacity is
+        then answered 400 like vLLM's context-length error instead of 500.
+        """
+        limit = self._capabilities.max_model_len
+        if (prepared is not None and isinstance(limit, int)
+                and "EDGELLM_" not in str(exc)):
+            try:
+                count = await _run_sync(
+                    partial(self._llm._count_prepared_prompt_tokens,
+                            prepared.request))
+            except Exception:  # Classification must not mask the failure.
+                count = None
+            # Speculative decoding reserves room for one verify tree beyond
+            # the prompt; plain decoding reserves one token.
+            reserve = 1
+            if getattr(self._llm, "has_draft_model", False):
+                reserve = max(1, getattr(self._llm, "_verify_tree_size", 1) or 1)
+            if count is not None and count + reserve >= limit:
+                return InvalidRequestError(
+                    f"This model's maximum context length is {limit} "
+                    f"tokens, and the prompt uses {count} tokens, leaving no "
+                    f"room for completion tokens.",
+                    param="messages")
+        return EngineError(str(exc))
 
     async def prepare_request(
         self,
@@ -587,7 +623,7 @@ class EngineClient:
         except getattr(self, "_submit_errors", ()) as exc:
             raise ServerOverloadedError(str(exc)) from exc
         except Exception as exc:
-            raise EngineError(str(exc)) from exc
+            raise await self._engine_failure(exc, owned) from exc
         finally:
             if iterator is not None:
                 await asyncio.to_thread(_close_stream, iterator)

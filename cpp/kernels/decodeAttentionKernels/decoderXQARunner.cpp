@@ -66,6 +66,7 @@ XQADataType trtToXqaDataType(nvinfer1::DataType type)
     case nvinfer1::DataType::kHALF: xqaType = XQADataType::DATA_TYPE_FP16; break;
     case nvinfer1::DataType::kBF16: xqaType = XQADataType::DATA_TYPE_BF16; break;
     case nvinfer1::DataType::kFP8: xqaType = XQADataType::DATA_TYPE_E4M3; break;
+    case nvinfer1::DataType::kINT8: xqaType = XQADataType::DATA_TYPE_INT8; break;
     default: throw std::runtime_error("Unsupported datatype for XQA.");
     }
     return xqaType;
@@ -203,6 +204,10 @@ struct XQAKernelFuncInfo
     bool mRequiresClusterLaunch{false};
     bool mRequiresDistributedSharedMemory{false};
     bool mSlidingWindow{false};
+    //! Multi-block merge scratch geometry exported by the kernel (0 when the module predates it,
+    //! which disables multi-block launches for that kernel).
+    uint32_t mMultiBlockRowStatBytes{0};
+    uint32_t mMultiBlockScratchTileBytes{0};
 };
 
 struct XQADeviceCapability
@@ -358,9 +363,86 @@ bool isJitKernelSupportedByBuild(XQAJitKey const& key) noexcept
 #endif // SUPPORTS_CLUSTER_LAUNCH
 }
 
-uint32_t getXQAKernelGridDimX(XQAKernelFuncInfo const& kernelInfo) noexcept
+uint32_t getXQAKernelGridDimX(XQAKernelFuncInfo const& kernelInfo, uint32_t nbSubSeqPerSeq) noexcept
 {
-    return kernelInfo.mRequiresClusterLaunch ? kSPLIT_HEAD_DIM_512_CLUSTER_SIZE : 1U;
+    return kernelInfo.mRequiresClusterLaunch ? kSPLIT_HEAD_DIM_512_CLUSTER_SIZE : std::max(1U, nbSubSeqPerSeq);
+}
+
+//! Value of a `__device__ uint32_t` the module exports, or 0 when it does not export it.
+uint32_t readModuleU32(CUmodule module, char const* name)
+{
+    CUdeviceptr devicePtr{};
+    size_t dataSize{0};
+    if (cuModuleGetGlobal(&devicePtr, &dataSize, module, name) != CUDA_SUCCESS || dataSize != sizeof(uint32_t))
+    {
+        return 0;
+    }
+    uint32_t value{0};
+    CUDA_CHECK(cudaMemcpy(&value, reinterpret_cast<void const*>(devicePtr), sizeof(value), cudaMemcpyDeviceToHost));
+    return value;
+}
+
+//! Bytes of the multi-block merge scratch for @p nbSubSeq sub-sequences: the kernel lays out
+//! rowMax[nbSubSeq], rowSum[nbSubSeq] and the output tiles with MemSegmenter, each segment aligned to
+//! its element size.
+size_t computeMultiBlockScratchBytes(XQAKernelFuncInfo const& kernelInfo, size_t nbSubSeq) noexcept
+{
+    auto const roundUpTo = [](size_t value, size_t multiple) { return (value + multiple - 1) / multiple * multiple; };
+    size_t const rowStat = kernelInfo.mMultiBlockRowStatBytes;
+    size_t const tile = kernelInfo.mMultiBlockScratchTileBytes;
+    size_t offset = 0;
+    offset = roundUpTo(offset, rowStat) + rowStat * nbSubSeq; // rowMax
+    offset = roundUpTo(offset, rowStat) + rowStat * nbSubSeq; // rowSum
+    offset = roundUpTo(offset, tile) + tile * nbSubSeq;       // output tiles
+    return offset;
+}
+
+} // namespace
+
+size_t trt_edgellm::xqaMultiBlockScratchUpperBound(int32_t headSize, size_t nbSubSeq) noexcept
+{
+    constexpr size_t kXQA_MAX_ROWS_PER_CTA = 64;
+    size_t const rowStat = kXQA_MAX_ROWS_PER_CTA * sizeof(float);
+    size_t const tile = kXQA_MAX_ROWS_PER_CTA * static_cast<size_t>(headSize) * sizeof(uint16_t);
+    // Three segments, each rounded up to its element size before it starts.
+    return 2 * rowStat * (nbSubSeq + 1) + tile * (nbSubSeq + 1);
+}
+
+namespace
+{
+
+//! Validate and resolve the split count of one launch; returns gridDim.x.
+uint32_t resolveMultiBlock(XQAKernelFuncInfo const& kernelInfo, XQALaunchParams const& params, size_t nbSeq)
+{
+    uint32_t nbSubSeqPerSeq = params.nbSubSeqPerSeq;
+    if (nbSubSeqPerSeq == kXQA_MULTI_BLOCK_AUTO)
+    {
+        static int32_t const smCount = []() {
+            int32_t device{0};
+            int32_t count{0};
+            CUDA_CHECK(cudaGetDevice(&device));
+            CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+            return count;
+        }();
+        uint32_t const maxPages = params.kvCache.tokensPerPage > 0
+            ? std::max(1U, params.kvCache.capacity / params.kvCache.tokensPerPage)
+            : 1U;
+        nbSubSeqPerSeq = std::min<uint32_t>(
+            std::max<uint32_t>(1U, static_cast<uint32_t>(smCount) / static_cast<uint32_t>(std::max<size_t>(nbSeq, 1))),
+            maxPages);
+    }
+    if (kernelInfo.mRequiresClusterLaunch || nbSubSeqPerSeq <= 1)
+    {
+        return getXQAKernelGridDimX(kernelInfo, 1U);
+    }
+    check::check(kernelInfo.mMultiBlockRowStatBytes > 0 && kernelInfo.mMultiBlockScratchTileBytes > 0,
+        "XQA multi-block launch requested but the kernel module does not export its scratch geometry.");
+    check::check(params.semaphores != nullptr && params.scratch != nullptr,
+        "XQA multi-block launch requires semaphores and scratch.");
+    size_t const required = computeMultiBlockScratchBytes(kernelInfo, nbSeq * nbSubSeqPerSeq);
+    check::check(required <= params.scratchBytes,
+        format::fmtstr("XQA multi-block scratch too small: need %zu bytes, have %zu.", required, params.scratchBytes));
+    return nbSubSeqPerSeq;
 }
 
 dim3 getXQAKernelCtaDim(XQAKernelFuncInfo const& kernelInfo) noexcept
@@ -523,6 +605,8 @@ public:
         CUDA_DRIVER_CHECK(cuModuleGetGlobal(
             reinterpret_cast<CUdeviceptr*>(&deviceSmemSize), &dataSize, moduleGuard.get(), "smemSize"));
         CUDA_CHECK(cudaMemcpy(&funcInfo.mSharedMemBytes, deviceSmemSize, dataSize, cudaMemcpyDeviceToHost));
+        funcInfo.mMultiBlockRowStatBytes = readModuleU32(moduleGuard.get(), "multiBlockRowStatBytes");
+        funcInfo.mMultiBlockScratchTileBytes = readModuleU32(moduleGuard.get(), "multiBlockScratchTileBytes");
 
         XQADeviceCapability const deviceCapability = getDeviceCapability();
         if (!isKernelCompatibleWithDevice(funcInfo, deviceCapability))
@@ -674,8 +758,8 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
     // The multi-block kernel launch is mainly for long sequence.
     // TODO: Add multiple block launch logic. The launch configuration highly depends on usecase and performance
     // context. Current measured workload doesn't get performance gain from multi-block launch.
-    dim3 const dimGrid{
-        getXQAKernelGridDimX(kernelInfo), static_cast<uint32_t>(mNumKVHeads), static_cast<uint32_t>(mBatchSize)};
+    uint32_t const gridX = resolveMultiBlock(kernelInfo, params, static_cast<size_t>(mNumKVHeads) * mBatchSize);
+    dim3 const dimGrid{gridX, static_cast<uint32_t>(mNumKVHeads), static_cast<uint32_t>(mBatchSize)};
     dim3 const dimCta = getXQAKernelCtaDim(kernelInfo);
     launchXQAKernel(kernelInfo, dimGrid, dimCta, stream, kernelParams.data(), params.enablePdl, mSmVersion);
 }
@@ -706,8 +790,9 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
     int32_t const ctaTileY = static_cast<int32_t>(kernelInfo.mMTileSize);
     check::check(ctaTileY > 0, format::fmtstr("Invalid spec-decode ctaTileY %d in XQA kernel metadata.", ctaTileY));
     int32_t const tokenBlockPerGroup = (params.qSeqLen * params.headGroupSize - 1) / ctaTileY + 1;
-    dim3 const dimGrid{getXQAKernelGridDimX(kernelInfo), static_cast<uint32_t>(mNumKVHeads * tokenBlockPerGroup),
-        static_cast<uint32_t>(mBatchSize)};
+    uint32_t const gridY = static_cast<uint32_t>(mNumKVHeads * tokenBlockPerGroup);
+    uint32_t const gridX = resolveMultiBlock(kernelInfo, params, static_cast<size_t>(gridY) * mBatchSize);
+    dim3 const dimGrid{gridX, gridY, static_cast<uint32_t>(mBatchSize)};
     dim3 const dimCta = getXQAKernelCtaDim(kernelInfo);
     launchXQAKernel(kernelInfo, dimGrid, dimCta, stream, kernelParams.data(), params.enablePdl, mSmVersion);
 }

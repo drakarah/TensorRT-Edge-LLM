@@ -772,8 +772,8 @@ void validateKVLayerCapacities(Json const& configJson, LLMEngineConfig const& cf
     {
         return;
     }
-    ELLM_CHECK(cfg.kvCacheDtype != nvinfer1::DataType::kFP8,
-        "parseEngineConfig: reduced SWA KV pools do not support FP8 KV cache");
+    ELLM_CHECK(cfg.kvCacheDtype == nvinfer1::DataType::kHALF,
+        "parseEngineConfig: reduced SWA KV pools do not support a quantized (FP8/INT8) KV cache");
     ELLM_CHECK(cfg.specDecodeType == SpecDecodeMode::kNONE && !configRevealsSpecDecode(configJson),
         "parseEngineConfig: reduced SWA KV pools do not support speculative decoding");
     int64_t const minimumSwaPages = computeMinimumSwaPoolPages(cfg.maxSupportedBatchSize, *reducedCapacity);

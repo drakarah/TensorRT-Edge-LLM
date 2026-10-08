@@ -115,5 +115,11 @@ void generateVisionBlockIds(
 void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
     int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream);
 
+//! \brief INT8 Gemma4 PLE gather: int8 table [vocab, numLayers * pleHiddenSize] with fp16 scales
+//! [vocab, numLayers] (one per token-layer slice), dequantised into the fp16 output buffer.
+void gemma4PleGatherInt8(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor const& pleScales,
+    rt::Tensor& outputBuffer, int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId,
+    cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

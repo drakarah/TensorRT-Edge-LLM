@@ -116,7 +116,7 @@ def _is_dense_ffn_int4_weight_name(
     ``layer_types`` before marking those weights external.
     """
     normalized = name.replace("/", ".").lower()
-    ffn_projections = (".gate_proj.", ".up_proj.", ".down_proj.")
+    ffn_projections = (".gate_proj.", ".up_proj.", ".down_proj.", ".gate_up_proj.")
     if ".mlp." in normalized and any(p in normalized for p in ffn_projections):
         return True
 

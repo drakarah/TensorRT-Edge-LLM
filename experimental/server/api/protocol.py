@@ -153,8 +153,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         return self
 
     @property
-    def effective_max_tokens(self) -> int:
-        return self.max_completion_tokens or self.max_tokens or 2048
+    def effective_max_tokens(self) -> Optional[int]:
+        """The requested completion budget, or None when the client set none.
+
+        None means "up to the remaining context", as in vLLM; the serving
+        layer substitutes the KV capacity, which the runtime clamps to the
+        room the prompt leaves.
+        """
+        return self.max_completion_tokens or self.max_tokens
 
     @property
     def stop_strings(self) -> List[str]:

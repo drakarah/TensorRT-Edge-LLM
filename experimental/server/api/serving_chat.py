@@ -18,6 +18,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -43,6 +44,9 @@ from .protocol import (ChatCompletionChoice, ChatCompletionMessage,
 logger = logging.getLogger("edgellm.server.chat")
 
 IM_END_TOKEN = "<|im_end|>"
+# Completion budget for a request without max_tokens when the bundle does not
+# report its KV capacity (the previous fixed default).
+_FALLBACK_MAX_TOKENS = 2048
 
 
 @dataclass(frozen=True)
@@ -108,6 +112,17 @@ class OpenAIServingChat:
         self._client = engine_client
         self._config = config
         self._model_dir = engine_client.llm.model_dir
+        # Without max_tokens a reply may run to the end of the context, as in
+        # vLLM: ask for the whole KV capacity and let the runtime clamp it to
+        # what the prompt leaves (clampMaxGenerateLengthForKVCapacity). The
+        # capacity, not an unbounded value, because the runtime sizes some
+        # per-request buffers (logprobs) from the unclamped length.
+        max_model_len = getattr(
+            getattr(engine_client, "capabilities", None), "max_model_len",
+            None)
+        self._default_max_tokens = (max_model_len if isinstance(
+            max_model_len, int) and max_model_len > 0 else
+                                    _FALLBACK_MAX_TOKENS)
         # Fail during startup instead of after the first request.
         REASONING_PARSERS.resolve(config.reasoning_parser, self._model_dir)
         if config.tool_call_parser not in list_tool_parsers():
@@ -265,13 +280,18 @@ class OpenAIServingChat:
         num_logprobs = 0
         if request.logprobs:
             num_logprobs = max(1, request.top_logprobs or 0)
-        greedy = request.temperature == 0
+        # Gemma 4 MTP tree drafting verifies greedy requests only; with
+        # EDGELLM_FORCE_GREEDY=1 every request is served greedily instead of
+        # being refused (the seed and sampling fields are then ignored).
+        greedy = (request.temperature == 0
+                  or os.environ.get("EDGELLM_FORCE_GREEDY") == "1")
         sampling = SamplingParams(
-            temperature=request.temperature,
+            temperature=0.0 if greedy else request.temperature,
             top_p=1.0 if greedy else request.top_p,
             top_k=1 if greedy else request.top_k,
             seed=request.seed,
-            max_tokens=request.effective_max_tokens,
+            max_tokens=(request.effective_max_tokens
+                        or self._default_max_tokens),
             enable_thinking=request.enable_thinking,
             reasoning_effort=request.reasoning_effort or "",
             disable_spec_decode=request.disable_spec_decode,
@@ -324,7 +344,12 @@ class OpenAIServingChat:
                 reasoning_parser=prepared.reasoning_parser,
                 prepared=engine_request,
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        except ValueError as exc:
+            # The request was validated and rendered by prepare_request and
+            # prepare_engine_request, so the client error left here is the
+            # native tokenizer rejecting the input (std::invalid_argument
+            # surfaces as ValueError). KeyError/TypeError are server bugs and
+            # fall through to the 500 handler instead of reading as a 400.
             raise InvalidRequestError(str(exc)) from exc
 
         output.text = output.text.replace(IM_END_TOKEN, "")

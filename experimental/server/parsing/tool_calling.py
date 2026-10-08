@@ -18,6 +18,7 @@ The public data structures follow the OpenAI tool-calling API shape.
 """
 
 import ast
+import functools
 import json
 import logging
 import os
@@ -121,6 +122,10 @@ def parse_assistant_output(
         tool_parser: str = "auto",
         reasoning_parser: str = "none") -> ParsedAssistantOutput:
     """Parse model text into ordered content, reasoning, and tool-call events."""
+    # Tool parsing decodes with special tokens kept (the call markers are special tokens), so
+    # the model's end-of-sequence / end-of-turn token reaches the end of the text too (Gemma 4:
+    # "<turn|>"), where a client's JSON parser rejects it.
+    text = _strip_trailing_end_tokens(text, _end_token_strings(model_dir))
     if not tool_config.parse_output:
         return ParsedAssistantOutput(
             _split_reasoning_events(text,
@@ -291,6 +296,9 @@ _MARKER_FAMILIES: Tuple[_MarkerFamily, ...] = (
     _MarkerFamily(("<function=", ), ("</function>", ),
                   open_is_prefix=True,
                   strippable=False),
+    # Gemma 4: <|tool_call>call:name{key:<|"|>text<|"|>,n:3}<tool_call|>
+    _MarkerFamily(("<|tool_call>", ), ("<tool_call|>", ),
+                  close_optional=True),
     _MarkerFamily(("[TOOL_CALL]", "[TOOL_CALLS]"),
                   ("[/TOOL_CALL]", "[/TOOL_CALLS]"),
                   close_optional=True),
@@ -659,6 +667,122 @@ def stream_assistant_output(
                                           reasoning_parser)
 
 
+_GEMMA4_OPEN = "<|tool_call>"
+_GEMMA4_CLOSE = "<tool_call|>"
+# End of output also closes a block: generation can stop on the call's last
+# token before the close marker is emitted.
+_GEMMA4_BLOCK_RE = re.compile(
+    re.escape(_GEMMA4_OPEN) + r"(.*?)(?:" + re.escape(_GEMMA4_CLOSE) +
+    r"|\Z)", re.S)
+
+
+class _Gemma4ToolParser:
+    """Gemma 4 tool calls: only explicit ``<|tool_call>...<tool_call|>`` blocks.
+
+    Gemma 4 marks every call with dedicated special tokens, so text outside
+    those blocks is always content. Unlike the generic parser there is no
+    markerless fallback: a plain JSON answer such as ``{"name": "run_sql"}``
+    (a structured-output reply that happens to name a tool) stays content
+    instead of becoming a tool call.
+    """
+
+    def stream(self, tool_config: ToolConfig) -> "_Gemma4StreamingToolParser":
+        """Create independent streaming state for one response."""
+        return _Gemma4StreamingToolParser(self, tool_config)
+
+    def parse(self, text: str,
+              tool_config: ToolConfig) -> Tuple[List[Dict[str, Any]], bool]:
+        events: List[Dict[str, Any]] = []
+        malformed = False
+        pos = 0
+        for match in _GEMMA4_BLOCK_RE.finditer(text):
+            if match.start() > pos:
+                events.append({
+                    "type": "content",
+                    "text": text[pos:match.start()]
+                })
+            calls = _parse_gemma4_calls(match.group(1), tool_config)
+            if calls:
+                events.extend({
+                    "type": "tool_call",
+                    "tool_call": c
+                } for c in calls)
+            else:
+                malformed = True
+                events.append({"type": "content", "text": match.group(0)})
+            pos = match.end()
+        if pos < len(text) or not events:
+            events.append({"type": "content", "text": text[pos:]})
+        return events, malformed
+
+
+class _Gemma4StreamingToolParser:
+    """Streaming counterpart of ``_Gemma4ToolParser``.
+
+    Content streams through except a possible partial open marker; each call
+    block is buffered until its close marker and then parsed by the
+    whole-text parser, so streaming and non-streaming output agree.
+    """
+
+    def __init__(self, whole_text_parser: _Gemma4ToolParser,
+                 tool_config: ToolConfig) -> None:
+        self._whole = whole_text_parser
+        self._config = tool_config
+        self._buffer = ""
+        self._in_block = False
+        self._next_index = 0
+
+    def feed(self, text: str) -> Iterable["ToolStreamEvent"]:
+        self._buffer += text
+        while True:
+            if not self._in_block:
+                start = self._buffer.find(_GEMMA4_OPEN)
+                if start < 0:
+                    hold = _longest_partial_token(self._buffer,
+                                                  (_GEMMA4_OPEN, ))
+                    emit_len = len(self._buffer) - hold
+                    if emit_len > 0:
+                        yield ToolStreamEvent("content",
+                                              self._buffer[:emit_len])
+                        self._buffer = self._buffer[emit_len:]
+                    return
+                if start > 0:
+                    yield ToolStreamEvent("content", self._buffer[:start])
+                self._buffer = self._buffer[start:]
+                self._in_block = True
+            close = self._buffer.find(_GEMMA4_CLOSE)
+            if close < 0:
+                return
+            end = close + len(_GEMMA4_CLOSE)
+            block, self._buffer = self._buffer[:end], self._buffer[end:]
+            self._in_block = False
+            yield from self._emit(block)
+
+    def flush(self) -> Iterable["ToolStreamEvent"]:
+        withheld, self._buffer = self._buffer, ""
+        self._in_block = False
+        if withheld:
+            yield from self._emit(withheld)
+
+    def _emit(self, text: str) -> Iterable["ToolStreamEvent"]:
+        events, _ = self._whole.parse(text, self._config)
+        for event in events:
+            if event["type"] == "content":
+                if event["text"]:
+                    yield ToolStreamEvent("content", event["text"])
+                continue
+            call = event["tool_call"]
+            index = self._next_index
+            self._next_index += 1
+            yield ToolStreamEvent("tool_head",
+                                  index=index,
+                                  call_id=call.id,
+                                  name=call.name)
+            if call.arguments:
+                yield ToolStreamEvent("tool_args", call.arguments, index=index)
+            yield ToolStreamEvent("tool_done", index=index)
+
+
 class _ToolParserRegistry:
 
     def __init__(self):
@@ -669,6 +793,7 @@ class _ToolParserRegistry:
             "qwen3_xml": parser,
             "nemotron": parser,
             "openai": parser,
+            "gemma4": _Gemma4ToolParser(),
         }
 
     def names(self) -> List[str]:
@@ -1085,6 +1210,8 @@ def list_tool_parsers() -> List[str]:
 
 
 def _parser_name_for_model(model_dir: str) -> str:
+    if _is_gemma4_tokenizer(model_dir):
+        return "gemma4"
     model_type = ""
     try:
         with open(os.path.join(model_dir, "config.json")) as f:
@@ -1103,8 +1230,33 @@ def _parser_name_for_model(model_dir: str) -> str:
     return "generic"
 
 
+def _is_gemma4_tokenizer(model_dir: str) -> bool:
+    """Whether the model marks tool calls with Gemma 4's ``<|tool_call>`` token.
+
+    Engine bundles carry tokenizer_config.json and chat_template.jinja but
+    often no config.json, so detection keys off the tokenizer's start-of-call
+    token, falling back to the chat template.
+    """
+    try:
+        with open(os.path.join(model_dir, "tokenizer_config.json"),
+                  encoding="utf-8") as handle:
+            if json.load(handle).get("stc_token") == _GEMMA4_OPEN:
+                return True
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        with open(os.path.join(model_dir, "chat_template.jinja"),
+                  encoding="utf-8") as handle:
+            return _GEMMA4_OPEN in handle.read()
+    except OSError:
+        return False
+
+
 def _parse_tool_block(block: str, tool_config: ToolConfig) -> List[ToolCall]:
     body = _strip_tool_tags(block)
+    calls = _parse_gemma4_calls(body, tool_config)
+    if calls:
+        return calls
     calls = _parse_atem_calls(body, tool_config)
     if calls:
         return calls
@@ -1313,3 +1465,131 @@ def _arguments_to_json(arguments: Any) -> str:
 
 def _new_call_id() -> str:
     return f"call_{uuid.uuid4().hex[:24]}"
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 compact call syntax
+# ---------------------------------------------------------------------------
+
+_GEMMA4_QUOTE = '<|"|>'
+_GEMMA4_CALL_RE = re.compile(r"call:([A-Za-z_][\w.\-]*)\{", re.S)
+
+
+class _Gemma4ArgsError(ValueError):
+    pass
+
+
+def _gemma4_value(text: str, pos: int) -> Tuple[Any, int]:
+    """Parse one value of Gemma 4's argument syntax starting at ``pos``.
+
+    Strings are delimited by the ``<|"|>`` token, so their content is taken
+    verbatim (quotes, commas and braces in SQL stay intact). Objects use bare
+    keys, arrays use brackets, and the rest is a JSON scalar or bare word.
+    """
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    if text.startswith(_GEMMA4_QUOTE, pos):
+        end = text.find(_GEMMA4_QUOTE, pos + len(_GEMMA4_QUOTE))
+        if end < 0:
+            raise _Gemma4ArgsError("unterminated string")
+        return text[pos + len(_GEMMA4_QUOTE):end], end + len(_GEMMA4_QUOTE)
+    if pos < len(text) and text[pos] == "{":
+        return _gemma4_object(text, pos + 1)
+    if pos < len(text) and text[pos] == "[":
+        items: List[Any] = []
+        pos += 1
+        while True:
+            while pos < len(text) and text[pos] in " \t\r\n,":
+                pos += 1
+            if pos >= len(text):
+                raise _Gemma4ArgsError("unterminated array")
+            if text[pos] == "]":
+                return items, pos + 1
+            value, pos = _gemma4_value(text, pos)
+            items.append(value)
+    if pos < len(text) and text[pos] == '"':
+        # Plain JSON string, as some templates render it.
+        try:
+            value, end = json.JSONDecoder().raw_decode(text, pos)
+            return value, end
+        except ValueError as exc:
+            raise _Gemma4ArgsError(str(exc)) from exc
+    end = pos
+    while end < len(text) and text[end] not in ",}]":
+        end += 1
+    raw = text[pos:end].strip()
+    if not raw:
+        raise _Gemma4ArgsError("empty value")
+    try:
+        return json.loads(raw), end
+    except ValueError:
+        return raw, end
+
+
+def _gemma4_object(text: str, pos: int) -> Tuple[Dict[str, Any], int]:
+    """Parse ``key:value,...}`` with ``pos`` just past the opening brace."""
+    result: Dict[str, Any] = {}
+    while True:
+        while pos < len(text) and text[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= len(text):
+            raise _Gemma4ArgsError("unterminated object")
+        if text[pos] == "}":
+            return result, pos + 1
+        colon = text.find(":", pos)
+        if colon < 0:
+            raise _Gemma4ArgsError("missing ':'")
+        key = text[pos:colon].strip().replace(_GEMMA4_QUOTE, "").strip('"')
+        if not key:
+            raise _Gemma4ArgsError("empty key")
+        value, pos = _gemma4_value(text, colon + 1)
+        result[key] = value
+
+
+def _parse_gemma4_calls(text: str,
+                        tool_config: ToolConfig) -> List[ToolCall]:
+    calls: List[ToolCall] = []
+    pos = 0
+    while True:
+        match = _GEMMA4_CALL_RE.search(text, pos)
+        if match is None:
+            return calls
+        name = match.group(1)
+        try:
+            args, pos = _gemma4_object(text, match.end())
+        except _Gemma4ArgsError:
+            return calls
+        if _tool_name_allowed(name, tool_config):
+            calls.append(
+                ToolCall(id=_new_call_id(),
+                         name=name,
+                         arguments=_arguments_to_json(args)))
+
+
+@functools.lru_cache(maxsize=8)
+def _end_token_strings(model_dir: str) -> Tuple[str, ...]:
+    """The tokenizer's end-of-sequence and end-of-turn token strings, longest first.
+
+    Read from tokenizer_config.json (``eos_token`` and, where defined, ``eot_token``); an
+    unreadable config yields no strings, so nothing is stripped.
+    """
+    try:
+        with open(os.path.join(model_dir, "tokenizer_config.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return ()
+    tokens = {config.get(key) for key in ("eos_token", "eot_token")}
+    return tuple(sorted((t for t in tokens if isinstance(t, str) and t), key=len, reverse=True))
+
+
+def _strip_trailing_end_tokens(text: str, end_tokens: Tuple[str, ...]) -> str:
+    """Remove end-of-sequence / end-of-turn token strings (and whitespace) from the end of text."""
+    stripped = True
+    while stripped:
+        stripped = False
+        for token in end_tokens:
+            candidate = text.rstrip()
+            if candidate.endswith(token):
+                text = candidate[: -len(token)]
+                stripped = True
+    return text

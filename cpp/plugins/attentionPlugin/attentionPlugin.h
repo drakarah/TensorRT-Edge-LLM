@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -71,7 +72,8 @@ public:
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
         int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
         int32_t enableContextMaskSelector, bool supportsBoundedKVCache = false, int32_t slidingWindowSize = -1,
-        std::vector<float> const& qkvScales = {}, std::optional<float> attentionScale = std::nullopt);
+        std::vector<float> const& qkvScales = {}, std::optional<float> attentionScale = std::nullopt,
+        int32_t enableInt8KVCache = 0);
     AttentionPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     AttentionPlugin() = delete;
@@ -199,7 +201,30 @@ protected:
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion; //!< CUDA SM version
 
-    int32_t mEnableFp8KVCache{}; //!< Whether FP8 KV cache is enabled
+    int32_t mEnableFp8KVCache{};  //!< Whether FP8 KV cache is enabled
+    int32_t mEnableInt8KVCache{}; //!< Whether INT8 KV cache is enabled (symmetric, per-layer K/V scales)
+    //! XQA decode/verify split-KV mode, fixed at engine build (EDGELLM_XQA_MULTI_BLOCK) because the
+    //! workspace reserved for the merge scratch is sized then: 1 = off (one CTA per sequence, the
+    //! default), 0 = auto (fill the SMs), N > 1 = N splits per sequence.
+    int32_t mXqaMultiBlock{1};
+    //! Multi-block merge semaphores, one per launch sequence; zeroed once at attach, the kernel's last
+    //! CTA resets each counter. Owned per execution context so overlapping layers never share them.
+    std::shared_ptr<void> mXqaSemaphores;
+    static constexpr int32_t kXQA_MAX_SEMAPHORES{1024};
+
+    //! True for a one-byte (FP8 or INT8) KV cache: K/V carry quant scales and FP16 consumers dequantize.
+    bool quantizedKVCache() const noexcept
+    {
+        return mEnableFp8KVCache != 0 || mEnableInt8KVCache != 0;
+    }
+
+    //! Storage dtype of the paged KV pool.
+    nvinfer1::DataType kvCacheDataType() const noexcept
+    {
+        return mEnableFp8KVCache ? nvinfer1::DataType::kFP8
+            : mEnableInt8KVCache ? nvinfer1::DataType::kINT8
+                                 : nvinfer1::DataType::kHALF;
+    }
     //! Whether the optional runtime context-mask selector input is present. Shape [0] keeps default causal/sliding
     //! context attention; shape [batch] selects padding/non-causal context attention. The tensor value is ignored.
     int32_t mEnableContextMaskSelector{};

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <optional>
 #include <stdexcept>
@@ -342,7 +343,13 @@ Json contentToJson(rt::Message const& message, std::optional<size_t> const& traj
         return nemotronOmniContent(message);
     }
 
-    if (!expectsContentBlocks || message.role == "tool")
+    // A text-only message the client sent as a plain string stays a string, as in the reference
+    // (Jinja2) rendering: block-aware templates branch on `content is string`, and Gemma 4's
+    // block branch appends a space after every text block ("...kort. <turn|>").
+    bool const textOnlyString = !message.contentIsArray
+        && std::all_of(message.contents.begin(), message.contents.end(),
+            [](rt::Message::MessageContent const& item) { return item.type == "text"; });
+    if (!expectsContentBlocks || message.role == "tool" || textOnlyString)
     {
         // A string-content template renders message.content as a single string.
         // Media requires a rendering contract the model owns: either a provider
@@ -809,7 +816,16 @@ bool ChatTemplate::load(std::filesystem::path const& modelDir, std::string bosTo
 bool ChatTemplate::apply(rt::LLMGenerationRequest::Request const& request,
     rt::LLMGenerationRequest::FormattedRequest& formattedRequest, Options const& options) const
 {
-    return mImpl->apply(request, formattedRequest, options);
+    bool const applied = mImpl->apply(request, formattedRequest, options);
+    // EDGELLM_DUMP_PROMPTS=<file> appends every rendered prompt to <file>, so the provider
+    // template rendered through Inja can be diffed against the reference (Jinja2) rendering.
+    static char const* const dumpPath = std::getenv("EDGELLM_DUMP_PROMPTS");
+    if (applied && dumpPath != nullptr && *dumpPath != '\0')
+    {
+        std::ofstream dump(dumpPath, std::ios::app | std::ios::binary);
+        dump << "<<<EDGELLM_PROMPT>>>" << formattedRequest.formattedCompleteRequest << "<<<END>>>\n";
+    }
+    return applied;
 }
 
 bool ChatTemplate::isLoaded() const noexcept

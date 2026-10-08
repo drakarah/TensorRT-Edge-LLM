@@ -374,6 +374,8 @@ def apply_all_repacking(model: nn.Module) -> None:
     """
     _stack_moe_experts(model)
     _repack_awq_weights(model)
+    from ..models.gemma4.modeling_gemma4_text import fuse_gemma4_int4_projections
+    fuse_gemma4_int4_projections(model)
     _repack_gptq_weights(model)
     _cast_modelopt_awq_prepacked(model)
     _cast_fp8_linear_scales(model)

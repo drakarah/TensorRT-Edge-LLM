@@ -27,6 +27,9 @@ namespace trt_edgellm
 {
 
 //! \brief Launch parameters for XQA (eXtended Query Attention) kernel
+//! XQALaunchParams::nbSubSeqPerSeq value that sizes the split to the GPU.
+constexpr uint32_t kXQA_MULTI_BLOCK_AUTO = 0;
+
 struct XQALaunchParams
 {
     //! \cond INTERNAL
@@ -49,8 +52,15 @@ struct XQALaunchParams
     float vScale = 1.0f;             //!< V dequant scale (quantized -> original), host scalar
     uint32_t slidingWinSize = 0;     //!< Sliding window size (0 = no sliding window)
     bool contiguousQuerySwa = false; //!< Use a query-relative sliding-window boundary
-    int32_t* semaphores = nullptr;   //!< Semaphores for synchronization
-    void* scratch = nullptr;         //!< Scratch memory
+    int32_t* semaphores = nullptr;   //!< Multi-block merge semaphores, one per sequence, zeroed once
+    void* scratch = nullptr;         //!< Multi-block merge scratch (see multiBlockScratchBytes())
+    size_t scratchBytes = 0;         //!< Size of scratch, checked against the launch's requirement
+    //! K/V sequence splits per sequence (gridDim.x). 1 = one CTA per sequence (default). Values > 1
+    //! split the KV range over that many CTAs and merge their partial results (split-KV); this needs
+    //! semaphores and scratch. kXQA_MULTI_BLOCK_AUTO fills the GPU: SMs / sequences of the launch,
+    //! at most one split per KV page. Ignored by kernels that use the 2-CTA head-dim-512 cluster launch.
+    //! The split only depends on launch shapes, so CUDA-graph replays of one shape keep one grid.
+    uint32_t nbSubSeqPerSeq = 1;
 
     //! Unique device memory pointer for spec-decode tree attention
     void* treeAttnMask = nullptr;      //!< Tree attention mask
@@ -135,5 +145,12 @@ private:
 
     int32_t mSmVersion; //!< CUDA SM version
 };
+
+//! Upper bound of the multi-block merge scratch for @p nbSubSeq sub-sequences of a head size
+//! @p headSize, valid for every XQA kernel variant: per sub-sequence the kernel stores two row-statistic
+//! buffers (at most 64 fp32 rows each) and one FP16 output tile of at most 64 rows x headSize, plus
+//! segment alignment. Launches check the exact requirement against the buffer they are given, so an
+//! engine never runs with a too-small scratch.
+size_t xqaMultiBlockScratchUpperBound(int32_t headSize, size_t nbSubSeq) noexcept;
 
 } // namespace trt_edgellm

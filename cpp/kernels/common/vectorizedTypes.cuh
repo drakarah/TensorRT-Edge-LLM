@@ -275,5 +275,47 @@ struct DVec<__nv_fp8_e4m3>
 //! \endcond
 #endif
 
+//! \cond INTERNAL
+/*!
+ * @brief Vector of 8 int8 values (INT8 KV cache storage)
+ */
+template <>
+struct DVec<int8_t>
+{
+    uint2 data;                             //!< Storage for 8 int8 as uint2 (8 bytes)
+    static constexpr uint32_t vec_size = 8; //!< Vector size
+
+    //! @brief Access element at index
+    //! @param idx Element index (0-7)
+    //! @return Reference to int8 element
+    __device__ __forceinline__ int8_t& operator[](uint32_t idx)
+    {
+        return reinterpret_cast<int8_t*>(&data)[idx];
+    }
+
+    //! @brief Access element at index (const)
+    //! @param idx Element index (0-7)
+    //! @return Const reference to int8 element
+    __device__ __forceinline__ int8_t const& operator[](uint32_t idx) const
+    {
+        return reinterpret_cast<int8_t const*>(&data)[idx];
+    }
+
+    //! @brief Load 8 int8 from global memory
+    //! @param ptr Source pointer (must be 8-byte aligned)
+    __device__ __forceinline__ void load(int8_t const* ptr)
+    {
+        data = *(reinterpret_cast<uint2 const*>(ptr));
+    }
+
+    //! @brief Store 8 int8 to global memory
+    //! @param ptr Destination pointer (must be 8-byte aligned)
+    __device__ __forceinline__ void store(int8_t* ptr) const
+    {
+        *(reinterpret_cast<uint2*>(ptr)) = data;
+    }
+};
+//! \endcond
+
 } // namespace kernel
 } // namespace trt_edgellm
