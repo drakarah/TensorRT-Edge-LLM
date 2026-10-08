@@ -104,14 +104,19 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> 
                 {
                     float qVal = __half2float(q[qoIndexer(tokenIdx, qHeadIdx, valIdx)]);
                     float kvVal;
+                    if constexpr (std::is_same_v<T, int8_t>)
+                    {
+                        kvVal = static_cast<float>(k[kvIndexer(kvIdx, kvHeadIdx, valIdx)])
+                            * kScaleQuantOrig; // INT8 -> FP32
+                    }
 #if SUPPORTS_FP8
-                    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+                    else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
                     {
                         kvVal = static_cast<float>(k[kvIndexer(kvIdx, kvHeadIdx, valIdx)])
                             * kScaleQuantOrig; // FP8 -> FP32
                     }
-                    else
 #endif
+                    else
                     {
                         kvVal = __half2float(k[kvIndexer(kvIdx, kvHeadIdx, valIdx)]); // half -> FP32
                     }
@@ -158,15 +163,20 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> 
                         continue;
                     }
                     float vVal;
+                    if constexpr (std::is_same_v<T, int8_t>)
+                    {
+                        vVal = static_cast<float>(v[kvIndexer(kvIdx, kvHeadIdx, valIdx)])
+                            * vScaleQuantOrig; // INT8 -> FP32
+                    }
 #if SUPPORTS_FP8
-                    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+                    else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
                     {
                         // Dequantize FP8 value back to original range using vScaleQuantOrig
                         vVal = static_cast<float>(v[kvIndexer(kvIdx, kvHeadIdx, valIdx)])
                             * vScaleQuantOrig; // FP8 -> FP32
                     }
-                    else
 #endif
+                    else
                     {
                         vVal = __half2float(v[kvIndexer(kvIdx, kvHeadIdx, valIdx)]); // half -> FP32
                     }
@@ -183,6 +193,12 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> 
 // Explicit template instantiations for attention reference used in unit tests
 template std::vector<half> casualAttentionRef<half>(std::vector<half> const& q, std::vector<half> const& k,
     std::vector<half> const& v, int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize, float attentionScale, std::optional<std::vector<int32_t>> const& treeAttnMask,
+    float const kScaleQuantOrig, float const vScaleQuantOrig, int32_t slidingWindowSize, bool contiguousQuerySwa,
+    std::optional<std::vector<float>> const& attentionSinks);
+
+template std::vector<half> casualAttentionRef<int8_t>(std::vector<half> const& q, std::vector<int8_t> const& k,
+    std::vector<int8_t> const& v, int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads,
     int32_t headSize, float attentionScale, std::optional<std::vector<int32_t>> const& treeAttnMask,
     float const kScaleQuantOrig, float const vScaleQuantOrig, int32_t slidingWindowSize, bool contiguousQuerySwa,
     std::optional<std::vector<float>> const& attentionSinks);

@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #if SUPPORTS_FP8
@@ -43,6 +45,13 @@ bool isclose(T a, T b, float rtol, float atol)
     float af = static_cast<float>(a);
     float bf = static_cast<float>(b);
     return fabs(af - bf) <= (atol + rtol * fabs(bf));
+}
+
+//! Symmetric INT8 quantization of the INT8 KV cache: round-half-to-even of x * scaleOrigQuant, clamped to
+//! [-127, 127]. scaleOrigQuant is the reciprocal of the dequant (quant->orig) scale.
+inline int8_t quantizeInt8Symmetric(float const x, float const scaleOrigQuant)
+{
+    return static_cast<int8_t>(std::nearbyint(std::min(std::max(x * scaleOrigQuant, -127.0F), 127.0F)));
 }
 
 template <typename T>
