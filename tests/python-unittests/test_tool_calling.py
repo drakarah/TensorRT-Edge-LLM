@@ -196,3 +196,84 @@ def test_streams_muse_glimmer_atem_tool_call(tmp_path):
     assert len(calls) == 1
     assert calls[0].name == "get_weather"
     assert json.loads(calls[0].arguments) == {"city": "Paris"}
+
+
+def _write_end_tokens(model_dir, eos_token="<eos>", eot_token="<turn|>"):
+    config = {"eos_token": eos_token}
+    if eot_token is not None:
+        config["eot_token"] = eot_token
+    (model_dir / "tokenizer_config.json").write_text(json.dumps(config))
+    return str(model_dir)
+
+
+def _streamed(parser, chunks):
+    events = []
+    for chunk in chunks:
+        events.extend(parser.feed(chunk))
+    events.extend(parser.flush())
+    return events
+
+
+def _content(events):
+    return "".join(event["text"] for event in events
+                   if event["type"] == "content")
+
+
+def test_strips_trailing_end_tokens_from_tool_output(tmp_path):
+    model_dir = _write_end_tokens(tmp_path)
+    parsed = parse_assistant_output('{"answer": 42}<turn|>', _config(),
+                                    model_dir)
+    assert parsed.content == '{"answer": 42}'
+    assert json.loads(parsed.content) == {"answer": 42}
+
+    # A run of end tokens, with whitespace between or after them, goes too.
+    parsed = parse_assistant_output("Done.<turn|>\n<eos>\n", _config(),
+                                    model_dir)
+    assert parsed.content == "Done."
+
+    text = ('<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}'
+            "</tool_call><turn|>")
+    parsed = parse_assistant_output(text, _config(), model_dir)
+    assert parsed.content == ""
+    assert [call.name for call in parsed.tool_calls] == ["get_weather"]
+
+
+def test_keeps_end_token_inside_tool_output_content(tmp_path):
+    model_dir = _write_end_tokens(tmp_path)
+    text = "Gemma ends a turn with <turn|> and then stops."
+    parsed = parse_assistant_output(text, _config(), model_dir)
+    assert parsed.content == text
+    parsed = parse_assistant_output(text + "<turn|>", _config(), model_dir)
+    assert parsed.content == text
+
+
+def test_tool_output_unchanged_without_tokenizer_config(tmp_path):
+    text = "Plain answer<turn|>"
+    parsed = parse_assistant_output(text, _config(), str(tmp_path))
+    assert parsed.content == text
+    events = _streamed(stream_assistant_output(_config(), str(tmp_path)),
+                       ["Plain answer<tu", "rn|>"])
+    assert _content(events) == text
+
+
+def test_stream_strips_end_token_split_across_chunks(tmp_path):
+    model_dir = _write_end_tokens(tmp_path)
+    parser = stream_assistant_output(_config(), model_dir)
+    events = _streamed(parser, ['{"answer": ', "42}<", "tur", "n|>"])
+    assert _content(events) == '{"answer": 42}'
+
+    # Text that only looks like the start of an end token is released.
+    parser = stream_assistant_output(_config(), model_dir)
+    events = _streamed(parser, ["a <tu", "be> b <turn|", "> c", "<"])
+    assert _content(events) == "a <tube> b <turn|> c<"
+
+    parser = stream_assistant_output(_config(), model_dir)
+    events = _streamed(parser, [
+        "Checking.<tool_call>", '{"name":"get_weather","arguments":',
+        '{"city":"Paris"}}</tool_call><tur', "n|>"
+    ])
+    assert _content(events) == "Checking."
+    calls = [
+        event["tool_call"] for event in events if event["type"] == "tool_call"
+    ]
+    assert [call.name for call in calls] == ["get_weather"]

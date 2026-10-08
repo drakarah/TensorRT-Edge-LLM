@@ -18,6 +18,7 @@ The public data structures follow the OpenAI tool-calling API shape.
 """
 
 import ast
+import functools
 import json
 import logging
 import os
@@ -129,6 +130,7 @@ def parse_assistant_output(
                                     allow_implicit=True))
 
     parser = _select_parser(model_dir, tool_parser)
+    text = _strip_trailing_end_tokens(text, end_token_strings(model_dir))
     events, malformed = parser.parse(text, tool_config)
     expanded: List[Dict[str, Any]] = []
     for event in events:
@@ -346,6 +348,94 @@ def _longest_partial_token(buffer: str, tokens: Sequence[str]) -> int:
     return 0
 
 
+@functools.lru_cache(maxsize=None)
+def end_token_strings(model_dir: str) -> Tuple[str, ...]:
+    """End-of-sequence / end-of-turn token strings from the tokenizer config.
+
+    Tool and reasoning parsing decode with special tokens kept, so the token
+    that stopped generation can reach the end of the decoded text. Reads
+    ``eos_token`` and, where the tokenizer defines one, ``eot_token`` from
+    ``tokenizer_config.json``; a missing or unreadable config yields no
+    strings, which disables stripping.
+    """
+    try:
+        with open(os.path.join(model_dir, "tokenizer_config.json"),
+                  encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        return ()
+    if not isinstance(config, dict):
+        return ()
+    tokens: List[str] = []
+    for key in ("eos_token", "eot_token"):
+        value = config.get(key)
+        if isinstance(value, dict):  # Serialized AddedToken.
+            value = value.get("content")
+        if isinstance(value, str) and value and value not in tokens:
+            tokens.append(value)
+    return tuple(tokens)
+
+
+def _end_sequence_regex(end_tokens: Sequence[str]) -> re.Pattern:
+    """Match one or more end tokens, whitespace between or after them, at
+    the end of the text."""
+    token = _alternation(sorted(end_tokens, key=len, reverse=True))
+    return re.compile(token + r"(?:\s*" + token + r")*\s*\Z")
+
+
+def _strip_trailing_end_tokens(text: str, end_tokens: Sequence[str]) -> str:
+    """Remove trailing end-of-sequence / end-of-turn tokens from ``text``.
+
+    Only a run of end tokens (with whitespace between or after them) at the
+    very end is removed; an end token followed by other text is content.
+    """
+    if not end_tokens:
+        return text
+    match = _end_sequence_regex(end_tokens).search(text)
+    return text[:match.start()] if match else text
+
+
+class _EndTokenFilter:
+    """Streaming counterpart of ``_strip_trailing_end_tokens``.
+
+    Holds back any suffix that could still grow into a trailing run of end
+    tokens and releases it as soon as other text follows. At the end of the
+    stream the held text is emitted after the same whole-text strip, so the
+    concatenated output equals the non-streaming result for any chunking.
+    """
+
+    def __init__(self, end_tokens: Sequence[str]) -> None:
+        self._end_tokens = tuple(end_tokens)
+        self._held = ""
+        if self._end_tokens:
+            token = _alternation(
+                sorted(self._end_tokens, key=len, reverse=True))
+            partials = sorted(
+                {t[:n]
+                 for t in self._end_tokens for n in range(1, len(t))},
+                key=len,
+                reverse=True)
+            partial = _alternation(partials) if partials else "(?!)"
+            # A complete run (each token optionally followed by whitespace)
+            # with an optional partial token, or a lone partial token.
+            self._pending_re = re.compile("(?:" + token + r"\s*)+(?:" +
+                                          partial + r")?\Z|" + partial +
+                                          r"\Z")
+
+    def feed(self, text: str) -> str:
+        if not self._end_tokens:
+            return text
+        self._held += text
+        match = self._pending_re.search(self._held)
+        cut = match.start() if match else len(self._held)
+        emitted, self._held = self._held[:cut], self._held[cut:]
+        return emitted
+
+    def flush(self) -> str:
+        held, self._held = self._held, ""
+        return _strip_trailing_end_tokens(held, self._end_tokens)
+
+
 _JSON_WS = " \t\n\r"
 _ESCAPABLE = '"\\/bfnrtu'
 _LITERALS = {"t": "true", "f": "false", "n": "null"}
@@ -544,9 +634,15 @@ class _GenericToolParser:
         "|".join(_family_block_regex(family)
                  for family in _MARKER_FAMILIES) + ")", re.S)
 
-    def stream(self, tool_config: ToolConfig) -> "StreamingToolParser":
-        """Create independent streaming state for one response."""
-        return StreamingToolParser(self, tool_config)
+    def stream(self,
+               tool_config: ToolConfig,
+               end_tokens: Sequence[str] = ()) -> "StreamingToolParser":
+        """Create independent streaming state for one response.
+
+        ``end_tokens`` (see ``end_token_strings``) are stripped from the end
+        of the stream, as ``parse_assistant_output`` does for whole text.
+        """
+        return StreamingToolParser(self, tool_config, end_tokens)
 
     def parse(self, text: str,
               tool_config: ToolConfig) -> Tuple[List[Dict[str, Any]], bool]:
@@ -597,8 +693,8 @@ class StreamingAssistantOutputParser:
     def __init__(self, tool_config: ToolConfig, model_dir: str,
                  tool_parser: str, reasoning_parser: str) -> None:
         parser = _select_parser(model_dir, tool_parser)
-        self._tools = parser.stream(
-            tool_config) if tool_config.parse_output else None
+        self._tools = parser.stream(tool_config, end_token_strings(
+            model_dir)) if tool_config.parse_output else None
         reasoning = REASONING_PARSERS.resolve(reasoning_parser, model_dir)
         self._reasoning = (reasoning.stream(
             allow_implicit=not tool_config.parse_output)
@@ -766,12 +862,17 @@ class StreamingToolParser:
 
     flush() re-parses everything still held back with the whole-text parser,
     so EOF behavior matches the non-streaming path -- except calls whose head
-    already streamed and cannot be recalled.
+    already streamed and cannot be recalled. Input first passes an
+    _EndTokenFilter, which withholds a possible trailing end token.
     """
 
-    def __init__(self, whole_text_parser, tool_config: ToolConfig) -> None:
+    def __init__(self,
+                 whole_text_parser,
+                 tool_config: ToolConfig,
+                 end_tokens: Sequence[str] = ()) -> None:
         self._whole = whole_text_parser
         self._config = tool_config
+        self._end_filter = _EndTokenFilter(end_tokens)
         self._buffer = ""
         self._state = "gate"
         self._next_index = 0
@@ -792,6 +893,11 @@ class StreamingToolParser:
         self._poisoned = False
 
     def feed(self, text: str) -> Iterable[ToolStreamEvent]:
+        text = self._end_filter.feed(text)
+        if text:
+            yield from self._advance(text)
+
+    def _advance(self, text: str) -> Iterable[ToolStreamEvent]:
         self._buffer += text
         while True:
             if self._state == "gate":
@@ -970,6 +1076,9 @@ class StreamingToolParser:
         return True
 
     def flush(self) -> Iterable[ToolStreamEvent]:
+        tail = self._end_filter.flush()
+        if tail:
+            yield from self._advance(tail)
         if (self._state in ("raw", "raw_tail", "raw_sink", "param")
                 and self._head_out):
             # The head already streamed and cannot be recalled.

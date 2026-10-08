@@ -26,8 +26,8 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 from ..config import ApiConfig
 from ..parsing.reasoning import REASONING_PARSERS
 from ..parsing.tool_calling import (StreamingAssistantOutputParser, ToolConfig,
-                                    _select_parser, list_tool_parsers,
-                                    parse_assistant_output,
+                                    _select_parser, end_token_strings,
+                                    list_tool_parsers, parse_assistant_output,
                                     stream_assistant_output,
                                     validate_tool_request)
 from ..runtime.engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams,
@@ -647,7 +647,8 @@ class OpenAIServingChat:
     ) -> AsyncGenerator[str, None]:
         parser = _select_parser(self._model_dir,
                                 self._config.tool_call_parser).stream(
-                                    prepared.tool_config)
+                                    prepared.tool_config,
+                                    end_token_strings(self._model_dir))
         reasoning = REASONING_PARSERS.resolve(prepared.reasoning_parser,
                                               self._model_dir)
         reasoning_stream = reasoning.stream() if reasoning else None
