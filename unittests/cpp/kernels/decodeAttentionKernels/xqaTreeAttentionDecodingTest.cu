@@ -1241,6 +1241,187 @@ TEST(XQATreeAttentionDecodingFP8Test, slidingWindowAccuracy)
 }
 #endif
 
+//! INT8 KV cache spec-decode attention on a paged pool whose page list is reversed per sequence, with a causal
+//! draft chain over the last qSequenceLength cache tokens. K/V are quantized per tensor with scale = amax / 127.
+//! The output is checked (1) against the reference on the dequantized INT8 K/V with the FP16-path tolerances and
+//! (2) against the FP16 reference on the original K/V within one V quantization step (see
+//! TestXQAAttentionDecodingInt8Accuracy in xqaAttentionDecodingTest.cu for the bound).
+void TestXQATreeAttentionDecodingInt8Accuracy(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize, int32_t kvSequenceLength, int32_t qSequenceLength, int32_t tokensPerPage)
+{
+    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headSize));
+    initializeCudaContextForXQATest();
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    ASSERT_EQ(kvSequenceLength % tokensPerPage, 0);
+    int32_t const maxNbPagesPerSeq = kvSequenceLength / tokensPerPage;
+    size_t const compactVolume = static_cast<size_t>(numKVHeads) * kvSequenceLength * headSize;
+
+    std::vector<int32_t> treeMask(static_cast<size_t>(qSequenceLength) * qSequenceLength, 0);
+    for (int32_t queryIdx = 0; queryIdx < qSequenceLength; ++queryIdx)
+    {
+        std::fill_n(treeMask.begin() + queryIdx * qSequenceLength, queryIdx + 1, 1);
+    }
+    int32_t const numPackedMasksPerToken = divUp(qSequenceLength, 32);
+    std::vector<int32_t> packedTreeMask(static_cast<size_t>(batchSize) * qSequenceLength * numPackedMasksPerToken, 0);
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        for (int32_t queryIdx = 0; queryIdx < qSequenceLength; ++queryIdx)
+        {
+            for (int32_t keyIdx = 0; keyIdx <= queryIdx; ++keyIdx)
+            {
+                packedTreeMask[(static_cast<size_t>(b) * qSequenceLength + queryIdx) * numPackedMasksPerToken
+                    + keyIdx / 32] |= static_cast<int32_t>(1U << (keyIdx % 32));
+            }
+        }
+    }
+
+    // Compact [B][Hkv, kvSequenceLength, D] K/V and [B][qSequenceLength, Hq, D] Q.
+    std::vector<half> qInput(static_cast<size_t>(batchSize) * qSequenceLength * numQHeads * headSize);
+    std::vector<half> kInput(batchSize * compactVolume);
+    std::vector<half> vInput(batchSize * compactVolume);
+    uniformFloatInitialization(qInput, -1.0F, 1.0F);
+    uniformFloatInitialization(kInput, -1.0F, 1.0F);
+    uniformFloatInitialization(vInput, -1.0F, 1.0F);
+    float kAmax = 0.0F;
+    float vAmax = 0.0F;
+    for (size_t idx = 0; idx < kInput.size(); ++idx)
+    {
+        kAmax = std::max(kAmax, std::fabs(__half2float(kInput[idx])));
+        vAmax = std::max(vAmax, std::fabs(__half2float(vInput[idx])));
+    }
+    ASSERT_GT(kAmax, 0.0F);
+    ASSERT_GT(vAmax, 0.0F);
+    float const kScaleQuantOrig = kAmax / 127.0F;
+    float const vScaleQuantOrig = vAmax / 127.0F;
+    std::vector<int8_t> kInputInt8(kInput.size());
+    std::vector<int8_t> vInputInt8(vInput.size());
+    for (size_t idx = 0; idx < kInput.size(); ++idx)
+    {
+        kInputInt8[idx] = quantizeInt8Symmetric(__half2float(kInput[idx]), 1.0F / kScaleQuantOrig);
+        vInputInt8[idx] = quantizeInt8Symmetric(__half2float(vInput[idx]), 1.0F / vScaleQuantOrig);
+    }
+
+    int32_t const nbPoolPages = batchSize * 2 * maxNbPagesPerSeq;
+    std::vector<int8_t> kvPoolInt8(static_cast<size_t>(nbPoolPages) * tokensPerPage * numKVHeads * headSize, 0);
+    std::vector<int32_t> kvCachePageList(static_cast<size_t>(batchSize) * 2 * maxNbPagesPerSeq);
+    std::vector<half> outReference;
+    std::vector<half> outReferenceInt8;
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        int32_t const listBase = b * 2 * maxNbPagesPerSeq;
+        for (int32_t p = 0; p < maxNbPagesPerSeq; ++p)
+        {
+            kvCachePageList[listBase + p] = listBase + maxNbPagesPerSeq - 1 - p;
+            kvCachePageList[listBase + maxNbPagesPerSeq + p] = listBase + 2 * maxNbPagesPerSeq - 1 - p;
+        }
+        for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
+        {
+            for (int32_t skv = 0; skv < kvSequenceLength; ++skv)
+            {
+                int32_t const kPageIdx = kvCachePageList[listBase + skv / tokensPerPage];
+                int32_t const vPageIdx = kvCachePageList[listBase + maxNbPagesPerSeq + skv / tokensPerPage];
+                for (int32_t d = 0; d < headSize; ++d)
+                {
+                    size_t const compactOffset
+                        = b * compactVolume + (static_cast<size_t>(hkv) * kvSequenceLength + skv) * headSize + d;
+                    kvPoolInt8[getPagedKVPoolOffset(kPageIdx, numKVHeads, tokensPerPage, headSize, hkv,
+                        skv % tokensPerPage, d)] = kInputInt8[compactOffset];
+                    kvPoolInt8[getPagedKVPoolOffset(vPageIdx, numKVHeads, tokensPerPage, headSize, hkv,
+                        skv % tokensPerPage, d)] = vInputInt8[compactOffset];
+                }
+            }
+        }
+
+        size_t const qVolume = static_cast<size_t>(qSequenceLength) * numQHeads * headSize;
+        std::vector<half> const qi(qInput.begin() + b * qVolume, qInput.begin() + (b + 1) * qVolume);
+        std::vector<half> const ki(kInput.begin() + b * compactVolume, kInput.begin() + (b + 1) * compactVolume);
+        std::vector<half> const vi(vInput.begin() + b * compactVolume, vInput.begin() + (b + 1) * compactVolume);
+        std::vector<int8_t> const kiInt8(
+            kInputInt8.begin() + b * compactVolume, kInputInt8.begin() + (b + 1) * compactVolume);
+        std::vector<int8_t> const viInt8(
+            vInputInt8.begin() + b * compactVolume, vInputInt8.begin() + (b + 1) * compactVolume);
+        auto const ref = casualAttentionRef<half>(qi, ki, vi, qSequenceLength, kvSequenceLength, numQHeads, numKVHeads,
+            headSize, attentionScale, std::make_optional(treeMask));
+        auto const refInt8
+            = casualAttentionRef<int8_t>(qi, kiInt8, viInt8, qSequenceLength, kvSequenceLength, numQHeads, numKVHeads,
+                headSize, attentionScale, std::make_optional(treeMask), kScaleQuantOrig, vScaleQuantOrig);
+        outReference.insert(outReference.end(), ref.begin(), ref.end());
+        outReferenceInt8.insert(outReferenceInt8.end(), refInt8.begin(), refInt8.end());
+    }
+
+    thrust::device_vector<half> qInputDevice(qInput);
+    thrust::device_vector<int8_t> kvPoolInt8Device(kvPoolInt8);
+    thrust::device_vector<half> outDevice(outReference.size(), __float2half(0.0F));
+    thrust::device_vector<int32_t> kvCacheLengthDevice(std::vector<int32_t>(batchSize, kvSequenceLength));
+    thrust::device_vector<int32_t> kvCachePageListDevice(kvCachePageList);
+    thrust::device_vector<int32_t> packedTreeMaskDevice(packedTreeMask);
+
+    ASSERT_TRUE(
+        trt_edgellm::canCompileXQAKernel(numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kINT8));
+    ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kINT8, headSize, numQHeads,
+        numKVHeads, /*slidingWindow=*/false, /*specDecode=*/true, tokensPerPage));
+    trt_edgellm::DecoderXQARunner runner(
+        DataType::kHALF, DataType::kINT8, batchSize, numQHeads, numKVHeads, headSize, smVersion);
+    auto params = runner.initXQAParams();
+    params.qSeqLen = qSequenceLength;
+    params.qInputPtr = thrust::raw_pointer_cast(qInputDevice.data());
+    params.kvCache.data = thrust::raw_pointer_cast(kvPoolInt8Device.data());
+    params.kvCache.sequence_lengths = thrust::raw_pointer_cast(kvCacheLengthDevice.data());
+    params.kvCache.capacity = kvSequenceLength;
+    params.kvCache.pageList = thrust::raw_pointer_cast(kvCachePageListDevice.data());
+    params.kvCache.tokensPerPage = static_cast<uint32_t>(tokensPerPage);
+    params.output = thrust::raw_pointer_cast(outDevice.data());
+    params.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
+    params.attentionScale = attentionScale;
+    params.kScale = kScaleQuantOrig;
+    params.vScale = vScaleQuantOrig;
+
+    cudaStream_t stream{nullptr};
+    runner.dispatchSpecDecodeXQAKernel(params, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    thrust::host_vector<half> outHost(outDevice.size());
+    thrust::copy(outDevice.begin(), outDevice.end(), outHost.begin());
+
+    ASSERT_EQ(outHost.size(), outReferenceInt8.size());
+    int32_t numErrorWithin1E_3 = 0;
+    float maxAbsDiffFp16 = 0.0F;
+    for (size_t i = 0; i < outHost.size(); ++i)
+    {
+        ASSERT_TRUE(std::isfinite(__half2float(outHost[i]))) << "non-finite output at " << i;
+        EXPECT_TRUE(isclose(outHost[i], outReferenceInt8[i], 1e-2, 1e-2))
+            << "INT8 reference mismatch at " << i << ": got " << __half2float(outHost[i]) << ", expected "
+            << __half2float(outReferenceInt8[i]);
+        if (isclose(outHost[i], outReferenceInt8[i], 1e-3, 1e-3))
+        {
+            numErrorWithin1E_3++;
+        }
+        float const absDiffFp16 = std::fabs(__half2float(outHost[i]) - __half2float(outReference[i]));
+        maxAbsDiffFp16 = std::max(maxAbsDiffFp16, absDiffFp16);
+        EXPECT_LE(absDiffFp16, vScaleQuantOrig)
+            << "FP16 reference mismatch at " << i << ": got " << __half2float(outHost[i]) << ", expected "
+            << __half2float(outReference[i]);
+    }
+    float const passRate1E_3 = static_cast<float>(numErrorWithin1E_3) / static_cast<float>(outHost.size());
+
+    std::cout << "XQA Tree Attention Decoding test. [INT8 KV cache] batch_size: " << batchSize
+              << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
+              << " kvcache seq_len: " << kvSequenceLength << " q_seq_len: " << qSequenceLength
+              << " tokens_per_page: " << tokensPerPage << " pass_rate_1e-3: " << passRate1E_3
+              << " max_abs_diff_vs_fp16_ref: " << maxAbsDiffFp16 << std::endl;
+    EXPECT_GT(passRate1E_3, 0.9);
+}
+
+// INT8 converts are native on every XQA SM, so unlike FP8 these run on SM80+ including SM87.
+TEST(XQATreeAttentionDecodingINT8Test, pagedKVAccuracyKVRatio4Gemma4)
+{
+    // Gemma 4 MTP drafts: 8 Q heads, 2 KV heads, head_dim 256 (sliding-window layers) and 512 (global layers).
+    TestXQATreeAttentionDecodingInt8Accuracy(2, 8, 2, 256, 256, 8, 128);
+    TestXQATreeAttentionDecodingInt8Accuracy(1, 8, 2, 512, 256, 8, 128);
+}
+
 struct XQATreeAttentionBenchShape
 {
     int32_t batchSize{1};

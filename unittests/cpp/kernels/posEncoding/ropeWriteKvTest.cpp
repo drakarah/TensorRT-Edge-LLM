@@ -17,9 +17,6 @@
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
-#include <cmath>
-
 #include "common/cudaUtils.h"
 #include "common/pagedKvTypes.h"
 #include "common/tensor.h"
@@ -89,14 +86,6 @@ std::vector<int32_t> makeReversedPageTable(int32_t const batchSize, int32_t cons
     return pageTable;
 }
 
-//! Host reference of the INT8 KV-cache write: round-half-to-even of x / scale, clamped to [-127, 127].
-//! Takes the reciprocal (orig->quant) scale because the kernel multiplies by the correctly rounded
-//! reciprocal of the dequant scale.
-int8_t quantizeInt8Ref(float const x, float const scaleOrigQuant)
-{
-    return static_cast<int8_t>(std::nearbyint(std::min(std::max(x * scaleOrigQuant, -127.0F), 127.0F)));
-}
-
 //! INT8 never written by the KV-cache writer (its range is [-127, 127]); marks untouched pool slots.
 constexpr int8_t kINT8_SENTINEL = -128;
 
@@ -123,7 +112,7 @@ void expectInt8PoolMatchesQuantizedFp16Pool(std::vector<int8_t> const& int8Pool,
                         int64_t const idx
                             = pagedKvIndex(plane, page, slot % kPageSize, h, d, numPages, numKVHeads, headDim);
                         int8_t const expected = slot < writtenTokens
-                            ? quantizeInt8Ref(__half2float(fp16Pool[idx]), scaleOrigQuant)
+                            ? quantizeInt8Symmetric(__half2float(fp16Pool[idx]), scaleOrigQuant)
                             : kINT8_SENTINEL;
                         ASSERT_EQ(int8Pool[idx], expected)
                             << "b=" << b << " plane=" << plane << " slot=" << slot << " h=" << h << " d=" << d;
@@ -450,9 +439,11 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
                             /*cachePlane=*/0, page, j % kPageSize, hkv, d, numPages, numKVHeads, headDim);
                         int64_t const vIdx = pagedKvIndex(
                             /*cachePlane=*/1, page, j % kPageSize, hkv, d, numPages, numKVHeads, headDim);
-                        ASSERT_EQ(kvOutInt8[kIdx], quantizeInt8Ref(__half2float(kvCacheOut[kIdx]), kScaleOrigQuant))
+                        ASSERT_EQ(
+                            kvOutInt8[kIdx], quantizeInt8Symmetric(__half2float(kvCacheOut[kIdx]), kScaleOrigQuant))
                             << "K mismatch b=" << b << " s=" << j << " h=" << hkv << " d=" << d;
-                        ASSERT_EQ(kvOutInt8[vIdx], quantizeInt8Ref(__half2float(kvCacheOut[vIdx]), vScaleOrigQuant))
+                        ASSERT_EQ(
+                            kvOutInt8[vIdx], quantizeInt8Symmetric(__half2float(kvCacheOut[vIdx]), vScaleOrigQuant))
                             << "V mismatch b=" << b << " s=" << j << " h=" << hkv << " d=" << d;
                     }
                 }
@@ -840,9 +831,11 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
                             /*cachePlane=*/0, page, inCacheIdx % kPageSize, hkv, d, numPages, numKVHeads, headDim);
                         int64_t const vIdx = pagedKvIndex(
                             /*cachePlane=*/1, page, inCacheIdx % kPageSize, hkv, d, numPages, numKVHeads, headDim);
-                        ASSERT_EQ(kvOutInt8[kIdx], quantizeInt8Ref(__half2float(kvCacheOut[kIdx]), kScaleOrigQuant))
+                        ASSERT_EQ(
+                            kvOutInt8[kIdx], quantizeInt8Symmetric(__half2float(kvCacheOut[kIdx]), kScaleOrigQuant))
                             << "K mismatch b=" << b << " s=" << s << " h=" << hkv << " d=" << d;
-                        ASSERT_EQ(kvOutInt8[vIdx], quantizeInt8Ref(__half2float(kvCacheOut[vIdx]), vScaleOrigQuant))
+                        ASSERT_EQ(
+                            kvOutInt8[vIdx], quantizeInt8Symmetric(__half2float(kvCacheOut[vIdx]), vScaleOrigQuant))
                             << "V mismatch b=" << b << " s=" << s << " h=" << hkv << " d=" << d;
                     }
                 }
@@ -1613,8 +1606,10 @@ TEST(RopeWriteKvInt8Pool, PackedScrambledPagesMatchQuantizedFp16Pool)
     float const kScale = 0.07F;
     float const vScale = 0.045F;
 
-    rt::Tensor cosSinCacheTensor(rt::Coords{1, kvCacheCapacity, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    initializeNormalRopeCosSin(cosSinCacheTensor.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, headDim, kvCacheCapacity, stream);
+    rt::Tensor cosSinCacheTensor(
+        rt::Coords{1, kvCacheCapacity, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(
+        cosSinCacheTensor.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, headDim, kvCacheCapacity, stream);
 
     std::vector<half> packedInput(static_cast<size_t>(batchSize) * qSeqLen * combinedHeads * headDim);
     uniformFloatInitialization(packedInput);
@@ -1660,8 +1655,10 @@ TEST(RopeWriteKvInt8Pool, SplitQKVScrambledPagesMatchQuantizedFp16Pool)
     float const kScale = 0.07F;
     float const vScale = 0.045F;
 
-    rt::Tensor cosSinCacheTensor(rt::Coords{1, kvCacheCapacity, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    initializeNormalRopeCosSin(cosSinCacheTensor.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, headDim, kvCacheCapacity, stream);
+    rt::Tensor cosSinCacheTensor(
+        rt::Coords{1, kvCacheCapacity, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(
+        cosSinCacheTensor.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, headDim, kvCacheCapacity, stream);
 
     std::vector<half> qInput(static_cast<size_t>(batchSize) * qSeqLen * numQHeads * headDim);
     std::vector<half> kInput(static_cast<size_t>(batchSize) * qSeqLen * numKVHeads * headDim);
@@ -1723,8 +1720,8 @@ TEST(RopeWriteKvInt8Pool, RejectsFp8QOutput)
     rt::Tensor qTensor(rt::Coords{1, qSeqLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor kTensor(rt::Coords{1, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor vTensor(rt::Coords{1, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor packedTensor(rt::Coords{1, qSeqLen, numQHeads + 2 * numKVHeads, headDim}, rt::DeviceType::kGPU,
-        nvinfer1::DataType::kHALF);
+    rt::Tensor packedTensor(
+        rt::Coords{1, qSeqLen, numQHeads + 2 * numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor kvCacheEndLensTensor(rt::Coords{1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
     rt::Tensor int8PoolTensor(
         rt::Coords{2, 1, kPageSize, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
@@ -1741,9 +1738,9 @@ TEST(RopeWriteKvInt8Pool, RejectsFp8QOutput)
         qTensor, int8PoolTensor, 1.0F, 1.0F, nullptr, pageTableTensor.dataPointer<int32_t>(), 1));
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
 
-    EXPECT_THROW(launchApplyRopeWriteKVSplitQKV(cosSinCacheTensor, kvCacheEndLensTensor, qTensor, kTensor, vTensor,
-                     int8PoolTensor, 1.0F, 1.0F, nullptr, pageTableTensor.dataPointer<int32_t>(), 1,
-                     fp8QOutTensor.rawPointer()),
+    EXPECT_THROW(
+        launchApplyRopeWriteKVSplitQKV(cosSinCacheTensor, kvCacheEndLensTensor, qTensor, kTensor, vTensor,
+            int8PoolTensor, 1.0F, 1.0F, nullptr, pageTableTensor.dataPointer<int32_t>(), 1, fp8QOutTensor.rawPointer()),
         std::runtime_error);
     EXPECT_THROW(launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qTensor,
                      int8PoolTensor, 1.0F, 1.0F, nullptr, pageTableTensor.dataPointer<int32_t>(), 1, nullptr, nullptr,
@@ -1869,7 +1866,7 @@ TEST(RopeWriteKvPrefill, Int8RoundingAndSaturationAcrossAllFiniteHalfValues)
     auto const result = copyDeviceToHost<int8_t>(cache);
     for (int32_t i = 0; i < kCOUNT; ++i)
     {
-        int8_t const expected = quantizeInt8Ref(__half2float(values[i]), 1.0F / scale);
+        int8_t const expected = quantizeInt8Symmetric(__half2float(values[i]), 1.0F / scale);
         for (int32_t plane = 0; plane < 2; ++plane)
         {
             auto const offset
