@@ -22,6 +22,7 @@
 #include "runtime/exec/tensorMap.h"
 #include <NvInferRuntime.h>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -85,6 +86,15 @@ public:
      */
     bool bindAll(
         nvinfer1::IExecutionContext* ctx, TensorMap const& tensorMap, InferenceDims const& inferenceDims) const;
+
+    //! Binds one tensor: its address and, for inputs, its resolved shape (nullptr for outputs).
+    using BindFn = std::function<bool(char const* name, void* address, nvinfer1::Dims const* inputShape)>;
+
+    /*!
+     * @brief Bind all registered tensors through @p bind instead of a context, so the caller can
+     * skip bindings that did not change since the previous step.
+     */
+    bool bindAll(BindFn const& bind, TensorMap const& tensorMap, InferenceDims const& inferenceDims) const;
 
     /*!
      * @brief Return the set of `InferenceDims` members referenced by any symbolic
