@@ -545,7 +545,8 @@ REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 // The gather follows the page table and dequantizes FP8 pools.
 std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::splitPagedKV(rt::Tensor const& poolTensor, int32_t const* pageTable,
     int32_t const* kvSeqLens, int32_t maxPagesPerSeq, std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads,
-    int32_t capPadded, int32_t headSize, int32_t seqLen, float kScale, float vScale, cudaStream_t stream)
+    int32_t capPadded, int32_t headSize, int32_t seqLen, float kScale, float vScale, cudaStream_t stream,
+    int32_t consumerTailTokens, int32_t consumerKeepTrailingTokens)
 {
     // The pool binding is [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
     check::check(isPagedPoolShape(poolTensor.getShape(), numKVHeads, headSize),
@@ -581,7 +582,7 @@ std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::splitPagedKV(rt::Tensor const
 
     kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(), pageTable,
         kvSeqLens, maxPagesPerSeq, batchSize, outSeqDim, numKVHeads, headSize, elemSize, poolQuant, kScale, vScale,
-        stream);
+        stream, consumerTailTokens, consumerKeepTrailingTokens);
 
     return std::make_pair(std::move(kTensor), std::move(vTensor));
 }
@@ -1924,6 +1925,14 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             bool const compact = executionMode == AttentionExecutionMode::kNORMAL_PREFILL;
             return compact ? runtimeSeqLen : 0;
         };
+        // A capacity-wide split (splitSeqLen == 0) is read by kernels bounded by the per-sequence KV
+        // lengths, which exceed the live (end-index) length by at most the padded query length.
+        [[maybe_unused]] auto consumerTailForFallback
+            = [&](int32_t splitSeqLen) { return splitSeqLen > 0 ? -1 : runtimeSeqLen; };
+        // Sliding-window layers read no key older than window + query length before the live end.
+        [[maybe_unused]] auto consumerWindowForFallback = [&](int32_t splitSeqLen) {
+            return (splitSeqLen > 0 || mSlidingWindowSize <= 0) ? -1 : runtimeSeqLen + mSlidingWindowSize;
+        };
         [[maybe_unused]] auto physicalLenForFallback
             = [&]() { return splitLenForFallback() > 0 ? runtimeSeqLen : kvCacheCapacity; };
 
@@ -2040,7 +2049,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     int32_t const splitSeqLen = splitLenForFallback();
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
-                        runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream);
+                        runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,
+                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen));
                     CuteDslFMHAV2Runner runner(mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen,
                         physicalLenForFallback(), splitSeqLen > 0);
                     if (!runner.run(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
@@ -2075,7 +2085,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     int32_t const splitSeqLen = splitLenForFallback();
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
-                        runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream);
+                        runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,
+                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen));
                     int32_t const kvExtent = physicalLenForFallback();
                     CuteDslFMHAV2Runner runner(
                         mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvExtent);
@@ -2272,7 +2283,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     int32_t const splitSeqLen = splitLenForFallback();
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
-                        runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream);
+                        runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,
+                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen));
                     CuteDslFMHAV2Runner runner(mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen,
                         physicalLenForFallback(), splitSeqLen > 0);
                     bool const ranKernel = usePaddingContextMask
