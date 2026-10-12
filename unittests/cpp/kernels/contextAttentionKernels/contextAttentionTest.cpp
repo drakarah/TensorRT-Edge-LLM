@@ -777,6 +777,14 @@ TEST(ContextAttentionTest, longSequence_Causal)
     TestContextAttentionAccuracy(1, 1024, 8, 2, 256, true);
 }
 
+// Dense (gathered K/V) D512 prefill, Gemma 4 global-layer ratio; odd length exercises the tail tile.
+TEST(ContextAttentionTest, accuracyD512_Causal)
+{
+    TestContextAttentionAccuracy(1, 1024, 8, 2, 512, true);
+    TestContextAttentionAccuracy(1, 333, 8, 2, 512, true);
+    TestContextAttentionAccuracy(2, 160, 8, 2, 512, true);
+}
+
 // Convenience wrapper for compact layout (variable sequence lengths, non-causal)
 void TestContextAttentionCompactAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t numQHeads, int32_t numKVHeads,
     int32_t headSize, int32_t maxSeqLen, std::optional<float> attentionScale = std::nullopt)
