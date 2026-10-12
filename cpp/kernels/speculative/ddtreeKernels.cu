@@ -48,12 +48,26 @@ size_t getCandidateTokenWorkspaceBytes(int32_t batchSize, int32_t dflashBlockSiz
         static_cast<size_t>(batchSize) * dflashBlockSize * candidateTopK * sizeof(int32_t));
 }
 
+//! Bytes of the per-slice candidate partials (pass 1 of candidate selection) for @p numPartials
+//! (rows x slices): top-K scores and token ids, logsumexp max and sum.
+size_t getCandidatePartialWorkspaceBytes(size_t numPartials)
+{
+    return alignSpeculativeWorkspaceSize(numPartials * kDDTreeMaxCandidateTopK * sizeof(float))
+        + alignSpeculativeWorkspaceSize(numPartials * kDDTreeMaxCandidateTopK * sizeof(int32_t))
+        + 2 * alignSpeculativeWorkspaceSize(numPartials * sizeof(float));
+}
+
 struct DDTreeBuildWorkspace
 {
     int32_t* candidateTokenIds{nullptr};
     float* candidateLogProbs{nullptr};
+    float* partialScores{nullptr};
+    int32_t* partialTokenIds{nullptr};
+    float* partialMax{nullptr};
+    float* partialSum{nullptr};
 
-    void setup(void* workspace, size_t workspaceSize, int32_t batchSize, int32_t dflashBlockSize, int32_t candidateTopK)
+    void setup(void* workspace, size_t workspaceSize, int32_t batchSize, int32_t dflashBlockSize, int32_t candidateTopK,
+        size_t numPartials)
     {
         ELLM_CHECK(reinterpret_cast<uintptr_t>(workspace) % kSpeculativeWorkspaceAlignment == 0,
             "DDTree workspace must be 256-byte aligned.");
@@ -67,6 +81,16 @@ struct DDTreeBuildWorkspace
             static_cast<size_t>(batchSize) * dflashBlockSize * candidateTopK * sizeof(float));
         candidateLogProbs = reinterpret_cast<float*>(static_cast<char*>(workspace) + offset);
         offset += candidateLogProbBytes;
+
+        auto take = [&](size_t bytes) {
+            void* ptr = static_cast<char*>(workspace) + offset;
+            offset += alignSpeculativeWorkspaceSize(bytes);
+            return ptr;
+        };
+        partialScores = static_cast<float*>(take(numPartials * kDDTreeMaxCandidateTopK * sizeof(float)));
+        partialTokenIds = static_cast<int32_t*>(take(numPartials * kDDTreeMaxCandidateTopK * sizeof(int32_t)));
+        partialMax = static_cast<float*>(take(numPartials * sizeof(float)));
+        partialSum = static_cast<float*>(take(numPartials * sizeof(float)));
 
         ELLM_CHECK(offset <= workspaceSize,
             "DDTree build workspace too small. Required: " + std::to_string(offset)
@@ -124,28 +148,35 @@ __device__ __forceinline__ void mergeLogSumExp(float& m, float& s, float om, flo
     }
 }
 
-// One CTA per (batch, proposal-depth): top-K token candidates + logsumexp over
-// the draft vocab. Optimized single pass: fused online logsumexp (was two full
-// vocab sweeps), float4 loads, guarded top-K insertion, warp-shuffle logsumexp
-// reduction and a parallel tree merge of per-thread top-K lists (was serial
-// tid==0 scans over all 256 threads).
-__global__ void selectDDTreeCandidatesKernel(float const* __restrict__ draftLogits,
-    int32_t* __restrict__ candidateTokenIds, float* __restrict__ candidateLogProbs, int32_t dflashBlockSize,
-    int32_t vocabSize, int32_t candidateTopK, int32_t firstCandidateLogitsRow)
-{
-    int32_t const batchIdx = blockIdx.x / dflashBlockSize;
-    int32_t const depthIdx = blockIdx.x % dflashBlockSize;
-    int32_t const tid = threadIdx.x;
+//! Vocabulary entries one candidate-selection CTA scans; a row is split into at most
+//! kCandidateMaxSplits such slices so a batch-1 tree uses more than a few SMs.
+constexpr int32_t kCandidateVocabPerSplit{8192};
+constexpr int32_t kCandidateMaxSplits{64};
 
-    int32_t const candidateOffset = (batchIdx * dflashBlockSize + depthIdx) * candidateTopK;
+__host__ __device__ __forceinline__ int32_t candidateSplits(int32_t vocabSize)
+{
+    int32_t const splits = (vocabSize + kCandidateVocabPerSplit - 1) / kCandidateVocabPerSplit;
+    return splits < 1 ? 1 : (splits > kCandidateMaxSplits ? kCandidateMaxSplits : splits);
+}
+
+// Pass 1: one CTA per (batch, proposal-depth, vocabulary slice): top-K token candidates and an
+// online logsumexp partial over the slice. Fused single pass, float4 loads, guarded top-K
+// insertion, warp-shuffle logsumexp reduction and a parallel tree merge of per-thread lists.
+// Rows outside [firstCandidateLogitsRow, firstUnusedDepth) are left to the merge pass.
+__global__ void selectDDTreeCandidatesPartialKernel(float const* __restrict__ draftLogits,
+    float* __restrict__ partialScores, int32_t* __restrict__ partialTokenIds, float* __restrict__ partialMax,
+    float* __restrict__ partialSum, int32_t dflashBlockSize, int32_t vocabSize, int32_t candidateTopK,
+    int32_t firstCandidateLogitsRow)
+{
+    int32_t const row = blockIdx.x;
+    int32_t const split = blockIdx.y;
+    int32_t const numSplits = gridDim.y;
+    int32_t const batchIdx = row / dflashBlockSize;
+    int32_t const depthIdx = row % dflashBlockSize;
+    int32_t const tid = threadIdx.x;
     int32_t const firstUnusedDepth = firstCandidateLogitsRow + dflashBlockSize - 1;
     if (depthIdx < firstCandidateLogitsRow || depthIdx >= firstUnusedDepth)
     {
-        for (int32_t slot = tid; slot < candidateTopK; slot += blockDim.x)
-        {
-            candidateTokenIds[candidateOffset + slot] = 0;
-            candidateLogProbs[candidateOffset + slot] = -INFINITY;
-        }
         return;
     }
 
@@ -153,7 +184,6 @@ __global__ void selectDDTreeCandidatesKernel(float const* __restrict__ draftLogi
     __shared__ int32_t sTopTokenIds[kCandidateBlockSize * kDDTreeMaxCandidateTopK];
     __shared__ float sWarpMax[kCandidateBlockSize / 32];
     __shared__ float sWarpSum[kCandidateBlockSize / 32];
-    __shared__ float sLogSumExp;
 
     float topScores[kDDTreeMaxCandidateTopK];
     int32_t topTokenIds[kDDTreeMaxCandidateTopK];
@@ -167,37 +197,13 @@ __global__ void selectDDTreeCandidatesKernel(float const* __restrict__ draftLogi
         = static_cast<int64_t>(batchIdx) * dflashBlockSize * vocabSize + static_cast<int64_t>(depthIdx) * vocabSize;
     float const* logits = draftLogits + logitsOffset;
 
-    // ---- Single fused pass: online logsumexp + guarded top-K, float4 loads --
-    // float4 path requires the per-row base to stay 16B-aligned; fall back to
-    // the scalar tail loop for the whole row otherwise.
-    float runMax = -INFINITY;
-    float runSum = 0.0F;
-    int32_t const vocab4 = (vocabSize % 4 == 0) ? vocabSize / 4 : 0;
-    float4 const* logits4 = reinterpret_cast<float4 const*>(logits);
-    for (int32_t i4 = tid; i4 < vocab4; i4 += blockDim.x)
-    {
-        float4 const v4 = logits4[i4];
-        float const vals[4] = {v4.x, v4.y, v4.z, v4.w};
-        int32_t const base = i4 * 4;
-#pragma unroll
-        for (int32_t j = 0; j < 4; ++j)
-        {
-            float const score = vals[j];
-            if (score > runMax)
-            {
-                runSum = runSum * expf(runMax - score) + 1.0F;
-                runMax = score;
-            }
-            else if (runMax > -INFINITY)
-            {
-                runSum += expf(score - runMax);
-            }
-            insertCandidate(score, base + j, topScores, topTokenIds, candidateTopK);
-        }
-    }
-    for (int32_t vocabIdx = vocab4 * 4 + tid; vocabIdx < vocabSize; vocabIdx += blockDim.x)
-    {
-        float const score = logits[vocabIdx];
+    // Slice bounds; kCandidateVocabPerSplit is a multiple of 4, so slices stay float4-aligned.
+    int32_t const perSplit = (vocabSize + numSplits - 1) / numSplits;
+    int32_t const perSplit4 = (perSplit + 3) / 4 * 4;
+    int32_t const begin = min(vocabSize, split * perSplit4);
+    int32_t const end = min(vocabSize, begin + perSplit4);
+
+    auto consume = [&](float score, int32_t tokenId, float& runMax, float& runSum) {
         if (score > runMax)
         {
             runSum = runSum * expf(runMax - score) + 1.0F;
@@ -207,10 +213,30 @@ __global__ void selectDDTreeCandidatesKernel(float const* __restrict__ draftLogi
         {
             runSum += expf(score - runMax);
         }
-        insertCandidate(score, vocabIdx, topScores, topTokenIds, candidateTopK);
+        insertCandidate(score, tokenId, topScores, topTokenIds, candidateTopK);
+    };
+
+    float runMax = -INFINITY;
+    float runSum = 0.0F;
+    // float4 path needs a 16B-aligned row base; otherwise scan the slice scalar.
+    bool const vectorized = (vocabSize % 4 == 0);
+    int32_t const vecEnd = vectorized ? begin + (end - begin) / 4 * 4 : begin;
+    float4 const* logits4 = reinterpret_cast<float4 const*>(logits);
+    for (int32_t i4 = begin / 4 + tid; i4 < vecEnd / 4; i4 += blockDim.x)
+    {
+        float4 const v4 = logits4[i4];
+        int32_t const base = i4 * 4;
+        consume(v4.x, base, runMax, runSum);
+        consume(v4.y, base + 1, runMax, runSum);
+        consume(v4.z, base + 2, runMax, runSum);
+        consume(v4.w, base + 3, runMax, runSum);
+    }
+    for (int32_t vocabIdx = vecEnd + tid; vocabIdx < end; vocabIdx += blockDim.x)
+    {
+        consume(logits[vocabIdx], vocabIdx, runMax, runSum);
     }
 
-    // ---- logsumexp: warp shuffle reduce, then one merge over warps ---------
+    // ---- logsumexp partial: warp shuffle reduce, then one merge over warps ----
     int32_t const lane = tid & 31;
     int32_t const warp = tid >> 5;
 #pragma unroll
@@ -234,18 +260,7 @@ __global__ void selectDDTreeCandidatesKernel(float const* __restrict__ draftLogi
     }
     __syncthreads();
 
-    if (tid == 0)
-    {
-        float m = sWarpMax[0];
-        float s = sWarpSum[0];
-        for (int32_t w = 1; w < static_cast<int32_t>(blockDim.x) / 32; ++w)
-        {
-            mergeLogSumExp(m, s, sWarpMax[w], sWarpSum[w]);
-        }
-        sLogSumExp = m + logf(s);
-    }
-
-    // ---- Parallel tree merge of the 256 top-K lists (8 rounds) -------------
+    // ---- Parallel tree merge of the per-thread top-K lists ---------------------
     for (int32_t stride = static_cast<int32_t>(blockDim.x) / 2; stride >= 1; stride >>= 1)
     {
         if (tid < stride)
@@ -274,15 +289,77 @@ __global__ void selectDDTreeCandidatesKernel(float const* __restrict__ draftLogi
 
     if (tid == 0)
     {
+        float m = sWarpMax[0];
+        float sum = sWarpSum[0];
+        for (int32_t w = 1; w < static_cast<int32_t>(blockDim.x) / 32; ++w)
+        {
+            mergeLogSumExp(m, sum, sWarpMax[w], sWarpSum[w]);
+        }
+        int32_t const partial = row * numSplits + split;
+        partialMax[partial] = m;
+        partialSum[partial] = sum;
         for (int32_t slot = 0; slot < candidateTopK; ++slot)
         {
-            candidateTokenIds[candidateOffset + slot] = sTopTokenIds[slot];
-            // A fully masked row (all logits -inf) yields score == lse == -inf;
-            // keep the slot at -inf instead of the NaN that (-inf) - (-inf)
-            // would produce (NaN would poison downstream score comparisons).
-            float const score = sTopScores[slot];
-            candidateLogProbs[candidateOffset + slot] = (score == -INFINITY) ? -INFINITY : score - sLogSumExp;
+            partialScores[partial * kDDTreeMaxCandidateTopK + slot] = sTopScores[slot];
+            partialTokenIds[partial * kDDTreeMaxCandidateTopK + slot] = sTopTokenIds[slot];
         }
+    }
+}
+
+// Pass 2: one thread per (batch, proposal-depth): merge the slices' top-K lists and logsumexp
+// partials into the row's candidates and log-probabilities.
+__global__ void mergeDDTreeCandidatesKernel(float const* __restrict__ partialScores,
+    int32_t const* __restrict__ partialTokenIds, float const* __restrict__ partialMax,
+    float const* __restrict__ partialSum, int32_t* __restrict__ candidateTokenIds,
+    float* __restrict__ candidateLogProbs, int32_t numRows, int32_t numSplits, int32_t dflashBlockSize,
+    int32_t candidateTopK, int32_t firstCandidateLogitsRow)
+{
+    int32_t const row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= numRows)
+    {
+        return;
+    }
+    int32_t const depthIdx = row % dflashBlockSize;
+    int32_t const candidateOffset = row * candidateTopK;
+    int32_t const firstUnusedDepth = firstCandidateLogitsRow + dflashBlockSize - 1;
+    if (depthIdx < firstCandidateLogitsRow || depthIdx >= firstUnusedDepth)
+    {
+        for (int32_t slot = 0; slot < candidateTopK; ++slot)
+        {
+            candidateTokenIds[candidateOffset + slot] = 0;
+            candidateLogProbs[candidateOffset + slot] = -INFINITY;
+        }
+        return;
+    }
+
+    float topScores[kDDTreeMaxCandidateTopK];
+    int32_t topTokenIds[kDDTreeMaxCandidateTopK];
+    for (int32_t slot = 0; slot < kDDTreeMaxCandidateTopK; ++slot)
+    {
+        topScores[slot] = -INFINITY;
+        topTokenIds[slot] = 0;
+    }
+    float m = -INFINITY;
+    float sum = 0.0F;
+    for (int32_t split = 0; split < numSplits; ++split)
+    {
+        int32_t const partial = row * numSplits + split;
+        mergeLogSumExp(m, sum, partialMax[partial], partialSum[partial]);
+        for (int32_t slot = 0; slot < candidateTopK; ++slot)
+        {
+            insertCandidate(partialScores[partial * kDDTreeMaxCandidateTopK + slot],
+                partialTokenIds[partial * kDDTreeMaxCandidateTopK + slot], topScores, topTokenIds, candidateTopK);
+        }
+    }
+    float const logSumExp = m + logf(sum);
+    for (int32_t slot = 0; slot < candidateTopK; ++slot)
+    {
+        candidateTokenIds[candidateOffset + slot] = topTokenIds[slot];
+        // A fully masked row (all logits -inf) yields score == lse == -inf;
+        // keep the slot at -inf instead of the NaN that (-inf) - (-inf)
+        // would produce (NaN would poison downstream score comparisons).
+        float const score = topScores[slot];
+        candidateLogProbs[candidateOffset + slot] = (score == -INFINITY) ? -INFINITY : score - logSumExp;
     }
 }
 
@@ -537,7 +614,8 @@ size_t getDDTreeBuildWorkspaceSize(
     size_t const candidateTokenBytes = getCandidateTokenWorkspaceBytes(batchSize, dflashBlockSize, candidateTopK);
     size_t const candidateLogProbBytes = alignSpeculativeWorkspaceSize(
         static_cast<size_t>(batchSize) * dflashBlockSize * candidateTopK * sizeof(float));
-    return candidateTokenBytes + candidateLogProbBytes;
+    size_t const numPartials = static_cast<size_t>(batchSize) * dflashBlockSize * candidateSplits(vocabSize);
+    return candidateTokenBytes + candidateLogProbBytes + getCandidatePartialWorkspaceBytes(numPartials);
 }
 
 void ddtreeBuild(DDTreeBuildParams const& params)
@@ -664,13 +742,23 @@ void ddtreeBuild(DDTreeBuildParams const& params)
             + ", provided: " + std::to_string(params.workspaceSize));
 
     DDTreeBuildWorkspace buildWorkspace;
-    buildWorkspace.setup(params.workspace, params.workspaceSize, batchSize, dflashBlockSize, candidateTopK);
+    int32_t const numRows = batchSize * dflashBlockSize;
+    int32_t const numSplits = candidateSplits(vocabSize);
+    buildWorkspace.setup(params.workspace, params.workspaceSize, batchSize, dflashBlockSize, candidateTopK,
+        static_cast<size_t>(numRows) * numSplits);
 
-    dim3 const candidateGrid(batchSize * dflashBlockSize);
+    dim3 const candidateGrid(numRows, numSplits);
     dim3 const candidateBlock(kCandidateBlockSize);
-    selectDDTreeCandidatesKernel<<<candidateGrid, candidateBlock, 0, params.stream>>>(draftLogits.dataPointer<float>(),
-        buildWorkspace.candidateTokenIds, buildWorkspace.candidateLogProbs, dflashBlockSize, vocabSize, candidateTopK,
+    selectDDTreeCandidatesPartialKernel<<<candidateGrid, candidateBlock, 0, params.stream>>>(
+        draftLogits.dataPointer<float>(), buildWorkspace.partialScores, buildWorkspace.partialTokenIds,
+        buildWorkspace.partialMax, buildWorkspace.partialSum, dflashBlockSize, vocabSize, candidateTopK,
         firstCandidateLogitsRow);
+    CUDA_CHECK(cudaGetLastError());
+    constexpr int32_t kMergeBlockSize{32};
+    mergeDDTreeCandidatesKernel<<<(numRows + kMergeBlockSize - 1) / kMergeBlockSize, kMergeBlockSize, 0,
+        params.stream>>>(buildWorkspace.partialScores, buildWorkspace.partialTokenIds, buildWorkspace.partialMax,
+        buildWorkspace.partialSum, buildWorkspace.candidateTokenIds, buildWorkspace.candidateLogProbs, numRows,
+        numSplits, dflashBlockSize, candidateTopK, firstCandidateLogitsRow);
     CUDA_CHECK(cudaGetLastError());
 
     float const confSurvivalFloorLog = params.inputs.confidenceSurvivalThreshold > 0.0F
