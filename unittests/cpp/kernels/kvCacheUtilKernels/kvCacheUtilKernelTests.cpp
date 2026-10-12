@@ -365,6 +365,125 @@ TEST(GatherPagedKVToSplitTest, Int8DequantMatchesHostReference)
     }
 }
 
+// Live-bounded mode (zeroFillTailTokens >= 0): a capacity-wide split for chunked/reuse prefill must
+// cost O(live length). Live tokens are dequantized, pages starting before live + tail are written
+// (zero past the live page), and pages starting at or beyond that bound are left untouched.
+TEST(GatherPagedKVToSplitTest, Int8LiveBoundedTailLeavesFarPagesUntouched)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const B = 1, H = 2, D = 64, S = 1024; // capacity: 8 logical pages.
+    int32_t const live = 200, tail = 100;          // bound 300: pages 0..2 written, 3..7 untouched.
+    int32_t const pagesPerBatch = S / rt::kTOKENS_PER_PAGE;
+    float const kScale = 0.05f, vScale = 0.02f;
+
+    size_t const splitVol = (size_t) B * S * H * D;
+    std::vector<int8_t> refK(splitVol), refV(splitVol);
+    uniformIntInitialization(refK, -127, 127);
+    uniformIntInitialization(refV, -127, 127);
+    std::vector<int8_t> const poolHost = buildIdentityFlatPool(refK, refV, B, S, H, D, pagesPerBatch);
+    rt::Tensor poolTensor({(int64_t) poolHost.size()}, rt::DeviceType::kGPU, DataType::kINT8);
+    copyHostToDevice(poolTensor, poolHost);
+    rt::KVPageTable pageTable(B, pagesPerBatch, B * pagesPerBatch);
+    pageTable.setIdentity();
+    pageTable.upload(stream);
+
+    rt::Tensor kDstTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vDstTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    CUDA_CHECK(cudaMemset(kDstTensor.rawPointer(), 0x77, splitVol * sizeof(half)));
+    CUDA_CHECK(cudaMemset(vDstTensor.rawPointer(), 0x77, splitVol * sizeof(half)));
+    rt::Tensor kvSeqLens = makeKvSeqLens({live});
+    kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
+        pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), pagesPerBatch, B, S, H, D,
+        sizeof(int8_t), kernel::KVPoolQuant::kINT8, kScale, vScale, stream, tail);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<half> const kOut = copyDeviceToHost<half>(kDstTensor);
+    std::vector<half> const vOut = copyDeviceToHost<half>(vDstTensor);
+
+    size_t const tokenElems = static_cast<size_t>(H) * D;
+    int32_t const livePageEnd = (live + rt::kTOKENS_PER_PAGE - 1) / rt::kTOKENS_PER_PAGE * rt::kTOKENS_PER_PAGE;
+    for (int32_t t = 0; t < S; ++t)
+    {
+        int32_t const pageStart = t / rt::kTOKENS_PER_PAGE * rt::kTOKENS_PER_PAGE;
+        for (size_t e = 0; e < tokenElems; ++e)
+        {
+            size_t const i = t * tokenElems + e;
+            uint16_t const k = __half_as_ushort(kOut[i]);
+            uint16_t const v = __half_as_ushort(vOut[i]);
+            if (t < live)
+            {
+                ASSERT_EQ(k, __half_as_ushort(__float2half(static_cast<float>(refK[i]) * kScale))) << "K at token " << t;
+                ASSERT_EQ(v, __half_as_ushort(__float2half(static_cast<float>(refV[i]) * vScale))) << "V at token " << t;
+            }
+            else if (t >= livePageEnd && pageStart < live + tail)
+            {
+                ASSERT_EQ(k, 0u) << "K not zero-filled at token " << t;
+                ASSERT_EQ(v, 0u) << "V not zero-filled at token " << t;
+            }
+            else if (pageStart >= live + tail)
+            {
+                ASSERT_EQ(k, 0x7777u) << "K written past the bound at token " << t;
+                ASSERT_EQ(v, 0x7777u) << "V written past the bound at token " << t;
+            }
+        }
+    }
+}
+
+// Sliding-window consumers (keepTrailingTokens >= 0) read no key older than keepTrailingTokens before
+// the live end: whole pages before that (one page of margin) are left untouched; the rest is exact.
+TEST(GatherPagedKVToSplitTest, Int8SlidingWindowSkipsLeadingPages)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const B = 1, H = 2, D = 64, S = 2048; // capacity: 16 logical pages.
+    int32_t const live = 1500, keep = 600;          // keep window: pages ending at or before 1500-600-128 skipped.
+    int32_t const pagesPerBatch = S / rt::kTOKENS_PER_PAGE;
+    float const kScale = 0.05f, vScale = 0.02f;
+    size_t const splitVol = (size_t) B * S * H * D;
+    std::vector<int8_t> refK(splitVol), refV(splitVol);
+    uniformIntInitialization(refK, -127, 127);
+    uniformIntInitialization(refV, -127, 127);
+    std::vector<int8_t> const poolHost = buildIdentityFlatPool(refK, refV, B, S, H, D, pagesPerBatch);
+    rt::Tensor poolTensor({(int64_t) poolHost.size()}, rt::DeviceType::kGPU, DataType::kINT8);
+    copyHostToDevice(poolTensor, poolHost);
+    rt::KVPageTable pageTable(B, pagesPerBatch, B * pagesPerBatch);
+    pageTable.setIdentity();
+    pageTable.upload(stream);
+    rt::Tensor kDstTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vDstTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    CUDA_CHECK(cudaMemset(kDstTensor.rawPointer(), 0x77, splitVol * sizeof(half)));
+    CUDA_CHECK(cudaMemset(vDstTensor.rawPointer(), 0x77, splitVol * sizeof(half)));
+    rt::Tensor kvSeqLens = makeKvSeqLens({live});
+    kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
+        pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), pagesPerBatch, B, S, H, D,
+        sizeof(int8_t), kernel::KVPoolQuant::kINT8, kScale, vScale, stream, /*zeroFillTailTokens=*/0, keep);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<half> const kOut = copyDeviceToHost<half>(kDstTensor);
+    std::vector<half> const vOut = copyDeviceToHost<half>(vDstTensor);
+    size_t const tokenElems = static_cast<size_t>(H) * D;
+    for (int32_t t = 0; t < live; ++t)
+    {
+        int32_t const pageStart = t / rt::kTOKENS_PER_PAGE * rt::kTOKENS_PER_PAGE;
+        bool const skipped = pageStart + 2 * rt::kTOKENS_PER_PAGE <= live - keep;
+        for (size_t e = 0; e < tokenElems; ++e)
+        {
+            size_t const i = t * tokenElems + e;
+            uint16_t const k = __half_as_ushort(kOut[i]);
+            uint16_t const v = __half_as_ushort(vOut[i]);
+            if (skipped)
+            {
+                ASSERT_EQ(k, 0x7777u) << "K written before the window at token " << t;
+                ASSERT_EQ(v, 0x7777u) << "V written before the window at token " << t;
+            }
+            else
+            {
+                ASSERT_EQ(k, __half_as_ushort(__float2half(static_cast<float>(refK[i]) * kScale))) << "K at token " << t;
+                ASSERT_EQ(v, __half_as_ushort(__float2half(static_cast<float>(refV[i]) * vScale))) << "V at token " << t;
+            }
+        }
+    }
+    // Every token the consumer may read (the last `keep` before the live end) was gathered.
+    ASSERT_NE(__half_as_ushort(kOut[(live - keep) * tokenElems]), 0x7777u);
+}
+
 // An unmapped page INSIDE the live range (a hole, not a trailing tail) cannot occur by construction
 // (the runtime guarantees mapped coverage for live positions); if it ever does, the kernel must fail
 // soft by zero-filling that page's destination span -- never reading a wild address or leaving

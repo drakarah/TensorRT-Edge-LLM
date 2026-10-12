@@ -120,10 +120,18 @@ enum class KVPoolQuant
 //! \param[in]  kScale         K dequant scale (dequant value = stored * kScale). Unused for kNONE.
 //! \param[in]  vScale         V dequant scale. Unused for kNONE.
 //! \param[in]  stream         CUDA stream to launch the kernel on.
+//! \param[in]  zeroFillTailTokens -1: every destination token at or beyond the live length is zero-filled.
+//!                            >= 0: the consumer reads at most this many tokens past each slot's live length;
+//!                            pages starting beyond that are left untouched, so the gather costs O(live length)
+//!                            instead of O(seqLen) (seqLen is the full capacity for chunked/reuse prefill).
+//! \param[in]  keepTrailingTokens -1: gather from the first token. >= 0: the consumer (sliding-window attention)
+//!                            reads no key older than this many tokens before each slot's live end; whole pages
+//!                            before that (one page of margin) are left untouched.
 //! \throws std::runtime_error if ceil(seqLen/128) exceeds maxPagesPerSeq.
 void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t const* pageTable, int32_t const* kvSeqLens,
     int32_t maxPagesPerSeq, int32_t batchSize, int32_t seqLen, int32_t numKVHeads, int32_t headDim, size_t elemSize,
-    KVPoolQuant poolQuant, float kScale, float vScale, cudaStream_t stream);
+    KVPoolQuant poolQuant, float kScale, float vScale, cudaStream_t stream, int32_t zeroFillTailTokens = -1,
+    int32_t keepTrailingTokens = -1);
 
 //! Gather a paged NHD K/V pool into the head-major [B,H,S,D] layout consumed by action engines.
 //! Tokens at or beyond each slot's live length are zero-filled, including the tail of a partial page.
