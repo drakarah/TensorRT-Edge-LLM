@@ -135,6 +135,25 @@ nvinfer1::Dims TensorRegistry::resolveShape(
 bool TensorRegistry::bindAll(
     nvinfer1::IExecutionContext* ctx, TensorMap const& tensorMap, InferenceDims const& inferenceDims) const
 {
+    return bindAll(
+        [ctx](char const* name, void* address, nvinfer1::Dims const* inputShape) {
+            if (!ctx->setTensorAddress(name, address))
+            {
+                LOG_ERROR("setTensorAddress failed for '%s'", name);
+                return false;
+            }
+            if (inputShape != nullptr && !ctx->setInputShape(name, *inputShape))
+            {
+                LOG_ERROR("setInputShape failed for '%s'", name);
+                return false;
+            }
+            return true;
+        },
+        tensorMap, inferenceDims);
+}
+
+bool TensorRegistry::bindAll(BindFn const& bind, TensorMap const& tensorMap, InferenceDims const& inferenceDims) const
+{
     bool success = true;
     for (auto const& spec : allExpandedSpecs())
     {
@@ -145,24 +164,18 @@ bool TensorRegistry::bindAll(
             success = false;
             continue;
         }
-        if (!ctx->setTensorAddress(spec.name.c_str(), tensor->rawPointer()))
-        {
-            LOG_ERROR("setTensorAddress failed for '%s'", spec.name.c_str());
-            success = false;
-            continue;
-        }
         if (spec.io == TensorIO::kInput)
         {
             // Resolve the input shape from symbolic dimensions. This is necessary
             // because some tensors (e.g. KV cache) are allocated at maxBatchSize
             // but need their input shape set to activeBatchSize for TRT execution.
             // Tensors with all-fixed shapes are returned as-is.
-            auto dims = resolveShape(spec.shape, inferenceDims);
-            if (!ctx->setInputShape(spec.name.c_str(), dims))
-            {
-                LOG_ERROR("setInputShape failed for '%s'", spec.name.c_str());
-                success = false;
-            }
+            auto const dims = resolveShape(spec.shape, inferenceDims);
+            success = bind(spec.name.c_str(), tensor->rawPointer(), &dims) && success;
+        }
+        else
+        {
+            success = bind(spec.name.c_str(), tensor->rawPointer(), nullptr) && success;
         }
     }
     return success;

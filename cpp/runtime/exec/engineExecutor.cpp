@@ -143,11 +143,22 @@ private:
     //! Graph cache keyed by a hash of all binding addresses + shapes.
     std::unordered_map<size_t, CapturedGraph> mGraphs;
 
-    //! Hash the current binding addresses and shapes into a single key.
-    size_t computeBindingHash() const;
-
     //! Build a full snapshot of the current binding state.
     BindingSnapshot snapshotBindings() const;
+
+    //! What this executor last set on the context for one I/O tensor (TRT keeps bindings across
+    //! steps and profile switches), so unchanged bindings need no TRT call.
+    struct BoundTensor
+    {
+        uintptr_t address{0};
+        nvinfer1::Dims shape{};
+        bool valid{false};
+    };
+    std::vector<BoundTensor> mBound;
+    std::unordered_map<std::string, int32_t> mIOIndex;
+
+    //! Set address and (inputs) shape of one binding, calling TRT only for what changed.
+    bool bindTensor(char const* name, void* address, nvinfer1::Dims const* inputShape);
 };
 
 TrtEngineExecutor::TrtEngineExecutor(std::filesystem::path const& enginePath, TensorRegistry registry)
@@ -166,6 +177,13 @@ TrtEngineExecutor::TrtEngineExecutor(std::filesystem::path const& enginePath, Te
     ELLM_CHECK(mContext != nullptr, "failed to create execution context");
 
     setNonBlockingAuxStreams(mContext.get(), mEngine.get(), mAuxStreams);
+
+    int32_t const numIO = mEngine->getNbIOTensors();
+    mBound.resize(static_cast<size_t>(numIO));
+    for (int32_t i = 0; i < numIO; ++i)
+    {
+        mIOIndex.emplace(mEngine->getIOTensorName(i), i);
+    }
 
     auto registerOptionalTreeMetadata = [&](char const* name) {
         if (engineHasInputTensor(*mEngine, name) && !mRegistry.contains(name))
@@ -275,14 +293,25 @@ bool TrtEngineExecutor::prepare(
         return false;
     }
 
-    if (mCurrentProfileIndex != profileIndex && !mContext->setOptimizationProfileAsync(profileIndex, stream))
+    if (mCurrentProfileIndex != profileIndex)
     {
-        LOG_ERROR("failed to set optimization profile %d", profileIndex);
-        return false;
+        if (!mContext->setOptimizationProfileAsync(profileIndex, stream))
+        {
+            LOG_ERROR("failed to set optimization profile %d", profileIndex);
+            return false;
+        }
+        // Rebind everything after a profile switch rather than rely on TRT's binding persistence.
+        for (auto& bound : mBound)
+        {
+            bound.valid = false;
+        }
     }
     mCurrentProfileIndex = profileIndex;
 
-    if (!mRegistry.bindAll(mContext.get(), map, dims))
+    auto const bind = [this](char const* name, void* address, nvinfer1::Dims const* inputShape) {
+        return bindTensor(name, address, inputShape);
+    };
+    if (!mRegistry.bindAll(bind, map, dims))
     {
         LOG_ERROR("bindAll failed for profile %d", profileIndex);
         return false;
@@ -318,31 +347,66 @@ bool TrtEngineExecutor::prepare(
                 name);
             return false;
         }
-        if (!mContext->setTensorAddress(name, tensor->rawPointer()))
+        bool const isInput = mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
+        nvinfer1::Dims const shape = isInput ? tensor->getTRTDims() : nvinfer1::Dims{};
+        if (!bindTensor(name, tensor->rawPointer(), isInput ? &shape : nullptr))
         {
-            LOG_ERROR("setTensorAddress failed for binding '%s'", name);
             return false;
-        }
-        if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
-        {
-            if (!mContext->setInputShape(name, tensor->getTRTDims()))
-            {
-                LOG_ERROR("setInputShape failed for binding '%s'", name);
-                return false;
-            }
         }
     }
 
     return true;
 }
 
+bool TrtEngineExecutor::bindTensor(char const* name, void* address, nvinfer1::Dims const* inputShape)
+{
+    auto const it = mIOIndex.find(name);
+    BoundTensor* bound = it != mIOIndex.end() ? &mBound[static_cast<size_t>(it->second)] : nullptr;
+    uintptr_t const addr = reinterpret_cast<uintptr_t>(address);
+    if (bound == nullptr || !bound->valid || bound->address != addr)
+    {
+        if (!mContext->setTensorAddress(name, address))
+        {
+            LOG_ERROR("setTensorAddress failed for binding '%s'", name);
+            if (bound != nullptr)
+            {
+                bound->valid = false;
+            }
+            return false;
+        }
+    }
+    if (inputShape != nullptr && (bound == nullptr || !bound->valid || !dimsEqual(bound->shape, *inputShape)))
+    {
+        if (!mContext->setInputShape(name, *inputShape))
+        {
+            LOG_ERROR("setInputShape failed for binding '%s'", name);
+            if (bound != nullptr)
+            {
+                bound->valid = false;
+            }
+            return false;
+        }
+    }
+    if (bound != nullptr)
+    {
+        bound->address = addr;
+        if (inputShape != nullptr)
+        {
+            bound->shape = *inputShape;
+        }
+        bound->valid = true;
+    }
+    return true;
+}
+
 bool TrtEngineExecutor::execute(cudaStream_t stream)
 {
-    size_t const hash = computeBindingHash();
+    BindingSnapshot const current = snapshotBindings();
+    size_t const hash
+        = computeExecutionGraphKey(reinterpret_cast<uintptr_t>(mEngine.get()), mCurrentProfileIndex, current);
     auto it = mGraphs.find(hash);
     if (it != mGraphs.end())
     {
-        BindingSnapshot const current = snapshotBindings();
         if (current == it->second.snapshot)
         {
             cudaError_t const err = cudaGraphLaunch(it->second.exec, stream);
@@ -374,8 +438,9 @@ bool TrtEngineExecutor::captureGraph(cudaStream_t stream)
         return false;
     }
 
-    size_t const hash = computeBindingHash();
     BindingSnapshot const snap = snapshotBindings();
+    size_t const hash
+        = computeExecutionGraphKey(reinterpret_cast<uintptr_t>(mEngine.get()), mCurrentProfileIndex, snap);
 
     // If there was a previous graph for this hash, destroy it first.
     auto it = mGraphs.find(hash);
@@ -479,12 +544,6 @@ bool EngineExecutor::BindingSnapshot::operator==(BindingSnapshot const& rhs) con
 // Private helpers
 // ---------------------------------------------------------------------------
 
-size_t TrtEngineExecutor::computeBindingHash() const
-{
-    return computeExecutionGraphKey(
-        reinterpret_cast<uintptr_t>(mEngine.get()), mCurrentProfileIndex, snapshotBindings());
-}
-
 size_t computeExecutionGraphKey(
     uintptr_t engineIdentity, int32_t profileIndex, EngineExecutor::BindingSnapshot const& snapshot)
 {
@@ -505,15 +564,18 @@ size_t computeExecutionGraphKey(
 
 EngineExecutor::BindingSnapshot TrtEngineExecutor::snapshotBindings() const
 {
+    // From what prepare() bound, without querying TRT: input shapes and every address. Output
+    // shapes follow from the input shapes and the profile (both part of the graph key).
     BindingSnapshot snap;
-    int32_t const numIO = mEngine->getNbIOTensors();
-    snap.bindings.reserve(numIO);
-    for (int32_t i = 0; i < numIO; ++i)
+    snap.bindings.reserve(mBound.size());
+    for (auto const& bound : mBound)
     {
-        char const* name = mEngine->getIOTensorName(i);
-        auto const addr = reinterpret_cast<uintptr_t>(mContext->getTensorAddress(name));
-        nvinfer1::Dims const shape = mContext->getTensorShape(name);
-        snap.bindings.emplace_back(addr, shape);
+        nvinfer1::Dims shape = bound.shape;
+        if (!bound.valid)
+        {
+            shape.nbDims = -1;
+        }
+        snap.bindings.emplace_back(bound.valid ? bound.address : 0, shape);
     }
     return snap;
 }
