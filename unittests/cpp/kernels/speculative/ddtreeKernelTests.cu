@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <limits>
+#include <random>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -789,4 +790,35 @@ TEST(DDTreeKernels, SupportsVerifySize128)
     EXPECT_EQ(actual.validCounts[0], kVerifySize);
     EXPECT_EQ(kPackedMaskLen, 4);
     EXPECT_EQ(actual.contextLengths[0], baseLengths[0] + kVerifySize);
+}
+
+// Gemma 4 vocabulary size: candidate selection splits each row over many CTAs; the merged
+// candidates and log-probabilities must match the single-pass CPU reference.
+TEST(DDTreeKernels, LargeVocabSplitSelectionMatchesReference)
+{
+    constexpr int32_t kBatchSize{1};
+    constexpr int32_t kProposalDepthSize{3};
+    constexpr int32_t kVocabSize{262144};
+    constexpr int32_t kCandidateFanout{3};
+    constexpr int32_t kVerifySize{8};
+    std::mt19937 rng(1234);
+    std::normal_distribution<float> dist(0.0F, 3.0F);
+    std::vector<float> logits(static_cast<size_t>(kBatchSize) * kProposalDepthSize * kVocabSize);
+    for (auto& value : logits)
+    {
+        value = dist(rng);
+    }
+    // Ties across slice boundaries: equal scores must resolve to the lower token id.
+    setLogit(logits, 0, 1, 8191, kProposalDepthSize, kVocabSize, 30.0F);
+    setLogit(logits, 0, 1, 8192, kProposalDepthSize, kVocabSize, 30.0F);
+    setLogit(logits, 0, 2, kVocabSize - 1, kProposalDepthSize, kVocabSize, 25.0F);
+
+    std::vector<int32_t> const rootTokenIds{7};
+    std::vector<int32_t> const baseLengths{512};
+    DDTreeBuildOutputs actual = runDDTreeBuild(
+        logits, rootTokenIds, baseLengths, kBatchSize, kProposalDepthSize, kVocabSize, kVerifySize, kCandidateFanout);
+    DDTreeReference expected = buildReference(
+        logits, rootTokenIds, baseLengths, kBatchSize, kProposalDepthSize, kVocabSize, kVerifySize, kCandidateFanout);
+    validateBuildAgainstReference(actual, expected, kBatchSize, kVerifySize);
+    EXPECT_EQ(actual.nodeTokenIds[1], 8191);
 }
