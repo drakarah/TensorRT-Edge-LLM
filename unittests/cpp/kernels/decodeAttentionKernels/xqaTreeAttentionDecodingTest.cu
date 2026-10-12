@@ -1530,6 +1530,118 @@ TEST(XQATreeAttentionDecodingINT8Test, multiBlockMatchesSingleBlockSlidingWindow
     }
 }
 
+//! Times the Gemma 4 sliding-window verify shape (INT8 paged KV, 8 Q / 2 KV heads, 8-token tree,
+//! contiguous-query SWA) for a KV length and split count; prints microseconds per launch.
+void BenchXQATreeSwaInt8(int32_t headSize, int32_t kvSequenceLength, int32_t slidingWindowSize, uint32_t splits)
+{
+    constexpr int32_t kQ_HEADS = 8;
+    constexpr int32_t kKV_HEADS = 2;
+    constexpr int32_t kQ_LEN = 8;
+    constexpr int32_t kTOKENS_PER_PAGE = 128;
+    constexpr int32_t kITERS = 200;
+    initializeCudaContextForXQATest();
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    int32_t const nbPages = (kvSequenceLength + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE;
+    thrust::device_vector<half> qDevice(static_cast<size_t>(kQ_LEN) * kQ_HEADS * headSize, __float2half(0.1F));
+    // Rotate over kPOOLS copies (> L2) so every launch reads cold KV, as one layer in a real step does.
+    constexpr int32_t kPOOLS = 16;
+    size_t const poolElems = static_cast<size_t>(2) * nbPages * kTOKENS_PER_PAGE * kKV_HEADS * headSize;
+    thrust::device_vector<int8_t> poolDevice(poolElems * kPOOLS, 3);
+    thrust::device_vector<int32_t> lengthDevice(1, kvSequenceLength);
+    std::vector<int32_t> pageList(2 * nbPages);
+    for (int32_t p = 0; p < 2 * nbPages; ++p)
+    {
+        pageList[p] = p;
+    }
+    thrust::device_vector<int32_t> pageListDevice(pageList);
+    std::vector<int32_t> packedMask(kQ_LEN);
+    for (int32_t q = 0; q < kQ_LEN; ++q)
+    {
+        packedMask[q] = static_cast<int32_t>((1U << (q + 1)) - 1U);
+    }
+    thrust::device_vector<int32_t> maskDevice(packedMask);
+    thrust::device_vector<half> outDevice(qDevice.size());
+    ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kINT8, headSize, kQ_HEADS,
+        kKV_HEADS, /*slidingWindow=*/slidingWindowSize > 0, /*specDecode=*/true, kTOKENS_PER_PAGE,
+        /*contiguousQuerySwa=*/slidingWindowSize > 0 && std::getenv("XQA_BENCH_NONCONTIGUOUS") == nullptr));
+    size_t const nbSeqs = static_cast<size_t>(kKV_HEADS) * 8;
+    thrust::device_vector<int32_t> semaphores(nbSeqs, 0);
+    size_t const scratchBytes = trt_edgellm::xqaMultiBlockScratchUpperBound(headSize, nbSeqs * splits);
+    thrust::device_vector<int8_t> scratch(scratchBytes, 0);
+    trt_edgellm::DecoderXQARunner runner(DataType::kHALF, DataType::kINT8, 1, kQ_HEADS, kKV_HEADS, headSize, smVersion);
+    auto params = runner.initXQAParams();
+    params.qSeqLen = kQ_LEN;
+    params.qInputPtr = thrust::raw_pointer_cast(qDevice.data());
+    params.kvCache.data = thrust::raw_pointer_cast(poolDevice.data());
+    params.kvCache.sequence_lengths = thrust::raw_pointer_cast(lengthDevice.data());
+    params.kvCache.capacity = nbPages * kTOKENS_PER_PAGE;
+    params.kvCache.pageList = thrust::raw_pointer_cast(pageListDevice.data());
+    params.kvCache.tokensPerPage = kTOKENS_PER_PAGE;
+    params.output = thrust::raw_pointer_cast(outDevice.data());
+    params.treeAttnMask = thrust::raw_pointer_cast(maskDevice.data());
+    params.attentionScale = 1.0F / std::sqrt(static_cast<float>(headSize));
+    params.kScale = 0.01F;
+    params.vScale = 0.01F;
+    params.slidingWinSize = static_cast<uint32_t>(slidingWindowSize);
+    params.contiguousQuerySwa = slidingWindowSize > 0 && std::getenv("XQA_BENCH_NONCONTIGUOUS") == nullptr;
+    if (splits > 1)
+    {
+        params.nbSubSeqPerSeq = splits;
+        params.semaphores = thrust::raw_pointer_cast(semaphores.data());
+        params.scratch = thrust::raw_pointer_cast(scratch.data());
+        params.scratchBytes = scratchBytes;
+    }
+    for (int32_t i = 0; i < 20; ++i)
+    {
+        runner.dispatchSpecDecodeXQAKernel(params, nullptr);
+    }
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, nullptr));
+    for (int32_t i = 0; i < kITERS; ++i)
+    {
+        params.kvCache.data = thrust::raw_pointer_cast(poolDevice.data()) + (i % kPOOLS) * poolElems;
+        if (std::getenv("XQA_BENCH_ISOLATE") != nullptr)
+        {
+            // A different operation between launches, as in a real layer (no back-to-back PDL overlap).
+            CUDA_CHECK(cudaMemsetAsync(thrust::raw_pointer_cast(lengthDevice.data()), 0, 0, nullptr));
+            CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(outDevice.data()),
+                thrust::raw_pointer_cast(outDevice.data()) + 8, 16, cudaMemcpyDeviceToDevice, nullptr));
+        }
+        runner.dispatchSpecDecodeXQAKernel(params, nullptr);
+    }
+    CUDA_CHECK(cudaEventRecord(stop, nullptr));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float ms = 0.0F;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    CUDA_CHECK(cudaGetLastError());
+    std::cout << "BENCH xqa-tree int8 head " << headSize << " swa " << slidingWindowSize << " kv " << kvSequenceLength
+              << " splits " << splits << " us/launch " << ms * 1000.0F / kITERS << std::endl;
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+}
+
+TEST(XQATreeAttentionDecodingINT8Benchmark, swaGemma4Shapes)
+{
+    for (int32_t kvLength : {512, 1024, 3328, 7168})
+    {
+        for (uint32_t splits : {1U, 2U, 4U, 7U, 8U, 16U})
+        {
+            BenchXQATreeSwaInt8(256, kvLength, 512, splits);
+        }
+    }
+    for (int32_t kvLength : {512, 3328, 7168})
+    {
+        for (uint32_t splits : {1U, 3U, 8U})
+        {
+            BenchXQATreeSwaInt8(512, kvLength, 0, splits);
+        }
+    }
+}
+
 TEST(XQATreeAttentionDecodingINT8Test, multiBlockPagedGemma4)
 {
     for (uint32_t splits : {2U, 8U})
