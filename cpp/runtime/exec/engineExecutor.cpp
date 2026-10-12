@@ -112,6 +112,7 @@ public:
 
     bool prepare(int32_t profileIndex, InferenceDims const& dims, TensorMap const& map, cudaStream_t stream) override;
     bool execute(cudaStream_t stream) override;
+    size_t bindingKey() const override;
     bool captureGraph(cudaStream_t stream) override;
     int64_t getRequiredContextMemorySize() const override;
     bool setContextMemory(Tensor& sharedMem) override;
@@ -401,6 +402,13 @@ bool TrtEngineExecutor::bindTensor(char const* name, void* address, nvinfer1::Di
 
 bool TrtEngineExecutor::execute(cudaStream_t stream)
 {
+    // Inside a caller's stream capture, record TensorRT's kernels directly (as captureGraph does) instead of
+    // launching the cached graph into the capture.
+    cudaStreamCaptureStatus captureStatus{cudaStreamCaptureStatusNone};
+    if (cudaStreamIsCapturing(stream, &captureStatus) == cudaSuccess && captureStatus == cudaStreamCaptureStatusActive)
+    {
+        return mContext->enqueueV3(stream);
+    }
     BindingSnapshot const current = snapshotBindings();
     size_t const hash
         = computeExecutionGraphKey(reinterpret_cast<uintptr_t>(mEngine.get()), mCurrentProfileIndex, current);
@@ -419,6 +427,11 @@ bool TrtEngineExecutor::execute(cudaStream_t stream)
     }
 
     return mContext->enqueueV3(stream);
+}
+
+size_t TrtEngineExecutor::bindingKey() const
+{
+    return computeExecutionGraphKey(reinterpret_cast<uintptr_t>(mEngine.get()), mCurrentProfileIndex, snapshotBindings());
 }
 
 bool TrtEngineExecutor::captureGraph(cudaStream_t stream)

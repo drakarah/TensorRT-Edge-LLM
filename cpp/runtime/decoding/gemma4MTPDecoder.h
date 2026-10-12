@@ -40,6 +40,7 @@ class Gemma4MTPDecoder final : public DecodingStrategy
 public:
     Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig const& draftingConfig,
         std::unique_ptr<EngineExecutor> draftExecutor, ExternalWeightManager draftWeights, cudaStream_t stream);
+    ~Gemma4MTPDecoder() override;
 
     DecodingStrategyKind kind() const noexcept override
     {
@@ -93,6 +94,10 @@ private:
     bool runDraftProposal(DecodingInferenceContext& context);
     bool prepareSeed(DecodingInferenceContext& context);
     bool runAssistantDraftChain(DecodingInferenceContext& context);
+    //! Enqueue the assistant draft steps (draft engine, logits stacking, top-1, token store, next embedding).
+    bool enqueueAssistantDraftSteps(DecodingInferenceContext& context);
+    //! Key of everything the captured draft chain depends on; 0 = not cacheable.
+    size_t draftChainKey(int32_t activeBatchSize) const;
     bool buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t stream);
     bool runBaseVerification(DecodingInferenceContext& context);
     bool acceptAndCommit(DecodingInferenceContext& context);
@@ -126,6 +131,15 @@ private:
     Tensor mTreeBuildWorkspace; //!< DDTree build workspace.
 
     hash_utils::HashMap<SystemPromptCacheKey, bool> mSystemPromptCacheKeys;
+
+    //! The whole draft chain as one CUDA graph: its steps are small, and launching them one by one leaves
+    //! the GPU waiting on the host. Captured on the second round with the same key (the first runs uncaptured,
+    //! warming TensorRT), replayed while the key holds. EDGELLM_DRAFT_CHAIN_GRAPH=0 disables it.
+    bool mDraftChainGraphEnabled{true};
+    size_t mDraftChainKey{0};
+    size_t mDraftChainSeenKey{0};
+    cudaGraph_t mDraftChainGraph{nullptr};
+    cudaGraphExec_t mDraftChainExec{nullptr};
 };
 
 } // namespace rt

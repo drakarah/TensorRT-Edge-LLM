@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -100,11 +101,27 @@ void fillRectangularMetadata(RaggedExecutionBatch& batch, int32_t batchSize, int
 }
 } // namespace
 
+Gemma4MTPDecoder::~Gemma4MTPDecoder()
+{
+    if (mDraftChainExec != nullptr)
+    {
+        cudaGraphExecDestroy(mDraftChainExec);
+    }
+    if (mDraftChainGraph != nullptr)
+    {
+        cudaGraphDestroy(mDraftChainGraph);
+    }
+}
+
 Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig const& draftingConfig,
     std::unique_ptr<EngineExecutor> draftExecutor, ExternalWeightManager draftWeights, cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftExecutor(std::move(draftExecutor))
 {
+    if (char const* env = std::getenv("EDGELLM_DRAFT_CHAIN_GRAPH"))
+    {
+        mDraftChainGraphEnabled = std::string(env) != "0";
+    }
     check::check(mRuntime.deployment.draft.has_value(), "Gemma4 MTP requires a draft model config.");
     check::check(mRuntime.deployment.specConfig.has_value(), "Gemma4 MTP requires a drafting config.");
     check::check(runtime.deployment.base.specDecodeType == SpecDecodeMode::kGemma4MTP,
@@ -582,6 +599,105 @@ bool Gemma4MTPDecoder::runAssistantDraftChain(DecodingInferenceContext& context)
         mRuntime.base.pipelineIO, *mRuntime.base.sharedResources.kvPageTables[0], activeBatchSize, context.stream);
     prepareRaggedRope(mRuntime.base.pipelineIO, mRuntime.base.sharedResources, *mRuntime.deployment.draft,
         activeBatchSize, activeBatchSize, context.stream);
+
+    if (!mDraftChainGraphEnabled)
+    {
+        return enqueueAssistantDraftSteps(context);
+    }
+    // Bind once up front so the key reflects the bindings the steps will use.
+    check::check(
+        mRuntime.base.pipelineIO.outputLogits.reshape({activeBatchSize, draftVocabSize}), "Tensor reshape failed");
+    check::check(mRuntime.base.pipelineIO.draftHiddenStatesIn.reshape({activeBatchSize, baseHiddenSize}),
+        "Tensor reshape failed");
+    check::check(mRuntime.base.pipelineIO.draftHiddenStatesOut.reshape({activeBatchSize, baseHiddenSize}),
+        "Tensor reshape failed");
+    if (!mDraftExecutor->prepare(kDecodeProfile, draftDims, mDraftTensorMap, context.stream))
+    {
+        LOG_ERROR("Gemma4 MTP assistant draft prepare failed.");
+        return false;
+    }
+    size_t const key = draftChainKey(activeBatchSize);
+    if (key == 0)
+    {
+        return enqueueAssistantDraftSteps(context);
+    }
+    if (mDraftChainExec != nullptr && key == mDraftChainKey)
+    {
+        CUDA_CHECK(cudaGraphLaunch(mDraftChainExec, context.stream));
+        return true;
+    }
+    if (key != mDraftChainSeenKey)
+    {
+        mDraftChainSeenKey = key;
+        return enqueueAssistantDraftSteps(context);
+    }
+
+    if (mDraftChainExec != nullptr)
+    {
+        cudaGraphExecDestroy(mDraftChainExec);
+        mDraftChainExec = nullptr;
+    }
+    if (mDraftChainGraph != nullptr)
+    {
+        cudaGraphDestroy(mDraftChainGraph);
+        mDraftChainGraph = nullptr;
+    }
+    CUDA_CHECK(cudaStreamBeginCapture(context.stream, cudaStreamCaptureModeThreadLocal));
+    bool const enqueued = enqueueAssistantDraftSteps(context);
+    cudaGraph_t graph{nullptr};
+    cudaError_t const endErr = cudaStreamEndCapture(context.stream, &graph);
+    cudaGraphExec_t exec{nullptr};
+    cudaError_t const instErr
+        = (enqueued && endErr == cudaSuccess && graph != nullptr) ? cudaGraphInstantiate(&exec, graph, 0) : endErr;
+    if (!enqueued || endErr != cudaSuccess || instErr != cudaSuccess || exec == nullptr)
+    {
+        if (graph != nullptr)
+        {
+            cudaGraphDestroy(graph);
+        }
+        (void) cudaGetLastError();
+        LOG_WARNING("Gemma4 MTP draft chain graph capture failed (%s); launching the steps individually from now on.",
+            cudaGetErrorString(endErr != cudaSuccess ? endErr : instErr));
+        mDraftChainGraphEnabled = false;
+        return enqueueAssistantDraftSteps(context);
+    }
+    mDraftChainGraph = graph;
+    mDraftChainExec = exec;
+    mDraftChainKey = key;
+    LOG_INFO("Gemma4 MTP draft chain captured as one CUDA graph (batch %d, %d steps)", activeBatchSize, draftingStep);
+    CUDA_CHECK(cudaGraphLaunch(mDraftChainExec, context.stream));
+    return true;
+}
+
+size_t Gemma4MTPDecoder::draftChainKey(int32_t activeBatchSize) const
+{
+    size_t key = mDraftExecutor->bindingKey();
+    if (key == 0)
+    {
+        return 0;
+    }
+    auto const& io = mRuntime.base.pipelineIO;
+    hash_utils::hashCombine(key, activeBatchSize);
+    hash_utils::hashCombine(key, mRuntime.deployment.specConfig->draftingStep);
+    hash_utils::hashCombine(key, mUseTree);
+    for (void const* ptr : std::initializer_list<void const*>{io.outputLogits.rawPointer(), io.draftHiddenStatesIn.rawPointer(),
+             io.draftHiddenStatesOut.rawPointer(), io.inputsEmbeds.rawPointer(),
+             mRuntime.sampling.indices.rawPointer(), mRuntime.sampling.workspace.rawPointer(),
+             mRuntime.preprocess.embedding.table.rawPointer(), mStackedDraftLogits.rawPointer(),
+             mDraftTokenIds.rawPointer()})
+    {
+        hash_utils::hashCombine(key, reinterpret_cast<uintptr_t>(ptr));
+    }
+    return key == 0 ? 1 : key;
+}
+
+bool Gemma4MTPDecoder::enqueueAssistantDraftSteps(DecodingInferenceContext& context)
+{
+    int32_t const activeBatchSize = context.activeBatchSize;
+    int32_t const draftingStep = mRuntime.deployment.specConfig->draftingStep;
+    int32_t const baseHiddenSize = mRuntime.deployment.specConfig->baseOutputHiddenDim;
+    int32_t const draftVocabSize = mRuntime.deployment.draft->outputVocabSize;
+    auto const draftDims = mRuntime.deployment.draft->decodeDims(activeBatchSize);
 
     for (int32_t step = 0; step < draftingStep; ++step)
     {

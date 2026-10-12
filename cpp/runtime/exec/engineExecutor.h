@@ -104,6 +104,16 @@ public:
     virtual bool execute(cudaStream_t stream) = 0;
 
     /*!
+     * @brief Key of the current binding state (engine, profile, addresses, shapes), as used for the
+     *        executor's own CUDA graphs. Callers that capture execute() into a larger graph use it to tell
+     *        when that graph is stale. 0 = not supported (do not cache).
+     */
+    virtual size_t bindingKey() const
+    {
+        return 0;
+    }
+
+    /*!
      * @brief Capture a CUDA graph for the current binding state (after prepare()).
      *
      * Performs a warmup enqueue, then captures via cudaStreamBeginCapture.
