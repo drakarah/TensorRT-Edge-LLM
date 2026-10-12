@@ -1717,6 +1717,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     LLMGenerationResponse& response, cudaStream_t stream, bool outputThinkerEmbeddings, TokenBroadcastFn tokenBroadcast,
     int32_t parallelRank, RequestId founderRequestId)
 {
+    NVTX_SCOPED_RANGE(nvtxBegin, "BEGIN_GENERATION", nvtx_colors::PURPLE);
     bool expected = false;
     if (!mHandleRequestInProgress.compare_exchange_strong(
             expected, true, std::memory_order_acquire, std::memory_order_relaxed))
@@ -1951,6 +1952,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
                 continue;
             }
             std::string failReason;
+            NVTX_SCOPED_RANGE(nvtxGuide, "GUIDED_PREPARE_SLOT", nvtx_colors::YELLOW);
             if (mGuidedDecoder.prepareSlot(i, *slotGuide, failReason))
             {
                 context.hasGuidedDecoding = true;
@@ -2051,6 +2053,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     std::optional<ManagedKVCacheRequest>& managedKVCacheRequest = generation->managedKVCacheRequest;
     if (mContextCache != nullptr || mBoundedSwaKVPageManager != nullptr)
     {
+        NVTX_SCOPED_RANGE(nvtxCacheBegin, "CONTEXT_CACHE_BEGIN", nvtx_colors::LIGHT_GREEN);
         std::optional<ManagedKVCacheRequest> admitted = ManagedKVCacheRequest::begin(mContextCache.get(),
             mBoundedSwaKVPageManager.get(), request, context, decodingStrategy.isSpeculative(), kvHeadroom,
             tokenStateContract, contextCacheCommitPolicy, mediaTokenIds);

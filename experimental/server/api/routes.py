@@ -23,7 +23,17 @@ from fastapi.responses import (JSONResponse, PlainTextResponse,
 from . import anthropic_compat
 from .errors import ServerError
 from .protocol import (ChatCompletionRequest, ModelCard, ModelList,
+
                        SpeechRequest, TranscriptionResponse)
+
+try:  # optional profiler annotations (no-ops unless a profiler is attached)
+    from nvtx import annotate as _nvtx_range
+except ImportError:  # pragma: no cover
+    import contextlib as _contextlib
+
+    def _nvtx_range(*_args, **_kwargs):
+        return _contextlib.nullcontext()
+
 
 router = APIRouter()
 
@@ -111,7 +121,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 "Connection": "keep-alive",
             },
         )
-    response = await handler.create_chat_completion(body)
+    with _nvtx_range("PY_CHAT_COMPLETION"):
+        response = await handler.create_chat_completion(body)
     payload = response.model_dump(exclude_none=True)
     # OpenAI always sends message.content, as null on a tool-call-only reply;
     # clients read it unguarded. Other unset optional fields stay omitted.

@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "profiling/nvtx_wrapper.h"
 #include "runtime/multiDevice/runtimeCoordinator.h"
 
 #include "chatTemplate/chatTemplate.h"
@@ -1021,6 +1022,7 @@ LLMGenerationRequest RuntimeCoordinator::prepareRequestState(LLMGenerationReques
             }
         }
 
+        NVTX_SCOPED_RANGE(nvtxTemplate, "REQUEST_CHAT_TEMPLATE", nvtx_colors::PINK);
         bool const formatted = mChatTemplate->apply(preparedRequest.requests[i], preparedRequest.formattedRequests[i],
             chat_template::ChatTemplate::optionsFrom(preparedRequest));
         if (!formatted)
@@ -1033,6 +1035,7 @@ LLMGenerationRequest RuntimeCoordinator::prepareRequestState(LLMGenerationReques
         }
 
         // The formatted chat request already carries the model template's special-token policy.
+        NVTX_SCOPED_RANGE(nvtxTokenize, "REQUEST_TOKENIZE", nvtx_colors::MAGENTA);
         preparedRequest.preTokenizedInputIds[i]
             = mTokenizer->encode(preparedRequest.formattedRequests[i].formattedCompleteRequest, false);
         if (preparedRequest.preTokenizedInputIds[i].empty())

@@ -51,7 +51,17 @@ from ..config import DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig
 from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
                                     validate_tool_request)
 from .engine_layout import (BundleLayout, EngineType, detect_engine_type,
+
                             inspect_bundle)
+
+try:  # optional profiler annotations (no-ops unless a profiler is attached)
+    from nvtx import annotate as _nvtx_range
+except ImportError:  # pragma: no cover
+    import contextlib as _contextlib
+
+    def _nvtx_range(*_args, **_kwargs):
+        return _contextlib.nullcontext()
+
 
 logger = logging.getLogger("edgellm.server")
 
@@ -1442,7 +1452,8 @@ class LLM:
         reasoning_parser: str = "none",
         on_handle=None,
     ) -> CompletionOutput:
-        response = self._handle_request(request, on_handle=on_handle)
+        with _nvtx_range("PY_RUNTIME_CALL"):
+            response = self._handle_request(request, on_handle=on_handle)
         text = response.output_texts[0] if response.output_texts else ""
         token_ids = response.output_ids[0] if response.output_ids else []
         prompt_tokens = (response.prompt_token_counts[0]
@@ -1450,15 +1461,16 @@ class LLM:
         finish_reason = (finish_reason_name(self._rt,
                                             response.finish_reasons[0])
                          if response.finish_reasons else "stop")
-        output = self._parse_generation_output(
-            text,
-            token_ids,
-            prompt_tokens,
-            finish_reason,
-            tool_config,
-            tool_parser=tool_parser,
-            reasoning_parser=reasoning_parser,
-        )
+        with _nvtx_range("PY_PARSE_OUTPUT"):
+            output = self._parse_generation_output(
+                text,
+                token_ids,
+                prompt_tokens,
+                finish_reason,
+                tool_config,
+                tool_parser=tool_parser,
+                reasoning_parser=reasoning_parser,
+            )
         if params.num_logprobs > 0 and response.logprobs:
             output.logprobs = _convert_logprobs(response.logprobs[0])
         return output
