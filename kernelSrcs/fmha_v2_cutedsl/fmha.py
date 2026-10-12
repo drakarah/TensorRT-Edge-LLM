@@ -2788,6 +2788,7 @@ def run(
     window_size_left: int = -1,
     skip_rescale: bool = True,
     hybrid_exp2: bool = False,
+    d512_ws: bool = False,
     warmup_iterations: int = 3,
     iterations: int = 10,
     skip_ref_check: bool = False,
@@ -3061,6 +3062,14 @@ def run(
         skip_rescale=skip_rescale,
         hybrid_exp2=hybrid_exp2,
     )
+    if d512_ws:
+        # Warp-specialized head-512 causal context kernel (same ABI as
+        # __call_context__); see fmha_d512_ws.py.
+        if not (fmha_v2_context and head_dim == 512 and is_causal and window_size_left < 0
+                and not vision_block):
+            raise ValueError(f"{_tag} --d512_ws needs --fmha_v2_context, head_dim 512, causal, no window")
+        from fmha_d512_ws import FMHAV2D512WS
+        fa2_fwd = FMHAV2D512WS(is_causal=True, skip_rescale=skip_rescale)
 
     current_stream = (
         aot_placeholders.make_stream()
@@ -3622,6 +3631,8 @@ def _parse_args(argv=None):
                    help="Tier-1: clamp rescale factor to 1.0 when within 2^-8 of unity.")
     p.add_argument("--hybrid_exp2", action="store_true",
                    help="Scaffold for FA4-style 75%% MUFU + 25%% polynomial exp2 (not validated).")
+    p.add_argument("--d512_ws", action="store_true",
+                   help="Use the warp-specialized head-512 causal context kernel (fmha_d512_ws.py).")
     p.add_argument("--warmup_iterations", type=int, default=3)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--skip_ref_check", action="store_true")
@@ -3676,6 +3687,7 @@ def main():
         window_size_left=args.window_size_left,
         skip_rescale=args.skip_rescale,
         hybrid_exp2=args.hybrid_exp2,
+        d512_ws=args.d512_ws,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
         skip_ref_check=args.skip_ref_check or args.benchmark_paged_kv_ragged,

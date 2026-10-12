@@ -1082,11 +1082,14 @@ KERNEL_VARIANTS = [
         group="fmha",
         supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
+        # Causal full-attention D512 (Gemma4 global layers) uses the
+        # warp-specialized kernel (fmha_d512_ws.py): one CTA per 32-row query
+        # tile computes Q·Kᵀ once for both 256-column output halves.
         script_args=[
             "--head_dim", "512",
             "--m_block_size", "32", "--n_block_size", "32", "--num_threads", "64",
             "--dtype", "Float16", "--is_causal", "--fmha_v2_context",
-            "--skip_rescale", "--export_only",
+            "--skip_rescale", "--d512_ws", "--export_only",
         ],
     ),
     KernelVariant(
