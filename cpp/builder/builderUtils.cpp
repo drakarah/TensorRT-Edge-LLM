@@ -24,7 +24,10 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <iterator>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace trt_edgellm
 {
@@ -324,6 +327,41 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
     }
 #endif
 
+    // Autotuning picks each tactic (e.g. the INT4 GEMM plugin's tile variant) from one timing run, so two
+    // builds of the same network can differ in speed. EDGELLM_AVG_TIMING_ITERATIONS averages more runs;
+    // EDGELLM_TIMING_CACHE=<file> loads earlier timings (if the file exists) and saves them after the
+    // build, so a rebuild on the same GPU and TensorRT version makes the same choices.
+    if (char const* iters = std::getenv("EDGELLM_AVG_TIMING_ITERATIONS"))
+    {
+        int32_t const n = std::atoi(iters);
+        if (n > 0)
+        {
+            config->setAvgTimingIterations(n);
+            LOG_INFO("Builder: averaging %d timing iterations per tactic", n);
+        }
+    }
+    if (char const* cachePath = std::getenv("EDGELLM_TIMING_CACHE"))
+    {
+        std::vector<char> blob;
+        std::ifstream ifs(cachePath, std::ios::binary);
+        if (ifs)
+        {
+            blob.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+        }
+        // TensorRT requires the cache to outlive the build; keep it for the process lifetime.
+        static std::vector<std::unique_ptr<nvinfer1::ITimingCache>> sTimingCaches;
+        std::unique_ptr<nvinfer1::ITimingCache> cache(config->createTimingCache(blob.data(), blob.size()));
+        if (!cache || !config->setTimingCache(*cache, /*ignoreMismatch=*/false))
+        {
+            LOG_WARNING("Builder: could not use timing cache %s", cachePath);
+        }
+        else
+        {
+            LOG_INFO("Builder: timing cache %s (%zu bytes loaded)", cachePath, blob.size());
+            sTimingCaches.push_back(std::move(cache));
+        }
+    }
+
     return config;
 }
 
@@ -370,6 +408,21 @@ bool buildAndSerializeEngine(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefi
     {
         LOG_ERROR("Failed to build serialized engine");
         return false;
+    }
+    if (char const* cachePath = std::getenv("EDGELLM_TIMING_CACHE"))
+    {
+        nvinfer1::ITimingCache const* cache = config->getTimingCache();
+        std::unique_ptr<nvinfer1::IHostMemory> blob(cache != nullptr ? cache->serialize() : nullptr);
+        std::ofstream cacheOut(cachePath, std::ios::out | std::ios::binary);
+        if (blob && cacheOut)
+        {
+            cacheOut.write(static_cast<char const*>(blob->data()), static_cast<std::streamsize>(blob->size()));
+            LOG_INFO("Builder: saved timing cache %s (%zu bytes)", cachePath, blob->size());
+        }
+        else
+        {
+            LOG_WARNING("Builder: could not save timing cache %s", cachePath);
+        }
     }
 
     // Write to file
