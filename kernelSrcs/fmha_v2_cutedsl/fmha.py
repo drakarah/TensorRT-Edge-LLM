@@ -3068,8 +3068,11 @@ def run(
         if not (fmha_v2_context and head_dim == 512 and is_causal and window_size_left < 0
                 and not vision_block):
             raise ValueError(f"{_tag} --d512_ws needs --fmha_v2_context, head_dim 512, causal, no window")
-        from fmha_d512_ws import FMHAV2D512WS
-        fa2_fwd = FMHAV2D512WS(is_causal=True, skip_rescale=skip_rescale)
+        from fmha_d512_ws import FMHAV2D512WS, FMHAV2D512WS64
+        if m_block_size == 64:
+            fa2_fwd = FMHAV2D512WS64(is_causal=True, skip_rescale=skip_rescale)
+        else:
+            fa2_fwd = FMHAV2D512WS(is_causal=True, skip_rescale=skip_rescale)
 
     current_stream = (
         aot_placeholders.make_stream()
