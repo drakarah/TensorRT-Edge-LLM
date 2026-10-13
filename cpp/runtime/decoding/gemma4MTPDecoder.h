@@ -119,6 +119,9 @@ private:
 
     bool mUseTree{false};
     Tensor mStackedDraftLogits; //!< [B, specDraftStep + 1, draftVocab] per-depth proposal logits.
+    //! Sparse assistant logits only: token id of each logits column, per draft step and stacked per depth.
+    Tensor mDraftLogitTokenIds;        //!< [B, draftVocab]
+    Tensor mStackedDraftLogitTokenIds; //!< [B, specDraftStep + 1, draftVocab]
     Tensor mTreeTokenIds;       //!< [B, verifySize] flattened tree token ids.
     Tensor mTreeNodeScores;     //!< [B, verifySize] prefix log-prob scores.
     Tensor mValidCounts;        //!< [B] valid tree node counts.

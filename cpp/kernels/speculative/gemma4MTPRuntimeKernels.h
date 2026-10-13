@@ -39,5 +39,10 @@ void launchGemma4MTPGatherSeedHidden(void const* sourceHiddenStates, void* seedH
 void launchGemma4MTPStoreDraftToken(int32_t const* selectedTokenIds, int32_t* draftTokenIds, int32_t batchSize,
     int32_t draftingStep, int32_t step, cudaStream_t stream);
 
+//! Replace each batch row's selected logits column with its token id (sparse assistant logits):
+//! selected[b] = logitTokenIds[b * numColumns + selected[b]].
+void launchGemma4MTPMapLogitColumnsToTokenIds(
+    int32_t* selected, int32_t const* logitTokenIds, int32_t batchSize, int32_t numColumns, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

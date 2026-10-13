@@ -269,7 +269,8 @@ struct DDTreeBuildOutputs
 DDTreeBuildOutputs runDDTreeBuild(std::vector<float> const& logits, std::vector<int32_t> const& rootTokenIds,
     std::vector<int32_t> const& baseLengths, int32_t batchSize, int32_t dflashBlockSize, int32_t vocabSize,
     int32_t verifySize, int32_t candidateTopK, int32_t firstCandidateLogitsRow = 1,
-    std::vector<float> const& depthConfidence = {}, float survivalThreshold = 0.0F, bool tokenMajorLogits = false)
+    std::vector<float> const& depthConfidence = {}, float survivalThreshold = 0.0F, bool tokenMajorLogits = false,
+    std::vector<int32_t> const& logitTokenIds = {})
 {
     int32_t const packedMaskLen = (verifySize + kMaskBitsPerWord - 1) / kMaskBitsPerWord;
     rt::Tensor logitsTensor = tokenMajorLogits
@@ -309,13 +310,22 @@ DDTreeBuildOutputs runDDTreeBuild(std::vector<float> const& logits, std::vector<
         copyHostToDevice(depthConfidenceTensor, depthConfidence);
     }
 
-    kernel::DDTreeBuildParams const buildParams{
+    rt::Tensor logitTokenIdsTensor;
+    if (!logitTokenIds.empty())
+    {
+        logitTokenIdsTensor
+            = rt::Tensor({batchSize, dflashBlockSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+        copyHostToDevice(logitTokenIdsTensor, logitTokenIds);
+    }
+
+    kernel::DDTreeBuildParams buildParams{
         {logitsTensor, rootTokenTensor, baseLengthsTensor, nullptr,
             depthConfidence.empty() ? nullptr : &depthConfidenceTensor, survivalThreshold},
         {nodeTokenIdsTensor, nodeDepthsTensor, parentIdsTensor, nodeScoresTensor, validCountsTensor,
             verifyTokenIdsTensor, verifyPositionIdsTensor, packedAncestorMaskTensor, ancestorMaskTensor,
             contextLengthsTensor, selectTokenIndicesTensor},
         candidateTopK, workspace, workspaceSize, nullptr, firstCandidateLogitsRow};
+    buildParams.inputs.logitTokenIds = logitTokenIds.empty() ? nullptr : &logitTokenIdsTensor;
     kernel::ddtreeBuild(buildParams);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -525,6 +535,59 @@ TEST(DDTreeKernels, MtpChainStackedLogitsBuildsTree)
     }
     // Proposal depth is capped at draftingStep (= "blockSize" - 1).
     EXPECT_EQ(maxDepth, kDraftingStep);
+}
+
+// Sparse draft logits (Gemma 4 assistant): each logits row holds only candidates, and logitTokenIds gives
+// the token id of every column. The tree is the same as without the table; node tokens are the ids of the
+// selected columns in their depth's row.
+TEST(DDTreeKernels, LogitTokenIdsMapColumnsPerDepthRow)
+{
+    constexpr int32_t kBatchSize{2};
+    constexpr int32_t kDraftingStep{3};
+    constexpr int32_t kProposalDepthSize{kDraftingStep + 1};
+    constexpr int32_t kColumns{16};
+    constexpr int32_t kCandidateFanout{3};
+    constexpr int32_t kVerifySize{9};
+
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> logitDist(-4.0F, 4.0F);
+    std::vector<float> logits(static_cast<size_t>(kBatchSize) * kProposalDepthSize * kColumns);
+    for (float& logit : logits)
+    {
+        logit = logitDist(rng);
+    }
+    // Distinct ids per (batch, row, column), as from different centroid sets per draft step.
+    std::vector<int32_t> logitTokenIds(logits.size());
+    for (size_t idx = 0; idx < logitTokenIds.size(); ++idx)
+    {
+        logitTokenIds[idx] = static_cast<int32_t>(100000 + idx * 37 % 262144);
+    }
+
+    std::vector<int32_t> const rootTokenIds{42, 43};
+    std::vector<int32_t> const baseLengths{100, 200};
+    DDTreeBuildOutputs const columns = runDDTreeBuild(
+        logits, rootTokenIds, baseLengths, kBatchSize, kProposalDepthSize, kColumns, kVerifySize, kCandidateFanout);
+    DDTreeBuildOutputs const mapped = runDDTreeBuild(logits, rootTokenIds, baseLengths, kBatchSize,
+        kProposalDepthSize, kColumns, kVerifySize, kCandidateFanout, /*firstCandidateLogitsRow=*/1,
+        /*depthConfidence=*/{}, /*survivalThreshold=*/0.0F, /*tokenMajorLogits=*/false, logitTokenIds);
+
+    EXPECT_EQ(mapped.parentIds, columns.parentIds);
+    EXPECT_EQ(mapped.nodeDepths, columns.nodeDepths);
+    EXPECT_EQ(mapped.validCounts, columns.validCounts);
+    for (int32_t batchIdx = 0; batchIdx < kBatchSize; ++batchIdx)
+    {
+        int32_t const offset = batchIdx * kVerifySize;
+        EXPECT_EQ(mapped.nodeTokenIds[offset], rootTokenIds[batchIdx]);
+        for (int32_t nodeIdx = 1; nodeIdx < columns.validCounts[batchIdx]; ++nodeIdx)
+        {
+            int32_t const depth = columns.nodeDepths[offset + nodeIdx];
+            int32_t const column = columns.nodeTokenIds[offset + nodeIdx];
+            int32_t const expected
+                = logitTokenIds[(static_cast<size_t>(batchIdx) * kProposalDepthSize + depth) * kColumns + column];
+            EXPECT_EQ(mapped.nodeTokenIds[offset + nodeIdx], expected) << "batch " << batchIdx << " node " << nodeIdx;
+            EXPECT_EQ(mapped.verifyTokenIds[offset + nodeIdx], expected);
+        }
+    }
 }
 
 // With candidateFanout = 1 the greedy builder must reproduce the linear MTP

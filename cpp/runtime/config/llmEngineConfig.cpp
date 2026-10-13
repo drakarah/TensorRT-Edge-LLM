@@ -331,6 +331,7 @@ void parseGemma4MTPFields(Json const& configJson, LLMEngineConfig& cfg)
     cfg.constantDraftPositions = configJson.value("constant_draft_positions", false);
     cfg.returnsFeedbackHidden = configJson.value("returns_feedback_hidden", false);
     cfg.assistantHiddenSize = configJson.value("assistant_hidden_size", 0);
+    cfg.sparseDraftLogits = configJson.value("sparse_logits_enabled", false);
 
     if (!configJson.contains("kv_sharing_map"))
     {
@@ -1063,6 +1064,17 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     cfg.vocabSize = configJson.value("draft_vocab_size", configJson.value("vocab_size", 0));
     cfg.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
     cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
+    if (cfg.sparseDraftLogits)
+    {
+        // Top-k centroids x tokens per centroid: the assistant's candidate count per row.
+        int32_t const numCentroids = configJson.value("num_centroids", 0);
+        int32_t const centroidTopK = configJson.value("centroid_intermediate_top_k", 0);
+        ELLM_CHECK(cfg.reducedVocabSize == 0 && numCentroids > 0 && centroidTopK > 0 && centroidTopK <= numCentroids
+                && cfg.vocabSize % numCentroids == 0,
+            "parseDraftEngineConfig: sparse_logits_enabled needs num_centroids and centroid_intermediate_top_k and "
+            "no reduced vocabulary.");
+        cfg.outputVocabSize = centroidTopK * (cfg.vocabSize / numCentroids);
+    }
     parseDFlashFields(configJson, cfg);
     parseJetSpecFields(configJson, cfg);
     parseDSparkFields(configJson, cfg);

@@ -389,7 +389,8 @@ __device__ __forceinline__ bool isBetterTreeExpansion(float lhsScore, int32_t lh
 __global__ void buildDDTreeKernel(int32_t const* __restrict__ rootTokenIds, int32_t const* __restrict__ baseLengths,
     int32_t const* __restrict__ candidateTokenIds, float const* __restrict__ candidateLogProbs,
     float const* __restrict__ depthConfidence, float confSurvivalFloorLog,
-    int32_t const* __restrict__ draftVocabMappingTable, int32_t* __restrict__ nodeTokenIds,
+    int32_t const* __restrict__ draftVocabMappingTable, int32_t const* __restrict__ logitTokenIds,
+    int32_t vocabSize, int32_t* __restrict__ nodeTokenIds,
     int32_t* __restrict__ nodeDepths, int32_t* __restrict__ parentIds, float* __restrict__ nodeScores,
     int32_t* __restrict__ validCounts, int32_t* __restrict__ verifyTokenIds, int32_t* __restrict__ verifyPositionIds,
     int32_t* __restrict__ packedAncestorMask, int8_t* __restrict__ ancestorMask, int32_t* __restrict__ contextLengths,
@@ -556,8 +557,17 @@ __global__ void buildDDTreeKernel(int32_t const* __restrict__ rootTokenIds, int3
                 bestToken = sBestTokens[0];
                 bestScore = sBestScores[0];
                 nextCandidateSlot[bestParent] += 1;
-                nodeTokenIds[treeOffset + outNodeIdx]
-                    = draftVocabMappingTable == nullptr ? bestToken : draftVocabMappingTable[bestToken];
+                if (logitTokenIds != nullptr)
+                {
+                    int32_t const depthIdx = firstCandidateLogitsRow + nodeDepths[treeOffset + bestParent];
+                    nodeTokenIds[treeOffset + outNodeIdx] = logitTokenIds[
+                        (static_cast<int64_t>(batchIdx) * dflashBlockSize + depthIdx) * vocabSize + bestToken];
+                }
+                else
+                {
+                    nodeTokenIds[treeOffset + outNodeIdx]
+                        = draftVocabMappingTable == nullptr ? bestToken : draftVocabMappingTable[bestToken];
+                }
                 nodeDepths[treeOffset + outNodeIdx] = nodeDepths[treeOffset + bestParent] + 1;
                 parentIds[treeOffset + outNodeIdx] = bestParent;
                 nodeScores[treeOffset + outNodeIdx] = bestScore;
@@ -694,6 +704,18 @@ void ddtreeBuild(DDTreeBuildParams const& params)
         draftVocabMappingTablePtr = draftVocabMappingTable->dataPointer<int32_t>();
     }
 
+    int32_t const* logitTokenIdsPtr{nullptr};
+    if (params.inputs.logitTokenIds != nullptr)
+    {
+        rt::Tensor const& logitTokenIds = *params.inputs.logitTokenIds;
+        validateGpuTensor(logitTokenIds, "logitTokenIds", nvinfer1::DataType::kINT32, "INT32");
+        check::check(draftVocabMappingTable == nullptr,
+            "logitTokenIds and draftVocabMappingTable are mutually exclusive.");
+        check::check(logitTokenIds.getShape().volume() == logitsShape.volume(),
+            "logitTokenIds must have the draftLogits layout.");
+        logitTokenIdsPtr = logitTokenIds.dataPointer<int32_t>();
+    }
+
     float const* depthConfidencePtr{nullptr};
     if (depthConfidence != nullptr)
     {
@@ -767,7 +789,7 @@ void ddtreeBuild(DDTreeBuildParams const& params)
     size_t const buildSharedBytes = static_cast<size_t>(verifySize) * sizeof(int32_t);
     buildDDTreeKernel<<<batchSize, kBuildBlockSize, buildSharedBytes, params.stream>>>(
         rootTokenIds.dataPointer<int32_t>(), baseLengths.dataPointer<int32_t>(), buildWorkspace.candidateTokenIds,
-        buildWorkspace.candidateLogProbs, depthConfidencePtr, confSurvivalFloorLog, draftVocabMappingTablePtr,
+        buildWorkspace.candidateLogProbs, depthConfidencePtr, confSurvivalFloorLog, draftVocabMappingTablePtr, logitTokenIdsPtr, vocabSize,
         nodeTokenIds.dataPointer<int32_t>(), nodeDepths.dataPointer<int32_t>(), parentIds.dataPointer<int32_t>(),
         nodeScores.dataPointer<float>(), validCounts.dataPointer<int32_t>(), verifyTokenIds.dataPointer<int32_t>(),
         verifyPositionIds.dataPointer<int32_t>(), packedAncestorMask.dataPointer<int32_t>(),

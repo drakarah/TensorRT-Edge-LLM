@@ -54,7 +54,7 @@ def _make_gemma4_assistant_flat_wrapper(model: nn.Module,
         f"past_key_values_{i}"
         for i in range(num_layers))) if num_layers else "()"
     body = (
-        f"    logits, hidden_states = self._model.forward_ragged(\n"
+        f"    outputs = self._model.forward_ragged(\n"
         f"        inputs_embeds, hidden_states_input, {past_kv_tuple},\n"
         f"        rope_rotary_cos_sin_sliding=rope_rotary_cos_sin_sliding,\n"
         f"        rope_rotary_cos_sin_full=rope_rotary_cos_sin_full,\n"
@@ -65,7 +65,7 @@ def _make_gemma4_assistant_flat_wrapper(model: nn.Module,
         f"        state_indices=state_indices, execution_phase_marker=execution_phase_marker,\n"
         f"        context_sequence_count_carrier=context_sequence_count_carrier,\n"
         f"        kv_page_table=kv_page_table)\n"
-        f"    return logits, hidden_states\n")
+        f"    return outputs\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
     globs: dict = {}
@@ -358,8 +358,10 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
                 token_ordering.to(lm_head_weight.device)].view(
                     self.num_centroids, self.vocab_size_per_centroid, -1)
 
-    def forward(self, hidden_states: torch.Tensor,
-                lm_head_weight: torch.Tensor) -> torch.Tensor:
+    def candidates(
+            self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (token ids, logits) of the top-k centroids' tokens."""
         # Only the top-k centroids' tokens (k * vocab/num_centroids, 4096 of
         # 262144 for E4B) can survive the mask, so gather just those LM-head
         # rows instead of streaming the whole tied embedding table every draft
@@ -383,7 +385,12 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
                 candidate_ids, lm_head_weight.to(hidden_states.dtype))
         candidate_logits = (candidate_rows *
                             hidden_states.unsqueeze(-2)).sum(-1)
+        return candidate_ids, candidate_logits
 
+    def forward(self, hidden_states: torch.Tensor,
+                lm_head_weight: torch.Tensor) -> torch.Tensor:
+        candidate_ids, candidate_logits = self.candidates(
+            hidden_states, lm_head_weight)
         logits = hidden_states.new_full(
             (*hidden_states.shape[:-1], self.vocab_size), -65504.0)
         # Candidate ids are unique (distinct centroids, disjoint token sets),
@@ -421,6 +428,9 @@ class Gemma4AssistantForCausalLM(nn.Module):
                                            module_name="post_projection")
         self.masked_embedding = (Gemma4AssistantMaskedEmbedder(config)
                                  if config.use_ordered_embeddings else None)
+        if config.sparse_logits_enabled and self.masked_embedding is None:
+            raise ValueError(
+                "Gemma4 assistant sparse logits require ordered embeddings.")
 
     def forward(
         self,
@@ -468,6 +478,14 @@ class Gemma4AssistantForCausalLM(nn.Module):
                                                  past_key_values[layer_idx],
                                                  rope, **metadata)
         hidden_states = self.model.norm(hidden_states)
+        if self.config.sparse_logits_enabled:
+            # Candidate logits and their token ids instead of a full-vocabulary
+            # row: the runtime selects and builds the draft tree over these.
+            token_ids, logits = self.masked_embedding.candidates(
+                hidden_states, self.model.embed_tokens.weight)
+            return (logits.to(torch.float32),
+                    self.post_projection(hidden_states),
+                    token_ids.to(torch.int32))
         if self.masked_embedding is not None:
             logits = self.masked_embedding(hidden_states,
                                            self.model.embed_tokens.weight)
@@ -573,6 +591,8 @@ class Gemma4AssistantForCausalLM(nn.Module):
                 "kv_page_table"
             ])
         output_names = ["logits", "hidden_states"]
+        if config.sparse_logits_enabled:
+            output_names.append("logit_token_ids")
 
         tokens = torch.export.Dim("physical_tokens", min=1, max=8_388_608)
         batch = torch.export.Dim("num_sequences", min=1, max=256)

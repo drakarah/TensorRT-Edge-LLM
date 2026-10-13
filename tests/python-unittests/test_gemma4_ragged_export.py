@@ -307,3 +307,38 @@ def test_gemma4_assistant_onnx_reads_centroid_ordered_head(tmp_path):
     }
     assert any("ordered_lm_head" in name for name in initializers)
     assert not any("embed_tokens" in name for name in initializers)
+
+
+def test_gemma4_assistant_sparse_logits_match_full_row():
+    model = _ordered_embedding_assistant()
+    embedder = model.masked_embedding
+    lm_head_weight = model.model.embed_tokens.weight
+    embedder.prepare_for_export(lm_head_weight)
+    hidden_states = torch.randn(5, model.config.hidden_size).half()
+
+    token_ids, logits = embedder.candidates(hidden_states, lm_head_weight)
+    full_row = embedder(hidden_states, lm_head_weight)
+
+    assert token_ids.shape == logits.shape == (
+        5, embedder.centroid_intermediate_top_k *
+        embedder.vocab_size_per_centroid)
+    assert torch.equal(full_row.gather(-1, token_ids), logits)
+
+
+def test_gemma4_assistant_sparse_logits_onnx_outputs(tmp_path):
+    model = _ordered_embedding_assistant()
+    model.config.sparse_logits_enabled = True
+    output = tmp_path / "gemma4-assistant-sparse-logits.onnx"
+
+    _export_model(model, str(output), optimize=False)
+
+    graph = onnx.load(str(output), load_external_data=False).graph
+    outputs = {tensor.name: tensor for tensor in graph.output}
+    assert list(outputs) == ["logits", "hidden_states", "logit_token_ids"]
+    candidates = (model.config.centroid_intermediate_top_k *
+                  model.config.vocab_size // model.config.num_centroids)
+    for name, elem_type in (("logits", onnx.TensorProto.FLOAT),
+                            ("logit_token_ids", onnx.TensorProto.INT32)):
+        tensor_type = outputs[name].type.tensor_type
+        assert tensor_type.elem_type == elem_type
+        assert tensor_type.shape.dim[1].dim_value == candidates

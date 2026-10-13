@@ -79,6 +79,18 @@ __global__ void storeDraftTokenKernel(int32_t const* __restrict__ selectedTokenI
     draftTokenIds[batchIdx * draftingStep + step] = selectedTokenIds[batchIdx];
 }
 
+__global__ void mapLogitColumnsToTokenIdsKernel(int32_t* __restrict__ selected,
+    int32_t const* __restrict__ logitTokenIds, int32_t numColumns, int32_t batchSize)
+{
+    int32_t const batchIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batchIdx >= batchSize)
+    {
+        return;
+    }
+
+    selected[batchIdx] = logitTokenIds[static_cast<int64_t>(batchIdx) * numColumns + selected[batchIdx]];
+}
+
 } // namespace
 
 void launchGemma4MTPBuildVerifyTokens(int32_t const* seedTokenIds, int32_t const* draftTokenIds,
@@ -132,6 +144,20 @@ void launchGemma4MTPStoreDraftToken(int32_t const* selectedTokenIds, int32_t* dr
     int32_t const blocks = (batchSize + kThreads - 1) / kThreads;
     storeDraftTokenKernel<<<blocks, kThreads, 0, stream>>>(
         selectedTokenIds, draftTokenIds, draftingStep, step, batchSize);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launchGemma4MTPMapLogitColumnsToTokenIds(
+    int32_t* selected, int32_t const* logitTokenIds, int32_t batchSize, int32_t numColumns, cudaStream_t stream)
+{
+    if (batchSize == 0)
+    {
+        return;
+    }
+
+    constexpr int32_t kThreads = 256;
+    int32_t const blocks = (batchSize + kThreads - 1) / kThreads;
+    mapLogitColumnsToTokenIdsKernel<<<blocks, kThreads, 0, stream>>>(selected, logitTokenIds, numColumns, batchSize);
     CUDA_CHECK(cudaGetLastError());
 }
 

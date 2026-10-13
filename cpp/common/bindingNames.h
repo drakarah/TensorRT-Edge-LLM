@@ -122,6 +122,13 @@ inline constexpr char const* kSelfConditioningTemperature = "self_conditioning_t
 inline constexpr char const* kLogits = "logits";
 
 /*!
+ * @brief Token ids of the logits columns, for drafts with sparse logits (Gemma 4 assistant)
+ *
+ * Shape: [batch_size, num_candidates] (INT32), aligned with kLogits
+ */
+inline constexpr char const* kLogitTokenIds = "logit_token_ids";
+
+/*!
  * @brief Output hidden states tensor - intermediate representations for speculative decoding
  *
  * Shape: [batch_size, sequence_length, hidden_dim] (FLOAT16)

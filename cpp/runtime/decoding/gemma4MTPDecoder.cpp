@@ -17,6 +17,7 @@
 
 #include "runtime/decoding/gemma4MTPDecoder.h"
 
+#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
@@ -125,6 +126,12 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
 
     int32_t const maxRuntimeBatchSize = mRuntime.maxRuntimeBatchSize;
     int32_t const maxDraftStep = draftingConfig.draftingStep;
+    if (mRuntime.deployment.draft->sparseDraftLogits)
+    {
+        mDraftLogitTokenIds = Tensor({maxRuntimeBatchSize, mRuntime.deployment.draft->outputVocabSize},
+            DeviceType::kGPU, nvinfer1::DataType::kINT32, "Gemma4MTP::draftLogitTokenIds");
+        mDraftTensorMap.set(binding_names::kLogitTokenIds, mDraftLogitTokenIds);
+    }
     int32_t const maxAcceptDepth = maxDraftStep + 1;
     mUseTree = draftingConfig.draftingTopK > 1;
     int32_t const maxPhysicalTokens = maxRuntimeBatchSize * maxAcceptDepth;
@@ -168,6 +175,13 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
         int32_t const draftVocabSize = mRuntime.deployment.draft->outputVocabSize;
         mStackedDraftLogits = Tensor({maxRuntimeBatchSize, proposalDepthSize, draftVocabSize}, DeviceType::kGPU,
             nvinfer1::DataType::kFLOAT, "Gemma4MTP::stackedDraftLogits");
+        if (mRuntime.deployment.draft->sparseDraftLogits)
+        {
+            mStackedDraftLogitTokenIds = Tensor({maxRuntimeBatchSize, proposalDepthSize, draftVocabSize},
+                DeviceType::kGPU, nvinfer1::DataType::kINT32, "Gemma4MTP::stackedDraftLogitTokenIds");
+            CUDA_CHECK(cudaMemsetAsync(mStackedDraftLogitTokenIds.rawPointer(), 0,
+                mStackedDraftLogitTokenIds.getMemoryCapacity(), stream));
+        }
         mTreeTokenIds = Tensor(
             {maxRuntimeBatchSize, verifySize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "Gemma4MTP::treeTokenIds");
         mTreeNodeScores = Tensor({maxRuntimeBatchSize, verifySize}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
@@ -280,6 +294,10 @@ bool Gemma4MTPDecoder::captureCudaGraphs(cudaStream_t stream)
                 "Tensor reshape failed");
             check::check(
                 mRuntime.base.pipelineIO.outputLogits.reshape({batchSize, draftVocabSize}), "Tensor reshape failed");
+            if (!mDraftLogitTokenIds.isEmpty())
+            {
+                check::check(mDraftLogitTokenIds.reshape({batchSize, draftVocabSize}), "Tensor reshape failed");
+            }
 
             auto const draftDims = mRuntime.deployment.draft->decodeDims(batchSize);
             if (mDraftExecutor->prepare(kDecodeProfile, draftDims, mDraftTensorMap, stream))
@@ -411,6 +429,7 @@ void Gemma4MTPDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, in
     compactExecutionTensor(mAcceptedTokenIndices);
     compactExecutionTensor(mAcceptLength);
     compactExecutionTensor(mStackedDraftLogits);
+    compactExecutionTensor(mStackedDraftLogitTokenIds);
     compactExecutionTensor(mTreeTokenIds);
     compactExecutionTensor(mTreeNodeScores);
     compactExecutionTensor(mValidCounts);
@@ -583,10 +602,15 @@ bool Gemma4MTPDecoder::runAssistantDraftChain(DecodingInferenceContext& context)
     prepareRaggedRope(mRuntime.base.pipelineIO, mRuntime.base.sharedResources, *mRuntime.deployment.draft,
         activeBatchSize, activeBatchSize, context.stream);
 
+    bool const sparseLogits = !mDraftLogitTokenIds.isEmpty();
     for (int32_t step = 0; step < draftingStep; ++step)
     {
         check::check(
             mRuntime.base.pipelineIO.outputLogits.reshape({activeBatchSize, draftVocabSize}), "Tensor reshape failed");
+        if (sparseLogits)
+        {
+            check::check(mDraftLogitTokenIds.reshape({activeBatchSize, draftVocabSize}), "Tensor reshape failed");
+        }
         check::check(mRuntime.base.pipelineIO.draftHiddenStatesIn.reshape({activeBatchSize, baseHiddenSize}),
             "Tensor reshape failed");
         check::check(mRuntime.base.pipelineIO.draftHiddenStatesOut.reshape({activeBatchSize, baseHiddenSize}),
@@ -611,11 +635,24 @@ bool Gemma4MTPDecoder::runAssistantDraftChain(DecodingInferenceContext& context)
                 static_cast<char*>(mStackedDraftLogits.rawPointer()) + static_cast<size_t>(step + 1) * rowBytes,
                 static_cast<size_t>(proposalDepthSize) * rowBytes, mRuntime.base.pipelineIO.outputLogits.rawPointer(),
                 rowBytes, rowBytes, activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+            if (sparseLogits)
+            {
+                size_t const idRowBytes = static_cast<size_t>(draftVocabSize) * sizeof(int32_t);
+                CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char*>(mStackedDraftLogitTokenIds.rawPointer())
+                        + static_cast<size_t>(step + 1) * idRowBytes,
+                    static_cast<size_t>(proposalDepthSize) * idRowBytes, mDraftLogitTokenIds.rawPointer(), idRowBytes,
+                    idRowBytes, activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+            }
         }
 
         check::check(mRuntime.sampling.indices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
         selectAllTopK(mRuntime.base.pipelineIO.outputLogits, std::nullopt, mRuntime.sampling.indices, 1,
             mRuntime.sampling.workspace, context.stream);
+        if (sparseLogits)
+        {
+            kernel::launchGemma4MTPMapLogitColumnsToTokenIds(mRuntime.sampling.indices.dataPointer<int32_t>(),
+                mDraftLogitTokenIds.dataPointer<int32_t>(), activeBatchSize, draftVocabSize, context.stream);
+        }
 
         kernel::launchGemma4MTPStoreDraftToken(mRuntime.sampling.indices.dataPointer<int32_t>(),
             mDraftTokenIds.dataPointer<int32_t>(), activeBatchSize, draftingStep, step, context.stream);
@@ -647,6 +684,11 @@ bool Gemma4MTPDecoder::buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream
 
     check::check(
         mStackedDraftLogits.reshape({activeBatchSize, proposalDepthSize, draftVocabSize}), "Tensor reshape failed");
+    if (!mStackedDraftLogitTokenIds.isEmpty())
+    {
+        check::check(mStackedDraftLogitTokenIds.reshape({activeBatchSize, proposalDepthSize, draftVocabSize}),
+            "Tensor reshape failed");
+    }
     check::check(mSeedTokenIds.reshape({activeBatchSize}), "Tensor reshape failed");
     check::check(mTreeTokenIds.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
     check::check(mTreeNodeScores.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
@@ -667,13 +709,14 @@ bool Gemma4MTPDecoder::buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream
         mRuntime.base.pipelineIO.selectTokenIndices.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
 
     Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
-    kernel::DDTreeBuildParams const buildParams{{mStackedDraftLogits, mSeedTokenIds, baseKVCacheLengths, nullptr},
+    kernel::DDTreeBuildParams buildParams{{mStackedDraftLogits, mSeedTokenIds, baseKVCacheLengths, nullptr},
         {mTreeTokenIds, mRuntime.base.pipelineIO.specTreeDepths, mRuntime.base.pipelineIO.specTreeParentIds,
             mTreeNodeScores, mValidCounts, mRuntime.preprocess.idsInput, mRuntime.base.pipelineIO.specDecodePositionIds,
             mRuntime.base.pipelineIO.packedAttentionMask, mVerifyTreeMask, mRuntime.base.pipelineIO.contextLengths,
             mRuntime.base.pipelineIO.selectTokenIndices},
         config.draftingTopK, mTreeBuildWorkspace.rawPointer(),
         static_cast<size_t>(mTreeBuildWorkspace.getMemoryCapacity()), stream};
+    buildParams.inputs.logitTokenIds = mStackedDraftLogitTokenIds.isEmpty() ? nullptr : &mStackedDraftLogitTokenIds;
     kernel::ddtreeBuild(buildParams);
     return true;
 }

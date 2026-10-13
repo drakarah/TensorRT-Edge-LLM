@@ -1369,6 +1369,12 @@ class ModelConfig:
             num_centroids=int(llm_dict.get("num_centroids", 0) or 0),
             centroid_intermediate_top_k=int(
                 llm_dict.get("centroid_intermediate_top_k", 0) or 0),
+            # Opt-in: the assistant emits only its top-k centroids' candidates
+            # (logits + logit_token_ids) instead of a full-vocabulary row.
+            sparse_logits_enabled=(
+                is_gemma4_assistant
+                and bool(llm_dict.get("use_ordered_embeddings", False))
+                and os.environ.get("EDGELLM_GEMMA4_SPARSE_DRAFT_LOGITS") == "1"),
             mtp_tree_base=bool(llm_dict.get("mtp_tree_base", False)),
             dflash_base=bool(llm_dict.get("dflash_base", False)),
             dflash_tree_base=bool(llm_dict.get("dflash_tree_base", False)),

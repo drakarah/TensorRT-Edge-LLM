@@ -55,6 +55,10 @@ struct DDTreeBuildInputs
     //! Survival floor in [0, 1): growth stops past depths whose confidence product
     //! falls below it. 0 (default) disables. Only meaningful with depthConfidence.
     float confidenceSurvivalThreshold{0.0F};
+
+    //! Optional INT32 token id of every draftLogits column, same layout as draftLogits. For drafts that emit
+    //! only their candidates' logits (Gemma 4 assistant sparse logits); exclusive with draftVocabMappingTable.
+    rt::Tensor const* logitTokenIds{nullptr};
 };
 
 //! Tensor outputs produced by ddtreeBuild().
