@@ -25,6 +25,7 @@
 #include <gtest/gtest.h>
 #include <limits>
 #include <random>
+#include <set>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -123,7 +124,7 @@ bool betterExpansion(float lhsScore, int32_t lhsParent, int32_t lhsSlot, int32_t
 DDTreeReference buildReference(std::vector<float> const& logits, std::vector<int32_t> const& rootTokenIds,
     std::vector<int32_t> const& baseLengths, int32_t batchSize, int32_t dflashBlockSize, int32_t vocabSize,
     int32_t verifySize, int32_t candidateTopK, int32_t firstCandidateLogitsRow = 1,
-    std::vector<float> const& depthConfidence = {}, float survivalThreshold = 0.0F)
+    std::vector<float> const& depthConfidence = {}, float survivalThreshold = 0.0F, bool chainParentsOnly = false)
 {
     int32_t const packedMaskLen = (verifySize + kMaskBitsPerWord - 1) / kMaskBitsPerWord;
     DDTreeReference ref;
@@ -172,6 +173,8 @@ DDTreeReference buildReference(std::vector<float> const& logits, std::vector<int
             maxProposalDepth = std::max(maxProposalDepth, 1);
         }
         std::vector<int32_t> nextCandidateSlot(static_cast<size_t>(verifySize), 0);
+        std::vector<bool> onChain(static_cast<size_t>(verifySize), false);
+        onChain[0] = true;
         for (int32_t outNodeIdx = 1; outNodeIdx < verifySize; ++outNodeIdx)
         {
             int32_t bestParent{-1};
@@ -181,7 +184,7 @@ DDTreeReference buildReference(std::vector<float> const& logits, std::vector<int
             for (int32_t parentIdx = 0; parentIdx < validCount; ++parentIdx)
             {
                 int32_t const parentDepth = ref.nodeDepths[treeOffset + parentIdx];
-                if (parentDepth >= maxProposalDepth)
+                if (parentDepth >= maxProposalDepth || (chainParentsOnly && !onChain[static_cast<size_t>(parentIdx)]))
                 {
                     continue;
                 }
@@ -222,6 +225,7 @@ DDTreeReference buildReference(std::vector<float> const& logits, std::vector<int
                 break;
             }
             nextCandidateSlot[static_cast<size_t>(bestParent)] += 1;
+            onChain[static_cast<size_t>(outNodeIdx)] = onChain[static_cast<size_t>(bestParent)] && bestSlot == 0;
             ref.nodeTokenIds[treeOffset + outNodeIdx] = bestToken;
             ref.nodeDepths[treeOffset + outNodeIdx] = ref.nodeDepths[treeOffset + bestParent] + 1;
             ref.parentIds[treeOffset + outNodeIdx] = bestParent;
@@ -269,7 +273,8 @@ struct DDTreeBuildOutputs
 DDTreeBuildOutputs runDDTreeBuild(std::vector<float> const& logits, std::vector<int32_t> const& rootTokenIds,
     std::vector<int32_t> const& baseLengths, int32_t batchSize, int32_t dflashBlockSize, int32_t vocabSize,
     int32_t verifySize, int32_t candidateTopK, int32_t firstCandidateLogitsRow = 1,
-    std::vector<float> const& depthConfidence = {}, float survivalThreshold = 0.0F, bool tokenMajorLogits = false)
+    std::vector<float> const& depthConfidence = {}, float survivalThreshold = 0.0F, bool tokenMajorLogits = false,
+    bool chainParentsOnly = false)
 {
     int32_t const packedMaskLen = (verifySize + kMaskBitsPerWord - 1) / kMaskBitsPerWord;
     rt::Tensor logitsTensor = tokenMajorLogits
@@ -309,13 +314,14 @@ DDTreeBuildOutputs runDDTreeBuild(std::vector<float> const& logits, std::vector<
         copyHostToDevice(depthConfidenceTensor, depthConfidence);
     }
 
-    kernel::DDTreeBuildParams const buildParams{
+    kernel::DDTreeBuildParams buildParams{
         {logitsTensor, rootTokenTensor, baseLengthsTensor, nullptr,
             depthConfidence.empty() ? nullptr : &depthConfidenceTensor, survivalThreshold},
         {nodeTokenIdsTensor, nodeDepthsTensor, parentIdsTensor, nodeScoresTensor, validCountsTensor,
             verifyTokenIdsTensor, verifyPositionIdsTensor, packedAncestorMaskTensor, ancestorMaskTensor,
             contextLengthsTensor, selectTokenIndicesTensor},
         candidateTopK, workspace, workspaceSize, nullptr, firstCandidateLogitsRow};
+    buildParams.chainParentsOnly = chainParentsOnly;
     kernel::ddtreeBuild(buildParams);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -525,6 +531,59 @@ TEST(DDTreeKernels, MtpChainStackedLogitsBuildsTree)
     }
     // Proposal depth is capped at draftingStep (= "blockSize" - 1).
     EXPECT_EQ(maxDepth, kDraftingStep);
+}
+
+// A chained drafter (Gemma 4 MTP) computes depth-d logits after the depth-(d-1) top-1 token, so only
+// the top-1 chain may have children; lower-ranked candidates stay leaves. Without the restriction the
+// strong depth-2 row pulls a child under the depth-1 rank-2 node.
+TEST(DDTreeKernels, MtpChainParentsOnlyKeepsBranchesAsLeaves)
+{
+    constexpr int32_t kBatchSize{1};
+    constexpr int32_t kDraftingStep{3};
+    constexpr int32_t kProposalDepthSize{kDraftingStep + 1};
+    constexpr int32_t kVocabSize{10};
+    constexpr int32_t kCandidateFanout{2};
+    // Chain (3) + one sibling per depth (3) + root: the whole chain-restricted tree.
+    constexpr int32_t kVerifySize{7};
+
+    std::vector<float> logits(static_cast<size_t>(kBatchSize) * kProposalDepthSize * kVocabSize, -12.0F);
+    setLogit(logits, 0, 1, 1, kProposalDepthSize, kVocabSize, 6.0F);
+    setLogit(logits, 0, 1, 2, kProposalDepthSize, kVocabSize, 5.9F);
+    setLogit(logits, 0, 2, 4, kProposalDepthSize, kVocabSize, 6.0F);
+    setLogit(logits, 0, 2, 5, kProposalDepthSize, kVocabSize, 1.0F);
+    setLogit(logits, 0, 3, 7, kProposalDepthSize, kVocabSize, 6.0F);
+    setLogit(logits, 0, 3, 8, kProposalDepthSize, kVocabSize, 1.0F);
+
+    std::vector<int32_t> const rootTokenIds{42};
+    std::vector<int32_t> const baseLengths{100};
+
+    DDTreeBuildOutputs const unrestricted = runDDTreeBuild(
+        logits, rootTokenIds, baseLengths, kBatchSize, kProposalDepthSize, kVocabSize, kVerifySize, kCandidateFanout);
+    bool branchHasChild{false};
+    for (int32_t nodeIdx = 1; nodeIdx < unrestricted.validCounts[0]; ++nodeIdx)
+    {
+        branchHasChild |= unrestricted.nodeTokenIds[unrestricted.parentIds[nodeIdx]] == 2;
+    }
+    EXPECT_TRUE(branchHasChild) << "test logits must make the unrestricted builder expand the rank-2 node";
+
+    DDTreeBuildOutputs const actual = runDDTreeBuild(logits, rootTokenIds, baseLengths, kBatchSize,
+        kProposalDepthSize, kVocabSize, kVerifySize, kCandidateFanout, /*firstCandidateLogitsRow=*/1,
+        /*depthConfidence=*/{}, /*survivalThreshold=*/0.0F, /*tokenMajorLogits=*/false, /*chainParentsOnly=*/true);
+    DDTreeReference const expected = buildReference(logits, rootTokenIds, baseLengths, kBatchSize,
+        kProposalDepthSize, kVocabSize, kVerifySize, kCandidateFanout, /*firstCandidateLogitsRow=*/1,
+        /*depthConfidence=*/{}, /*survivalThreshold=*/0.0F, /*chainParentsOnly=*/true);
+    validateBuildAgainstReference(actual, expected, kBatchSize, kVerifySize);
+
+    ASSERT_EQ(actual.validCounts[0], kVerifySize);
+    std::set<int32_t> const chainTokens{42, 1, 4};
+    std::set<int32_t> tokens;
+    for (int32_t nodeIdx = 1; nodeIdx < kVerifySize; ++nodeIdx)
+    {
+        tokens.insert(actual.nodeTokenIds[nodeIdx]);
+        EXPECT_EQ(chainTokens.count(actual.nodeTokenIds[actual.parentIds[nodeIdx]]), 1U)
+            << "node " << nodeIdx << " hangs under a non-chain node";
+    }
+    EXPECT_EQ(tokens, (std::set<int32_t>{1, 2, 4, 5, 7, 8}));
 }
 
 // With candidateFanout = 1 the greedy builder must reproduce the linear MTP

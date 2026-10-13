@@ -83,6 +83,10 @@ struct DDTreeBuildParams
     size_t workspaceSize;               //!< Workspace size in bytes.
     cudaStream_t stream;                //!< CUDA stream for kernel launches.
     int32_t firstCandidateLogitsRow{1}; //!< Logits row used for depth-1 children.
+    //! Only the top-1 chain (root and slot-0 children of chain nodes) may have children. For chained
+    //! drafters (Gemma 4 MTP) whose depth-d logits are computed after the depth-(d-1) top-1 token, a child
+    //! of any other node would be drafted from logits of a different prefix; its siblings stay valid leaves.
+    bool chainParentsOnly{false};
 };
 
 //! Returns temporary workspace size required by ddtreeBuild().

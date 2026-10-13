@@ -394,7 +394,7 @@ __global__ void buildDDTreeKernel(int32_t const* __restrict__ rootTokenIds, int3
     int32_t* __restrict__ validCounts, int32_t* __restrict__ verifyTokenIds, int32_t* __restrict__ verifyPositionIds,
     int32_t* __restrict__ packedAncestorMask, int8_t* __restrict__ ancestorMask, int32_t* __restrict__ contextLengths,
     int64_t* __restrict__ selectTokenIndices, int32_t dflashBlockSize, int32_t verifySize, int32_t candidateTopK,
-    int32_t firstCandidateLogitsRow)
+    int32_t firstCandidateLogitsRow, bool chainParentsOnly)
 {
     int32_t const batchIdx = blockIdx.x;
     int32_t const tid = threadIdx.x;
@@ -404,6 +404,7 @@ __global__ void buildDDTreeKernel(int32_t const* __restrict__ rootTokenIds, int3
     int32_t const ancestorMaskOffset = batchIdx * verifySize * verifySize;
 
     extern __shared__ int32_t nextCandidateSlot[];
+    int32_t* onChain = nextCandidateSlot + verifySize;
     __shared__ int32_t sValidCount;
     __shared__ int32_t sStopBuild;
     __shared__ float sBestScores[kBuildBlockSize];
@@ -440,6 +441,7 @@ __global__ void buildDDTreeKernel(int32_t const* __restrict__ rootTokenIds, int3
         verifyPositionIds[treeOffset + nodeIdx] = 0;
         selectTokenIndices[treeOffset + nodeIdx] = treeOffset + nodeIdx;
         nextCandidateSlot[nodeIdx] = 0;
+        onChain[nodeIdx] = nodeIdx == 0;
     }
     for (int32_t maskIdx = tid; maskIdx < verifySize * packedMaskLen; maskIdx += blockDim.x)
     {
@@ -478,7 +480,7 @@ __global__ void buildDDTreeKernel(int32_t const* __restrict__ rootTokenIds, int3
         for (int32_t parentIdx = tid; parentIdx < validCount; parentIdx += blockDim.x)
         {
             int32_t const parentDepth = nodeDepths[treeOffset + parentIdx];
-            if (parentDepth >= maxProposalDepth)
+            if (parentDepth >= maxProposalDepth || (chainParentsOnly && onChain[parentIdx] == 0))
             {
                 continue;
             }
@@ -556,6 +558,7 @@ __global__ void buildDDTreeKernel(int32_t const* __restrict__ rootTokenIds, int3
                 bestToken = sBestTokens[0];
                 bestScore = sBestScores[0];
                 nextCandidateSlot[bestParent] += 1;
+                onChain[outNodeIdx] = onChain[bestParent] != 0 && bestSlot == 0;
                 nodeTokenIds[treeOffset + outNodeIdx]
                     = draftVocabMappingTable == nullptr ? bestToken : draftVocabMappingTable[bestToken];
                 nodeDepths[treeOffset + outNodeIdx] = nodeDepths[treeOffset + bestParent] + 1;
@@ -764,7 +767,7 @@ void ddtreeBuild(DDTreeBuildParams const& params)
     float const confSurvivalFloorLog = params.inputs.confidenceSurvivalThreshold > 0.0F
         ? logf(params.inputs.confidenceSurvivalThreshold)
         : -INFINITY;
-    size_t const buildSharedBytes = static_cast<size_t>(verifySize) * sizeof(int32_t);
+    size_t const buildSharedBytes = 2 * static_cast<size_t>(verifySize) * sizeof(int32_t);
     buildDDTreeKernel<<<batchSize, kBuildBlockSize, buildSharedBytes, params.stream>>>(
         rootTokenIds.dataPointer<int32_t>(), baseLengths.dataPointer<int32_t>(), buildWorkspace.candidateTokenIds,
         buildWorkspace.candidateLogProbs, depthConfidencePtr, confSurvivalFloorLog, draftVocabMappingTablePtr,
@@ -772,7 +775,8 @@ void ddtreeBuild(DDTreeBuildParams const& params)
         nodeScores.dataPointer<float>(), validCounts.dataPointer<int32_t>(), verifyTokenIds.dataPointer<int32_t>(),
         verifyPositionIds.dataPointer<int32_t>(), packedAncestorMask.dataPointer<int32_t>(),
         ancestorMask.dataPointer<int8_t>(), contextLengths.dataPointer<int32_t>(),
-        selectTokenIndices.dataPointer<int64_t>(), dflashBlockSize, verifySize, candidateTopK, firstCandidateLogitsRow);
+        selectTokenIndices.dataPointer<int64_t>(), dflashBlockSize, verifySize, candidateTopK, firstCandidateLogitsRow,
+        params.chainParentsOnly);
     CUDA_CHECK(cudaGetLastError());
 }
 

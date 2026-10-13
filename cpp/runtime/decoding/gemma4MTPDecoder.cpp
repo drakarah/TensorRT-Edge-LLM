@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -667,13 +668,19 @@ bool Gemma4MTPDecoder::buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream
         mRuntime.base.pipelineIO.selectTokenIndices.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
 
     Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
-    kernel::DDTreeBuildParams const buildParams{{mStackedDraftLogits, mSeedTokenIds, baseKVCacheLengths, nullptr},
+    kernel::DDTreeBuildParams buildParams{{mStackedDraftLogits, mSeedTokenIds, baseKVCacheLengths, nullptr},
         {mTreeTokenIds, mRuntime.base.pipelineIO.specTreeDepths, mRuntime.base.pipelineIO.specTreeParentIds,
             mTreeNodeScores, mValidCounts, mRuntime.preprocess.idsInput, mRuntime.base.pipelineIO.specDecodePositionIds,
             mRuntime.base.pipelineIO.packedAttentionMask, mVerifyTreeMask, mRuntime.base.pipelineIO.contextLengths,
             mRuntime.base.pipelineIO.selectTokenIndices},
         config.draftingTopK, mTreeBuildWorkspace.rawPointer(),
         static_cast<size_t>(mTreeBuildWorkspace.getMemoryCapacity()), stream};
+    // The draft chain follows the top-1 token, so deeper logits only hold for the top-1 chain.
+    static bool const chainParentsOnly = [] {
+        char const* env = std::getenv("EDGELLM_MTP_CHAIN_TREE");
+        return env != nullptr && env[0] == '1';
+    }();
+    buildParams.chainParentsOnly = chainParentsOnly;
     kernel::ddtreeBuild(buildParams);
     return true;
 }
