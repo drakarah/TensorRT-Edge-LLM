@@ -257,3 +257,53 @@ def test_gemma4_eagle_default_hidden_output_survives_onnx_export(tmp_path):
         "physical_tokens"
     assert hidden_output.type.tensor_type.shape.dim[1].dim_value == \
         3 * config.hidden_size
+
+
+def _ordered_embedding_assistant() -> Gemma4AssistantForCausalLM:
+    config = _config()
+    config.backbone_hidden_size = config.hidden_size
+    config.use_ordered_embeddings = True
+    config.num_centroids = 8
+    config.centroid_intermediate_top_k = 3
+    model = Gemma4AssistantForCausalLM(config)
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.copy_(torch.randn(parameter.shape, generator=generator))
+        model.masked_embedding.token_ordering.copy_(
+            torch.randperm(config.vocab_size, generator=generator))
+    return model
+
+
+def test_gemma4_assistant_centroid_ordered_head_matches_row_gather():
+    model = _ordered_embedding_assistant()
+    embedder = model.masked_embedding
+    lm_head_weight = model.model.embed_tokens.weight
+    hidden_states = torch.randn(5, model.config.hidden_size).half()
+
+    embedder.prepare_for_export()
+    row_gather = embedder(hidden_states, lm_head_weight)
+    embedder.prepare_for_export(lm_head_weight)
+    block_gather = embedder(hidden_states, lm_head_weight)
+
+    assert torch.equal(block_gather, row_gather)
+    # Only top-k centroids' tokens survive the mask.
+    kept = (block_gather > -65504.0).sum(-1)
+    assert torch.equal(
+        kept,
+        torch.full((5, ), embedder.centroid_intermediate_top_k *
+                   embedder.vocab_size_per_centroid))
+
+
+def test_gemma4_assistant_onnx_reads_centroid_ordered_head(tmp_path):
+    output = tmp_path / "gemma4-assistant-ordered-head.onnx"
+
+    _export_model(_ordered_embedding_assistant(), str(output), optimize=False)
+
+    initializers = {
+        tensor.name
+        for tensor in onnx.load(str(output),
+                                load_external_data=False).graph.initializer
+    }
+    assert any("ordered_lm_head" in name for name in initializers)
+    assert not any("embed_tokens" in name for name in initializers)

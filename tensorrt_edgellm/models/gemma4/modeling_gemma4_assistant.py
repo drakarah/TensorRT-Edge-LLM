@@ -326,8 +326,13 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
                              torch.empty(self.vocab_size, dtype=torch.long))
         self.register_buffer("token_to_centroid",
                              torch.empty(self.vocab_size, dtype=torch.long))
+        # LM-head rows in centroid order, filled by prepare_for_export.
+        self.register_buffer("ordered_lm_head",
+                             torch.empty(0),
+                             persistent=False)
 
-    def prepare_for_export(self) -> None:
+    def prepare_for_export(self,
+                           lm_head_weight: torch.Tensor | None = None) -> None:
         token_ordering = self.token_ordering.detach().to(torch.long).cpu()
         # forward() scatters candidate logits by token id; that is only
         # equivalent to the per-token centroid mask if every token belongs to
@@ -344,6 +349,14 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         token_to_centroid[token_ordering] = cluster_ids
         self.token_to_centroid.copy_(
             token_to_centroid.to(self.token_to_centroid.device))
+        if lm_head_weight is not None:
+            # Each centroid's rows become one contiguous block, so forward()
+            # gathers k blocks (64 KB each for E4B) instead of k * 128
+            # scattered rows; the draft graph then no longer needs the
+            # original table, so the engine holds one copy as before.
+            self.ordered_lm_head = lm_head_weight.detach()[
+                token_ordering.to(lm_head_weight.device)].view(
+                    self.num_centroids, self.vocab_size_per_centroid, -1)
 
     def forward(self, hidden_states: torch.Tensor,
                 lm_head_weight: torch.Tensor) -> torch.Tensor:
@@ -362,10 +375,14 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         centroid_tokens = self.token_ordering.view(
             self.num_centroids, self.vocab_size_per_centroid)
         candidate_ids = centroid_tokens[top_k_indices].flatten(-2)
-        candidate_rows = F.embedding(candidate_ids,
-                                     lm_head_weight.to(hidden_states.dtype))
-        candidate_logits = torch.matmul(
-            candidate_rows, hidden_states.unsqueeze(-1)).squeeze(-1)
+        if self.ordered_lm_head.numel():
+            candidate_rows = self.ordered_lm_head.to(
+                hidden_states.dtype)[top_k_indices].flatten(-3, -2)
+        else:
+            candidate_rows = F.embedding(
+                candidate_ids, lm_head_weight.to(hidden_states.dtype))
+        candidate_logits = (candidate_rows *
+                            hidden_states.unsqueeze(-2)).sum(-1)
 
         logits = hidden_states.new_full(
             (*hidden_states.shape[:-1], self.vocab_size), -65504.0)
@@ -465,7 +482,8 @@ class Gemma4AssistantForCausalLM(nn.Module):
         config = self.config
         num_layers = len(self.model.layers)
         if self.masked_embedding is not None:
-            self.masked_embedding.prepare_for_export()
+            self.masked_embedding.prepare_for_export(
+                self.model.embed_tokens.weight)
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
