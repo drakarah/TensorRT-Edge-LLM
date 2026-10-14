@@ -556,12 +556,21 @@ int CuteDslGDNRunner::runDecodeMTP(GDNParams const& params, cudaStream_t stream)
     gdn_decode_mtp_cache_Tensor_dt_bias_t dt_biasTensor{};
     SET_1D_TENSOR(dt_biasTensor, params.dt_bias, hv);
 
-    // h0_source : [n, hv, k, v]  (batch-dense, in-place updated)
+    // h0_source : [state_pool_rows, hv, k, v] resident state pool, read-only (the runtime commits the accepted
+    // intermediate state). state_indices : [n] pool row per sequence; an out-of-range row starts from a zero state.
+    if (params.state_indices == nullptr || params.state_pool_rows < 1)
+    {
+        LOG_ERROR("CuTe DSL GDN MTP: state_indices / state_pool_rows required.");
+        return -1;
+    }
     gdn_decode_mtp_cache_Tensor_h0_source_t h0Tensor{};
     h0Tensor.data = params.h0_source;
-    h0Tensor.dynamic_shapes[0] = n;
+    h0Tensor.dynamic_shapes[0] = params.state_pool_rows;
     h0Tensor.dynamic_shapes[1] = hv;
     h0Tensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
+
+    gdn_decode_mtp_cache_Tensor_state_indices_t stateIndicesTensor{};
+    SET_1D_TENSOR(stateIndicesTensor, params.state_indices, n);
 
     // o : [n, seq_len, hv, v]
     gdn_decode_mtp_cache_Tensor_o_t oTensor{};
@@ -584,7 +593,7 @@ int CuteDslGDNRunner::runDecodeMTP(GDNParams const& params, cudaStream_t stream)
     intermTensor.dynamic_strides[2] = static_cast<int64_t>(k) * v;
     intermTensor.dynamic_strides[3] = static_cast<int64_t>(v);
 
-    return cute_dsl_gdn_decode_mtp_cache_wrapper(&sMTPDecodeCacheModule.module, &h0Tensor, &qTensor, &kTensor, &vTensor,
+    return cute_dsl_gdn_decode_mtp_cache_wrapper(&sMTPDecodeCacheModule.module, &h0Tensor, &stateIndicesTensor, &qTensor, &kTensor, &vTensor,
         &aTensor, &bTensor, &A_logTensor, &dt_biasTensor, &oTensor, &intermTensor, seq_len, stream);
 }
 

@@ -588,7 +588,9 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     }
 #endif
 
-    if (verifyActive || diffusionDenoise)
+    // Linear MTP verify reads the resident pool rows directly and never writes them (the accepted step's
+    // intermediate state is committed by the runtime), so it needs no transactional copy of the state.
+    if ((verifyActive && !mtpActive) || diffusionDenoise)
     {
         if (workspace == nullptr)
         {

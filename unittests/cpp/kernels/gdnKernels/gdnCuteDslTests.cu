@@ -1324,6 +1324,19 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
     for (size_t i = 0; i < h0Len; ++i)
         h_h0[i] = 0.01f * (1.f + static_cast<float>(i % 10));
 
+    // Resident pool: sequence i lives in row n - i; row 0 belongs to no sequence. Verify reads the rows through
+    // state_indices and must leave the whole pool untouched (the runtime commits the accepted step's snapshot).
+    int32_t const poolRows = n + 1;
+    size_t const rowLen = static_cast<size_t>(hv) * k * v;
+    std::vector<int32_t> h_indices(n);
+    std::vector<float> h_pool(static_cast<size_t>(poolRows) * rowLen, 7.f);
+    for (int32_t i = 0; i < n; ++i)
+    {
+        h_indices[i] = n - i;
+        std::copy(h_h0.begin() + i * rowLen, h_h0.begin() + (i + 1) * rowLen, h_pool.begin() + h_indices[i] * rowLen);
+    }
+    size_t const poolBytes = h_pool.size() * sizeof(float);
+
     // FP16 converted inputs.
     std::vector<half> h_q_h(qkvLen), h_k_h(qkvLen), h_v_h(vLen);
     std::vector<half> h_a_h(abLen), h_b_h(abLen), h_dt_h(hv);
@@ -1359,7 +1372,10 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
     CUDA_CHECK(cudaMalloc(&d_b, abBytes));
     CUDA_CHECK(cudaMalloc(&d_A_log, A_logBytes));
     CUDA_CHECK(cudaMalloc(&d_dt, dtBytes));
-    CUDA_CHECK(cudaMalloc(&d_h0, h0Bytes));
+    CUDA_CHECK(cudaMalloc(&d_h0, poolBytes));
+    int32_t* d_indices = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_indices, n * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemcpy(d_indices, h_indices.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc(&d_o, oBytes));
     CUDA_CHECK(cudaMalloc(&d_interm, intermBytes));
 
@@ -1370,7 +1386,7 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
     CUDA_CHECK(cudaMemcpy(d_b, h_b_h.data(), abBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_A_log, h_A_log.data(), A_logBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_dt, h_dt_h.data(), dtBytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_h0, h_h0.data(), h0Bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_h0, h_pool.data(), poolBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_o, 0, oBytes));
     CUDA_CHECK(cudaMemset(d_interm, 0, intermBytes));
 
@@ -1384,6 +1400,8 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
     params.A_log = d_A_log;
     params.dt_bias = d_dt;
     params.h0_source = d_h0;
+    params.state_indices = d_indices;
+    params.state_pool_rows = poolRows;
     params.o = d_o;
     params.intermediate_states = d_interm;
     params.use_mtp = true;
@@ -1402,10 +1420,10 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
 
     // Copy outputs back.
     std::vector<half> h_o_half(oLen);
-    std::vector<float> h_h0_out(h0Len);
+    std::vector<float> h_pool_out(h_pool.size());
     std::vector<float> h_interm_out(intermLen, 0.f);
     CUDA_CHECK(cudaMemcpy(h_o_half.data(), d_o, oBytes, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_h0_out.data(), d_h0, h0Bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_pool_out.data(), d_h0, poolBytes, cudaMemcpyDeviceToHost));
     if (with_cache)
         CUDA_CHECK(cudaMemcpy(h_interm_out.data(), d_interm, intermBytes, cudaMemcpyDeviceToHost));
 
@@ -1430,12 +1448,8 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
             << "MTP output mismatch at " << i << ": got=" << h_o[i] << " ref=" << o_ref[i];
     }
 
-    // Verify final h-state.
-    for (size_t i = 0; i < h0Len; ++i)
-    {
-        EXPECT_TRUE(isclose(h_h0_out[i], h0_ref[i], rtol, atol))
-            << "MTP h0 mismatch at " << i << ": got=" << h_h0_out[i] << " ref=" << h0_ref[i];
-    }
+    // The resident pool is read-only for verify.
+    EXPECT_EQ(h_pool_out, h_pool) << "MTP verify modified the resident state pool";
 
     // Verify intermediate states (rollback support).
     if (with_cache)
@@ -1458,6 +1472,7 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
     CUDA_CHECK(cudaFree(d_h0));
     CUDA_CHECK(cudaFree(d_o));
     CUDA_CHECK(cudaFree(d_interm));
+    CUDA_CHECK(cudaFree(d_indices));
 }
 
 } // namespace

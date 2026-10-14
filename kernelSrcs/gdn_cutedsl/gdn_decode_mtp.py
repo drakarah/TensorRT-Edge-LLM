@@ -90,8 +90,9 @@ AOT_PLACEHOLDER_T   = 8     # representative T for compilation
 
 # Register-resident verify kernel (sm_80-class GPUs; Jetson Orin is sm_87), same layout as gdn_prefill.py: one block
 # per (batch, value head, 32-column V tile), 4 warps of 8 V columns, each thread keeps 32 state rows of one column in
-# registers. The state is read from h0_source once and written back once; each step writes only its output row and,
-# when caching, its rollback snapshot. (The previous kernel reloaded and stored every state tile from global memory
+# registers. The state is read once from its resident pool row (h0_source[state_indices[n]]); each step writes only its
+# output row and, when caching, its rollback snapshot. The caching (verify) variant never writes the pool: the runtime
+# commits the accepted step's snapshot (mtpStateScatterKernel), so no pre-verify copy of the state is needed. (The previous kernel reloaded and stored every state tile from global memory
 # for every step and V tile.) One warp per step stages the step's L2-normalised k, scaled q, gates and V tile.
 REG_TILE_V = 32
 REG_NUM_WARPS = 4
@@ -108,7 +109,8 @@ def _define_mtp_kernels():
 
     @cute.kernel
     def gdn_mtp_kernel_warpspec(
-        h0_source: cute.Tensor,           # [n, hv, K, V] FP32  (in-place updated)
+        h0_source: cute.Tensor,           # [pool_rows, hv, K, V] FP32 resident state pool
+        state_indices: cute.Tensor,       # [n] Int32: pool row of each sequence (out of range = zero state)
         num_v_tiles: Int32,
         q: cute.Tensor,                   # [n, seq_len, h, K] FP16
         k: cute.Tensor,                   # [n, seq_len, h, K] FP16
@@ -189,11 +191,19 @@ def _define_mtp_kernels():
                 sBeta[t] = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-cutlass.Float32(b[i_n, t, i_hv])))
         cute.arch.barrier()
 
+        pool_row = state_indices[i_n]
+        valid_row = Int32(0)
+        if pool_row >= 0:
+            if pool_row < h0_source.layout.shape[0]:
+                valid_row = Int32(1)
         rH = cute.make_rmem_tensor((REG_K_PER_THREAD,), cutlass.Float32)
         rK = cute.make_rmem_tensor((REG_K_PER_THREAD,), cutlass.Float32)
         rQ = cute.make_rmem_tensor((REG_K_PER_THREAD,), cutlass.Float32)
         for i in cutlass.range_constexpr(REG_K_PER_THREAD):
-            rH[i] = h0_source[(i_n, i_hv, k_base + i, v_global)]
+            rH[i] = cutlass.Float32(0.0)
+        if valid_row != 0:
+            for i in cutlass.range_constexpr(REG_K_PER_THREAD):
+                rH[i] = h0_source[(pool_row, i_hv, k_base + i, v_global)]
 
         for t in range(seq_len):
             r_g = sG[t]
@@ -220,8 +230,10 @@ def _define_mtp_kernels():
                 for i in cutlass.range_constexpr(REG_K_PER_THREAD):
                     intermediate_states[i_n, t, i_hv, k_base + i, v_global] = rH[i]
 
-        for i in cutlass.range_constexpr(REG_K_PER_THREAD):
-            h0_source[(i_n, i_hv, k_base + i, v_global)] = rH[i]
+        if cutlass.const_expr(not cache_intermediate_states):
+            if valid_row != 0:
+                for i in cutlass.range_constexpr(REG_K_PER_THREAD):
+                    h0_source[(pool_row, i_hv, k_base + i, v_global)] = rH[i]
 
     return (gdn_mtp_kernel_warpspec,)
 
@@ -249,6 +261,7 @@ def _create_jit_mtp_wrappers():
     @cute.jit
     def run_mtp(
         h0_source: cute.Tensor,
+        state_indices: cute.Tensor,
         q: cute.Tensor,
         k: cute.Tensor,
         v: cute.Tensor,
@@ -267,13 +280,14 @@ def _create_jit_mtp_wrappers():
         T_MAX: cutlass.Constexpr[int],
         stream: cuda.CUstream,
     ):
-        n_batch = h0_source.layout.shape[0]
+        n_batch = q.layout.shape[0]
         hv_dim = v.layout.shape[2]
         num_v_tiles = cute.ceil_div(v.layout.shape[3], REG_TILE_V)
         smem_bytes = 4 * (2 * T_MAX * TILE_K + T_MAX * REG_TILE_V + 2 * T_MAX) + 5 * 16
 
         gdn_mtp_kernel_warpspec(
             h0_source,
+            state_indices,
             num_v_tiles,
             q, k, v, a, b,
             A_log, dt_bias,
@@ -326,6 +340,7 @@ def _make_mtp_placeholder_tensors(n, h, hv, k, v, seq_len, with_cache):
         "A_log":         cp.zeros(hv,                    dtype=cp.float32),
         "dt_bias":       cp.zeros(hv,                    dtype=dt),
         "h0_source":     cp.zeros((n, hv, k, v),         dtype=cp.float32),
+        "state_indices": cp.arange(n,                    dtype=cp.int32),
         "o":             cp.zeros((n, seq_len, hv, v),   dtype=dt),
     }
     # Always allocate a full 5D tensor so MLIR type matches 5D store coordinates
@@ -385,6 +400,7 @@ def _to_mtp_cute_tensors(ph, with_cache):
         "A_log":      wrap(ph["A_log"], leading_dim=0),
         "dt_bias":    wrap(ph["dt_bias"], leading_dim=0),
         "h0_source":  _mark_h0_source_dynamic(from_dlpack(ph["h0_source"], assumed_align=32)),
+        "state_indices": wrap(ph["state_indices"], leading_dim=0).mark_compact_shape_dynamic(mode=0),
         "o":          wrap(ph["o"]),
         "intermediate_states": _mark_intermediate_states_dynamic(ph["intermediate_states"], with_cache),
     }
@@ -416,6 +432,7 @@ def _make_aot_mtp_cute_tensors(n, h, hv, k, v, seq_len):
         "A_log": compact(cutlass.Float32, (hv,)).mark_layout_dynamic(leading_dim=0),
         "dt_bias": compact(cutlass.Float16, (hv,)).mark_layout_dynamic(leading_dim=0),
         "h0_source": _mark_h0_source_dynamic(h0_source),
+        "state_indices": compact(cutlass.Int32, (n,)).mark_layout_dynamic(leading_dim=0),
         "o": compact(cutlass.Float16, (n, seq_len, hv, v)).mark_layout_dynamic(leading_dim=3),
         "intermediate_states": (
             intermediate_states.mark_layout_dynamic(leading_dim=4)
@@ -451,6 +468,7 @@ def _compile_mtp(
     compiled = cute.compile(
         run_mtp,
         t["h0_source"],
+        t["state_indices"],
         t["q"], t["k"], t["v"], t["a"], t["b"],
         t["A_log"], t["dt_bias"],
         t["o"],
@@ -612,6 +630,7 @@ def _run_mtp_decode_jit(
 
     compiled(
         wrap(h0_cp, 32),
+        wrap(cp.arange(n, dtype=cp.int32)),
         wrap(q_cp), wrap(k_cp), wrap(v_cp),
         wrap(a_cp), wrap(b_cp),
         wrap(A_log_cp), wrap(dt_bias_cp),
