@@ -65,6 +65,9 @@ def _text_calib_dataloader(tokenizer,
     ``text_dataset`` is a text generator function; the first ``num_samples``
     non-empty strings it yields are tokenized.
     """
+    # EDGELLM_QUANT_MAX_LENGTH: shorter calibration sequences for memory-bound boards (a 32 GB
+    # Jetson cannot hold the 512-token full-vocabulary AWQ search for a 248k-vocabulary LM head).
+    max_length = int(os.environ.get("EDGELLM_QUANT_MAX_LENGTH", max_length))
     texts = list(islice(text_dataset(), num_samples))
     if not texts:
         raise ValueError(
@@ -174,6 +177,9 @@ def _multimodal_calib_dataloader(processor,
     Drops down to 128 samples at batch_size=1 — VLM calibration is
     GPU-memory bound; small batches are safest.
     """
+    # EDGELLM_QUANT_MAX_LENGTH: shorter calibration sequences for memory-bound boards (a 32 GB
+    # Jetson cannot hold the 512-token full-vocabulary AWQ search for a 248k-vocabulary LM head).
+    max_length = int(os.environ.get("EDGELLM_QUANT_MAX_LENGTH", max_length))
     batches: list[dict[str, Any]] = []
     for image, question in image_dataset():
         messages = [{

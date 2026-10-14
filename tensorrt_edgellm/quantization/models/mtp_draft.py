@@ -552,7 +552,11 @@ def quantize_mtp_from_base(
         for data in tqdm(loader, desc="Calibrating MTP draft"):
             data = data.to(device)
             with torch.no_grad():
-                outputs = base_model(data, output_hidden_states=True)
+                # Only the last hidden state is used: keep one logits row instead of
+                # batch x seq x vocab (16 x 512 x 248k for Qwen3.5 is > 4 GB, which
+                # does not fit next to the model on a 32 GB Jetson).
+                outputs = base_model(data, output_hidden_states=True,
+                                     logits_to_keep=1)
             last_hidden = outputs["hidden_states"][-1]
             draft(data, last_hidden)
 
