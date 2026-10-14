@@ -60,6 +60,8 @@ public:
 
     //! Number of reused prefix tokens for a slot (== the logical prefill start offset).
     int32_t reuseTokenLength(int32_t slot) const noexcept;
+    //! See ContextCacheCoordinator::hybridSharedPrefixLength.
+    int32_t hybridSharedPrefixLength(int32_t slot);
 
     enum class AdmitSequenceStatus : uint8_t
     {

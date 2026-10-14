@@ -378,6 +378,16 @@ def _read_bundle_builder_config(bundle_dir: str) -> dict:
     return {}
 
 
+def _bundle_num_linear_attn_layers(bundle_dir: str) -> int:
+    """Number of linear-attention layers of the bundle's base model."""
+    for filename in ("config.json", "base_config.json"):
+        cfg_path = os.path.join(bundle_dir, filename)
+        if os.path.exists(cfg_path):
+            with open(cfg_path) as f:
+                return int(json.load(f).get("num_linear_attn_layers", 0) or 0)
+    return 0
+
+
 @dataclass(frozen=True)
 class _SpecDecodeRuntimeOptions:
     """Drafting shape resolved from one speculative engine bundle."""
@@ -839,8 +849,15 @@ def _native_context_cache_config(rt, config: ContextCacheConfig):
 
 
 def _set_context_cache_request_policies(rt, request,
-                                        params: SamplingParams) -> None:
-    """Map the two public request controls onto native cache policies."""
+                                        params: SamplingParams,
+                                        prefill_state_only: bool = False
+                                        ) -> None:
+    """Map the two public request controls onto native cache policies.
+
+    ``prefill_state_only`` forces the PREFILL_STATE_ONLY commit: hybrid
+    (linear-attention) bases with a draft model can only publish a checkpoint
+    at the prefill endpoint, not after generated tokens.
+    """
     if not isinstance(params.reuse_context, bool):
         raise ValueError("reuse_context must be boolean")
     if not isinstance(params.cache_generated_tokens, bool):
@@ -850,7 +867,7 @@ def _set_context_cache_request_policies(rt, request,
         if params.reuse_context else rt.ContextCacheLookupPolicy.BYPASS)
     request.context_cache_commit_policy = (
         rt.ContextCacheCommitPolicy.INCLUDING_GENERATED_TOKENS
-        if params.cache_generated_tokens else
+        if params.cache_generated_tokens and not prefill_state_only else
         rt.ContextCacheCommitPolicy.PREFILL_STATE_ONLY)
 
 
@@ -885,6 +902,8 @@ class LLM:
 
     #: Selects the HTTP contract without a hierarchy of capability flags.
     runtime_kind = "chat"
+    #: Base model has linear-attention layers (set from the bundle at load).
+    _hybrid_base = False
 
     def __init__(
         self,
@@ -1053,6 +1072,10 @@ class LLM:
 
         self._bundle_dir = self._layout.root
         builder_config = _read_bundle_builder_config(self._bundle_dir)
+        # Hybrid base (linear-attention layers, e.g. Qwen3.5 Gated DeltaNet):
+        # with a draft model the context cache only takes prefill-endpoint
+        # checkpoints (see _set_context_cache_request_policies).
+        self._hybrid_base = _bundle_num_linear_attn_layers(self._bundle_dir) > 0
         self._max_input_len = _engine_config_value(builder_config,
                                                    "max_input_len",
                                                    self._max_input_len)
@@ -1356,8 +1379,10 @@ class LLM:
         # checkpoint must land on a turn boundary the next render reproduces.
         # A negative value asks the native renderer/tokenizer to derive it.
         cache_config = getattr(self, "_context_cache_config", None)
+        prefill_state_only = self._hybrid_base and self.has_draft_model
         derive_replay_tail = (cache_config is not None and cache_config.enabled
-                              and not params.cache_generated_tokens
+                              and (prefill_state_only
+                                   or not params.cache_generated_tokens)
                               and self.has_draft_model and apply_chat_template
                               and add_generation_prompt)
         replay_tail_length = -1 if derive_replay_tail else 0
@@ -1395,7 +1420,8 @@ class LLM:
         request.disable_spec_decode = params.disable_spec_decode
         request.skip_special_tokens = params.skip_special_tokens
         request.num_logprobs = params.num_logprobs
-        _set_context_cache_request_policies(self._rt, request, params)
+        _set_context_cache_request_policies(self._rt, request, params,
+                                            prefill_state_only)
         request.context_cache_replay_tail_length = replay_tail_length
         return request
 

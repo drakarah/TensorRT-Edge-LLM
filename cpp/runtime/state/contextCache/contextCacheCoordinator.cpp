@@ -294,6 +294,7 @@ struct ContextCacheCoordinator::RequestHandle::Impl
         BlockKeyExtras keyExtras;
         std::vector<Hash128> perPositionMediaHash;
         int32_t reuseTokenLength{};
+        int32_t hybridSharedPrefixTokens{};
         ContextCacheLookupPolicy lookupPolicy{ContextCacheLookupPolicy::kUseCache};
         ContextCacheCommitPolicy commitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
         int32_t replayTailLength{};
@@ -1023,6 +1024,28 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
     };
 
     ReusePlan plan = makePlan(lookupPolicy);
+    if (usesCheckpointReuse())
+    {
+        if (lookupPolicy == ContextCacheLookupPolicy::kUseCache)
+        {
+            for (std::vector<BlockHash> const& recent : mRecentInputBlockHashes)
+            {
+                size_t const limit = std::min(recent.size(), hashes.size());
+                size_t n = 0;
+                while (n < limit && recent[n] == hashes[n])
+                {
+                    ++n;
+                }
+                plan.hybridSharedPrefixTokens
+                    = std::max(plan.hybridSharedPrefixTokens, static_cast<int32_t>(n) * kTOKENS_PER_PAGE);
+            }
+        }
+        mRecentInputBlockHashes.push_back(hashes);
+        if (mRecentInputBlockHashes.size() > kRECENT_INPUT_HISTORY)
+        {
+            mRecentInputBlockHashes.pop_front();
+        }
+    }
     bool forcedCold = false;
     LOG_INFO("Context cache lookup: %d matched pages, %d matched tokens, %zu total hashes, mediaHash=%s",
         static_cast<int32_t>(plan.basePageBindings.size()), plan.matchedTokenLength, hashes.size(),
@@ -1068,6 +1091,7 @@ bool ContextCacheCoordinator::acquireIntoRequest(RequestHandle::Impl& request,
     sequence.keyExtras = admission.keyExtras;
     sequence.perPositionMediaHash = admission.perPositionMediaHash;
     sequence.reuseTokenLength = acquired.plan.reuseTokenLength;
+    sequence.hybridSharedPrefixTokens = acquired.plan.hybridSharedPrefixTokens;
     sequence.lookupPolicy = lookupPolicy;
     sequence.commitPolicy = commitPolicy;
     sequence.replayTailLength = replayTailLength;
@@ -1180,6 +1204,7 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         sequence.keyExtras = sequenceAdmission.keyExtras;
         sequence.perPositionMediaHash = sequenceAdmission.perPositionMediaHash;
         sequence.reuseTokenLength = acquired.plan.reuseTokenLength;
+        sequence.hybridSharedPrefixTokens = acquired.plan.hybridSharedPrefixTokens;
         sequence.lookupPolicy = lookupPolicy;
         sequence.commitPolicy = admission.commitPolicy;
         sequence.replayTailLength = admission.replayTailLength;
@@ -1849,6 +1874,14 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridMtpEndpoint(
         "Hybrid+MTP endpoint publication requires a Hybrid+MTP deployment with snapshot storage");
     return checkedImpl(request).publicationPolicy->publishMtpBoundary(
         request, slot, residentStateLength, baseHiddenStates, boundaryHiddenRow);
+}
+
+int32_t ContextCacheCoordinator::hybridSharedPrefixLength(RequestHandle& request, int32_t slot)
+{
+    auto& impl = checkedImpl(request);
+    ELLM_CHECK(slot >= 0 && slot < static_cast<int32_t>(impl.sequences.size()),
+        "Hybrid shared-prefix query slot is outside the active batch");
+    return impl.sequences[static_cast<size_t>(slot)].hybridSharedPrefixTokens;
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::restoreHybridMtpBoundaryHidden(

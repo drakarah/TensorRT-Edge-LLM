@@ -318,6 +318,11 @@ bool ContextCacheRequest::publishHybridMtpEndpoint(
         "Hybrid+MTP endpoint publication");
 }
 
+int32_t ContextCacheRequest::hybridSharedPrefixLength(int32_t slot)
+{
+    return mCoordinator.hybridSharedPrefixLength(mRequest, slot);
+}
+
 bool ContextCacheRequest::restoreHybridMtpBoundaryHidden(int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow)
 {
     return contextCacheOperationSucceeded(

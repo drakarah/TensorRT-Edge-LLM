@@ -53,6 +53,8 @@ public:
     bool hasContextReuse() const noexcept;
     std::vector<int32_t> const* prefillStarts() const noexcept;
     int32_t reuseTokenLength(int32_t slot) const;
+    //! Longest page-aligned prefix shared with a cached hybrid record (context reuse only).
+    int32_t hybridSharedPrefixLength(int32_t slot);
 
     bool publishHybridMtpEndpoint(
         int32_t slot, int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow);

@@ -337,7 +337,11 @@ bool LLMBuilder::build()
     bool const attentionOnlyReusableSpec = mNumLinearAttnLayers == 0
         && (mode == "eagle3" || mode == "gemma4_mtp" || mode == "dflash" || mode == "dflash2" || mode == "jetspec"
             || mode == "dspark");
-    bool const supportsCrossRequestRetention = mNbKVCacheInputs > 0 && (mode == "none" || attentionOnlyReusableSpec);
+    // Hybrid (linear-attention) MTP retains attention KV pages next to recurrent checkpoints in the context cache.
+    // The MTP draft engine itself has no linear layers; the runtime only lets it retain pages under a hybrid base.
+    bool const hybridMtpReusableSpec = mode == "mtp" && (mNumLinearAttnLayers > 0 || engineRole(mModelConfig) == "draft");
+    bool const supportsCrossRequestRetention
+        = mNbKVCacheInputs > 0 && (mode == "none" || attentionOnlyReusableSpec || hybridMtpReusableSpec);
     if (hasExtraRetainedPages && !supportsCrossRequestRetention)
     {
         LOG_ERROR(

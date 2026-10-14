@@ -2828,8 +2828,30 @@ bool LLMRankRuntime::runHybridMtpPrefill(
 
     int32_t const reuseLength = managedKVCacheRequest.reuseTokenLength(0);
     int32_t const inputLength = math::cast<int32_t>(context.rawBatchedInputIds[0].size());
-    int32_t const replayTailLength = context.contextCacheReplayTailLength;
     int32_t const suffixLenOrig = context.effectivePrefillLengths[0];
+
+    // Divergence-point checkpoint (EDGELLM_HYBRID_DIVERGENCE_CHECKPOINT=<min tokens>): when this input shares a longer
+    // page-aligned prefix with an earlier request than the checkpoint it restored from, split the prefill there and
+    // publish the checkpoint at the shared prefix instead of at the prompt end. Requests that share a long prompt
+    // prefix and then diverge (templates, RAG context) only ever hit a checkpoint at a point both of them contain;
+    // endpoint checkpoints only serve exact continuations (multi-turn). The rest of the prompt runs as the replay
+    // chunk, exactly like a volatile generation-prompt tail.
+    int32_t replayTailLength = context.contextCacheReplayTailLength;
+    static int32_t const divergenceMinTokens = [] {
+        char const* env = std::getenv("EDGELLM_HYBRID_DIVERGENCE_CHECKPOINT");
+        return env != nullptr ? std::max(0, std::atoi(env)) : 0;
+    }();
+    if (divergenceMinTokens > 0)
+    {
+        int32_t const sharedPrefix = managedKVCacheRequest.hybridSharedPrefixLength(0);
+        int32_t const stableEnd = inputLength - std::max(replayTailLength, 0);
+        if (sharedPrefix >= reuseLength + divergenceMinTokens && sharedPrefix < stableEnd)
+        {
+            LOG_DEBUG("Hybrid+MTP prefill: divergence checkpoint at %d (reuse %d, input %d)", sharedPrefix,
+                reuseLength, inputLength);
+            replayTailLength = inputLength - sharedPrefix;
+        }
+    }
     LOG_DEBUG("Hybrid+MTP prefill: inputLength=%d reuseLength=%d basePrefill=%d", inputLength, reuseLength,
         inputLength - reuseLength);
 

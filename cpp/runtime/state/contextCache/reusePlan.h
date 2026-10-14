@@ -95,6 +95,10 @@ struct ReusePlan
     std::optional<RecordId> hybridRecord;
     std::optional<int32_t> recurrentSnapshotBinding;
     std::optional<int32_t> partialKvSnapshotBinding;
+    //! Hybrid plans: longest page-aligned prefix this input shares with any cached hybrid record's block path, whether
+    //! or not a checkpoint exists at that length. The runtime may split the prefill there and publish a checkpoint,
+    //! so later requests that share the prefix can restore from it.
+    int32_t hybridSharedPrefixTokens{};
     ResourceDemand demand;
     ReusePlanKind kind{ReusePlanKind::kStandard};
     SpecReplayMode specReplayMode{SpecReplayMode::kNone};

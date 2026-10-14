@@ -26,6 +26,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -210,6 +211,9 @@ public:
     //! base-hidden row, then commits the exact checkpoint. Skipped for bypass, already-published, or empty prefixes.
     ContextCacheCoordinatorStatus publishHybridMtpEndpoint(RequestHandle& request, int32_t slot,
         int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow);
+    //! Longest page-aligned prefix the slot's input shares with a cached hybrid record (see
+    //! ReusePlan::hybridSharedPrefixTokens); 0 for a bypassed lookup.
+    int32_t hybridSharedPrefixLength(RequestHandle& request, int32_t slot);
     //! Restore the checkpoint's saved boundary base-hidden row into baseHiddenStates[slot, destinationRow, :] for the
     //! runtime's fold micro-forward. No synchronization: the caller orders this within its prefill stream.
     ContextCacheCoordinatorStatus restoreHybridMtpBoundaryHidden(
@@ -338,6 +342,10 @@ private:
     cudaStream_t mStream{};
     StreamSynchronizer mSynchronizer;
     ContextCacheMetrics mMetrics;
+    //! Hybrid deployments: full-block hashes of the most recent inputs. Finds where a new input diverges from recent
+    //! prompts without keeping a recurrent snapshot per prompt (see ReusePlan::hybridSharedPrefixTokens).
+    std::deque<std::vector<BlockHash>> mRecentInputBlockHashes;
+    static constexpr size_t kRECENT_INPUT_HISTORY = 64;
     std::unique_ptr<Tensor> mHostReuseLengths;
     int32_t mActiveRequests{};
     bool mPoisoned{};

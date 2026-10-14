@@ -47,6 +47,24 @@ int64_t validateAndCountInputPages(
         / static_cast<int64_t>(pageSize);
 }
 
+
+int32_t sharedRecordPrefixTokens(
+    CacheRecordStore const& records, std::vector<BlockHash> const& inputFullBlockHashes, int32_t pageSize)
+{
+    size_t best = 0;
+    for (RecordId const id : records.lruToMru())
+    {
+        std::vector<BlockHash> const& path = records.get(id).logicalBlockHashes;
+        size_t const limit = std::min(path.size(), inputFullBlockHashes.size());
+        size_t n = 0;
+        while (n < limit && path[n] == inputFullBlockHashes[n])
+        {
+            ++n;
+        }
+        best = std::max(best, n);
+    }
+    return static_cast<int32_t>(best) * pageSize;
+}
 } // namespace
 
 ReusePlan makeVanillaReusePlan(std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount,
@@ -113,6 +131,7 @@ ReusePlan makeHybridReusePlan(std::vector<HybridCheckpointCandidate> const& cand
     {
         return makeCold();
     }
+    plan.hybridSharedPrefixTokens = sharedRecordPrefixTokens(records, inputFullBlockHashes, pageSize);
 
     std::vector<HybridCheckpointCandidate> ordered = candidates;
     std::sort(ordered.begin(), ordered.end(),
@@ -189,6 +208,7 @@ ReusePlan makeHybridMtpReusePlan(std::vector<HybridCheckpointCandidate> const& c
     {
         return makeCold();
     }
+    plan.hybridSharedPrefixTokens = sharedRecordPrefixTokens(records, inputFullBlockHashes, pageSize);
 
     std::vector<HybridCheckpointCandidate> ordered = candidates;
     std::sort(ordered.begin(), ordered.end(),
