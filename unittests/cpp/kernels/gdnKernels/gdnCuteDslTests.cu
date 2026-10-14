@@ -1280,11 +1280,8 @@ static void gdnDecodeMTPReference(float const* q, // [n, seq_len, h, k]
  * @param seq_len    Number of draft tokens (T); all batch items process the same T.
  * @param with_cache Whether to allocate + verify intermediate_states.
  */
-static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
+static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache, int32_t n = 4, int32_t h = 8, int32_t hv = 8)
 {
-    int32_t const n = 4;
-    int32_t const h = 8;
-    int32_t const hv = 8;
     int32_t const k = 128;
     int32_t const v = 128;
 
@@ -1481,7 +1478,7 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
             float const* ref = interm_ref.data() + (static_cast<size_t>(i) * seq_len + h_accept[i] - 1) * rowLen;
             for (size_t e = 0; e < rowLen; ++e)
             {
-                EXPECT_TRUE(isclose(got[e], ref[e], rtol, atol))
+                EXPECT_TRUE(isclose(got[e], ref[e], 1e-3f, 1e-4f))
                     << "replayed state mismatch, seq " << i << " (L=" << h_accept[i] << ") at " << e << ": got="
                     << got[e] << " ref=" << ref[e];
             }
@@ -3008,6 +3005,12 @@ TEST(GDNCuteDsl, BackendSelection)
 TEST(GDNCuteDsl, MTPDecodeWithIntermediateStates)
 {
     runGDNDecodeMTPTestConfig(/*seq_len=*/4, /*with_cache=*/true);
+}
+
+// Qwen3.5-4B head layout: 16 k heads shared by 32 v heads.
+TEST(GDNCuteDsl, MTPDecodeQwen35Heads)
+{
+    runGDNDecodeMTPTestConfig(/*seq_len=*/4, /*with_cache=*/true, /*n=*/2, /*h=*/16, /*hv=*/32);
 }
 
 #endif // CUTE_DSL_GDN_ENABLED
