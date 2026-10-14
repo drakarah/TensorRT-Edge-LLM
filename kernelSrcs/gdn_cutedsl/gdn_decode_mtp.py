@@ -100,8 +100,7 @@ AOT_PLACEHOLDER_T   = 8     # representative T for compilation
 REG_TILE_V = 32
 REG_NUM_WARPS = 4
 REG_NUM_THREADS = 32 * REG_NUM_WARPS
-REG_V_PER_WARP = REG_TILE_V // REG_NUM_WARPS     # 8 V columns per warp
-REG_K_PARTS = 32 // REG_V_PER_WARP               # 4 lanes share a column
+REG_K_PARTS = REG_NUM_WARPS                      # warp w owns state rows 32w..32w+31, lane = V column
 REG_K_PER_THREAD = TILE_K // REG_K_PARTS         # 32 state rows per thread
 REG_K_PER_LANE = TILE_K // 32                    # k / q elements per lane when staging a step
 REG_MIN_BLOCKS_PER_SM = 5                        # register budget, see gdn_prefill.py
@@ -144,8 +143,9 @@ def _define_mtp_kernels():
         i_hv = head_block % HV
         i_h = i_hv // (HV // H)
 
-        k_part = lane // REG_V_PER_WARP
-        v_in_tile = warp_idx * REG_V_PER_WARP + lane % REG_V_PER_WARP
+        # Warp = row group, lane = column: every state load is one contiguous 128-byte line per warp.
+        k_part = warp_idx
+        v_in_tile = lane
         v_global = v_tile * REG_TILE_V + v_in_tile
         k_base = k_part * REG_K_PER_THREAD
         r_A = cute.exp(cutlass.Float32(A_log[i_hv]))
@@ -165,6 +165,11 @@ def _define_mtp_kernels():
         sV = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T_MAX, REG_TILE_V), stride=(REG_TILE_V, 1)), 16)
         sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T_MAX,), stride=(1,)), 16)
         sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T_MAX,), stride=(1,)), 16)
+        # Row-group partial sums, combined as (p0 + p1) + (p2 + p3) (the former xor-shuffle order).
+        sPartHK = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((REG_K_PARTS, REG_TILE_V), stride=(REG_TILE_V, 1)), 16)
+        sPartHQ = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((REG_K_PARTS, REG_TILE_V), stride=(REG_TILE_V, 1)), 16)
 
         # ---- Stage all steps: warp w prepares steps w, w + NUM_WARPS, ...
         for t in range(warp_idx, seq_len, REG_NUM_WARPS):
@@ -237,17 +242,21 @@ def _define_mtp_kernels():
             for i in cutlass.range_constexpr(REG_K_PER_THREAD):
                 rH[i] = rH[i] * r_g
                 sum_hk += rH[i] * rK[i]
-            for offset in [REG_V_PER_WARP, 2 * REG_V_PER_WARP]:
-                sum_hk += cute.arch.shuffle_sync_bfly(sum_hk, offset=offset, mask=-1, mask_and_clamp=31)
+            sPartHK[(k_part, v_in_tile)] = sum_hk
+            cute.arch.barrier()
+            sum_hk = (sPartHK[(0, v_in_tile)] + sPartHK[(1, v_in_tile)]) + (
+                sPartHK[(2, v_in_tile)] + sPartHK[(3, v_in_tile)])
             v_new = (sV[(t, v_in_tile)] - sum_hk) * sBeta[t]
             # H = g * H + k v_new^T ; o = H^T q.
             sum_hq = cutlass.Float32(0.0)
             for i in cutlass.range_constexpr(REG_K_PER_THREAD):
                 rH[i] = rH[i] + rK[i] * v_new
                 sum_hq += rH[i] * rQ[i]
-            for offset in [REG_V_PER_WARP, 2 * REG_V_PER_WARP]:
-                sum_hq += cute.arch.shuffle_sync_bfly(sum_hq, offset=offset, mask=-1, mask_and_clamp=31)
+            sPartHQ[(k_part, v_in_tile)] = sum_hq
+            cute.arch.barrier()
             if k_part == 0:
+                sum_hq = (sPartHQ[(0, v_in_tile)] + sPartHQ[(1, v_in_tile)]) + (
+                    sPartHQ[(2, v_in_tile)] + sPartHQ[(3, v_in_tile)])
                 o[i_n, t, i_hv, v_global] = cutlass.Float16(sum_hq)
 
         if cutlass.const_expr(not cache_intermediate_states):
@@ -303,7 +312,7 @@ def _create_jit_mtp_wrappers():
         n_batch = q.layout.shape[0]
         hv_dim = v.layout.shape[2]
         num_v_tiles = cute.ceil_div(v.layout.shape[3], REG_TILE_V)
-        smem_bytes = 4 * (2 * T_MAX * TILE_K + T_MAX * REG_TILE_V + 2 * T_MAX) + 5 * 16
+        smem_bytes = 4 * (2 * T_MAX * TILE_K + T_MAX * REG_TILE_V + 2 * T_MAX + 2 * REG_K_PARTS * REG_TILE_V) + 7 * 16
 
         gdn_mtp_kernel_warpspec(
             h0_source,

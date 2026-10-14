@@ -3008,3 +3008,61 @@ TEST(GDNCuteDsl, MTPDecodeQwen35Heads)
 }
 
 #endif // CUTE_DSL_GDN_ENABLED
+
+#ifdef CUTE_DSL_GDN_ENABLED
+// Timing of the linear replay commit at the Qwen3.5-4B decode shape (24 GDN layers, 32 v / 16 k heads, 4 steps).
+// Run with --gtest_also_run_disabled_tests --gtest_filter='*LinearReplayBenchmark*'.
+TEST(GDNCuteDsl, DISABLED_LinearReplayBenchmark)
+{
+    int32_t const layers = 24, h = 16, hv = 32, steps = 4;
+    size_t const stateBytes = static_cast<size_t>(hv) * 128 * 128 * sizeof(float);
+    size_t const stashStride = static_cast<size_t>(steps) * stateBytes;
+    std::vector<void*> buffers;
+    std::vector<kernel::MtpLayerInfo> infos(layers);
+    for (auto& info : infos)
+    {
+        CUDA_CHECK(cudaMalloc(&info.recurrentDst, stateBytes));
+        CUDA_CHECK(cudaMalloc(&info.recurrentSrc, stashStride));
+        CUDA_CHECK(cudaMemset(info.recurrentDst, 0, stateBytes));
+        CUDA_CHECK(cudaMemset(info.recurrentSrc, 0, stashStride));
+        buffers.push_back(info.recurrentDst);
+        buffers.push_back(info.recurrentSrc);
+    }
+    kernel::MtpLayerInfo* dInfos = nullptr;
+    int32_t* dInts = nullptr;
+    CUDA_CHECK(cudaMalloc(&dInfos, layers * sizeof(kernel::MtpLayerInfo)));
+    CUDA_CHECK(cudaMemcpy(dInfos, infos.data(), layers * sizeof(kernel::MtpLayerInfo), cudaMemcpyHostToDevice));
+    int32_t const hostInts[2] = {steps, 0}; // acceptLength, stateIndex
+    CUDA_CHECK(cudaMalloc(&dInts, sizeof(hostInts)));
+    CUDA_CHECK(cudaMemcpy(dInts, hostInts, sizeof(hostInts), cudaMemcpyHostToDevice));
+    auto launch = [&]
+    { CUDA_CHECK(kernel::gdnLinearReplayCommitBatched(dInfos, layers, stashStride, dInts, dInts + 1, 1, 1, steps, h, hv, nullptr)); };
+    for (int32_t i = 0; i < 20; ++i)
+        launch();
+    cudaEvent_t e0, e1;
+    CUDA_CHECK(cudaEventCreate(&e0));
+    CUDA_CHECK(cudaEventCreate(&e1));
+    CUDA_CHECK(cudaEventRecord(e0));
+    for (int32_t i = 0; i < 200; ++i)
+        launch();
+    CUDA_CHECK(cudaEventRecord(e1));
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    float ms = 0.f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+    double const us = ms * 1000.0 / 200;
+    std::printf("linear replay commit: %.1f us per round, %.1f GB/s state traffic\n", us,
+        2.0 * stateBytes * layers / (us * 1e3));
+    // Reference: the snapshot scatter it replaced (a plain copy of the same bytes).
+    CUDA_CHECK(cudaEventRecord(e0));
+    for (int32_t i = 0; i < 200; ++i)
+        kernel::mtpScatterRecurrentStates(dInfos, layers, 1, 1, steps, hv * 128 * 128, dInts, dInts + 1, nullptr);
+    CUDA_CHECK(cudaEventRecord(e1));
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+    std::printf("snapshot scatter (copy):  %.1f us per round\n", ms * 1000.0 / 200);
+    for (void* p : buffers)
+        CUDA_CHECK(cudaFree(p));
+    CUDA_CHECK(cudaFree(dInfos));
+    CUDA_CHECK(cudaFree(dInts));
+}
+#endif // CUTE_DSL_GDN_ENABLED

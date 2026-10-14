@@ -791,15 +791,16 @@ __global__ void __launch_bounds__(kAPPLY_THREADS) treeVerifyChunkApplyWarpKernel
     }
 }
 
-// Linear (chain) replay commit, register-resident: same thread layout and op order as the sm_80-class verify kernel
-// (kernelSrcs/gdn_cutedsl/gdn_decode_mtp.py) — one CTA per (layer, batch, v head, 32-column V tile), 4 warps of 8 V
-// columns, each thread keeps 32 state rows of one column in registers — so the committed state is bit-identical to
-// the state the verify kernel reached after the same steps. Bandwidth-bound (one read and one write of the state);
-// the DDTree replay kernel above stages tiles in shared memory and is ~3x slower on Orin for a chain.
+// Linear (chain) replay commit, register-resident. One CTA per (layer, batch, v head, 32-column V tile); warp w owns
+// state rows 32w..32w+31 and lane = column, so every load / store of a warp is one contiguous 128-byte line (the
+// verify kernel's 8-column x 4-row warp footprint wastes half of each DRAM burst on Orin). Each thread sums its 32
+// rows in the verify kernel's order and the four row-group partials are combined as (s0 + s1) + (s2 + s3), the value
+// the verify kernel's xor-8 / xor-16 shuffle reduction produces, so the committed state is bit-identical to the
+// verify kernel's own state after the same steps.
 constexpr int32_t kLIN_TILE_V{32};
 constexpr int32_t kLIN_THREADS{128};
-constexpr int32_t kLIN_V_PER_WARP{8};
-constexpr int32_t kLIN_K_PER_THREAD{kTILE_K / (32 / kLIN_V_PER_WARP)}; // 32
+constexpr int32_t kLIN_K_PARTS{kLIN_THREADS / 32};               // 4 warps = 4 row groups
+constexpr int32_t kLIN_K_PER_THREAD{kTILE_K / kLIN_K_PARTS};     // 32 rows
 
 __global__ void __launch_bounds__(kLIN_THREADS) linearReplayCommitBatchedKernel(MtpLayerInfo const* __restrict__ infos,
     size_t stashBatchStrideBytes, int32_t const* __restrict__ acceptLengths, int32_t const* __restrict__ stateIndices,
@@ -823,10 +824,26 @@ __global__ void __launch_bounds__(kLIN_THREADS) linearReplayCommitBatchedKernel(
     __shared__ float sV[kGDN_TREE_CHUNK_MAX_ACCEPT * kLIN_TILE_V];
     __shared__ float sG[kGDN_TREE_CHUNK_MAX_ACCEPT];
     __shared__ float sBeta[kGDN_TREE_CHUNK_MAX_ACCEPT];
+    __shared__ float sPart[2][kLIN_K_PARTS][kLIN_TILE_V];
 
     int32_t const tid = threadIdx.x;
+    int32_t const warp = tid / 32;
+    int32_t const lane = tid % 32;
+    int32_t const kBase = warp * kLIN_K_PER_THREAD;
+    float* h = static_cast<float*>(infos[layer].recurrentDst)
+        + (static_cast<int64_t>(residentIdx) * HV + iHv) * kTILE_K * kTILE_K + vTile * kLIN_TILE_V + lane;
+
+    // State loads first: they overlap the stash staging below.
+    float rH[kLIN_K_PER_THREAD];
+#pragma unroll
+    for (int32_t i = 0; i < kLIN_K_PER_THREAD; ++i)
+    {
+        rH[i] = h[static_cast<int64_t>(kBase + i) * kTILE_K];
+    }
+
     StashOffsets const so = stashOffsets(H, HV);
-    char const* nodeBase = static_cast<char const*>(infos[layer].recurrentSrc) + static_cast<size_t>(iN) * stashBatchStrideBytes;
+    char const* nodeBase
+        = static_cast<char const*>(infos[layer].recurrentSrc) + static_cast<size_t>(iN) * stashBatchStrideBytes;
     for (int32_t t = 0; t < L; ++t)
     {
         char const* cell = nodeBase + static_cast<size_t>(t) * so.nodeBytes;
@@ -844,19 +861,6 @@ __global__ void __launch_bounds__(kLIN_THREADS) linearReplayCommitBatchedKernel(
     }
     __syncthreads();
 
-    int32_t const warp = tid / 32;
-    int32_t const lane = tid % 32;
-    int32_t const kBase = (lane / kLIN_V_PER_WARP) * kLIN_K_PER_THREAD;
-    int32_t const vInTile = warp * kLIN_V_PER_WARP + lane % kLIN_V_PER_WARP;
-    float* h = static_cast<float*>(infos[layer].recurrentDst)
-        + (static_cast<int64_t>(residentIdx) * HV + iHv) * kTILE_K * kTILE_K + vTile * kLIN_TILE_V + vInTile;
-
-    float rH[kLIN_K_PER_THREAD];
-#pragma unroll
-    for (int32_t i = 0; i < kLIN_K_PER_THREAD; ++i)
-    {
-        rH[i] = h[static_cast<int64_t>(kBase + i) * kTILE_K];
-    }
     for (int32_t t = 0; t < L; ++t)
     {
         float const g = sG[t];
@@ -869,9 +873,11 @@ __global__ void __launch_bounds__(kLIN_THREADS) linearReplayCommitBatchedKernel(
             rH[i] = rH[i] * g;
             sumHk += rH[i] * k[i];
         }
-        sumHk += __shfl_xor_sync(0xffffffffu, sumHk, kLIN_V_PER_WARP);
-        sumHk += __shfl_xor_sync(0xffffffffu, sumHk, 2 * kLIN_V_PER_WARP);
-        float const vNew = (sV[t * kLIN_TILE_V + vInTile] - sumHk) * sBeta[t];
+        float(*part)[kLIN_TILE_V] = sPart[t & 1];
+        part[warp][lane] = sumHk;
+        __syncthreads(); // partials of step t visible; sPart[t & 1] is next written at step t + 2, after this barrier
+        float const total = (part[0][lane] + part[1][lane]) + (part[2][lane] + part[3][lane]);
+        float const vNew = (sV[t * kLIN_TILE_V + lane] - total) * sBeta[t];
 #pragma unroll
         for (int32_t i = 0; i < kLIN_K_PER_THREAD; ++i)
         {
