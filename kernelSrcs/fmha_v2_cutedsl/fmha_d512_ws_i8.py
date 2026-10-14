@@ -95,7 +95,15 @@ class _MmaI8Op(warp.mma.WarpMmaOp):
 
 
 class FMHAV2D512WSI8:
-    def __init__(self, is_causal: bool = True, skip_rescale: bool = True, num_acc_s: int = 4):
+    def __init__(self, is_causal: bool = True, skip_rescale: bool = True, num_acc_s: int = 4,
+                 head_dim: int = 512):
+        # head_dim 512 (Gemma 4 global layers) or 256 (Qwen3.5 full attention, Gemma 4 sliding layers):
+        # each O group owns head_dim / 2 output columns.
+        if head_dim not in (256, 512):
+            raise ValueError("head_dim must be 256 or 512")
+        self._D = head_dim
+        self._DO = head_dim // 2
+        self._DQK = head_dim // 2  # Q/K columns in the 16-bit view of the int8 data
         if not is_causal:
             raise ValueError("FMHAV2D512WSI8 implements the causal context variant only")
         self._skip_rescale = skip_rescale
@@ -138,11 +146,11 @@ class FMHAV2D512WSI8:
         atom32 = cute.make_composed_layout(
             cute.make_swizzle(2, 3, 3), 0, cute.make_layout((8, 32), stride=(32, 1))
         )
-        sQ_layout = cute.tile_to_shape(atom64, (_BR, _DQK), (0, 1))
+        sQ_layout = cute.tile_to_shape(atom64, (_BR, self._DQK), (0, 1))
         # K (16-bit view): (16 keys, 256, stage * 2 + key half)
-        sK_layout = cute.tile_to_shape(atom64, (_BC // 2, _DQK, 4), (0, 1, 2))
+        sK_layout = cute.tile_to_shape(atom64, (_BC // 2, self._DQK, 4), (0, 1, 2))
         # V: (32 keys, 256 columns, stage * 2 + column half)
-        sV_layout = cute.tile_to_shape(atom64, (_BC, _DO, 4), (0, 1, 2))
+        sV_layout = cute.tile_to_shape(atom64, (_BC, self._DO, 4), (0, 1, 2))
         # P: (32 rows, 32 keys, stage)
         sP_layout = cute.tile_to_shape(atom32, (_BR, _BC, 2), (0, 1, 2))
 
@@ -274,7 +282,7 @@ class FMHAV2D512WSI8:
         sK = storage.sK.get_tensor(sK_layout)
         sP = storage.sP.get_tensor(sP_layout)
         # Q aliases V stage 1 (blocks 2 and 3); it is read once into registers.
-        sQ = cute.make_tensor(sV.iterator + 2 * _BC * _DO, sQ_layout)
+        sQ = cute.make_tensor(sV.iterator + 2 * _BC * self._DO, sQ_layout)
         sMax = storage.sMax.get_tensor(cute.make_layout((_BR, 2, 2)))
         sAlpha = storage.sAlpha.get_tensor(cute.make_layout((_BR, 2)))
         sRowSum = storage.sRowSum.get_tensor(cute.make_layout((_BR, 2)))
@@ -300,12 +308,12 @@ class FMHAV2D512WSI8:
         offset, num_tiles, softmax_scale_log2,
     ):
         # Q: all 128 S threads, zero-fill rows past the sequence.
-        gQ = cute.local_tile(mQ[batch, None, head, None], (_BR, _DQK), (m_block, 0))
+        gQ = cute.local_tile(mQ[batch, None, head, None], (_BR, self._DQK), (m_block, 0))
         thr_q = copy128.get_slice(tidx)
         tQgQ = thr_q.partition_S(gQ)
         tQsQ = thr_q.partition_D(sQ)
         cQ = cute.local_tile(
-            cute.make_identity_tensor((mQ.shape[1], _DQK)), (_BR, _DQK), (m_block, 0)
+            cute.make_identity_tensor((mQ.shape[1], self._DQK)), (_BR, self._DQK), (m_block, 0)
         )
         tQcQ = thr_q.partition_S(cQ)
         for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
@@ -315,9 +323,9 @@ class FMHAV2D512WSI8:
                 tQsQ[None, m, None].fill(0)
 
         # K: this group's 16-key half of each tile.
-        gK = cute.local_tile(mK[batch, None, head_kv, None], (_BC // 2, _DQK), (None, 0))
+        gK = cute.local_tile(mK[batch, None, head_kv, None], (_BC // 2, self._DQK), (None, 0))
         cK = cute.local_tile(
-            cute.make_identity_tensor((mK.shape[1], _DQK)), (_BC // 2, _DQK), (None, 0)
+            cute.make_identity_tensor((mK.shape[1], self._DQK)), (_BC // 2, self._DQK), (None, 0)
         )
         thr_k = copy64.get_slice(gtid)
         tKgK = thr_k.partition_S(gK)
@@ -517,9 +525,9 @@ class FMHAV2D512WSI8:
         self, mV, mO, sV, sP, sAlpha, sRowSum, copy64, copy_o, tiled_mma, thr_mma,
         gtid, grp, m_block, head, head_kv, batch, seqlen_q, seqlen_k, num_tiles,
     ):
-        gV = cute.local_tile(mV[batch, None, head_kv, None], (_BC, _DO), (None, grp))
+        gV = cute.local_tile(mV[batch, None, head_kv, None], (_BC, self._DO), (None, grp))
         cV = cute.local_tile(
-            cute.make_identity_tensor((mV.shape[1], _D)), (_BC, _DO), (None, grp)
+            cute.make_identity_tensor((mV.shape[1], self._D)), (_BC, self._DO), (None, grp)
         )
         thr_v = copy64.get_slice(gtid)
         tVgV = thr_v.partition_S(gV)
@@ -536,7 +544,7 @@ class FMHAV2D512WSI8:
 
         # Transposed view of V for the P·V B operand: (256 columns, 32 keys, block).
         sVt = cute.composition(
-            sV, cute.make_layout((_DO, _BC, 4), stride=(_BC, 1, _BC * _DO))
+            sV, cute.make_layout((self._DO, _BC, 4), stride=(_BC, 1, _BC * self._DO))
         )
         smem_copy_v = cute.make_tiled_copy_B(
             cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), cutlass.Float16),
@@ -556,9 +564,9 @@ class FMHAV2D512WSI8:
         tOrP = thr_mma.make_fragment_A(thr_mma.partition_A(sP[None, None, 0]))
         tOrP_view = thr_sp.retile(tOrP)
 
-        acc_O = cute.make_rmem_tensor(thr_mma.partition_shape_C((_BR, _DO)), cutlass.Float32)
+        acc_O = cute.make_rmem_tensor(thr_mma.partition_shape_C((_BR, self._DO)), cutlass.Float32)
         acc_O.fill(0.0)
-        tOcO = thr_mma.partition_C(cute.make_identity_tensor((_BR, _DO)))
+        tOcO = thr_mma.partition_C(cute.make_identity_tensor((_BR, self._DO)))
         tOcO_mn = self._mn_view(tOcO)
 
         st = (tOsVt, tOrVt, tOrVt_view, smem_copy_v, tOsP, tOrP, tOrP_view, smem_copy_p,
@@ -591,9 +599,9 @@ class FMHAV2D512WSI8:
         cute.copy(smem_copy_o, thr_so.retile(rO), thr_so.partition_D(sO))
         cute.arch.barrier(barrier_id=_BAR_O_GRP + grp, number_of_threads=64)
 
-        gO = cute.local_tile(mO[batch, None, head, None], (_BR, _DO), (m_block, grp))
+        gO = cute.local_tile(mO[batch, None, head, None], (_BR, self._DO), (m_block, grp))
         cO = cute.local_tile(
-            cute.make_identity_tensor((mO.shape[1], _D)), (_BR, _DO), (m_block, grp)
+            cute.make_identity_tensor((mO.shape[1], self._D)), (_BR, self._DO), (m_block, grp)
         )
         thr_o = copy_o.get_slice(gtid)
         tOsO = thr_o.partition_S(sO)

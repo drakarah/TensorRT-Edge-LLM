@@ -3086,19 +3086,19 @@ def run(
     if d512_ws:
         # Warp-specialized head-512 causal context kernel (same ABI as
         # __call_context__); see fmha_d512_ws.py.
-        if not (fmha_v2_context and head_dim == 512 and is_causal and window_size_left < 0
+        if not (fmha_v2_context and head_dim in (256, 512) and is_causal and window_size_left < 0
                 and not vision_block):
-            raise ValueError(f"{_tag} --d512_ws needs --fmha_v2_context, head_dim 512, causal, no window")
+            raise ValueError(f"{_tag} --d512_ws needs --fmha_v2_context, head_dim 256 or 512, causal, no window")
         from fmha_d512_ws import FMHAV2D512WS
-        fa2_fwd = FMHAV2D512WS(is_causal=True, skip_rescale=skip_rescale)
+        fa2_fwd = FMHAV2D512WS(is_causal=True, skip_rescale=skip_rescale, head_dim=head_dim)
     if d512_ws_i8:
         # INT8 Q·Kᵀ variant (fmha_d512_ws_i8.py): Q/K are int8 passed as a 16-bit view with D = 256,
         # plus per-row Q scales (B, H, Sq) and per-32-key-tile K scales (B, Hkv, ceil(Sk / 32)).
-        if not (fmha_v2_context and head_dim == 512 and is_causal and window_size_left < 0
+        if not (fmha_v2_context and head_dim in (256, 512) and is_causal and window_size_left < 0
                 and not vision_block):
-            raise ValueError(f"{_tag} --d512_ws_i8 needs --fmha_v2_context, head_dim 512, causal, no window")
+            raise ValueError(f"{_tag} --d512_ws_i8 needs --fmha_v2_context, head_dim 256 or 512, causal, no window")
         from fmha_d512_ws_i8 import FMHAV2D512WSI8
-        fa2_fwd = FMHAV2D512WSI8(is_causal=True, skip_rescale=skip_rescale)
+        fa2_fwd = FMHAV2D512WSI8(is_causal=True, skip_rescale=skip_rescale, head_dim=head_dim)
         q_dyn, q_arr = _create_bsnd_tensor(
             batch_size, seqlen_q, h_q, head_dim // 2, dtype,
             fill_random=False, storage_free=export_only,
@@ -3698,9 +3698,9 @@ def _parse_args(argv=None):
     p.add_argument("--hybrid_exp2", action="store_true",
                    help="Scaffold for FA4-style 75%% MUFU + 25%% polynomial exp2 (not validated).")
     p.add_argument("--d512_ws", action="store_true",
-                   help="Use the warp-specialized head-512 causal context kernel (fmha_d512_ws.py).")
+                   help="Use the warp-specialized causal context kernel (fmha_d512_ws.py; head 256 or 512).")
     p.add_argument("--d512_ws_i8", action="store_true",
-                   help="Head-512 causal context with INT8 Q·Kᵀ (fmha_d512_ws_i8.py); export only.")
+                   help="Causal context with INT8 Q·Kᵀ (fmha_d512_ws_i8.py; head 256 or 512); export only.")
     p.add_argument("--warmup_iterations", type=int, default=3)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--skip_ref_check", action="store_true")
