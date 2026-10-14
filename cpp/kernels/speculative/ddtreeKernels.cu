@@ -390,7 +390,8 @@ __global__ void buildDDTreeKernel(int32_t const* __restrict__ rootTokenIds, int3
     int32_t const* __restrict__ candidateTokenIds, float const* __restrict__ candidateLogProbs,
     float const* __restrict__ depthConfidence, float confSurvivalFloorLog,
     int32_t const* __restrict__ draftVocabMappingTable, int32_t const* __restrict__ logitTokenIds,
-    int32_t vocabSize, int32_t* __restrict__ nodeTokenIds,
+    int32_t vocabSize, int32_t const* __restrict__ appendChainTokenIds,
+    int32_t const* __restrict__ appendChainLengths, int32_t maxChainLength, int32_t* __restrict__ nodeTokenIds,
     int32_t* __restrict__ nodeDepths, int32_t* __restrict__ parentIds, float* __restrict__ nodeScores,
     int32_t* __restrict__ validCounts, int32_t* __restrict__ verifyTokenIds, int32_t* __restrict__ verifyPositionIds,
     int32_t* __restrict__ packedAncestorMask, int8_t* __restrict__ ancestorMask, int32_t* __restrict__ contextLengths,
@@ -463,7 +464,53 @@ __global__ void buildDDTreeKernel(int32_t const* __restrict__ rootTokenIds, int3
     __syncthreads();
 
     int32_t const maxProposalDepth = min(dflashBlockSize - 1, confMaxDepth);
-    for (int32_t outNodeIdx = 1; outNodeIdx < verifySize; ++outNodeIdx)
+    // An appended chain (e.g. a suffix-cache draft) reserves its length first; after it is merged from the
+    // root, the second pass lets the drafter fill the slots the merge did not need.
+    int32_t const chainLength = appendChainLengths == nullptr
+        ? 0
+        : max(0, min(appendChainLengths[batchIdx], min(maxChainLength, verifySize - 1)));
+    for (int32_t pass = 0; pass < (chainLength > 0 ? 2 : 1); ++pass)
+    {
+    if (pass == 1)
+    {
+        if (tid == 0)
+        {
+            int32_t current = 0;
+            for (int32_t chainIdx = 0; chainIdx < chainLength; ++chainIdx)
+            {
+                int32_t const token = appendChainTokenIds[batchIdx * maxChainLength + chainIdx];
+                int32_t next = -1;
+                for (int32_t nodeIdx = 1; nodeIdx < sValidCount; ++nodeIdx)
+                {
+                    if (parentIds[treeOffset + nodeIdx] == current && nodeTokenIds[treeOffset + nodeIdx] == token)
+                    {
+                        next = nodeIdx;
+                        break;
+                    }
+                }
+                if (next < 0)
+                {
+                    if (sValidCount >= verifySize)
+                    {
+                        break;
+                    }
+                    next = sValidCount;
+                    nodeTokenIds[treeOffset + next] = token;
+                    nodeDepths[treeOffset + next] = nodeDepths[treeOffset + current] + 1;
+                    parentIds[treeOffset + next] = current;
+                    nodeScores[treeOffset + next] = nodeScores[treeOffset + current];
+                    // Chain nodes are not expanded by the drafter: its logits hold for its own chain only.
+                    nextCandidateSlot[next] = candidateTopK;
+                    sValidCount += 1;
+                }
+                current = next;
+            }
+            sStopBuild = 0;
+        }
+        __syncthreads();
+    }
+    int32_t const nodeLimit = pass == 0 ? verifySize - chainLength : verifySize;
+    for (int32_t outNodeIdx = sValidCount; outNodeIdx < nodeLimit; ++outNodeIdx)
     {
         if (sStopBuild != 0)
         {
@@ -575,6 +622,7 @@ __global__ void buildDDTreeKernel(int32_t const* __restrict__ rootTokenIds, int3
             }
         }
         __syncthreads();
+    }
     }
 
     int32_t const validCount = sValidCount;
@@ -716,6 +764,23 @@ void ddtreeBuild(DDTreeBuildParams const& params)
         logitTokenIdsPtr = logitTokenIds.dataPointer<int32_t>();
     }
 
+    int32_t const* appendChainTokenIdsPtr{nullptr};
+    int32_t const* appendChainLengthsPtr{nullptr};
+    int32_t maxChainLength{0};
+    if (params.inputs.appendChainLengths != nullptr)
+    {
+        rt::Tensor const& chainTokens = *params.inputs.appendChainTokenIds;
+        rt::Tensor const& chainLengths = *params.inputs.appendChainLengths;
+        validateGpuTensor(chainTokens, "appendChainTokenIds", nvinfer1::DataType::kINT32, "INT32");
+        validateGpuTensor(chainLengths, "appendChainLengths", nvinfer1::DataType::kINT32, "INT32");
+        check::check(chainTokens.getShape().getNumDims() == 2 && chainTokens.getShape()[0] == batchSize
+                && chainLengths.getShape().getNumDims() == 1 && chainLengths.getShape()[0] == batchSize,
+            "appendChainTokenIds must be [batch, maxChainLength] and appendChainLengths [batch].");
+        appendChainTokenIdsPtr = chainTokens.dataPointer<int32_t>();
+        appendChainLengthsPtr = chainLengths.dataPointer<int32_t>();
+        maxChainLength = static_cast<int32_t>(chainTokens.getShape()[1]);
+    }
+
     float const* depthConfidencePtr{nullptr};
     if (depthConfidence != nullptr)
     {
@@ -789,7 +854,8 @@ void ddtreeBuild(DDTreeBuildParams const& params)
     size_t const buildSharedBytes = static_cast<size_t>(verifySize) * sizeof(int32_t);
     buildDDTreeKernel<<<batchSize, kBuildBlockSize, buildSharedBytes, params.stream>>>(
         rootTokenIds.dataPointer<int32_t>(), baseLengths.dataPointer<int32_t>(), buildWorkspace.candidateTokenIds,
-        buildWorkspace.candidateLogProbs, depthConfidencePtr, confSurvivalFloorLog, draftVocabMappingTablePtr, logitTokenIdsPtr, vocabSize,
+        buildWorkspace.candidateLogProbs, depthConfidencePtr, confSurvivalFloorLog, draftVocabMappingTablePtr, logitTokenIdsPtr, vocabSize, appendChainTokenIdsPtr,
+        appendChainLengthsPtr, maxChainLength,
         nodeTokenIds.dataPointer<int32_t>(), nodeDepths.dataPointer<int32_t>(), parentIds.dataPointer<int32_t>(),
         nodeScores.dataPointer<float>(), validCounts.dataPointer<int32_t>(), verifyTokenIds.dataPointer<int32_t>(),
         verifyPositionIds.dataPointer<int32_t>(), packedAncestorMask.dataPointer<int32_t>(),

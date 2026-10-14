@@ -59,6 +59,13 @@ struct DDTreeBuildInputs
     //! Optional INT32 token id of every draftLogits column, same layout as draftLogits. For drafts that emit
     //! only their candidates' logits (Gemma 4 assistant sparse logits); exclusive with draftVocabMappingTable.
     rt::Tensor const* logitTokenIds{nullptr};
+
+    //! Optional chain appended to every tree from the root: [batch, maxChainLength] INT32 token ids and
+    //! [batch] INT32 lengths (0 = none). The drafter's expansion stops length nodes early, the chain is
+    //! merged (nodes with the same token under the same parent are reused, the rest appended), then the
+    //! drafter fills the slots the merge did not need. Chain nodes are never expanded by the drafter.
+    rt::Tensor const* appendChainTokenIds{nullptr};
+    rt::Tensor const* appendChainLengths{nullptr};
 };
 
 //! Tensor outputs produced by ddtreeBuild().

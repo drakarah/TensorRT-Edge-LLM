@@ -270,7 +270,8 @@ DDTreeBuildOutputs runDDTreeBuild(std::vector<float> const& logits, std::vector<
     std::vector<int32_t> const& baseLengths, int32_t batchSize, int32_t dflashBlockSize, int32_t vocabSize,
     int32_t verifySize, int32_t candidateTopK, int32_t firstCandidateLogitsRow = 1,
     std::vector<float> const& depthConfidence = {}, float survivalThreshold = 0.0F, bool tokenMajorLogits = false,
-    std::vector<int32_t> const& logitTokenIds = {})
+    std::vector<int32_t> const& logitTokenIds = {}, std::vector<int32_t> const& chainTokenIds = {},
+    std::vector<int32_t> const& chainLengths = {})
 {
     int32_t const packedMaskLen = (verifySize + kMaskBitsPerWord - 1) / kMaskBitsPerWord;
     rt::Tensor logitsTensor = tokenMajorLogits
@@ -326,6 +327,19 @@ DDTreeBuildOutputs runDDTreeBuild(std::vector<float> const& logits, std::vector<
             contextLengthsTensor, selectTokenIndicesTensor},
         candidateTopK, workspace, workspaceSize, nullptr, firstCandidateLogitsRow};
     buildParams.inputs.logitTokenIds = logitTokenIds.empty() ? nullptr : &logitTokenIdsTensor;
+    rt::Tensor chainTokenIdsTensor;
+    rt::Tensor chainLengthsTensor;
+    if (!chainLengths.empty())
+    {
+        int32_t const maxChainLength = static_cast<int32_t>(chainTokenIds.size()) / batchSize;
+        chainTokenIdsTensor
+            = rt::Tensor({batchSize, maxChainLength}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+        chainLengthsTensor = rt::Tensor({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+        copyHostToDevice(chainTokenIdsTensor, chainTokenIds);
+        copyHostToDevice(chainLengthsTensor, chainLengths);
+        buildParams.inputs.appendChainTokenIds = &chainTokenIdsTensor;
+        buildParams.inputs.appendChainLengths = &chainLengthsTensor;
+    }
     kernel::ddtreeBuild(buildParams);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -588,6 +602,82 @@ TEST(DDTreeKernels, LogitTokenIdsMapColumnsPerDepthRow)
             EXPECT_EQ(mapped.verifyTokenIds[offset + nodeIdx], expected);
         }
     }
+}
+
+// A suffix-cache chain is merged into the drafted tree from the root: nodes the drafter already has are
+// reused, the rest appended (deeper than the drafter reaches), chain nodes get no drafter children, and the
+// drafter fills the slots the merge did not need. Batch 1 gets no chain and builds the plain tree.
+TEST(DDTreeKernels, AppendedChainMergesFromRootAndKeepsBudget)
+{
+    constexpr int32_t kBatchSize{2};
+    constexpr int32_t kDraftingStep{3};
+    constexpr int32_t kProposalDepthSize{kDraftingStep + 1};
+    constexpr int32_t kVocabSize{10};
+    constexpr int32_t kCandidateFanout{2};
+    constexpr int32_t kVerifySize{8};
+    constexpr int32_t kMaxChain{6};
+
+    std::vector<float> logits(static_cast<size_t>(kBatchSize) * kProposalDepthSize * kVocabSize, -12.0F);
+    for (int32_t batchIdx = 0; batchIdx < kBatchSize; ++batchIdx)
+    {
+        setLogit(logits, batchIdx, 1, 1, kProposalDepthSize, kVocabSize, 6.0F);
+        setLogit(logits, batchIdx, 1, 2, kProposalDepthSize, kVocabSize, 5.0F);
+        setLogit(logits, batchIdx, 2, 4, kProposalDepthSize, kVocabSize, 6.0F);
+        setLogit(logits, batchIdx, 2, 5, kProposalDepthSize, kVocabSize, 5.0F);
+        setLogit(logits, batchIdx, 3, 7, kProposalDepthSize, kVocabSize, 6.0F);
+        setLogit(logits, batchIdx, 3, 8, kProposalDepthSize, kVocabSize, 5.0F);
+    }
+    std::vector<int32_t> const rootTokenIds{42, 43};
+    std::vector<int32_t> const baseLengths{100, 200};
+    std::vector<int32_t> chainTokenIds(static_cast<size_t>(kBatchSize) * kMaxChain, 0);
+    std::vector<int32_t> const chain{1, 4, 9, 9, 9};
+    std::copy(chain.begin(), chain.end(), chainTokenIds.begin());
+    std::vector<int32_t> const chainLengths{static_cast<int32_t>(chain.size()), 0};
+
+    DDTreeBuildOutputs const plain = runDDTreeBuild(
+        logits, rootTokenIds, baseLengths, kBatchSize, kProposalDepthSize, kVocabSize, kVerifySize, kCandidateFanout);
+    DDTreeBuildOutputs const merged = runDDTreeBuild(logits, rootTokenIds, baseLengths, kBatchSize,
+        kProposalDepthSize, kVocabSize, kVerifySize, kCandidateFanout, /*firstCandidateLogitsRow=*/1,
+        /*depthConfidence=*/{}, /*survivalThreshold=*/0.0F, /*tokenMajorLogits=*/false, /*logitTokenIds=*/{},
+        chainTokenIds, chainLengths);
+
+    // Batch 0: the full budget is used and the chain path root-1-4-9-9-9 exists at depths 1..5.
+    EXPECT_EQ(merged.validCounts[0], kVerifySize);
+    int32_t current = 0;
+    for (size_t chainIdx = 0; chainIdx < chain.size(); ++chainIdx)
+    {
+        int32_t next = -1;
+        int32_t matches = 0;
+        for (int32_t nodeIdx = 1; nodeIdx < kVerifySize; ++nodeIdx)
+        {
+            if (merged.parentIds[nodeIdx] == current && merged.nodeTokenIds[nodeIdx] == chain[chainIdx])
+            {
+                next = nodeIdx;
+                ++matches;
+            }
+        }
+        ASSERT_EQ(matches, 1) << "chain token " << chainIdx << " missing or duplicated";
+        EXPECT_EQ(merged.nodeDepths[next], static_cast<int32_t>(chainIdx) + 1);
+        EXPECT_EQ(merged.verifyPositionIds[next], baseLengths[0] + static_cast<int32_t>(chainIdx) + 1);
+        current = next;
+    }
+    // Chain-only nodes (token 9) have no children other than the chain's own next node.
+    for (int32_t nodeIdx = 1; nodeIdx < kVerifySize; ++nodeIdx)
+    {
+        int32_t const parent = merged.parentIds[nodeIdx];
+        if (merged.nodeTokenIds[parent] == 9)
+        {
+            EXPECT_EQ(merged.nodeTokenIds[nodeIdx], 9) << "drafter expanded a chain node";
+        }
+    }
+    // Batch 1 had no chain: identical to the plain build.
+    for (int32_t nodeIdx = 0; nodeIdx < kVerifySize; ++nodeIdx)
+    {
+        int32_t const idx = kVerifySize + nodeIdx;
+        EXPECT_EQ(merged.nodeTokenIds[idx], plain.nodeTokenIds[idx]);
+        EXPECT_EQ(merged.parentIds[idx], plain.parentIds[idx]);
+    }
+    EXPECT_EQ(merged.validCounts[1], plain.validCounts[1]);
 }
 
 // With candidateFanout = 1 the greedy builder must reproduce the linear MTP

@@ -132,8 +132,32 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
             DeviceType::kGPU, nvinfer1::DataType::kINT32, "Gemma4MTP::draftLogitTokenIds");
         mDraftTensorMap.set(binding_names::kLogitTokenIds, mDraftLogitTokenIds);
     }
-    int32_t const maxAcceptDepth = maxDraftStep + 1;
     mUseTree = draftingConfig.draftingTopK > 1;
+    if (char const* env = std::getenv("EDGELLM_MTP_SUFFIX_DRAFT"); mUseTree && env != nullptr)
+    {
+        mSuffixMaxLength = std::max(0, std::min(std::atoi(env), draftingConfig.verifySize - 1));
+    }
+    if (char const* env = std::getenv("EDGELLM_MTP_SUFFIX_MIN"); env != nullptr)
+    {
+        mSuffixMinLength = std::max(1, std::atoi(env));
+    }
+    mMaxAcceptDepth = mSuffixMaxLength > 0 ? draftingConfig.verifySize : maxDraftStep + 1;
+    int32_t const maxAcceptDepth = mMaxAcceptDepth;
+    if (mSuffixMaxLength > 0)
+    {
+        mSuffixIndexedLengths.assign(maxRuntimeBatchSize, 0);
+        mHostSuffixChainTokenIds = Tensor({maxRuntimeBatchSize, mSuffixMaxLength}, DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "Gemma4MTP::hostSuffixChainTokenIds");
+        mHostSuffixChainLengths = Tensor(
+            {maxRuntimeBatchSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "Gemma4MTP::hostSuffixChainLengths");
+        mSuffixChainTokenIds = Tensor({maxRuntimeBatchSize, mSuffixMaxLength}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "Gemma4MTP::suffixChainTokenIds");
+        mSuffixChainLengths = Tensor(
+            {maxRuntimeBatchSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "Gemma4MTP::suffixChainLengths");
+        CUDA_CHECK(cudaMemsetAsync(mSuffixChainLengths.rawPointer(), 0, mSuffixChainLengths.getMemoryCapacity(), stream));
+        LOG_INFO("Gemma4 MTP: suffix-cache chain up to %d tokens (min %d) in a %d-node verify tree.",
+            mSuffixMaxLength, mSuffixMinLength, draftingConfig.verifySize);
+    }
     int32_t const maxPhysicalTokens = maxRuntimeBatchSize * maxAcceptDepth;
     mRaggedMetadataScratch.positions.reserve(maxPhysicalTokens);
     mRaggedMetadataScratch.queryStartOffsets.reserve(maxRuntimeBatchSize + 1);
@@ -404,7 +428,12 @@ void Gemma4MTPDecoder::saveSystemPromptKVCache(
 
 void Gemma4MTPDecoder::resetForNewSequences(Tensor&, cudaStream_t)
 {
-    // No draft-owned KV cache to reset.
+    // No draft-owned KV cache to reset. The suffix cache keeps earlier outputs; new requests start fresh.
+    if (mSuffixMaxLength > 0)
+    {
+        mSuffixCache.beginSequence();
+        std::fill(mSuffixIndexedLengths.begin(), mSuffixIndexedLengths.end(), 0);
+    }
 }
 
 void Gemma4MTPDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,
@@ -466,7 +495,7 @@ bool Gemma4MTPDecoder::prepareSeed(DecodingInferenceContext& context)
     int32_t const activeBatchSize = context.activeBatchSize;
     int32_t const baseHiddenSize = mRuntime.deployment.specConfig->baseOutputHiddenDim;
     int32_t const draftingStep = mRuntime.deployment.specConfig->draftingStep;
-    int32_t const maxAcceptDepth = draftingStep + 1;
+    int32_t const maxAcceptDepth = mMaxAcceptDepth;
 
     check::check(mSeedTokenIds.reshape({activeBatchSize}), "Tensor reshape failed");
     check::check(mDraftTokenIds.reshape({activeBatchSize, draftingStep}), "Tensor reshape failed");
@@ -497,6 +526,10 @@ bool Gemma4MTPDecoder::prepareSeed(DecodingInferenceContext& context)
         cudaMemcpyHostToDevice, context.stream));
     CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), hostSeedTokens,
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+    if (mSuffixMaxLength > 0)
+    {
+        proposeSuffixChains(context);
+    }
 
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
@@ -717,6 +750,13 @@ bool Gemma4MTPDecoder::buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream
         config.draftingTopK, mTreeBuildWorkspace.rawPointer(),
         static_cast<size_t>(mTreeBuildWorkspace.getMemoryCapacity()), stream};
     buildParams.inputs.logitTokenIds = mStackedDraftLogitTokenIds.isEmpty() ? nullptr : &mStackedDraftLogitTokenIds;
+    if (mSuffixMaxLength > 0)
+    {
+        check::check(mSuffixChainTokenIds.reshape({activeBatchSize, mSuffixMaxLength}), "Tensor reshape failed");
+        check::check(mSuffixChainLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+        buildParams.inputs.appendChainTokenIds = &mSuffixChainTokenIds;
+        buildParams.inputs.appendChainLengths = &mSuffixChainLengths;
+    }
     kernel::ddtreeBuild(buildParams);
     return true;
 }
@@ -838,7 +878,7 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
     auto const& config = *mRuntime.deployment.specConfig;
     int32_t const activeBatchSize = context.activeBatchSize;
     int32_t const verifySize = config.verifySize;
-    int32_t const maxAcceptDepth = std::min(config.draftingStep + 1, verifySize);
+    int32_t const maxAcceptDepth = std::min(mMaxAcceptDepth, verifySize);
     int32_t const baseHiddenSize = config.baseOutputHiddenDim;
     int32_t const vocabSize = mRuntime.deployment.base.outputVocabSize;
 
@@ -942,6 +982,39 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
     }
 
     return true;
+}
+
+void Gemma4MTPDecoder::proposeSuffixChains(DecodingInferenceContext& context)
+{
+    int32_t const activeBatchSize = context.activeBatchSize;
+    int32_t* hostTokens = mHostSuffixChainTokenIds.dataPointer<int32_t>();
+    int32_t* hostLengths = mHostSuffixChainLengths.dataPointer<int32_t>();
+    for (int32_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
+    {
+        // Index the generated tokens committed since the last round (outputs only, not the prompt).
+        std::vector<int32_t> const& tokens = context.tokenIds[batchIdx];
+        int32_t const generated = std::min<int32_t>(context.currentGenerateLengths[batchIdx], tokens.size());
+        int32_t& indexed = mSuffixIndexedLengths[batchIdx];
+        indexed = std::min(indexed, generated);
+        for (size_t pos = tokens.size() - generated + indexed; pos < tokens.size(); ++pos)
+        {
+            mSuffixCache.append(tokens[pos]);
+        }
+        indexed = generated;
+
+        std::vector<int32_t> const proposal
+            = mSuffixCache.propose(tokens.data(), static_cast<int32_t>(tokens.size()), mSuffixMaxLength);
+        int32_t const length = static_cast<int32_t>(proposal.size()) >= mSuffixMinLength
+            ? static_cast<int32_t>(proposal.size())
+            : 0;
+        std::copy(proposal.begin(), proposal.begin() + length, hostTokens + batchIdx * mSuffixMaxLength);
+        hostLengths[batchIdx] = length;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mSuffixChainTokenIds.rawPointer(), hostTokens,
+        static_cast<size_t>(activeBatchSize) * mSuffixMaxLength * sizeof(int32_t), cudaMemcpyHostToDevice,
+        context.stream));
+    CUDA_CHECK(cudaMemcpyAsync(mSuffixChainLengths.rawPointer(), hostLengths,
+        static_cast<size_t>(activeBatchSize) * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 }
 
 bool Gemma4MTPDecoder::updateNextSeed(DecodingInferenceContext&)

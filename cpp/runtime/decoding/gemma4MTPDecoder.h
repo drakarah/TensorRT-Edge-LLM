@@ -19,6 +19,7 @@
 
 #include "common/hashUtils.h"
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/decoding/suffixDraftCache.h"
 #include "runtime/state/externalWeightManager.h"
 
 #include <filesystem>
@@ -97,6 +98,8 @@ private:
     bool runBaseVerification(DecodingInferenceContext& context);
     bool acceptAndCommit(DecodingInferenceContext& context);
     bool updateNextSeed(DecodingInferenceContext& context);
+    //! Index newly committed outputs in the suffix cache and upload each sequence's proposed chain.
+    void proposeSuffixChains(DecodingInferenceContext& context);
 
     DecodingRuntimeContext& mRuntime;
     std::unique_ptr<EngineExecutor> mDraftExecutor;
@@ -118,6 +121,19 @@ private:
     RaggedExecutionBatch mRaggedMetadataScratch;
 
     bool mUseTree{false};
+    //! Max tokens accepted per round: draftingStep + 1, or the verify size when a suffix chain can be longer.
+    int32_t mMaxAcceptDepth{0};
+
+    //! Suffix-cache drafting (EDGELLM_MTP_SUFFIX_DRAFT=<max chain length>, 0 = off): a chain proposed from
+    //! earlier outputs is merged into each verify tree next to the assistant's drafts.
+    SuffixDraftCache mSuffixCache;
+    int32_t mSuffixMaxLength{0};
+    int32_t mSuffixMinLength{2};                //!< Shorter proposals are not worth verify slots.
+    std::vector<int32_t> mSuffixIndexedLengths; //!< [B] generated tokens already in the cache
+    Tensor mHostSuffixChainTokenIds;            //!< [B, maxLength] host staging
+    Tensor mHostSuffixChainLengths;             //!< [B] host staging
+    Tensor mSuffixChainTokenIds;                //!< [B, maxLength]
+    Tensor mSuffixChainLengths;                 //!< [B]
     Tensor mStackedDraftLogits; //!< [B, specDraftStep + 1, draftVocab] per-depth proposal logits.
     //! Sparse assistant logits only: token id of each logits column, per draft step and stacked per depth.
     Tensor mDraftLogitTokenIds;        //!< [B, draftVocab]
