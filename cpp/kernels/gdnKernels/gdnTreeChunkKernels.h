@@ -121,5 +121,14 @@ cudaError_t gdnTreeReplayCommitBatched(MtpLayerInfo const* deviceLayerInfos, int
     int32_t const* stateIndices, int32_t batch, int32_t residentPoolRows, int32_t maxAcceptLen, int32_t numNodes,
     int32_t h, int32_t hv, cudaStream_t stream);
 
+//! Linear (chain) MTP replay commit across all recurrent layers: advances the resident state of each sequence
+//! by its first acceptLengths[b] verified steps (L <= maxSteps <= kGDN_TREE_CHUNK_MAX_ACCEPT), consuming the stash
+//! the linear verify kernel (gdn_decode_mtp.py) wrote in the layout above at the head of
+//! MtpLayerInfo::recurrentSrc. Register-resident with the verify kernel's op order, so the result is bit-identical
+//! to the verify kernel's own state after L steps. Sequences with L <= 0 or an invalid state row are skipped.
+cudaError_t gdnLinearReplayCommitBatched(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers,
+    size_t stashBatchStrideBytes, int32_t const* acceptLengths, int32_t const* stateIndices, int32_t batch,
+    int32_t residentPoolRows, int32_t maxSteps, int32_t h, int32_t hv, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

@@ -1448,28 +1448,23 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache, int32_t 
     EXPECT_EQ(h_pool_out, h_pool) << "MTP verify modified the resident state pool";
 
     // The verify writes the DDTree replay stash (no per-step snapshots); commit it the way the runtime does
-    // (MambaCacheManager::scatterAcceptedLinearStates: replay along the path 0..L-1) with a different accepted
+    // (MambaCacheManager::scatterAcceptedLinearStates: replay the first L steps) with a different accepted
     // length per sequence. Each committed pool row must equal the reference state after L steps.
     if (with_cache)
     {
-        std::vector<int32_t> h_path(static_cast<size_t>(n) * kernel::kGDN_TREE_CHUNK_MAX_ACCEPT);
-        for (size_t i = 0; i < h_path.size(); ++i)
-            h_path[i] = static_cast<int32_t>(i % kernel::kGDN_TREE_CHUNK_MAX_ACCEPT);
         std::vector<int32_t> h_accept(n);
         for (int32_t i = 0; i < n; ++i)
             h_accept[i] = i % seq_len + 1;
         kernel::MtpLayerInfo const h_info{d_h0, d_interm, nullptr, nullptr};
-        int32_t *d_path = nullptr, *d_accept = nullptr;
+        int32_t* d_accept = nullptr;
         kernel::MtpLayerInfo* d_info = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_path, h_path.size() * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_accept, n * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_info, sizeof(kernel::MtpLayerInfo)));
-        CUDA_CHECK(cudaMemcpy(d_path, h_path.data(), h_path.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_accept, h_accept.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_info, &h_info, sizeof(kernel::MtpLayerInfo), cudaMemcpyHostToDevice));
         size_t const stashStride = static_cast<size_t>(seq_len) * hv * k * v * sizeof(float);
-        CUDA_CHECK(kernel::gdnTreeReplayCommitBatched(d_info, 1, stashStride, d_path, d_accept, d_indices, n, poolRows,
-            kernel::kGDN_TREE_CHUNK_MAX_ACCEPT, seq_len, h, hv, nullptr));
+        CUDA_CHECK(kernel::gdnLinearReplayCommitBatched(
+            d_info, 1, stashStride, d_accept, d_indices, n, poolRows, seq_len, h, hv, nullptr));
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(h_pool_out.data(), d_h0, poolBytes, cudaMemcpyDeviceToHost));
         for (int32_t i = 0; i < n; ++i)
@@ -1485,7 +1480,6 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache, int32_t 
         }
         EXPECT_TRUE(std::all_of(h_pool_out.begin(), h_pool_out.begin() + rowLen, [](float x) { return x == 7.f; }))
             << "replay commit touched a pool row no sequence owns";
-        CUDA_CHECK(cudaFree(d_path));
         CUDA_CHECK(cudaFree(d_accept));
         CUDA_CHECK(cudaFree(d_info));
     }

@@ -791,6 +791,100 @@ __global__ void __launch_bounds__(kAPPLY_THREADS) treeVerifyChunkApplyWarpKernel
     }
 }
 
+// Linear (chain) replay commit, register-resident: same thread layout and op order as the sm_80-class verify kernel
+// (kernelSrcs/gdn_cutedsl/gdn_decode_mtp.py) — one CTA per (layer, batch, v head, 32-column V tile), 4 warps of 8 V
+// columns, each thread keeps 32 state rows of one column in registers — so the committed state is bit-identical to
+// the state the verify kernel reached after the same steps. Bandwidth-bound (one read and one write of the state);
+// the DDTree replay kernel above stages tiles in shared memory and is ~3x slower on Orin for a chain.
+constexpr int32_t kLIN_TILE_V{32};
+constexpr int32_t kLIN_THREADS{128};
+constexpr int32_t kLIN_V_PER_WARP{8};
+constexpr int32_t kLIN_K_PER_THREAD{kTILE_K / (32 / kLIN_V_PER_WARP)}; // 32
+
+__global__ void __launch_bounds__(kLIN_THREADS) linearReplayCommitBatchedKernel(MtpLayerInfo const* __restrict__ infos,
+    size_t stashBatchStrideBytes, int32_t const* __restrict__ acceptLengths, int32_t const* __restrict__ stateIndices,
+    int32_t residentPoolRows, int32_t maxSteps, int32_t H, int32_t HV)
+{
+    constexpr int32_t kNumVTiles = kTILE_K / kLIN_TILE_V;
+    int32_t const layer = blockIdx.y;
+    int32_t const vTile = blockIdx.x % kNumVTiles;
+    int32_t const headBlock = blockIdx.x / kNumVTiles;
+    int32_t const iN = headBlock / HV;
+    int32_t const iHv = headBlock % HV;
+    int32_t const iH = iHv / (HV / H);
+    int32_t const residentIdx = stateIndices[iN];
+    int32_t const L = acceptLengths[iN];
+    if (residentIdx < 0 || residentIdx >= residentPoolRows || L <= 0 || L > maxSteps || L > kGDN_TREE_CHUNK_MAX_ACCEPT)
+    {
+        return;
+    }
+
+    __shared__ __align__(16) float sK[kGDN_TREE_CHUNK_MAX_ACCEPT * kTILE_K];
+    __shared__ float sV[kGDN_TREE_CHUNK_MAX_ACCEPT * kLIN_TILE_V];
+    __shared__ float sG[kGDN_TREE_CHUNK_MAX_ACCEPT];
+    __shared__ float sBeta[kGDN_TREE_CHUNK_MAX_ACCEPT];
+
+    int32_t const tid = threadIdx.x;
+    StashOffsets const so = stashOffsets(H, HV);
+    char const* nodeBase = static_cast<char const*>(infos[layer].recurrentSrc) + static_cast<size_t>(iN) * stashBatchStrideBytes;
+    for (int32_t t = 0; t < L; ++t)
+    {
+        char const* cell = nodeBase + static_cast<size_t>(t) * so.nodeBytes;
+        sK[t * kTILE_K + tid] = reinterpret_cast<float const*>(cell + so.kNorm)[static_cast<size_t>(iH) * kTILE_K + tid];
+        if (tid < kLIN_TILE_V)
+        {
+            sV[t * kLIN_TILE_V + tid] = __half2float(reinterpret_cast<__half const*>(
+                cell + so.v)[static_cast<size_t>(iHv) * kTILE_K + vTile * kLIN_TILE_V + tid]);
+        }
+        if (tid == 0)
+        {
+            sG[t] = reinterpret_cast<float const*>(cell + so.g)[iHv];
+            sBeta[t] = reinterpret_cast<float const*>(cell + so.beta)[iHv];
+        }
+    }
+    __syncthreads();
+
+    int32_t const warp = tid / 32;
+    int32_t const lane = tid % 32;
+    int32_t const kBase = (lane / kLIN_V_PER_WARP) * kLIN_K_PER_THREAD;
+    int32_t const vInTile = warp * kLIN_V_PER_WARP + lane % kLIN_V_PER_WARP;
+    float* h = static_cast<float*>(infos[layer].recurrentDst)
+        + (static_cast<int64_t>(residentIdx) * HV + iHv) * kTILE_K * kTILE_K + vTile * kLIN_TILE_V + vInTile;
+
+    float rH[kLIN_K_PER_THREAD];
+#pragma unroll
+    for (int32_t i = 0; i < kLIN_K_PER_THREAD; ++i)
+    {
+        rH[i] = h[static_cast<int64_t>(kBase + i) * kTILE_K];
+    }
+    for (int32_t t = 0; t < L; ++t)
+    {
+        float const g = sG[t];
+        float const* k = sK + t * kTILE_K + kBase;
+        // correction = v - (g * H)^T k ; v_new = beta * correction ; H = g * H + k v_new^T
+        float sumHk = 0.f;
+#pragma unroll
+        for (int32_t i = 0; i < kLIN_K_PER_THREAD; ++i)
+        {
+            rH[i] = rH[i] * g;
+            sumHk += rH[i] * k[i];
+        }
+        sumHk += __shfl_xor_sync(0xffffffffu, sumHk, kLIN_V_PER_WARP);
+        sumHk += __shfl_xor_sync(0xffffffffu, sumHk, 2 * kLIN_V_PER_WARP);
+        float const vNew = (sV[t * kLIN_TILE_V + vInTile] - sumHk) * sBeta[t];
+#pragma unroll
+        for (int32_t i = 0; i < kLIN_K_PER_THREAD; ++i)
+        {
+            rH[i] = rH[i] + k[i] * vNew;
+        }
+    }
+#pragma unroll
+    for (int32_t i = 0; i < kLIN_K_PER_THREAD; ++i)
+    {
+        h[static_cast<int64_t>(kBase + i) * kTILE_K] = rH[i];
+    }
+}
+
 // Batched replay commit: one launch covers all recurrent layers.
 // Grid = numLayers x batch x hv (z-major on layer via blockIdx.y not needed;
 // flat decode). Per (layer, batch, hv-head) the state tile is SMEM-resident
@@ -1116,6 +1210,16 @@ cudaError_t gdnTreeVerifyChunk(float const* h0, __half const* q, __half const* k
             v, masks, o, static_cast<char const*>(stash), stashBatchStrideBytes, numNodes, h, hv);
     }
     return gdnTreeTraceLaunch("treeVerifyChunkApply");
+}
+
+cudaError_t gdnLinearReplayCommitBatched(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers,
+    size_t stashBatchStrideBytes, int32_t const* acceptLengths, int32_t const* stateIndices, int32_t batch,
+    int32_t residentPoolRows, int32_t maxSteps, int32_t h, int32_t hv, cudaStream_t stream)
+{
+    dim3 const grid(batch * hv * (kTILE_K / kLIN_TILE_V), numLayers);
+    linearReplayCommitBatchedKernel<<<grid, kLIN_THREADS, 0, stream>>>(deviceLayerInfos, stashBatchStrideBytes,
+        acceptLengths, stateIndices, residentPoolRows, maxSteps, h, hv);
+    return cudaGetLastError();
 }
 
 cudaError_t gdnTreeReplayCommitBatched(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers,
