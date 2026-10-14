@@ -994,8 +994,12 @@ def run(
     file_name: str = "int4_fp16_gemm_ampere",
     function_prefix: str = "int4_fp16_gemm_ampere",
     gpu_arch: str = "",
+    acc_fp16: bool = False,
 ):
     """Run or export the INT4 (W4A16) FP16 Ampere GEMM kernel.
+
+    ``acc_fp16`` accumulates the MMAs in FP16 instead of FP32: 2x the tensor rate on GeForce Ada (60 vs 30 TFLOP/s on an
+    RTX 4060), at FP16 rounding and range in the K sum (opt-in, see build_cutedsl.py).
 
     A baked ``split_k`` is correct only when it divides ``ceil(K / 64)``
     (``split_k == 1`` always works).
@@ -1024,7 +1028,7 @@ def run(
     kernel = Int4Fp16GemmAmpere(
         ab_dtype=cutlass.Float16,
         c_dtype=cutlass.Float16,
-        acc_dtype=cutlass.Float32,
+        acc_dtype=cutlass.Float16 if acc_fp16 else cutlass.Float32,
         cta_tiler_mnk=cta_tiler_mnk,
         atom_layout_mnk=atom_layout_mnk,
         num_stages=num_stages,
@@ -1168,6 +1172,7 @@ def _parse_args(argv=None):
     p.add_argument("--warmup_iterations", type=int, default=2)
     p.add_argument("--iterations", type=int, default=100)
     p.add_argument("--skip_ref_check", action="store_true")
+    p.add_argument("--acc_fp16", action="store_true", help="accumulate in FP16 (default FP32)")
     p.add_argument("--export_only", action="store_true")
     p.add_argument("--output_dir", type=str, default="./int4_fp16_gemm_aot_artifacts")
     p.add_argument("--file_name", type=str, default="int4_fp16_gemm_ampere")
@@ -1197,6 +1202,7 @@ def main():
         file_name=args.file_name,
         function_prefix=args.function_prefix,
         gpu_arch=args.gpu_arch,
+        acc_fp16=args.acc_fp16,
     )
 
 

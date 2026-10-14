@@ -2077,6 +2077,11 @@ _INT4_FP16_GEMM_CONFIGS = [
 # `_g{gs}` suffix to the variant name below to ship both group sizes at once.
 _INT4_FP16_GEMM_GROUP_SIZE = 128
 
+# Opt-in FP16 accumulation for the large-M tiles (prefill): set EDGELLM_INT4_GEMM_FP16_ACC_MIN_BM=64 to build the
+# bM >= 64 variants with FP16 MMA accumulators (2x tensor rate on GeForce Ada; FP16 range and rounding in the K sum).
+# Default off: FP32 accumulation everywhere. The decode-regime tiles (bM 16 and 32) always stay FP32.
+_INT4_GEMM_FP16_ACC_MIN_BM = int(os.environ.get("EDGELLM_INT4_GEMM_FP16_ACC_MIN_BM", "0") or 0)
+
 for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
     _tile_tag = f"{_bm}x128x64"
     KERNEL_VARIANTS.append(
@@ -2092,6 +2097,7 @@ for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
                 "--num_stages", str(_stages),
                 "--split_k", str(_sk),
                 "--group_size", str(_INT4_FP16_GEMM_GROUP_SIZE),
+                *(["--acc_fp16"] if _INT4_GEMM_FP16_ACC_MIN_BM and _bm >= _INT4_GEMM_FP16_ACC_MIN_BM else []),
                 "--export_only",
             ],
         )
