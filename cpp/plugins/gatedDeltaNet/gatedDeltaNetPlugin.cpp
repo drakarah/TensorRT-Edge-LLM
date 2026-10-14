@@ -24,6 +24,7 @@
 #include "plugins/utils/raggedPluginMetadata.h"
 #if defined(CUTE_DSL_GDN_ENABLED) || defined(CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED)
 #include "kernels/gdnKernels/cuteDslGDNRunner.h"
+#include "kernels/gdnKernels/gdnChunkPrefill.h"
 #endif
 #ifdef CUTE_DSL_GDN_ENABLED
 #include "kernels/gdnKernels/gdnKernelUtils.cuh"
@@ -457,6 +458,53 @@ int32_t GatedDeltaNetPlugin::getAliasedInput([[maybe_unused]] int32_t outputInde
 // IPluginV3OneRuntime — execution
 // ---------------------------------------------------------------------------
 #ifdef CUTE_DSL_GDN_ENABLED
+namespace
+{
+
+bool gdnChunkPrefillEnabled()
+{
+    static bool const kEnabled = []
+    {
+        char const* value = std::getenv("EDGELLM_GDN_CHUNK_PREFILL");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    return kEnabled;
+}
+
+//! Process-wide scratch for the chunked prefill, grown on demand outside CUDA graph capture. Returns nullptr when
+//! it cannot be (re)allocated; the caller then uses the sequential kernel.
+void* gdnChunkPrefillScratch(size_t bytes, cudaStream_t stream)
+{
+    static std::mutex sMutex;
+    static void* sBuffer = nullptr;
+    static size_t sBytes = 0;
+    std::lock_guard<std::mutex> lock(sMutex);
+    if (bytes <= sBytes)
+    {
+        return sBuffer;
+    }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess || status != cudaStreamCaptureStatusNone)
+    {
+        return nullptr;
+    }
+    if (sBuffer != nullptr)
+    {
+        cudaFree(sBuffer); // synchronizes the device: no kernel still uses the old buffer
+    }
+    if (cudaMalloc(&sBuffer, bytes) != cudaSuccess)
+    {
+        cudaGetLastError();
+        sBuffer = nullptr;
+        sBytes = 0;
+        return nullptr;
+    }
+    sBytes = bytes;
+    return sBuffer;
+}
+
+} // namespace
+
 int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
@@ -703,6 +751,32 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
             params.tensormap_scratch = workspace;
         }
 #endif
+    }
+
+    // Chunked tensor-core prefill on sm_80-class GPUs (opt-in, EDGELLM_GDN_CHUNK_PREFILL=1). Falls back to the
+    // sequential kernel when its scratch cannot be allocated (e.g. during CUDA graph capture).
+    bool const chunkPhase
+        = phase == rt::ExecutionPhase::kContextPrefill || phase == rt::ExecutionPhase::kContextChunk;
+    if (chunkPhase && seq_len >= kernel::kGDN_CHUNK && mSMVersion >= 80 && mSMVersion < 90 && k_dim == 128
+        && v_dim == 128 && gdnChunkPrefillEnabled())
+    {
+        void* chunkWorkspace = gdnChunkPrefillScratch(kernel::gdnChunkPrefillWorkspaceBytes(n, h, hv), stream);
+        if (chunkWorkspace != nullptr)
+        {
+            cudaError_t const err = kernel::gdnChunkPrefill(static_cast<__half const*>(params.q),
+                static_cast<__half const*>(params.k), static_cast<__half const*>(params.v),
+                static_cast<__half const*>(params.a), static_cast<__half const*>(params.b),
+                static_cast<float const*>(params.A_log), static_cast<__half const*>(params.dt_bias),
+                static_cast<float*>(params.h0_source), static_cast<int32_t const*>(params.state_indices),
+                params.state_pool_rows, static_cast<int32_t const*>(params.context_lengths),
+                static_cast<__half*>(params.o), n, seq_len, h, hv, chunkWorkspace, stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("gated_delta_net: chunked prefill launch failed: %s", cudaGetErrorString(err));
+                return -1;
+            }
+            return 0;
+        }
     }
 
     CuteDslGDNRunner runner;
