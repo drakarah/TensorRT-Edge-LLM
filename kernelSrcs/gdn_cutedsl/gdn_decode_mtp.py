@@ -91,8 +91,11 @@ AOT_PLACEHOLDER_T   = 8     # representative T for compilation
 # Register-resident verify kernel (sm_80-class GPUs; Jetson Orin is sm_87), same layout as gdn_prefill.py: one block
 # per (batch, value head, 32-column V tile), 4 warps of 8 V columns, each thread keeps 32 state rows of one column in
 # registers. The state is read once from its resident pool row (h0_source[state_indices[n]]); each step writes only its
-# output row and, when caching, its rollback snapshot. The caching (verify) variant never writes the pool: the runtime
-# commits the accepted step's snapshot (mtpStateScatterKernel), so no pre-verify copy of the state is needed. (The previous kernel reloaded and stored every state tile from global memory
+# output row. The caching (verify) variant never writes the pool and writes no per-step state snapshots: it stores the
+# replay stash of the DDTree chunk verify (gdnTreeChunkKernels.h: per step L2-normalised k, gate g, beta, fp16 v) at
+# the head of each batch row of intermediate_states, and the runtime commit replays the accepted steps from the pool
+# (gdnTreeReplayCommitBatched with the path 0..L-1). That replaces T x 2 MB of snapshot writes per layer (Qwen3.5-4B)
+# with ~16 KB of stash per step. (The previous kernel reloaded and stored every state tile from global memory
 # for every step and V tile.) One warp per step stages the step's L2-normalised k, scaled q, gates and V tile.
 REG_TILE_V = 32
 REG_NUM_WARPS = 4
@@ -120,13 +123,13 @@ def _define_mtp_kernels():
         A_log: cute.Tensor,               # [hv] FP32
         dt_bias: cute.Tensor,             # [hv] FP16
         o: cute.Tensor,                   # [n, seq_len, hv, V] FP16 (output)
-        intermediate_states: cute.Tensor, # [n, seq_len, hv, K, V] FP32 (state cache)
+        intermediate_states: cute.Tensor, # [n, seq_len, hv, K, V] FP32 buffer; caching variant: replay stash at row heads
         seq_len: Int32,
         softplus_beta: cutlass.Constexpr[float],
         softplus_threshold: cutlass.Constexpr[float],
         scale: cutlass.Constexpr[float],
         use_qk_l2norm: cutlass.Constexpr[bool],
-        cache_intermediate_states: cutlass.Constexpr[bool],  # write intermediate_states
+        cache_intermediate_states: cutlass.Constexpr[bool],  # write the replay stash
         T_MAX: cutlass.Constexpr[int],    # SMEM prealloc upper bound (== T_MAX_AOT)
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -147,6 +150,14 @@ def _define_mtp_kernels():
         k_base = k_part * REG_K_PER_THREAD
         r_A = cute.exp(cutlass.Float32(A_log[i_hv]))
         r_dt_bias = cutlass.Float32(dt_bias[i_hv])
+
+        # Replay stash (float offsets): batch row = seq_len * HV * K * V floats; per step a cell of
+        # [kNorm H*K f32 | g HV f32 | beta HV f32 | v HV*V f16] packed at cell_floats.
+        cell_floats = H * TILE_K + 2 * HV + HV * (TILE_K // 2)
+        row_floats = seq_len * HV * TILE_K * TILE_K
+        stash_f32 = cute.make_tensor(intermediate_states.iterator, cute.make_layout(1 << 30))
+        stash_f16 = cute.make_tensor(
+            cute.recast_ptr(intermediate_states.iterator, dtype=cutlass.Float16), cute.make_layout(1 << 30))
 
         smem = cutlass.utils.SmemAllocator()
         sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T_MAX, TILE_K), stride=(TILE_K, 1)), 16)
@@ -177,7 +188,15 @@ def _define_mtp_kernels():
             for j in cutlass.range_constexpr(REG_K_PER_LANE):
                 sK[(t, lane * REG_K_PER_LANE + j)] = rk[j] * k_scale
                 sQ[(t, lane * REG_K_PER_LANE + j)] = rq[j] * q_scale
-            sV[(t, lane)] = cutlass.Float32(v[i_n, t, i_hv, v_tile * REG_TILE_V + lane])
+            v_raw = v[i_n, t, i_hv, v_tile * REG_TILE_V + lane]
+            sV[(t, lane)] = cutlass.Float32(v_raw)
+            cell = i_n * row_floats + t * cell_floats
+            if cutlass.const_expr(cache_intermediate_states):
+                if v_tile == 0:
+                    if i_hv % (HV // H) == 0:  # one block per k head writes its normalised k
+                        for j in cutlass.range_constexpr(REG_K_PER_LANE):
+                            stash_f32[cell + i_h * TILE_K + lane * REG_K_PER_LANE + j] = rk[j] * k_scale
+                stash_f16[2 * (cell + H * TILE_K + 2 * HV) + i_hv * TILE_K + v_tile * REG_TILE_V + lane] = v_raw
             if lane == 0:
                 # g = exp(-exp(A_log) * softplus(a + dt_bias)), beta = sigmoid(b).
                 x = cutlass.Float32(a[i_n, t, i_hv]) + r_dt_bias
@@ -189,6 +208,10 @@ def _define_mtp_kernels():
                     )
                 sG[t] = cute.exp(-r_A * softplus_x)
                 sBeta[t] = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-cutlass.Float32(b[i_n, t, i_hv])))
+                if cutlass.const_expr(cache_intermediate_states):
+                    if v_tile == 0:
+                        stash_f32[cell + H * TILE_K + i_hv] = sG[t]
+                        stash_f32[cell + H * TILE_K + HV + i_hv] = sBeta[t]
         cute.arch.barrier()
 
         pool_row = state_indices[i_n]
@@ -226,9 +249,6 @@ def _define_mtp_kernels():
                 sum_hq += cute.arch.shuffle_sync_bfly(sum_hq, offset=offset, mask=-1, mask_and_clamp=31)
             if k_part == 0:
                 o[i_n, t, i_hv, v_global] = cutlass.Float16(sum_hq)
-            if cutlass.const_expr(cache_intermediate_states):
-                for i in cutlass.range_constexpr(REG_K_PER_THREAD):
-                    intermediate_states[i_n, t, i_hv, k_base + i, v_global] = rH[i]
 
         if cutlass.const_expr(not cache_intermediate_states):
             if valid_row != 0:

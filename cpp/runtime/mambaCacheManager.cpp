@@ -24,6 +24,7 @@
 
 #include <limits>
 #include <string>
+#include <vector>
 
 using namespace nvinfer1;
 
@@ -173,6 +174,19 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
             {static_cast<int64_t>(infoBytes)}, DeviceType::kGPU, DataType::kINT8, "MambaCacheManager::mtpLayerInfos");
         CUDA_CHECK(cudaMemcpyAsync(
             mDeviceMtpLayerInfos.rawPointer(), hostInfos.data(), infoBytes, cudaMemcpyHostToDevice, stream));
+        if (!useReplay)
+        {
+            constexpr int32_t kPathLen = kernel::kGDN_TREE_CHUNK_MAX_ACCEPT;
+            std::vector<int32_t> hostPath(static_cast<size_t>(mConfig.maxBatchSize) * kPathLen);
+            for (size_t i = 0; i < hostPath.size(); ++i)
+            {
+                hostPath[i] = static_cast<int32_t>(i % kPathLen);
+            }
+            mLinearReplayPath = rt::Tensor({mConfig.maxBatchSize, kPathLen}, DeviceType::kGPU, DataType::kINT32,
+                "MambaCacheManager::linearReplayPath");
+            CUDA_CHECK(cudaMemcpy(mLinearReplayPath.rawPointer(), hostPath.data(), hostPath.size() * sizeof(int32_t),
+                cudaMemcpyHostToDevice));
+        }
         if (useReplay)
         {
             std::vector<mamba_ssm::MambaReplayLayerInfo> replayInfos(mConfig.numRecurrentLayers);
@@ -229,6 +243,7 @@ MambaCacheManager::MambaCacheManager(MambaCacheManager&& other) noexcept
     mDeviceStateLayerInfos = std::move(other.mDeviceStateLayerInfos);
     mDeviceMtpLayerInfos = std::move(other.mDeviceMtpLayerInfos);
     mDeviceMambaReplayLayerInfos = std::move(other.mDeviceMambaReplayLayerInfos);
+    mLinearReplayPath = std::move(other.mLinearReplayPath);
 
     other.mConfig = Config{};
 }
@@ -250,6 +265,7 @@ MambaCacheManager& MambaCacheManager::operator=(MambaCacheManager&& other) noexc
         mDeviceStateLayerInfos = std::move(other.mDeviceStateLayerInfos);
         mDeviceMtpLayerInfos = std::move(other.mDeviceMtpLayerInfos);
         mDeviceMambaReplayLayerInfos = std::move(other.mDeviceMambaReplayLayerInfos);
+        mLinearReplayPath = std::move(other.mLinearReplayPath);
 
         other.mConfig = Config{};
     }
@@ -532,12 +548,21 @@ void MambaCacheManager::scatterAcceptedLinearStates(
     }
     else
     {
-        // GDN linear MTP: commit the accepted per-token recurrent snapshot via the batched scatter.
-        int32_t const recElements
-            = mConfig.recurrentStateNumHeads * mConfig.recurrentStateHeadDim * mConfig.recurrentStateSize;
-        kernel::mtpScatterRecurrentStates(layerInfos, mConfig.numRecurrentLayers, activeBatchSize, mConfig.maxBatchSize,
-            verifySize, recElements, acceptPtr, stateIndices.dataPointer<int32_t>(), stream,
-            mConfig.recurrentStateType == DataType::kHALF);
+        // GDN linear MTP: the verify kernel (gdn_decode_mtp.py) writes the DDTree replay stash instead of per-step
+        // state snapshots, so commit by replaying the accepted steps 0..L-1 from the resident state.
+        int32_t const hv = mConfig.recurrentStateNumHeads;
+        int32_t const dk = mConfig.recurrentStateHeadDim;
+        int32_t const dv = mConfig.recurrentStateSize;
+        int32_t const h = (mConfig.convDim / dk - hv) / 2;
+        check::check(mConfig.recurrentStateType == DataType::kFLOAT && dk == 128 && dv == 128 && h > 0 && hv % h == 0,
+            "GDN linear replay commit requires FP32 states, dk == dv == 128 and hv divisible by the k-head count.");
+        check::check(verifySize <= kernel::kGDN_TREE_CHUNK_MAX_ACCEPT && !mLinearReplayPath.isEmpty(),
+            "GDN linear replay commit: verify length exceeds kGDN_TREE_CHUNK_MAX_ACCEPT.");
+        size_t const stashBatchStrideBytes
+            = static_cast<size_t>(verifySize) * hv * static_cast<size_t>(dk) * dv * sizeof(float);
+        CUDA_CHECK(kernel::gdnTreeReplayCommitBatched(layerInfos, mConfig.numRecurrentLayers, stashBatchStrideBytes,
+            mLinearReplayPath.dataPointer<int32_t>(), acceptPtr, stateIndices.dataPointer<int32_t>(), activeBatchSize,
+            mConfig.maxBatchSize, kernel::kGDN_TREE_CHUNK_MAX_ACCEPT, verifySize, h, hv, stream));
     }
     // Conv state: commit the accepted per-token snapshot via the batched scatter.
     kernel::mtpScatterConvStates(layerInfos, mConfig.numRecurrentLayers, activeBatchSize, mConfig.maxBatchSize,

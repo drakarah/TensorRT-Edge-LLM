@@ -228,6 +228,9 @@ private:
     rt::Tensor mDeviceStateLayerInfos;
     rt::Tensor mDeviceMtpLayerInfos;
     rt::Tensor mDeviceMambaReplayLayerInfos;
+    //! GDN linear MTP: [maxBatchSize, kGDN_TREE_CHUNK_MAX_ACCEPT] INT32, every row 0, 1, 2, ... — the accepted
+    //! "path" of a chain verify, so its recurrent commit can use the DDTree replay kernel.
+    rt::Tensor mLinearReplayPath;
 };
 
 } // namespace rt
