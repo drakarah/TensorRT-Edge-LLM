@@ -38,7 +38,9 @@ class SuffixDraftCache
 public:
     static constexpr int32_t kSeparator{-1}; //!< Between requests: no n-gram spans two requests.
 
-    explicit SuffixDraftCache(size_t maxTokens = size_t{1} << 22)
+    //! Up to 3 index entries per token (~56 B each): the default 2^18 tokens (~2,400 app answers) stays under
+    //! ~45 MB of host memory, which Jetson shares with the GPU. When full, the cache starts over.
+    explicit SuffixDraftCache(size_t maxTokens = size_t{1} << 18)
         : mMaxTokens(maxTokens)
     {
     }

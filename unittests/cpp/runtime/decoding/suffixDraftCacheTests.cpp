@@ -83,3 +83,18 @@ TEST(SuffixDraftCache, DoesNotProposeFromItsOwnEndOrAcrossRequests)
     // Unknown context: nothing.
     EXPECT_TRUE(propose(cache, {77, 78}, 4).empty());
 }
+
+TEST(SuffixDraftCache, StartsOverWhenFull)
+{
+    SuffixDraftCache cache(6);
+    appendAll(cache, {1, 2, 3, 4});
+    cache.beginSequence();
+    EXPECT_EQ(propose(cache, {1, 2}, 2), (std::vector<int32_t>{3, 4}));
+
+    // The 7th token exceeds the cap: everything before it is dropped.
+    appendAll(cache, {8, 9});
+    EXPECT_TRUE(propose(cache, {1, 2}, 2).empty());
+    // Indexing continues from the kept token.
+    appendAll(cache, {10, 7});
+    EXPECT_EQ(propose(cache, {9, 10}, 2), (std::vector<int32_t>{7}));
+}
