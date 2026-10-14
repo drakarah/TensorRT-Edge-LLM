@@ -1092,6 +1092,21 @@ KERNEL_VARIANTS = [
             "--skip_rescale", "--d512_ws", "--export_only",
         ],
     ),
+    # INT8 Q·Kᵀ variant of the warp-specialized causal D512 kernel (fmha_d512_ws_i8.py):
+    # int8 Q/K (16-bit view, D = 256) with per-row Q and per-32-key-tile K scales; P·V fp16.
+    # Selected at runtime by EDGELLM_FMHA_INT8_QK=1.
+    KernelVariant(
+        name="fmha_v2_d512_i8",
+        group="fmha",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "512",
+            "--m_block_size", "32", "--n_block_size", "32", "--num_threads", "64",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context",
+            "--skip_rescale", "--d512_ws_i8", "--export_only",
+        ],
+    ),
     KernelVariant(
         name="fmha_v2_d512_sw",
         group="fmha",

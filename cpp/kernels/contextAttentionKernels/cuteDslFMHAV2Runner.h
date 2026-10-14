@@ -131,6 +131,12 @@ public:
         int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream, float attentionScale);
 
 private:
+#if defined(CUTE_DSL_FMHA_ENABLED)
+    //! Quantise Q (per row) and K (per 32-key tile) to INT8 and run the INT8 Q·Kᵀ D512 kernel.
+    //! Returns the kernel status, or kINT8_QK_FALLBACK when the fp16 kernel must run instead.
+    int32_t runD512Int8(void const* params);
+#endif
+    static constexpr int32_t kINT8_QK_FALLBACK = -2;
     int32_t mBatchSize{};
     int32_t mSeqLenQ{};
     int32_t mKVSeqLen{};
@@ -145,6 +151,8 @@ private:
     static detail::LazyKernelModule<fmha_v2_d128_Kernel_Module_t> sLLM_d128;
     static detail::LazyKernelModule<fmha_v2_d256_Kernel_Module_t> sLLM_d256;
     static detail::LazyKernelModule<fmha_v2_d512_Kernel_Module_t> sLLM_d512;
+    //! INT8 Q·Kᵀ variant of the causal D512 kernel (EDGELLM_FMHA_INT8_QK=1).
+    static detail::LazyKernelModule<fmha_v2_d512_i8_Kernel_Module_t> sLLM_d512I8;
     static detail::LazyKernelModule<fmha_v2_d256_padding_Kernel_Module_t> sLLM_d256Padding;
     static detail::LazyKernelModule<fmha_v2_d64_sw_Kernel_Module_t> sLLM_d64Sw;
     static detail::LazyKernelModule<fmha_v2_d128_sw_Kernel_Module_t> sLLM_d128Sw;

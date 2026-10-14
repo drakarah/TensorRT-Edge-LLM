@@ -2633,6 +2633,26 @@ def _create_block_range_tensor(batch_size: int, seqlen: int, fill: int = -1,
     return t, arr
 
 
+
+def _create_scale_tensor(b: int, h: int, n: int, *, storage_free: bool = False):
+    """(B, H, N) Float32 dequantisation scales for the INT8 Q·Kᵀ kernel (all modes runtime-dynamic)."""
+    shape = (b, h, n)
+    if storage_free:
+        arr = None
+        t = aot_placeholders.make_compact_tensor(
+            cutlass.Float32, shape, stride_order=(2, 1, 0), assumed_align=16
+        )
+    else:
+        arr = cp.ones(shape, dtype=cp.float32)
+        t = from_dlpack(arr, assumed_align=16)
+    so = (0, 1, 2)
+    t = (
+        t.mark_compact_shape_dynamic(mode=0, stride_order=so)
+        .mark_compact_shape_dynamic(mode=1, stride_order=so)
+        .mark_compact_shape_dynamic(mode=2, stride_order=so)
+    )
+    return t, arr
+
 def _create_cu_seqlens_tensor(batch_size: int, seqlen: int,
                               *, storage_free: bool = False):
     """(B+1,) Int32 cumulative sequence lengths for uniform per-batch ``seqlen``.
@@ -2789,6 +2809,7 @@ def run(
     skip_rescale: bool = True,
     hybrid_exp2: bool = False,
     d512_ws: bool = False,
+    d512_ws_i8: bool = False,
     warmup_iterations: int = 3,
     iterations: int = 10,
     skip_ref_check: bool = False,
@@ -3070,6 +3091,26 @@ def run(
             raise ValueError(f"{_tag} --d512_ws needs --fmha_v2_context, head_dim 512, causal, no window")
         from fmha_d512_ws import FMHAV2D512WS
         fa2_fwd = FMHAV2D512WS(is_causal=True, skip_rescale=skip_rescale)
+    if d512_ws_i8:
+        # INT8 Q·Kᵀ variant (fmha_d512_ws_i8.py): Q/K are int8 passed as a 16-bit view with D = 256,
+        # plus per-row Q scales (B, H, Sq) and per-32-key-tile K scales (B, Hkv, ceil(Sk / 32)).
+        if not (fmha_v2_context and head_dim == 512 and is_causal and window_size_left < 0
+                and not vision_block):
+            raise ValueError(f"{_tag} --d512_ws_i8 needs --fmha_v2_context, head_dim 512, causal, no window")
+        from fmha_d512_ws_i8 import FMHAV2D512WSI8
+        fa2_fwd = FMHAV2D512WSI8(is_causal=True, skip_rescale=skip_rescale)
+        q_dyn, q_arr = _create_bsnd_tensor(
+            batch_size, seqlen_q, h_q, head_dim // 2, dtype,
+            fill_random=False, storage_free=export_only,
+        )
+        k_dyn, k_arr = _create_bsnd_tensor(
+            batch_size, seqlen_k, h_kv, head_dim // 2, dtype,
+            fill_random=False, storage_free=export_only,
+        )
+        q_scale_dyn, _ = _create_scale_tensor(batch_size, h_q, seqlen_q, storage_free=export_only)
+        k_scale_dyn, _ = _create_scale_tensor(
+            batch_size, h_kv, (seqlen_k + 31) // 32, storage_free=export_only
+        )
 
     current_stream = (
         aot_placeholders.make_stream()
@@ -3169,6 +3210,31 @@ def run(
             current_stream,
             **compile_options,
         )
+    elif d512_ws_i8:
+        compiled_fa2 = cute.compile(
+            fa2_fwd.__call_context__,
+            q_dyn,
+            k_dyn,
+            v_dyn,
+            o_dyn,
+            q_scale_dyn,
+            k_scale_dyn,
+            cu_k_dyn,
+            block_begin_dyn,
+            block_end_dyn,
+            cutlass.Int32(max(window_size_left, 0)),
+            cutlass.Float32(softmax_scale),
+            cutlass.Float32(1.0),
+            cutlass.Float32(1.0),
+            cutlass.Float32(1.0),
+            cutlass.Float32(1.0),
+            _sm_count,
+            current_stream,
+            **compile_options,
+        )
+        if not export_only:
+            print(f"{_tag} --d512_ws_i8 runs only as an export here; test it with test_i8.py")
+            return None
     elif fmha_v2_context:
         compiled_fa2 = cute.compile(
             fa2_fwd.__call_context__,
@@ -3633,6 +3699,8 @@ def _parse_args(argv=None):
                    help="Scaffold for FA4-style 75%% MUFU + 25%% polynomial exp2 (not validated).")
     p.add_argument("--d512_ws", action="store_true",
                    help="Use the warp-specialized head-512 causal context kernel (fmha_d512_ws.py).")
+    p.add_argument("--d512_ws_i8", action="store_true",
+                   help="Head-512 causal context with INT8 Q·Kᵀ (fmha_d512_ws_i8.py); export only.")
     p.add_argument("--warmup_iterations", type=int, default=3)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--skip_ref_check", action="store_true")
@@ -3688,6 +3756,7 @@ def main():
         skip_rescale=args.skip_rescale,
         hybrid_exp2=args.hybrid_exp2,
         d512_ws=args.d512_ws,
+        d512_ws_i8=args.d512_ws_i8,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
         skip_ref_check=args.skip_ref_check or args.benchmark_paged_kv_ragged,
