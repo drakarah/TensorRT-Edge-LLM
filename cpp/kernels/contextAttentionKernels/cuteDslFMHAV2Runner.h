@@ -121,6 +121,15 @@ public:
     bool runPadding(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuQSeqLens,
         int32_t const* cuKVSeqLens, cudaStream_t stream, float attentionScale);
 
+    //! INT8 K from the KV cache can be used now: EDGELLM_FMHA_INT8_QK=1, head 512, and the stream is not being
+    //! captured (the INT8 path grows a scratch buffer). Callers that gather K as INT8 must check this first.
+    static bool int8QKUsable(int32_t headDim, cudaStream_t stream);
+
+    //! Causal D512 context attention with INT8 K taken from an INT8 KV cache (one static dequant scale kScale);
+    //! Q is quantised per row. Requires int8QKUsable(); K is [B, S, Hkv, 512] int8, V fp16.
+    bool runInt8KCache(void const* qPtr, void const* kInt8Ptr, float kScale, void const* vPtr, void* oPtr,
+        int32_t const* cuKVSeqLens, cudaStream_t stream, float attentionScale);
+
     //! Runs Gemma4 vision-block attention: sliding-causal OR same-image-block.
     bool runVisionBlock(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuKVSeqLens,
         int32_t const* blockBegin, int32_t const* blockEnd, cudaStream_t stream, float attentionScale,
@@ -134,7 +143,8 @@ private:
 #if defined(CUTE_DSL_FMHA_ENABLED)
     //! Quantise Q (per row) and K (per 32-key tile) to INT8 and run the INT8 Q·Kᵀ D512 kernel.
     //! Returns the kernel status, or kINT8_QK_FALLBACK when the fp16 kernel must run instead.
-    int32_t runD512Int8(void const* params);
+    //! kInt8 != nullptr: K is already INT8 with the single scale kScale (no K quantisation pass).
+    int32_t runD512Int8(void const* params, void const* kInt8 = nullptr, float kScale = 1.F);
 #endif
     static constexpr int32_t kINT8_QK_FALLBACK = -2;
     int32_t mBatchSize{};

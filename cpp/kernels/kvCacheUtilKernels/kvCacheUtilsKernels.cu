@@ -319,8 +319,8 @@ __global__ void gatherPagedKVToSplitKernel(uint8_t const* __restrict__ pool, uin
 //! One-byte pool -> FP16 dequant gather (FP8 e4m3 or INT8). Same page addressing as the byte-copy kernel,
 //! but each element is dequantized (value * scale) into the FP16 destination, so the downstream
 //! `dataPointer<half>()` consumers see real FP16 rather than reinterpreted one-byte values.
-template <typename TCache>
-__global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ pool, half* __restrict__ kDst,
+template <typename TCache, bool kRawK = false>
+__global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ pool, void* __restrict__ kDstRaw,
     half* __restrict__ vDst, int32_t const* __restrict__ pageTable, int32_t const* __restrict__ kvSeqLens,
     int32_t maxPagesPerSeq, int32_t seqLen, int32_t tokenElems, float kScale, float vScale, int32_t zeroFillTailTokens, int32_t keepTrailingTokens)
 {
@@ -335,12 +335,25 @@ __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ poo
     size_t const elemsToCopy = static_cast<size_t>(tokensInPage) * tokenElems;
     size_t const dstOffset = (static_cast<size_t>(batch) * seqLen + tokenStart) * static_cast<size_t>(tokenElems);
     size_t const pageElems = static_cast<size_t>(rt::kTOKENS_PER_PAGE) * tokenElems;
+    // kRawK: K keeps its one-byte values (int8 destination); otherwise K is dequantised like V.
+    half* const kDst = static_cast<half*>(kDstRaw);
+    TCache* const kDstBytes = static_cast<TCache*>(kDstRaw);
+    auto storeK = [&](size_t i, TCache value) {
+        if constexpr (kRawK)
+        {
+            kDstBytes[i] = value;
+        }
+        else
+        {
+            kDst[i] = __float2half(static_cast<float>(value) * kScale);
+        }
+    };
 
     if (beyondLive)
     {
         for (size_t i = threadIdx.x; i < elemsToCopy; i += blockDim.x)
         {
-            kDst[dstOffset + i] = __float2half(0.f);
+            storeK(dstOffset + i, TCache{});
             vDst[dstOffset + i] = __float2half(0.f);
         }
         return;
@@ -350,7 +363,7 @@ __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ poo
         // Unmapped page: zero-fill (see the byte-copy kernel above).
         for (size_t i = threadIdx.x; i < elemsToCopy; i += blockDim.x)
         {
-            kDst[dstOffset + i] = __float2half(0.f);
+            storeK(dstOffset + i, TCache{});
             vDst[dstOffset + i] = __float2half(0.f);
         }
         return;
@@ -373,25 +386,37 @@ __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ poo
 #pragma unroll
             for (size_t j = 0; j < kVEC; ++j)
             {
-                kOut[j] = __float2half(static_cast<float>(kBytes[j]) * kScale);
+                if constexpr (!kRawK)
+                {
+                    kOut[j] = __float2half(static_cast<float>(kBytes[j]) * kScale);
+                }
                 vOut[j] = __float2half(static_cast<float>(vBytes[j]) * vScale);
             }
-            reinterpret_cast<uint4*>(kDst + dstOffset)[v] = *reinterpret_cast<uint4 const*>(kOut);
+            if constexpr (kRawK)
+            {
+                reinterpret_cast<uint2*>(kDstBytes + dstOffset)[v] = kIn;
+            }
+            else
+            {
+                reinterpret_cast<uint4*>(kDst + dstOffset)[v] = *reinterpret_cast<uint4 const*>(kOut);
+            }
             reinterpret_cast<uint4*>(vDst + dstOffset)[v] = *reinterpret_cast<uint4 const*>(vOut);
         }
         return;
     }
     for (size_t i = threadIdx.x; i < elemsToCopy; i += blockDim.x)
     {
-        kDst[dstOffset + i] = __float2half(static_cast<float>(kSrc[i]) * kScale);
+        storeK(dstOffset + i, kSrc[i]);
         vDst[dstOffset + i] = __float2half(static_cast<float>(vSrc[i]) * vScale);
     }
 }
 
 void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t const* pageTable, int32_t const* kvSeqLens,
     int32_t maxPagesPerSeq, int32_t batchSize, int32_t seqLen, int32_t numKVHeads, int32_t headDim, size_t elemSize,
-    KVPoolQuant poolQuant, float kScale, float vScale, cudaStream_t stream, int32_t zeroFillTailTokens, int32_t keepTrailingTokens)
+    KVPoolQuant poolQuant, float kScale, float vScale, cudaStream_t stream, int32_t zeroFillTailTokens, int32_t keepTrailingTokens,
+    bool rawInt8K)
 {
+    check::check(!rawInt8K || poolQuant == KVPoolQuant::kINT8, "gatherPagedKVToSplit: rawInt8K needs an INT8 pool.");
     check::check(batchSize > 0 && seqLen > 0 && numKVHeads > 0 && headDim > 0 && elemSize > 0,
         "gatherPagedKVToSplit: batchSize, seqLen, numKVHeads, headDim, and elemSize must all be positive.");
     check::check(
@@ -411,16 +436,22 @@ void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t cons
     {
 #if SUPPORTS_FP8
         gatherDequantPagedKVToSplitKernel<__nv_fp8_e4m3><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
-            static_cast<__nv_fp8_e4m3 const*>(pool), static_cast<half*>(kDst), static_cast<half*>(vDst), pageTable,
+            static_cast<__nv_fp8_e4m3 const*>(pool), kDst, static_cast<half*>(vDst), pageTable,
             kvSeqLens, maxPagesPerSeq, seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens);
 #else
         throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
 #endif
     }
+    else if (poolQuant == KVPoolQuant::kINT8 && rawInt8K)
+    {
+        gatherDequantPagedKVToSplitKernel<int8_t, true><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
+            static_cast<int8_t const*>(pool), kDst, static_cast<half*>(vDst), pageTable, kvSeqLens, maxPagesPerSeq,
+            seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens);
+    }
     else if (poolQuant == KVPoolQuant::kINT8)
     {
         gatherDequantPagedKVToSplitKernel<int8_t><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
-            static_cast<int8_t const*>(pool), static_cast<half*>(kDst), static_cast<half*>(vDst), pageTable,
+            static_cast<int8_t const*>(pool), kDst, static_cast<half*>(vDst), pageTable,
             kvSeqLens, maxPagesPerSeq, seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens);
     }
     else

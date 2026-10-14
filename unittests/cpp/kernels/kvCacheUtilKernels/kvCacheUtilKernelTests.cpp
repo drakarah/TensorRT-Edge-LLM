@@ -365,6 +365,52 @@ TEST(GatherPagedKVToSplitTest, Int8DequantMatchesHostReference)
     }
 }
 
+// rawInt8K (INT8 Q·Kᵀ FMHA): K keeps the pool's bytes in an int8 destination, V is dequantized as usual.
+// S = 300 with live length 190: pages 0-1 are live (copied whole, as in the dequant mode; attention masks the
+// tokens past the live length) and page 2 starts beyond it, so both K and V are zero-filled there.
+TEST(GatherPagedKVToSplitTest, Int8RawKCopiesBytesAndDequantizesV)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const B = 2, H = 2, D = 32, S = 300, live = 190;
+    int32_t const pagesPerBatch = (S + rt::kTOKENS_PER_PAGE - 1) / rt::kTOKENS_PER_PAGE;
+    int32_t const numPages = B * pagesPerBatch;
+    float const kScale = 0.0371f, vScale = 0.0213f;
+
+    size_t const splitVol = (size_t) B * S * H * D;
+    std::vector<int8_t> refK(splitVol), refV(splitVol);
+    uniformIntInitialization(refK, -127, 127);
+    uniformIntInitialization(refV, -127, 127);
+
+    std::vector<int8_t> const poolHost = buildIdentityFlatPool(refK, refV, B, S, H, D, pagesPerBatch);
+    rt::Tensor poolTensor({(int64_t) poolHost.size()}, rt::DeviceType::kGPU, DataType::kINT8);
+    copyHostToDevice(poolTensor, poolHost);
+
+    rt::KVPageTable pageTable(B, pagesPerBatch, numPages);
+    pageTable.setIdentity();
+    pageTable.upload(stream);
+
+    rt::Tensor kDstTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor vDstTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kvSeqLens = makeKvSeqLens(std::vector<int32_t>(B, live));
+    kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
+        pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), pagesPerBatch, B, S, H, D,
+        sizeof(int8_t), kernel::KVPoolQuant::kINT8, kScale, vScale, stream, -1, -1, /*rawInt8K=*/true);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<int8_t> const kOutHost = copyDeviceToHost<int8_t>(kDstTensor);
+    std::vector<half> const vOutHost = copyDeviceToHost<half>(vDstTensor);
+
+    size_t const tokenElems = (size_t) H * D;
+    for (size_t i = 0; i < splitVol; ++i)
+    {
+        int32_t const token = static_cast<int32_t>((i / tokenElems) % S);
+        bool const isLive = token / rt::kTOKENS_PER_PAGE * rt::kTOKENS_PER_PAGE < live;
+        int8_t const expK = isLive ? refK[i] : int8_t{0};
+        half const expV = __float2half(isLive ? static_cast<float>(refV[i]) * vScale : 0.F);
+        ASSERT_EQ(kOutHost[i], expK) << "raw K mismatch at flat idx " << i;
+        ASSERT_EQ(__half_as_ushort(vOutHost[i]), __half_as_ushort(expV)) << "V dequant mismatch at flat idx " << i;
+    }
+}
+
 // Live-bounded mode (zeroFillTailTokens >= 0): a capacity-wide split for chunked/reuse prefill must
 // cost O(live length). Live tokens are dequantized, pages starting before live + tail are written
 // (zero past the live page), and pages starting at or beyond that bound are left untouched.

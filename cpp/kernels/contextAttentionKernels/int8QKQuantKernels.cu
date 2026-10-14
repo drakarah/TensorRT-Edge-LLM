@@ -161,7 +161,27 @@ __global__ void quantizeKPerTileKernel(half const* k, int8_t* kOut, float* kScal
     }
 }
 
+__global__ void fillFloatKernel(float* dst, float value, int64_t n)
+{
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        dst[i] = value;
+    }
+}
+
 } // namespace
+
+void fillFloat(float* dst, float value, int64_t n, cudaStream_t stream)
+{
+    if (n == 0)
+    {
+        return;
+    }
+    uint32_t const blocks = static_cast<uint32_t>(n < 256 * 64 ? (n + 255) / 256 : 64);
+    fillFloatKernel<<<blocks, 256, 0, stream>>>(dst, value, n);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void quantizeQPerRowInt8(half const* q, int8_t* qOut, float* qScale, int32_t batchSize, int32_t seqLen,
     int32_t numHeads, int32_t headDim, cudaStream_t stream)

@@ -146,7 +146,7 @@ private:
         int32_t const* kvSeqLens, int32_t maxPagesPerSeq, std::byte*& workspacePtr, int32_t batchSize,
         int32_t numKVHeads, int32_t capPadded, int32_t headSize, int32_t seqLen, float kScale, float vScale,
         cudaStream_t stream, int32_t consumerTailTokens = -1,
-        int32_t consumerKeepTrailingTokens = -1);
+        int32_t consumerKeepTrailingTokens = -1, bool rawInt8K = false);
 
     //! enqueue() body. enqueue() wraps it in a try/catch so a thrown error
     //! fails the call instead of terminating the process (enqueue is noexcept).

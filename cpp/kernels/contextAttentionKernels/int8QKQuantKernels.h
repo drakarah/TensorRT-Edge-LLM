@@ -40,5 +40,8 @@ void quantizeQPerRowInt8(half const* q, int8_t* qOut, float* qScale, int32_t bat
 void quantizeKPerTileInt8(half const* k, int8_t* kOut, float* kScale, int32_t batchSize, int32_t seqLen,
     int32_t numHeads, int32_t headDim, cudaStream_t stream);
 
+//! dst[0 .. n) = value (per-tile K scales when K comes from an INT8 cache with one static scale).
+void fillFloat(float* dst, float value, int64_t n, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

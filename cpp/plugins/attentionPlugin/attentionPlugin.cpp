@@ -546,7 +546,7 @@ REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::splitPagedKV(rt::Tensor const& poolTensor, int32_t const* pageTable,
     int32_t const* kvSeqLens, int32_t maxPagesPerSeq, std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads,
     int32_t capPadded, int32_t headSize, int32_t seqLen, float kScale, float vScale, cudaStream_t stream,
-    int32_t consumerTailTokens, int32_t consumerKeepTrailingTokens)
+    int32_t consumerTailTokens, int32_t consumerKeepTrailingTokens, bool rawInt8K)
 {
     // The pool binding is [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
     check::check(isPagedPoolShape(poolTensor.getShape(), numKVHeads, headSize),
@@ -575,14 +575,15 @@ std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::splitPagedKV(rt::Tensor const
     rt::Tensor kvWorkspaceTensor
         = assignTensorFromWorkspace(workspacePtr, {batchSize, 2, numKVHeads, outSeqDim, headSize}, DataType::kHALF);
     auto* ptr = static_cast<std::byte*>(kvWorkspaceTensor.rawPointer());
-    rt::Tensor kTensor(
-        ptr, rt::Coords{batchSize, outSeqDim, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    // rawInt8K: K keeps the pool's INT8 bytes (for the INT8 Q·Kᵀ FMHA) in the same slot; V stays FP16.
+    rt::Tensor kTensor(ptr, rt::Coords{batchSize, outSeqDim, numKVHeads, headSize}, rt::DeviceType::kGPU,
+        rawInt8K ? DataType::kINT8 : DataType::kHALF);
     rt::Tensor vTensor(ptr + kTensorElems * sizeof(half), rt::Coords{batchSize, outSeqDim, numKVHeads, headSize},
         rt::DeviceType::kGPU, DataType::kHALF);
 
     kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(), pageTable,
         kvSeqLens, maxPagesPerSeq, batchSize, outSeqDim, numKVHeads, headSize, elemSize, poolQuant, kScale, vScale,
-        stream, consumerTailTokens, consumerKeepTrailingTokens);
+        stream, consumerTailTokens, consumerKeepTrailingTokens, rawInt8K);
 
     return std::make_pair(std::move(kTensor), std::move(vTensor));
 }
@@ -2050,15 +2051,23 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     // and run the dense causal/sliding kernel, as the own-KV quantized fallback does.
                     int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
                     int32_t const splitSeqLen = splitLenForFallback();
+                    // INT8 Q·Kᵀ FMHA: keep K as the cache's INT8 bytes (no K dequantisation or requantisation).
+                    bool const int8K = mEnableInt8KVCache && slidingWindow == INT_MAX
+                        && CuteDslFMHAV2Runner::int8QKUsable(mHeadSize, stream);
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
                         runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,
-                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen));
+                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen), int8K);
                     CuteDslFMHAV2Runner runner(mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen,
                         physicalLenForFallback(), splitSeqLen > 0);
-                    if (!runner.run(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
-                            vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
-                            paddedCuKVSeqLensTensor.dataPointer<int32_t>(), stream, mAttentionScale, slidingWindow))
+                    bool const ranKernel = int8K
+                        ? runner.runInt8KCache(qInputTensor.dataPointer<half>(), kSplit.rawPointer(), kScale,
+                              vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
+                              paddedCuKVSeqLensTensor.dataPointer<int32_t>(), stream, mAttentionScale)
+                        : runner.run(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
+                              vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
+                              paddedCuKVSeqLensTensor.dataPointer<int32_t>(), stream, mAttentionScale, slidingWindow);
+                    if (!ranKernel)
                     {
                         return -1;
                     }
@@ -2284,13 +2293,20 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                         true /* tokenAlignedRope */);
 
                     int32_t const splitSeqLen = splitLenForFallback();
+                    // INT8 Q·Kᵀ FMHA: keep K as the cache's INT8 bytes (no K dequantisation or requantisation).
+                    bool const int8K = mEnableInt8KVCache && !usePaddingContextMask && slidingWindow == INT_MAX
+                        && CuteDslFMHAV2Runner::int8QKUsable(mHeadSize, stream);
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
                         runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,
-                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen));
+                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen), int8K);
                     CuteDslFMHAV2Runner runner(mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen,
                         physicalLenForFallback(), splitSeqLen > 0);
-                    bool const ranKernel = usePaddingContextMask
+                    bool const ranKernel = int8K
+                        ? runner.runInt8KCache(qInputTensor.dataPointer<half>(), kSplit.rawPointer(), kScale,
+                              vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
+                              paddedCuKVSeqLensTensor.dataPointer<int32_t>(), stream, mAttentionScale)
+                        : usePaddingContextMask
                         ? runner.runPadding(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
                               vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
                               cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(), stream,

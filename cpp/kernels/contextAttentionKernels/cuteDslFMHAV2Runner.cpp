@@ -579,14 +579,20 @@ int32_t callFmhaV2Vit(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKe
 namespace
 {
 
-//! EDGELLM_FMHA_INT8_QK=1: causal D512 context attention with INT8 Q·Kᵀ (SageAttention-style).
+//! EDGELLM_FMHA_INT8_QK: causal D512 context attention with INT8 Q·Kᵀ (SageAttention-style).
+//! 1 = on, K straight from an INT8 KV cache where the caller gathers it; 2 = on, K always requantised (A/B).
+int32_t int8QKMode()
+{
+    static int32_t const mode = [] {
+        char const* v = std::getenv("EDGELLM_FMHA_INT8_QK");
+        return v == nullptr ? 0 : (std::strcmp(v, "1") == 0 ? 1 : (std::strcmp(v, "2") == 0 ? 2 : 0));
+    }();
+    return mode;
+}
+
 bool int8QKEnabled()
 {
-    static bool const enabled = [] {
-        char const* v = std::getenv("EDGELLM_FMHA_INT8_QK");
-        return v != nullptr && std::strcmp(v, "1") == 0;
-    }();
-    return enabled;
+    return int8QKMode() != 0;
 }
 
 //! Device scratch for the INT8 Q/K copies and their scales; grows on demand, never shrinks.
@@ -603,7 +609,7 @@ size_t alignUp(size_t n)
 
 } // namespace
 
-int32_t CuteDslFMHAV2Runner::runD512Int8(void const* paramsPtr)
+int32_t CuteDslFMHAV2Runner::runD512Int8(void const* paramsPtr, void const* kInt8, float kScaleValue)
 {
     auto const& params = *static_cast<FmhaV2LlmParams const*>(paramsPtr);
     // Growing the scratch allocates, which is not allowed while a CUDA graph is being captured.
@@ -615,7 +621,9 @@ int32_t CuteDslFMHAV2Runner::runD512Int8(void const* paramsPtr)
     }
     int32_t const numKTiles = (params.kvSeqLen + kernel::kINT8_QK_KEY_TILE - 1) / kernel::kINT8_QK_KEY_TILE;
     size_t const qBytes = alignUp(static_cast<size_t>(params.batchSize) * params.seqLenQ * params.numQHeads * 512);
-    size_t const kBytes = alignUp(static_cast<size_t>(params.batchSize) * params.kvSeqLen * params.numKVHeads * 512);
+    size_t const kBytes = kInt8 != nullptr
+        ? 0
+        : alignUp(static_cast<size_t>(params.batchSize) * params.kvSeqLen * params.numKVHeads * 512);
     size_t const qsBytes = alignUp(static_cast<size_t>(params.batchSize) * params.numQHeads * params.seqLenQ * 4);
     size_t const ksBytes = alignUp(static_cast<size_t>(params.batchSize) * params.numKVHeads * numKTiles * 4);
     static Int8QKScratch scratch;
@@ -631,7 +639,8 @@ int32_t CuteDslFMHAV2Runner::runD512Int8(void const* paramsPtr)
     }
     auto* base = static_cast<char*>(scratch.ptr);
     auto* qI8 = reinterpret_cast<int8_t*>(base);
-    auto* kI8 = reinterpret_cast<int8_t*>(base + qBytes);
+    auto* kI8 = kInt8 != nullptr ? static_cast<int8_t*>(const_cast<void*>(kInt8))
+                                 : reinterpret_cast<int8_t*>(base + qBytes);
     auto* qScale = reinterpret_cast<float*>(base + qBytes + kBytes);
     auto* kScale = reinterpret_cast<float*>(base + qBytes + kBytes + qsBytes);
 
@@ -643,8 +652,16 @@ int32_t CuteDslFMHAV2Runner::runD512Int8(void const* paramsPtr)
     }
     kernel::quantizeQPerRowInt8(static_cast<half const*>(params.qPtr), qI8, qScale, params.batchSize, params.seqLenQ,
         params.numQHeads, 512, params.stream);
-    kernel::quantizeKPerTileInt8(static_cast<half const*>(params.kPtr), kI8, kScale, params.batchSize,
-        params.kvSeqLen, params.numKVHeads, 512, params.stream);
+    if (kInt8 != nullptr)
+    {
+        kernel::fillFloat(kScale, kScaleValue,
+            static_cast<int64_t>(params.batchSize) * params.numKVHeads * numKTiles, params.stream);
+    }
+    else
+    {
+        kernel::quantizeKPerTileInt8(static_cast<half const*>(params.kPtr), kI8, kScale, params.batchSize,
+            params.kvSeqLen, params.numKVHeads, 512, params.stream);
+    }
 
     if (!detail::ensureModuleLoaded<fmha_v2_d512_i8_Kernel_Module_Load, fmha_v2_d512_i8_Kernel_Module_Unload>(
             sLLM_d512I8, "fmha_v2_d512_i8", params.stream))
@@ -672,6 +689,49 @@ int32_t CuteDslFMHAV2Runner::runD512Int8(void const* paramsPtr)
     return cute_dsl_fmha_v2_d512_i8_wrapper(&sLLM_d512I8.module, &qTensor, &kTensor, &vTensor, &oTensor, &qScaleTensor, &kScaleTensor,
         &cumSeqlenK, params.windowSizeLeft, params.attentionScale, params.scaleQ, params.scaleK, params.scaleV,
         params.invScaleO, getDeviceMultiProcessorCount(), params.stream);
+}
+
+bool CuteDslFMHAV2Runner::int8QKUsable(int32_t headDim, cudaStream_t stream)
+{
+    if (headDim != 512 || int8QKMode() != 1)
+    {
+        return false;
+    }
+    cudaStreamCaptureStatus captureStatus{};
+    return cudaStreamIsCapturing(stream, &captureStatus) == cudaSuccess
+        && captureStatus == cudaStreamCaptureStatusNone;
+}
+
+bool CuteDslFMHAV2Runner::runInt8KCache(void const* qPtr, void const* kInt8Ptr, float kScale, void const* vPtr,
+    void* oPtr, int32_t const* cuKVSeqLens, cudaStream_t stream, float attentionScale)
+{
+    validateAttentionScale(attentionScale);
+    check::check(mHeadDim == 512, "runInt8KCache: head dim must be 512");
+    FmhaV2LlmParams params{};
+    params.qPtr = qPtr;
+    params.kPtr = nullptr;
+    params.vPtr = vPtr;
+    params.oPtr = oPtr;
+    params.cuKVSeqLens = cuKVSeqLens;
+    params.batchSize = mBatchSize;
+    params.seqLenQ = mSeqLenQ;
+    params.kvSeqLen = mKVSeqLen;
+    params.numQHeads = mNumHeadsQ;
+    params.numKVHeads = mNumHeadsKV;
+    params.headDim = mHeadDim;
+    params.windowSizeLeft = 1 << 30;
+    params.attentionScale = attentionScale;
+    params.scaleQ = 1.0F;
+    params.scaleK = 1.0F;
+    params.scaleV = 1.0F;
+    params.invScaleO = 1.0F;
+    params.stream = stream;
+    int32_t const ret = runD512Int8(&params, kInt8Ptr, kScale);
+    if (ret != 0)
+    {
+        LOG_ERROR("FMHA-v2 INT8 Q·Kᵀ D512 kernel (K from INT8 cache) failed with error code: %d", ret);
+    }
+    return ret == 0;
 }
 
 bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr,
