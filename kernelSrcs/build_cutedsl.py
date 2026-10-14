@@ -104,6 +104,11 @@ _QSA_DECODE_THREADS = 128
 _QSA_DECODE_PIPE_DEPTH = 1
 
 
+# SMs whose per-block shared memory (99 KB: GeForce Ampere/Ada, RTX Blackwell) is below what the
+# warp-specialized D512 context kernel (fmha_d512_ws.py) needs.
+_SMEM_BELOW_D512_WS = frozenset({86, 89, 120})
+
+
 @dataclass
 class KernelVariant:
     """One compilable kernel variant in the CuTe DSL registry.
@@ -2495,7 +2500,12 @@ def _compile_command(
     else:
         cmd = [sys.executable, str(script)]
 
-    cmd += variant.script_args
+    script_args = variant.script_args
+    if sm in _SMEM_BELOW_D512_WS and "--d512_ws" in script_args:
+        # The warp-specialized D512 kernel needs 136 192 B of shared memory per block; these
+        # architectures allow 99 KB (101 376 B). They use the original two-pass kernel instead.
+        script_args = [a for a in script_args if a != "--d512_ws"]
+    cmd += script_args
     if variant.wants_target_sm:
         # The kernel script cannot resolve this itself: CUTE_DSL_ARCH is unset
         # for every target in build_cutedsl_tarballs.sh's matrix, so a device
