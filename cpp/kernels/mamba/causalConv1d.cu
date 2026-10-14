@@ -33,6 +33,7 @@
 #include "common/checkMacros.h"
 #include "conversion.cuh"
 
+#include <algorithm>
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <stdexcept>
@@ -135,6 +136,110 @@ __global__ void causalConv1dKernelT(T const* __restrict__ x, T const* __restrict
         for (int32_t k = 0; k < kWidth - 1; ++k)
         {
             xBuf[k] = xBuf[k + 1];
+        }
+    }
+}
+
+// FP16 variant of causalConv1dKernelT for even dim: each thread owns two adjacent channels and moves them with
+// half2 loads / stores (half the instructions and memory transactions of the scalar kernel per element).
+template <int32_t kWidth>
+__global__ void causalConv1dHalf2KernelT(half const* __restrict__ x, half const* __restrict__ weight,
+    half const* bias, half const* __restrict__ initialState, half* __restrict__ out, int32_t seqLen,
+    int32_t outSeqLen, int32_t dim, int32_t padding, int32_t const* contextLengths, int32_t const* stateIndices,
+    int32_t stateRows)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const pairIdx = static_cast<int32_t>(blockIdx.y * blockDim.x + threadIdx.x);
+    int32_t const pairs = dim / 2;
+    if (pairIdx >= pairs)
+    {
+        return;
+    }
+    int32_t const d0 = 2 * pairIdx;
+
+    int32_t const effectiveSeqLen = contextLengths ? contextLengths[batchIdx] : seqLen;
+    int32_t const stateSlot = stateIndices ? stateIndices[batchIdx] : batchIdx;
+    if (stateSlot < 0 || stateSlot >= stateRows)
+    {
+        return;
+    }
+    float const bias0 = (bias != nullptr) ? __half2float(bias[d0]) : 0.0F;
+    float const bias1 = (bias != nullptr) ? __half2float(bias[d0 + 1]) : 0.0F;
+
+    float w0[kWidth];
+    float w1[kWidth];
+#pragma unroll
+    for (int32_t k = 0; k < kWidth; ++k)
+    {
+        w0[k] = __half2float(weight[static_cast<int64_t>(d0) * kWidth + k]);
+        w1[k] = __half2float(weight[static_cast<int64_t>(d0 + 1) * kWidth + k]);
+    }
+
+    __half2 const* x2 = reinterpret_cast<__half2 const*>(x);
+    __half2* out2 = reinterpret_cast<__half2*>(out);
+    int64_t const xBatchOff = static_cast<int64_t>(batchIdx) * seqLen * pairs;
+    int64_t const outBatchOff = static_cast<int64_t>(batchIdx) * outSeqLen * pairs;
+    auto load = [&](int32_t inPos, float& v0, float& v1)
+    {
+        if (inPos >= 0 && inPos < effectiveSeqLen)
+        {
+            float2 const f = __half22float2(x2[xBatchOff + static_cast<int64_t>(inPos) * pairs + pairIdx]);
+            v0 = f.x;
+            v1 = f.y;
+        }
+        else
+        {
+            v0 = loadCausalConvInput(
+                x, initialState, batchIdx, stateSlot, d0, seqLen, dim, kWidth, inPos, effectiveSeqLen);
+            v1 = loadCausalConvInput(
+                x, initialState, batchIdx, stateSlot, d0 + 1, seqLen, dim, kWidth, inPos, effectiveSeqLen);
+        }
+    };
+
+    int32_t const zBlocks = static_cast<int32_t>(gridDim.z);
+    int32_t const chunkSize = (outSeqLen + zBlocks - 1) / zBlocks;
+    int32_t const chunkStart = static_cast<int32_t>(blockIdx.z) * chunkSize;
+    int32_t const chunkEnd = chunkStart + chunkSize < outSeqLen ? chunkStart + chunkSize : outSeqLen;
+    if (chunkStart >= outSeqLen)
+    {
+        return;
+    }
+
+    float xBuf0[kWidth];
+    float xBuf1[kWidth];
+#pragma unroll
+    for (int32_t k = 0; k < kWidth - 1; ++k)
+    {
+        load(chunkStart + k - padding, xBuf0[k], xBuf1[k]);
+    }
+
+    for (int32_t outPos = chunkStart; outPos < chunkEnd; ++outPos)
+    {
+        int64_t const outIdx = outBatchOff + static_cast<int64_t>(outPos) * pairs + pairIdx;
+        if (outPos >= effectiveSeqLen)
+        {
+            out2[outIdx] = __floats2half2_rn(0.0F, 0.0F);
+            xBuf0[kWidth - 1] = 0.0F;
+            xBuf1[kWidth - 1] = 0.0F;
+        }
+        else
+        {
+            load(outPos + kWidth - 1 - padding, xBuf0[kWidth - 1], xBuf1[kWidth - 1]);
+            float acc0 = bias0;
+            float acc1 = bias1;
+#pragma unroll
+            for (int32_t k = 0; k < kWidth; ++k)
+            {
+                acc0 += xBuf0[k] * w0[k];
+                acc1 += xBuf1[k] * w1[k];
+            }
+            out2[outIdx] = __floats2half2_rn(acc0, acc1);
+        }
+#pragma unroll
+        for (int32_t k = 0; k < kWidth - 1; ++k)
+        {
+            xBuf0[k] = xBuf0[k + 1];
+            xBuf1[k] = xBuf1[k + 1];
         }
     }
 }
@@ -267,35 +372,57 @@ void invokeCausalConv1d(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tenso
             "contextLengths must be contiguous GPU INT32 [batch].");
     }
 
+    half const* xPtr = x.dataPointer<half>();
+    half* outPtr = out.dataPointer<half>();
+    // Two channels per thread when dim is even and the rows are 4-byte aligned (widths 2-4).
+    bool const useHalf2 = dim % 2 == 0 && width >= 2 && width <= 4
+        && reinterpret_cast<uintptr_t>(xPtr) % 4 == 0 && reinterpret_cast<uintptr_t>(outPtr) % 4 == 0;
+
     int32_t constexpr kThreads = 256;
     dim3 const block(kThreads);
-    uint32_t const dimBlocks = static_cast<uint32_t>((dim + kThreads - 1) / kThreads);
+    int32_t const threadsPerRow = useHalf2 ? dim / 2 : dim;
+    uint32_t const dimBlocks = static_cast<uint32_t>((threadsPerRow + kThreads - 1) / kThreads);
 
-    // Adaptive seq-parallel: add z-blocks only when dim-blocks under-utilize the SMs
+    // Seq-parallel: each thread walks a contiguous chunk of positions serially (a dependent shift register), so
+    // the grid needs enough blocks to keep every SM busy: aim for 16 blocks per SM, chunks of >= 16 positions.
     int32_t smCount = 0;
     int32_t deviceId = 0;
     cudaGetDevice(&deviceId);
     cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, deviceId);
-    uint32_t seqBlocks = 1;
-    if (dimBlocks < static_cast<uint32_t>(smCount) * 2)
-    {
-        seqBlocks = (static_cast<uint32_t>(smCount) * 4 + dimBlocks - 1) / dimBlocks;
-    }
-    if (seqBlocks > static_cast<uint32_t>(outSeqLen))
-    {
-        seqBlocks = static_cast<uint32_t>(outSeqLen);
-    }
+    constexpr uint32_t kTargetBlocksPerSm = 16;
+    uint32_t seqBlocks = (static_cast<uint32_t>(smCount) * kTargetBlocksPerSm + dimBlocks - 1) / dimBlocks;
+    uint32_t const maxSeqBlocks = std::max(1, outSeqLen / 16);
+    seqBlocks = std::max(1u, std::min(seqBlocks, maxSeqBlocks));
     dim3 const grid(batch, dimBlocks, seqBlocks);
 
     half const* biasPtr = bias.has_value() ? bias->get().dataPointer<half>() : nullptr;
     int32_t const* clPtr = contextLengths.has_value() ? contextLengths->get().dataPointer<int32_t>() : nullptr;
-    half const* xPtr = x.dataPointer<half>();
     half const* wPtr = weight.dataPointer<half>();
     half const* statePtr = initialState.has_value() ? initialState->get().dataPointer<half>() : nullptr;
     int32_t const* stateIndicesPtr = stateIndices.has_value() ? stateIndices->get().dataPointer<int32_t>() : nullptr;
     int32_t const stateRows
         = initialState.has_value() ? static_cast<int32_t>(initialState->get().getShape()[0]) : batch;
-    half* outPtr = out.dataPointer<half>();
+
+    if (useHalf2)
+    {
+        switch (width)
+        {
+        case 2:
+            causalConv1dHalf2KernelT<2><<<grid, block, 0, stream>>>(xPtr, wPtr, biasPtr, statePtr, outPtr, seqLen,
+                outSeqLen, dim, padding, clPtr, stateIndicesPtr, stateRows);
+            break;
+        case 3:
+            causalConv1dHalf2KernelT<3><<<grid, block, 0, stream>>>(xPtr, wPtr, biasPtr, statePtr, outPtr, seqLen,
+                outSeqLen, dim, padding, clPtr, stateIndicesPtr, stateRows);
+            break;
+        default:
+            causalConv1dHalf2KernelT<4><<<grid, block, 0, stream>>>(xPtr, wPtr, biasPtr, statePtr, outPtr, seqLen,
+                outSeqLen, dim, padding, clPtr, stateIndicesPtr, stateRows);
+            break;
+        }
+        CUDA_CHECK(cudaPeekAtLastError());
+        return;
+    }
 
     switch (width)
     {

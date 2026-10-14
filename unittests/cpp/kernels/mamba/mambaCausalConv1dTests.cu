@@ -136,6 +136,22 @@ TEST(MambaCausalConv1d, Width4)
     runCausalConv1dTest(2, 31, 256, 4);
 }
 
+// Long prompts: the launcher splits the sequence across blocks (chunk boundaries), uses two channels per thread for
+// even dim and the scalar kernel for odd dim.
+TEST(MambaCausalConv1d, LongSequenceChunked)
+{
+    std::vector<int32_t> const contextLengths{1000, 613};
+    runCausalConv1dTest(2, 1000, 512, 4, &contextLengths);
+    runCausalConv1dTest(1, 777, 8192, 4);
+    runCausalConv1dTest(1, 500, 256, 3);
+    runCausalConv1dTest(1, 500, 256, 2);
+}
+
+TEST(MambaCausalConv1d, LongSequenceOddDim)
+{
+    runCausalConv1dTest(1, 300, 129, 4);
+}
+
 // ---------------------------------------------------------------------------
 // invokeCaptureConvState tests
 // ---------------------------------------------------------------------------
