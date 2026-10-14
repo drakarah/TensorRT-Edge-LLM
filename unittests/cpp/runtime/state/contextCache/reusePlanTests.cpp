@@ -348,6 +348,37 @@ TEST(ContextCacheReusePlanTests, HybridMtpPlanningSkipsRecordWithoutDraftPath)
     expectDemand(cold.demand, ResourceDemand{3, 3, 0, 0});
 }
 
+TEST(ContextCacheReusePlanTests, HybridMtpPlanningReportsSharedPrefixWithoutCheckpoint)
+{
+    constexpr int32_t kHYBRID_PAGE_SIZE = 4;
+    constexpr BlockHash kEXACT_DIGEST{0xBBBBBBBBBBBBBBB0ULL, 0xCCCCCCCCCCCCCCC0ULL};
+
+    // An endpoint record over blocks {A, B}: an input sharing only block A has no usable checkpoint, but the plan
+    // reports the one shared page so the runtime can publish a divergence checkpoint there.
+    CacheRecord record;
+    record.key = CacheRecordKey{kEXACT_DIGEST, 2};
+    record.logicalBlockHashes = {kHASH_A, kHASH_B};
+    record.basePagePath = {7, 9};
+    record.recurrentSnapshotSlot = 3;
+    record.partialKvSnapshotSlot = 4;
+    record.exactCheckpointLength = 10;
+    CacheRecordStore records(4);
+    ASSERT_TRUE(records.insert(record).inserted);
+
+    ReusePlan const diverging = makeHybridMtpReusePlan({}, {kHASH_A, kHASH_C}, /*inputTokenCount=*/10,
+        kHYBRID_PAGE_SIZE, records);
+    EXPECT_EQ(diverging.reuseTokenLength, 0);
+    EXPECT_EQ(diverging.hybridSharedPrefixTokens, kHYBRID_PAGE_SIZE);
+
+    ReusePlan const extending = makeHybridMtpReusePlan({}, {kHASH_A, kHASH_B, kHASH_C}, /*inputTokenCount=*/14,
+        kHYBRID_PAGE_SIZE, records);
+    EXPECT_EQ(extending.hybridSharedPrefixTokens, 2 * kHYBRID_PAGE_SIZE);
+
+    ReusePlan const bypass = makeHybridMtpReusePlan({}, {kHASH_A, kHASH_B, kHASH_C}, /*inputTokenCount=*/14,
+        kHYBRID_PAGE_SIZE, records, ContextCacheLookupPolicy::kBypass);
+    EXPECT_EQ(bypass.hybridSharedPrefixTokens, 0);
+}
+
 TEST(ContextCacheReusePlanTests, PlanningDoesNotChangePoolRefsOrRecordRecency)
 {
     ResourcePools pools(ResourceDemand{4, 2, 1, 1});
