@@ -466,7 +466,7 @@ bool gdnChunkPrefillEnabled()
     static bool const kEnabled = []
     {
         char const* value = std::getenv("EDGELLM_GDN_CHUNK_PREFILL");
-        return value != nullptr && std::atoi(value) != 0;
+        return value == nullptr || std::atoi(value) != 0;
     }();
     return kEnabled;
 }
@@ -753,8 +753,8 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
 #endif
     }
 
-    // Chunked tensor-core prefill on sm_80-class GPUs (opt-in, EDGELLM_GDN_CHUNK_PREFILL=1). Falls back to the
-    // sequential kernel when its scratch cannot be allocated (e.g. during CUDA graph capture).
+    // Chunked tensor-core prefill on sm_80-class GPUs; EDGELLM_GDN_CHUNK_PREFILL=0 selects the sequential kernel.
+    // Also falls back to the sequential kernel when its scratch cannot be allocated (e.g. during CUDA graph capture).
     bool const chunkPhase
         = phase == rt::ExecutionPhase::kContextPrefill || phase == rt::ExecutionPhase::kContextChunk;
     if (chunkPhase && seq_len >= kernel::kGDN_CHUNK && mSMVersion >= 80 && mSMVersion < 90 && k_dim == 128
