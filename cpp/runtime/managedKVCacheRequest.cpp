@@ -146,11 +146,17 @@ bool ManagedKVCacheRequest::preparePrefill()
     return !hasContextReuse() || contextRequest().preparePrefill();
 }
 
-bool ManagedKVCacheRequest::prepareSwaPrefill(std::vector<int32_t> const& effectiveInputLengths)
+bool ManagedKVCacheRequest::prepareSwaPrefill(std::vector<int32_t> const& effectiveInputLengths, bool continuation)
 {
     return hasContextReuse()
-        || swaOperationSucceeded(
-            mBoundedSwaPageManager->preparePrefill(swaRequest(), effectiveInputLengths), "SWA prefill preparation");
+        || swaOperationSucceeded(mBoundedSwaPageManager->preparePrefill(swaRequest(), effectiveInputLengths, continuation),
+            "SWA prefill preparation");
+}
+
+bool ManagedKVCacheRequest::completeSwaPrefillChunk()
+{
+    return hasContextReuse()
+        || swaOperationSucceeded(mBoundedSwaPageManager->completePrefillChunk(swaRequest()), "SWA prefill chunk completion");
 }
 
 bool ManagedKVCacheRequest::enqueuePrefillCaptures()

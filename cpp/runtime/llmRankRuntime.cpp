@@ -3079,7 +3079,16 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
         bool const lastPass = begin + length == suffixLength;
         context.tokenIds[0].assign(completeSuffix.begin() + begin, completeSuffix.begin() + begin + length);
         context.effectivePrefillLengths[0] = length;
-        if (!runBaseModelPrefill(context, lastPass ? managedKVCacheRequest : nullptr, /*sampleOutput=*/lastPass))
+        // Bounded SWA windows follow absolute positions, so every pass binds its own window; the context-reuse backend
+        // only participates in the final pass.
+        bool const swaBackend = managedKVCacheRequest != nullptr && !managedKVCacheRequest->hasContextReuse();
+        mSwaPrefillAbsoluteEnd = swaBackend ? begin + length : -1;
+        mSwaPrefillContinuation = begin > 0;
+        bool const passOk = runBaseModelPrefill(
+            context, (lastPass || swaBackend) ? managedKVCacheRequest : nullptr, /*sampleOutput=*/lastPass);
+        mSwaPrefillAbsoluteEnd = -1;
+        mSwaPrefillContinuation = false;
+        if (!passOk)
         {
             return false;
         }
@@ -3087,6 +3096,10 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
         {
             // The next pass restages the shared pinned token buffer.
             CUDA_CHECK(cudaStreamSynchronize(context.stream));
+            if (swaBackend && !managedKVCacheRequest->completeSwaPrefillChunk())
+            {
+                return false;
+            }
         }
     }
     int32_t const sampledToken = context.tokenIds[0].back();
@@ -3368,7 +3381,11 @@ bool LLMRankRuntime::runBaseModelPrefill(
 
     // Bounded SWA admission reserves pages by batch size, but its sparse mappings must use the final executed lengths.
     // Visual pruning can shorten those lengths after embeddings are assembled, so bind the window only now.
-    if (managedKVCacheRequest != nullptr && !managedKVCacheRequest->prepareSwaPrefill(batch.queryLengths))
+    if (managedKVCacheRequest != nullptr
+        && !managedKVCacheRequest->prepareSwaPrefill(mSwaPrefillAbsoluteEnd > 0
+                ? std::vector<int32_t>(batch.queryLengths.size(), mSwaPrefillAbsoluteEnd)
+                : batch.queryLengths,
+            mSwaPrefillContinuation))
     {
         return false;
     }

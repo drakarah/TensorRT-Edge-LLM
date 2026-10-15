@@ -61,7 +61,9 @@ public:
     bool restoreHybridMtpBoundaryHidden(int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow);
 
     bool preparePrefill();
-    bool prepareSwaPrefill(std::vector<int32_t> const& effectiveInputLengths);
+    bool prepareSwaPrefill(std::vector<int32_t> const& effectiveInputLengths, bool continuation = false);
+    //! Bounded-SWA backend: retire window pages after a non-final pass of a chunked prefill.
+    bool completeSwaPrefillChunk();
     bool enqueuePrefillCaptures();
     bool completePrefill(DecodingInferenceContext const& context, std::vector<int32_t> const& commonStateLengths);
     bool prepareDecodeStep(DecodingInferenceContext const& context, DecodingKvHeadroom const& headroom);

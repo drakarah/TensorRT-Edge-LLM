@@ -428,7 +428,7 @@ void BoundedSwaKVPageManager::retire(SwaKVCacheState& state, int32_t slot)
 }
 
 SwaKVCacheStatus BoundedSwaKVPageManager::preparePrefill(
-    RequestHandle& request, std::vector<int32_t> const& inputLengths)
+    RequestHandle& request, std::vector<int32_t> const& inputLengths, bool continuation)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
     ELLM_CHECK(impl.phase == RequestHandle::Impl::Phase::kAdmitted && !impl.deviceWorkPending,
@@ -446,7 +446,10 @@ SwaKVCacheStatus BoundedSwaKVPageManager::preparePrefill(
     for (size_t slot = 0; slot < impl.states.size(); ++slot)
     {
         int32_t const residentSlot = impl.states[slot].resident.slot;
-        mSwaPageTable.setRow(residentSlot, nullptr, 0);
+        if (!continuation)
+        {
+            mSwaPageTable.setRow(residentSlot, nullptr, 0);
+        }
         ELLM_CHECK(advance(impl.states[slot], impl.inputLengths[slot]),
             "SWA KV cache could not prepare the admitted prefill range");
         bindNewPages(impl.states[slot], residentSlot);
@@ -454,6 +457,20 @@ SwaKVCacheStatus BoundedSwaKVPageManager::preparePrefill(
     mSwaPageTable.uploadDirty(impl.stream);
     impl.phase = RequestHandle::Impl::Phase::kExecuting;
     impl.deviceWorkPending = true;
+    return SwaKVCacheStatus::kOk;
+}
+
+SwaKVCacheStatus BoundedSwaKVPageManager::completePrefillChunk(RequestHandle& request)
+{
+    RequestHandle::Impl& impl = checkedImpl(request);
+    ELLM_CHECK(impl.phase == RequestHandle::Impl::Phase::kExecuting && impl.deviceWorkPending,
+        "SWA KV cache chunk completion requires pending model work");
+    for (size_t slot = 0; slot < impl.states.size(); ++slot)
+    {
+        retire(impl.states[slot], impl.states[slot].resident.slot);
+    }
+    impl.deviceWorkPending = false;
+    impl.phase = RequestHandle::Impl::Phase::kAdmitted;
     return SwaKVCacheStatus::kOk;
 }
 

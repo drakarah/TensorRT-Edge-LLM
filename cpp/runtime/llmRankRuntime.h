@@ -551,6 +551,9 @@ private:
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
     //! Declared after SharedResources so SWA page ownership is released before the physical buffers.
     std::unique_ptr<BoundedSwaKVPageManager> mBoundedSwaKVPageManager;
+    //! Set by the chunked prefill loop for the bounded-SWA backend: absolute endpoint of the running pass (-1 otherwise).
+    int32_t mSwaPrefillAbsoluteEnd{-1};
+    bool mSwaPrefillContinuation{false};
 
     //! Admission-scoped MRope staging ([1, maxKVCacheCapacity, rotaryDim]): the admission
     //! preprocess writes here until the batch-one execution copies it to active-row scratch.

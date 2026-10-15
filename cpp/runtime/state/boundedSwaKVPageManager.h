@@ -118,8 +118,13 @@ public:
     BoundedSwaKVPageManager& operator=(BoundedSwaKVPageManager const&) = delete;
 
     BeginRequestResult beginRequest(std::vector<ResidentRef> const& residents, cudaStream_t stream);
-    SwaKVCacheStatus preparePrefill(RequestHandle& request, std::vector<int32_t> const& inputLengths);
+    //! `inputLengths` are absolute endpoints. A continuation pass extends the window bound by the previous pass of the
+    //! same chunked prefill instead of starting from an empty table.
+    SwaKVCacheStatus preparePrefill(
+        RequestHandle& request, std::vector<int32_t> const& inputLengths, bool continuation = false);
     SwaKVCacheStatus completePrefill(RequestHandle& request);
+    //! Retires the pages a non-final chunked-prefill pass no longer needs; the caller has already waited for the pass.
+    SwaKVCacheStatus completePrefillChunk(RequestHandle& request);
     SwaKVCacheStatus prepareDecodeStep(RequestHandle& request);
     SwaKVCacheStatus completeDecodeStep(RequestHandle& request);
     SwaKVCacheStatus beginBatchCompaction(
