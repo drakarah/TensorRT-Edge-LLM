@@ -269,7 +269,8 @@ bool saveSafetensors(std::filesystem::path const& filePath, std::vector<Tensor> 
     return true;
 }
 
-bool loadSafetensors(std::filesystem::path const& filePath, std::vector<Tensor>& tensors, cudaStream_t stream)
+bool loadSafetensors(
+    std::filesystem::path const& filePath, std::vector<Tensor>& tensors, cudaStream_t stream, DeviceType deviceType)
 {
     tensors.clear();
 
@@ -299,13 +300,19 @@ bool loadSafetensors(std::filesystem::path const& filePath, std::vector<Tensor>&
     for (TensorMetadata const& entry : metadata.tensors)
     {
         // Create tensor with owned memory
-        Tensor tensor(entry.shape, DeviceType::kGPU, entry.dataType, entry.name);
+        Tensor tensor(entry.shape, deviceType, entry.dataType, entry.name);
         ELLM_CHECK(static_cast<size_t>(tensor.getMemoryCapacity()) == entry.bytes,
             "Safetensors byte count does not match tensor metadata: " + entry.name);
 
-        // Copy data from file to GPU
         int8_t const* tensorData = mmapReader->getByteData() + metadata.dataOffset + entry.offset;
-        CUDA_CHECK(cudaMemcpyAsync(tensor.rawPointer(), tensorData, entry.bytes, cudaMemcpyHostToDevice, stream));
+        if (deviceType == DeviceType::kCPU)
+        {
+            std::memcpy(tensor.rawPointer(), tensorData, entry.bytes);
+        }
+        else
+        {
+            CUDA_CHECK(cudaMemcpyAsync(tensor.rawPointer(), tensorData, entry.bytes, cudaMemcpyHostToDevice, stream));
+        }
 
         tensors.push_back(std::move(tensor));
     }

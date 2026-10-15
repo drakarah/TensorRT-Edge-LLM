@@ -867,8 +867,13 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
     ELLM_CHECK(std::filesystem::exists(embeddingPath),
         format::fmtstr("Embedding file not found: %s", embeddingPath.string().c_str()));
 
+    // EDGELLM_EMBEDDING_ON_HOST=1 keeps the token embedding in pinned host memory: the lookup kernel reads only the rows
+    // of the current tokens over PCIe (UVA), so the table (2 GB in FP16 for a 262k x 3840 vocabulary) never occupies VRAM.
+    char const* const hostEnv = std::getenv("EDGELLM_EMBEDDING_ON_HOST");
+    rt::DeviceType const tableDevice
+        = (hostEnv != nullptr && std::atoi(hostEnv) != 0) ? rt::DeviceType::kCPU : rt::DeviceType::kGPU;
     std::vector<rt::Tensor> tensors;
-    ELLM_CHECK(safetensors::loadSafetensors(embeddingPath, tensors, stream),
+    ELLM_CHECK(safetensors::loadSafetensors(embeddingPath, tensors, stream, tableDevice),
         format::fmtstr("Failed to load embedding file: %s", embeddingPath.string().c_str()));
 
     // Find tensors by name

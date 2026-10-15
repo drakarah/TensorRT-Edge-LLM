@@ -79,7 +79,8 @@ bool saveSafetensors(std::filesystem::path const& filePath, std::vector<Tensor> 
  * @return True on success, false on failure
  * @throws std::runtime_error If CUDA operations fail, data type is unsupported, or tensor allocation fails
  */
-bool loadSafetensors(std::filesystem::path const& filePath, std::vector<Tensor>& tensors, cudaStream_t stream);
+bool loadSafetensors(std::filesystem::path const& filePath, std::vector<Tensor>& tensors, cudaStream_t stream,
+    DeviceType deviceType = DeviceType::kGPU);
 
 } // namespace safetensors
 } // namespace rt
