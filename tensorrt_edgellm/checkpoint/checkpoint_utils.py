@@ -748,6 +748,8 @@ def build_runtime_llm_config_dict(
             config.centroid_intermediate_top_k,
             "sparse_logits_enabled":
             config.sparse_logits_enabled,
+            "sparse_candidate_count":
+            _fixed_draft_candidate_count(config),
             "layer_types":
             list(config.raw_layer_types or config.layer_types),
             "sliding_window":
@@ -1234,3 +1236,15 @@ def write_runtime_artifacts(model: "CausalLM",
 
     if engine_role != "draft":
         write_chat_template(model_dir, out_dir)
+
+
+def _fixed_draft_candidate_count(config) -> int:
+    """Number of fixed draft candidates (0 when the assistant uses its centroid head)."""
+    vocab_dir = getattr(config, "draft_candidate_vocab_dir", "")
+    if not vocab_dir or not config.sparse_logits_enabled:
+        return 0
+    from ..vocab_reduction.onnx_export import load_reduced_vocab_map
+    return int(
+        load_reduced_vocab_map(vocab_dir,
+                               vocab_size=config.vocab_size,
+                               device="cpu").numel())

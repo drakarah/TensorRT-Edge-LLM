@@ -1067,13 +1067,23 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     if (cfg.sparseDraftLogits)
     {
         // Top-k centroids x tokens per centroid: the assistant's candidate count per row.
+        int32_t const fixedCandidates = configJson.value("sparse_candidate_count", 0);
         int32_t const numCentroids = configJson.value("num_centroids", 0);
         int32_t const centroidTopK = configJson.value("centroid_intermediate_top_k", 0);
-        ELLM_CHECK(cfg.reducedVocabSize == 0 && numCentroids > 0 && centroidTopK > 0 && centroidTopK <= numCentroids
-                && cfg.vocabSize % numCentroids == 0,
-            "parseDraftEngineConfig: sparse_logits_enabled needs num_centroids and centroid_intermediate_top_k and "
-            "no reduced vocabulary.");
-        cfg.outputVocabSize = centroidTopK * (cfg.vocabSize / numCentroids);
+        if (fixedCandidates > 0)
+        {
+            ELLM_CHECK(cfg.reducedVocabSize == 0 && fixedCandidates <= cfg.vocabSize,
+                "parseDraftEngineConfig: invalid sparse_candidate_count.");
+            cfg.outputVocabSize = fixedCandidates;
+        }
+        else
+        {
+            ELLM_CHECK(cfg.reducedVocabSize == 0 && numCentroids > 0 && centroidTopK > 0 && centroidTopK <= numCentroids
+                    && cfg.vocabSize % numCentroids == 0,
+                "parseDraftEngineConfig: sparse_logits_enabled needs num_centroids and centroid_intermediate_top_k and "
+                "no reduced vocabulary.");
+            cfg.outputVocabSize = centroidTopK * (cfg.vocabSize / numCentroids);
+        }
     }
     parseDFlashFields(configJson, cfg);
     parseJetSpecFields(configJson, cfg);
