@@ -772,6 +772,8 @@ class ModelConfig:
     constant_draft_positions: bool = False
     returns_feedback_hidden: bool = False
     use_ordered_embeddings: bool = False
+    # Gemma 4 assistants without a centroid head: directory of a reduced-vocabulary map used as a fixed draft candidate set.
+    draft_candidate_vocab_dir: str = ""
     num_centroids: int = 0
     centroid_intermediate_top_k: int = 0
     sparse_logits_enabled: bool = False
@@ -1371,10 +1373,17 @@ class ModelConfig:
                 llm_dict.get("centroid_intermediate_top_k", 0) or 0),
             # Opt-in: the assistant emits only its top-k centroids' candidates
             # (logits + logit_token_ids) instead of a full-vocabulary row.
+            draft_candidate_vocab_dir=(
+                os.environ.get("EDGELLM_GEMMA4_DRAFT_VOCAB_MAP", "")
+                if is_gemma4_assistant and not bool(
+                    llm_dict.get("use_ordered_embeddings", False)) else ""),
             sparse_logits_enabled=(
                 is_gemma4_assistant
-                and bool(llm_dict.get("use_ordered_embeddings", False))
-                and os.environ.get("EDGELLM_GEMMA4_SPARSE_DRAFT_LOGITS") == "1"),
+                and ((bool(llm_dict.get("use_ordered_embeddings", False))
+                      and os.environ.get("EDGELLM_GEMMA4_SPARSE_DRAFT_LOGITS")
+                      == "1")
+                     or (not bool(llm_dict.get("use_ordered_embeddings", False))
+                         and bool(os.environ.get("EDGELLM_GEMMA4_DRAFT_VOCAB_MAP"))))),
             mtp_tree_base=bool(llm_dict.get("mtp_tree_base", False)),
             dflash_base=bool(llm_dict.get("dflash_base", False)),
             dflash_tree_base=bool(llm_dict.get("dflash_tree_base", False)),

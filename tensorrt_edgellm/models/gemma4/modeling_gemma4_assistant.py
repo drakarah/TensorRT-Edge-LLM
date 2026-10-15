@@ -398,6 +398,52 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         return logits.scatter(-1, candidate_ids, candidate_logits)
 
 
+class Gemma4AssistantFixedCandidates(nn.Module):
+    """Fixed candidate set for assistants without a centroid head (Gemma 4 12B).
+
+    The draft step scores one fixed list of token ids (a reduced vocabulary, built from text of the target
+    languages) instead of the whole tied embedding table, and emits them through the sparse-logits contract
+    (candidate logits plus their token ids). Only drafts are restricted: the target verifies every token with
+    its full head, so outputs do not change, tokens outside the list are just never proposed.
+    """
+
+    def __init__(self, config: ModelConfig, candidate_ids: torch.Tensor) -> None:
+        super().__init__()
+        self.vocab_size = config.vocab_size
+        self.register_buffer("candidate_ids",
+                             candidate_ids.to(torch.long),
+                             persistent=False)
+        self.register_buffer("candidate_rows",
+                             torch.empty(0),
+                             persistent=False)
+
+    def prepare_for_export(self,
+                           lm_head_weight: torch.Tensor | None = None) -> None:
+        if lm_head_weight is not None:
+            # One contiguous [N, hidden] slice: the draft graph no longer needs the full table.
+            self.candidate_rows = lm_head_weight.detach()[self.candidate_ids.to(
+                lm_head_weight.device)].contiguous()
+
+    def candidates(
+            self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (token ids, logits) of the fixed candidates."""
+        rows = (self.candidate_rows if self.candidate_rows.numel() else
+                F.embedding(self.candidate_ids, lm_head_weight))
+        candidate_logits = F.linear(hidden_states, rows.to(hidden_states.dtype))
+        candidate_ids = self.candidate_ids.expand(*hidden_states.shape[:-1],
+                                                  -1)
+        return candidate_ids, candidate_logits
+
+    def forward(self, hidden_states: torch.Tensor,
+                lm_head_weight: torch.Tensor) -> torch.Tensor:
+        candidate_ids, candidate_logits = self.candidates(
+            hidden_states, lm_head_weight)
+        logits = hidden_states.new_full(
+            (*hidden_states.shape[:-1], self.vocab_size), -65504.0)
+        return logits.scatter(-1, candidate_ids, candidate_logits)
+
+
 class Gemma4AssistantForCausalLM(nn.Module):
     """Gemma4 paired MTP assistant with feedback hidden output."""
 
@@ -426,8 +472,17 @@ class Gemma4AssistantForCausalLM(nn.Module):
                                            config.backbone_hidden_size,
                                            bias=False,
                                            module_name="post_projection")
-        self.masked_embedding = (Gemma4AssistantMaskedEmbedder(config)
-                                 if config.use_ordered_embeddings else None)
+        if config.use_ordered_embeddings:
+            self.masked_embedding = Gemma4AssistantMaskedEmbedder(config)
+        elif config.draft_candidate_vocab_dir:
+            from ...vocab_reduction.onnx_export import load_reduced_vocab_map
+            self.masked_embedding = Gemma4AssistantFixedCandidates(
+                config,
+                load_reduced_vocab_map(config.draft_candidate_vocab_dir,
+                                       vocab_size=config.vocab_size,
+                                       device="cpu"))
+        else:
+            self.masked_embedding = None
         if config.sparse_logits_enabled and self.masked_embedding is None:
             raise ValueError(
                 "Gemma4 assistant sparse logits require ordered embeddings.")
