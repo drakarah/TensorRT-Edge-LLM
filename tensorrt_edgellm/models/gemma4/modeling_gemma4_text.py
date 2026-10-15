@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import itertools
 import re
 from typing import Callable, List, Tuple
@@ -136,7 +137,8 @@ def _gemma4_uses_swa_kv_cache(config: ModelConfig) -> bool:
         return False
 
     quant = getattr(config, "quant", None)
-    if getattr(quant, "kv_cache_quant", None) in ("fp8", "int8"):
+    if (getattr(quant, "kv_cache_quant", None) in ("fp8", "int8")
+            and os.environ.get("EDGELLM_GEMMA4_BOUNDED_KV_QUANT") != "1"):
         return False
 
     spec_flags = (

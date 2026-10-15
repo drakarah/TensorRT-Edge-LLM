@@ -646,7 +646,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
             + std::to_string(mQkvScales.size()) + " elements (expected 3). "
             "Re-export the model to include QKV scales [q, k, v].");
     ELLM_CHECK(!mSupportsBoundedKVCache
-            || (mSlidingWindowSize > 0 && !mEnableTreeAttention && !quantizedKVCache() && !mEnableQKNorm
+            || (mSlidingWindowSize > 0 && !mEnableTreeAttention && !mEnableQKNorm
                 && !mEnableContextMaskSelector),
         "Bounded KV cache capability requires FP16 vanilla sliding-window attention.");
 
@@ -754,7 +754,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     ELLM_CHECK(!mEnableVisionBlockAttention || kvCacheDataType() == DataType::kHALF,
         "Vision block attention does not support a quantized KV cache.");
     ELLM_CHECK(!mSupportsBoundedKVCache
-            || (mSlidingWindowSize > 0 && !mEnableTreeAttention && !quantizedKVCache() && !mEnableQKNorm
+            || (mSlidingWindowSize > 0 && !mEnableTreeAttention && !mEnableQKNorm
                 && !mEnableContextMaskSelector),
         "Bounded KV cache capability requires FP16 vanilla sliding-window attention.");
 
@@ -1998,7 +1998,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                         {runtimeBatchSize, kvSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, DataType::kHALF);
                     kernel::assemblePagedSWAChunkedPrefillFMHAKV(kvCacheTensor, kvPageTableTensor, currentKInputTensor,
                         currentVInputTensor, contextLengthTensor, kvCacheStartIdxTensor, kInputTensor, vInputTensor,
-                        mSlidingWindowSize, stream);
+                        mSlidingWindowSize, kScale, vScale, stream);
                     kData = kInputTensor.dataPointer<half>();
                     vData = vInputTensor.dataPointer<half>();
                 }
@@ -2153,7 +2153,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 {runtimeBatchSize, workspaceSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, DataType::kHALF);
             kernel::assemblePagedSWAChunkedPrefillFMHAKV(kvCacheTensor, kvPageTableTensor, kInputTensor, vInputTensor,
                 contextLengthTensor, kvCacheStartIdxTensor, kWorkspaceTensor, vWorkspaceTensor, mSlidingWindowSize,
-                stream);
+                kScale, vScale, stream);
 
             CuteDslFMHAV2Runner runner(
                 mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, workspaceSeqLen, false);

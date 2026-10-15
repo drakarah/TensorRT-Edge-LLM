@@ -157,12 +157,23 @@ __global__ void calSWAChunkedPrefillMetadataKernel(int32_t const* inputSeqLen, i
     }
 }
 
-__global__ void assemblePagedSWAChunkedPrefillFMHAKVKernel(half const* __restrict__ pool,
+__device__ __forceinline__ half loadPoolValue(half const* pool, int64_t idx, float /*scale*/)
+{
+    return pool[idx];
+}
+
+__device__ __forceinline__ half loadPoolValue(int8_t const* pool, int64_t idx, float scale)
+{
+    return __float2half(static_cast<float>(pool[idx]) * scale);
+}
+
+template <typename PoolT>
+__global__ void assemblePagedSWAChunkedPrefillFMHAKVKernel(PoolT const* __restrict__ pool,
     int32_t const* __restrict__ pageTable, half const* __restrict__ k, half const* __restrict__ v,
     int32_t const* __restrict__ inputSeqLen, int32_t const* __restrict__ kvCacheStartIndices,
     half* __restrict__ kWorkspace, half* __restrict__ vWorkspace, int64_t totalElements, int32_t qSeqLen,
     int32_t workspaceSeqLen, int32_t maxPagesPerSeq, int32_t numPages, int32_t numKVHeads, int32_t headDim,
-    int32_t slidingWindowSize)
+    int32_t slidingWindowSize, float kScale, float vScale)
 {
     int64_t const linearIdx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (linearIdx >= totalElements)
@@ -195,11 +206,11 @@ __global__ void assemblePagedSWAChunkedPrefillFMHAKVKernel(half const* __restric
             int64_t const pageStride = static_cast<int64_t>(rt::kTOKENS_PER_PAGE) * numKVHeads * headDim;
             if (kPage >= 0 && kPage < numPages)
             {
-                kValue = pool[static_cast<int64_t>(kPage) * pageStride + elementInPage];
+                kValue = loadPoolValue(pool, static_cast<int64_t>(kPage) * pageStride + elementInPage, kScale);
             }
             if (vPage >= numPages && vPage < 2 * numPages)
             {
-                vValue = pool[static_cast<int64_t>(vPage) * pageStride + elementInPage];
+                vValue = loadPoolValue(pool, static_cast<int64_t>(vPage) * pageStride + elementInPage, vScale);
             }
         }
     }
@@ -253,9 +264,11 @@ void calSWAChunkedPrefillMetadata(rt::Tensor const& inputSeqLen, rt::Tensor cons
 
 void assemblePagedSWAChunkedPrefillFMHAKV(rt::Tensor const& swaPool, rt::Tensor const& swaPageTable,
     rt::Tensor const& k, rt::Tensor const& v, rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
-    rt::Tensor& kWorkspace, rt::Tensor& vWorkspace, int32_t slidingWindowSize, cudaStream_t stream)
+    rt::Tensor& kWorkspace, rt::Tensor& vWorkspace, int32_t slidingWindowSize, float kScale, float vScale,
+    cudaStream_t stream)
 {
-    check::check(swaPool.getDataType() == nvinfer1::DataType::kHALF, "SWA pool must be FP16.");
+    check::check(swaPool.getDataType() == nvinfer1::DataType::kHALF || swaPool.getDataType() == nvinfer1::DataType::kINT8,
+        "SWA pool must be FP16 or INT8.");
     check::check(swaPageTable.getDataType() == nvinfer1::DataType::kINT32, "SWA page table must be INT32.");
     check::check(k.getDataType() == nvinfer1::DataType::kHALF && v.getDataType() == nvinfer1::DataType::kHALF,
         "SWA chunked-prefill K/V inputs must be FP16.");
@@ -305,11 +318,20 @@ void assemblePagedSWAChunkedPrefillFMHAKV(rt::Tensor const& swaPool, rt::Tensor 
         = static_cast<int64_t>(batchSize) * workspaceSeqLen * numKVHeads * static_cast<int64_t>(headDim);
     constexpr int32_t kBLOCK_SIZE = 256;
     int32_t const gridSize = static_cast<int32_t>((totalElements + kBLOCK_SIZE - 1) / kBLOCK_SIZE);
+    if (swaPool.getDataType() == nvinfer1::DataType::kINT8)
+    {
+        assemblePagedSWAChunkedPrefillFMHAKVKernel<<<gridSize, kBLOCK_SIZE, 0, stream>>>(
+            swaPool.dataPointer<int8_t>(), swaPageTable.dataPointer<int32_t>(), k.dataPointer<half>(),
+            v.dataPointer<half>(), inputSeqLen.dataPointer<int32_t>(), kvCacheStartIndices.dataPointer<int32_t>(),
+            kWorkspace.dataPointer<half>(), vWorkspace.dataPointer<half>(), totalElements, qSeqLen, workspaceSeqLen,
+            maxPagesPerSeq, numPages, numKVHeads, headDim, slidingWindowSize, kScale, vScale);
+        return;
+    }
     assemblePagedSWAChunkedPrefillFMHAKVKernel<<<gridSize, kBLOCK_SIZE, 0, stream>>>(swaPool.dataPointer<half>(),
         swaPageTable.dataPointer<int32_t>(), k.dataPointer<half>(), v.dataPointer<half>(),
         inputSeqLen.dataPointer<int32_t>(), kvCacheStartIndices.dataPointer<int32_t>(), kWorkspace.dataPointer<half>(),
         vWorkspace.dataPointer<half>(), totalElements, qSeqLen, workspaceSeqLen, maxPagesPerSeq, numPages, numKVHeads,
-        headDim, slidingWindowSize);
+        headDim, slidingWindowSize, kScale, vScale);
 }
 
 namespace

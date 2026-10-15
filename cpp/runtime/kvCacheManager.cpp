@@ -95,8 +95,6 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
             boundedCapability = resolvedCapacity;
         }
     }
-    check::check(!boundedCapability.has_value() || mConfig.kvCacheType == nvinfer1::DataType::kHALF,
-        "KVCacheManager: SWA-capable KV configurations do not support a quantized (FP8/INT8) KV cache.");
     if (boundedCapability.has_value())
     {
         int64_t const minimumSwaPages = computeMinimumSwaPoolPages(mConfig.maxBatchSize, *boundedCapability);

@@ -110,6 +110,7 @@ void calSWAChunkedPrefillMetadata(rt::Tensor const& inputSeqLen, rt::Tensor cons
 //! bounded independently of the maximum sequence length.
 void assemblePagedSWAChunkedPrefillFMHAKV(rt::Tensor const& swaPool, rt::Tensor const& swaPageTable,
     rt::Tensor const& k, rt::Tensor const& v, rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
-    rt::Tensor& kWorkspace, rt::Tensor& vWorkspace, int32_t slidingWindowSize, cudaStream_t stream);
+    rt::Tensor& kWorkspace, rt::Tensor& vWorkspace, int32_t slidingWindowSize, float kScale, float vScale,
+    cudaStream_t stream);
 } // namespace kernel
 } // namespace trt_edgellm
