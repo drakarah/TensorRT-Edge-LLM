@@ -63,9 +63,10 @@ std::optional<ManagedKVCacheRequest> ManagedKVCacheRequest::begin(ContextCacheCo
         return ManagedKVCacheRequest(std::move(*admitted));
     }
 
-    ELLM_CHECK(!speculativeRequest && tokenStateContract == DecodingTokenStateContract::kCommittedPlusLookahead
-            && headroom.baseExtraTokens == 1 && headroom.draftExtraTokens == 0,
-        "Bounded SWA KV cache supports only vanilla one-token decode");
+    ELLM_CHECK(tokenStateContract == DecodingTokenStateContract::kCommittedPlusLookahead
+            && headroom.baseExtraTokens >= 1 && headroom.baseExtraTokens <= kSWA_LOOKAHEAD_SLACK_TOKENS
+            && headroom.draftExtraTokens == 0 && (speculativeRequest || headroom.baseExtraTokens == 1),
+        "Bounded SWA KV cache supports one-token decode and speculative verify within the lookahead slack");
     ELLM_CHECK(context.activeBatchSize > 0
             && context.rawBatchedInputIds.size() == static_cast<size_t>(context.activeBatchSize),
         "Bounded SWA admission requires one raw input per active sequence");
@@ -179,9 +180,18 @@ bool ManagedKVCacheRequest::prepareDecodeStep(
     {
         return contextRequest().prepareDecodeStep(context, headroom);
     }
-    ELLM_CHECK(headroom.baseExtraTokens == 1 && headroom.draftExtraTokens == 0,
+    ELLM_CHECK(headroom.baseExtraTokens >= 1 && headroom.baseExtraTokens <= kSWA_LOOKAHEAD_SLACK_TOKENS
+            && headroom.draftExtraTokens == 0,
         "Bounded SWA decode headroom changed after admission");
-    return swaOperationSucceeded(mBoundedSwaPageManager->prepareDecodeStep(swaRequest()), "decode preparation");
+    std::vector<int32_t> targets;
+    if (headroom.baseExtraTokens > 1)
+    {
+        for (int32_t i = 0; i < context.activeBatchSize; ++i)
+        {
+            targets.push_back(context.committedLengths.at(static_cast<size_t>(i)) + headroom.baseExtraTokens);
+        }
+    }
+    return swaOperationSucceeded(mBoundedSwaPageManager->prepareDecodeStep(swaRequest(), targets), "decode preparation");
 }
 
 bool ManagedKVCacheRequest::completeDecodeStep(

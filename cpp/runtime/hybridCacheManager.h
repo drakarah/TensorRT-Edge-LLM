@@ -169,6 +169,12 @@ public:
     //! @return Vector of group views (one per distinct head dim).
     std::vector<KVHeadDimGroupView> getKVHeadDimGroups() const;
 
+    //! @brief Head-dim groups of the physically reduced (bounded sliding-window) layers.
+    //!
+    //! Empty unless the engine runs bounded SWA pools. Their `maxSeqLen` is the logical (full) capacity because the
+    //! layers are addressed through the sparse SWA page table, not through slot-major rows.
+    std::vector<KVHeadDimGroupView> getSwaKVHeadDimGroups() const;
+
     // ------------------------------------------------------------------
     // Shared state
     // ------------------------------------------------------------------
@@ -280,6 +286,7 @@ private:
     int32_t mActiveBatchSize{};               //!< Number of active sequences
     bool mKVCacheAllEmpty{true};              //!< True until the first commitSequenceLength call
     std::vector<HeadDimGroup> mHeadDimGroups; //!< Pre-computed per-headDim groups for batched kernels
+    std::vector<HeadDimGroup> mSwaHeadDimGroups; //!< Same for the bounded SWA layers (sparse page table)
 };
 
 } // namespace rt

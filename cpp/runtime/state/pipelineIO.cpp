@@ -230,6 +230,15 @@ void prepareRaggedKVPageTable(PipelineIO& io, KVPageTable const& pageTable, int3
     pageTable.gatherRows(io.raggedKVPageTable, io.stateIndices, numSequences, stream);
 }
 
+void prepareRaggedBoundedSwaKVPageTable(
+    PipelineIO& io, SharedResources& resources, int32_t kvCacheIndex, int32_t numSequences, cudaStream_t stream)
+{
+    if (KVPageTable* const swaPageTable = resources.getSwaKVPageTable(kvCacheIndex))
+    {
+        prepareRaggedSwaKVPageTable(io, *swaPageTable, numSequences, stream);
+    }
+}
+
 void prepareRaggedSwaKVPageTable(
     PipelineIO& io, KVPageTable const& pageTable, int32_t numSequences, cudaStream_t stream)
 {
@@ -716,6 +725,12 @@ void buildTensorMapForGemma4MTPDraft(
     // kv_page_table: the assistant reads the TARGET model's paged pool, so it binds the
     // target's page table (identity while reuse is off) — same object the base engine binds.
     map.set(binding_names::kKVPageTable, io.raggedKVPageTable);
+    if (res.getSwaKVPageTable(0) != nullptr)
+    {
+        // Bounded SWA pools: the assistant's sliding layers read the donor's window through the sparse table.
+        map.set(binding_names::kSwaKVPageTable, io.raggedSwaKVPageTable);
+        map.set(binding_names::kSwaKVCacheMode, res.swaKVCacheMode);
+    }
     for (auto const& entry : draftCfg.gemma4MTPKVSharingMap)
     {
         rt::Tensor& targetKV = baseCacheManager.getCombinedKVCache(entry.targetAbsoluteLayerIdx);

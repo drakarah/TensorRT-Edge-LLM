@@ -225,6 +225,10 @@ void scatterActiveMRopeToResident(
 //! Gather resident page-table rows into the stable active-step binding after state-index upload.
 void prepareRaggedKVPageTable(PipelineIO& io, KVPageTable const& pageTable, int32_t numSequences, cudaStream_t stream);
 
+//! Gathers the sparse SWA table rows of the active sequences when the engine runs bounded SWA pools (no-op otherwise).
+void prepareRaggedBoundedSwaKVPageTable(
+    PipelineIO& io, SharedResources& resources, int32_t kvCacheIndex, int32_t numSequences, cudaStream_t stream);
+
 //! Gather bounded-SWA resident rows into its stable active-step binding after state-index upload.
 void prepareRaggedSwaKVPageTable(
     PipelineIO& io, KVPageTable const& pageTable, int32_t numSequences, cudaStream_t stream);

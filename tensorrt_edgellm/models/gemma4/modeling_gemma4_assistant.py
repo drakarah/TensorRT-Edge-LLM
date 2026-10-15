@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 from typing import List, Tuple
 
 import torch
@@ -31,6 +32,10 @@ from ..ops import KV_PAGE_SIZE, attention_plugin
 from .modeling_gemma4_text import Gemma4MLP, _rotary_dim_from_rope_config
 
 __all__ = ["Gemma4AssistantForCausalLM", "Gemma4AssistantDecoderLayer"]
+
+def _bounded_swa_spec() -> bool:
+    return os.environ.get("EDGELLM_GEMMA4_BOUNDED_KV_SPEC") == "1"
+
 
 _DUMMY_BATCH_SIZE = 1
 _DUMMY_SEQ_LEN = 1
@@ -48,8 +53,12 @@ def _make_gemma4_assistant_flat_wrapper(model: nn.Module,
             "past_lengths", "attention_sequence_lengths", "state_indices",
             "execution_phase_marker", "context_sequence_count_carrier",
             "kv_page_table"
-        ])
+        ] + (["swa_kv_page_table", "swa_kv_cache_mode"]
+             if _bounded_swa_spec() else []))
 
+    swa_kwargs = (",\n        swa_kv_page_table=swa_kv_page_table,\n"
+                  "        swa_kv_cache_mode=swa_kv_cache_mode"
+                  if _bounded_swa_spec() else "")
     past_kv_tuple = "({},)".format(", ".join(
         f"past_key_values_{i}"
         for i in range(num_layers))) if num_layers else "()"
@@ -64,7 +73,7 @@ def _make_gemma4_assistant_flat_wrapper(model: nn.Module,
         f"        attention_sequence_lengths=attention_sequence_lengths,\n"
         f"        state_indices=state_indices, execution_phase_marker=execution_phase_marker,\n"
         f"        context_sequence_count_carrier=context_sequence_count_carrier,\n"
-        f"        kv_page_table=kv_page_table)\n"
+        f"        kv_page_table=kv_page_table{swa_kwargs})\n"
         f"    return outputs\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
@@ -213,13 +222,21 @@ class Gemma4SharedKVAttention(nn.Module):
                 physical_tokens, self.num_heads,
                 self.head_dim)).reshape(physical_tokens,
                                         self.num_heads * self.head_dim)
+        swa_mode = (metadata.get("swa_kv_cache_mode")
+                    if self.sliding_window_size > 0 else None)
+        page_table = (metadata["swa_kv_page_table"]
+                      if swa_mode is not None else metadata["kv_page_table"])
+        swa_kwargs = ({
+            "swa_kv_cache_mode": swa_mode
+        } if swa_mode is not None else {})
         attn_output, _ = attention_plugin(
             query_states,
             target_past_key_value,
             metadata["query_lengths"],
             rope_rotary_cos_sin,
             metadata["past_lengths"],
-            metadata["kv_page_table"],
+            page_table,
+            **swa_kwargs,
             num_q_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
@@ -604,6 +621,7 @@ class Gemma4AssistantForCausalLM(nn.Module):
                                     1,
                                     dtype=torch.int32,
                                     device=device)
+        bounded = _bounded_swa_spec()
 
         positions = torch.zeros(physical_tokens,
                                 dtype=torch.int32,
@@ -636,6 +654,13 @@ class Gemma4AssistantForCausalLM(nn.Module):
                 attention_sequence_lengths, state_indices,
                 execution_phase_marker, context_sequence_count_carrier,
                 kv_page_table)
+        if bounded:
+            args = args + (torch.zeros(batch_size,
+                                       2,
+                                       1,
+                                       dtype=torch.int32,
+                                       device=device),
+                           torch.zeros(1, dtype=torch.int8, device=device))
         input_names = (
             ["inputs_embeds", "hidden_states_input"] +
             [f"past_key_values_{i}" for i in range(num_layers)] + [
@@ -644,7 +669,7 @@ class Gemma4AssistantForCausalLM(nn.Module):
                 "past_lengths", "attention_sequence_lengths", "state_indices",
                 "execution_phase_marker", "context_sequence_count_carrier",
                 "kv_page_table"
-            ])
+            ] + (["swa_kv_page_table", "swa_kv_cache_mode"] if bounded else []))
         output_names = ["logits", "hidden_states"]
         if config.sparse_logits_enabled:
             output_names.append("logit_token_ids")
@@ -657,7 +682,16 @@ class Gemma4AssistantForCausalLM(nn.Module):
 
         phase_extent = torch.export.Dim("execution_phase_extent", min=1, max=8)
         dynamic_shapes: list = [{0: tokens}, {0: tokens}]
-        dynamic_shapes += [{1: num_pages} for _ in range(num_layers)]
+        if bounded:
+            num_swa_pages = torch.export.Dim("num_swa_pages",
+                                             min=1,
+                                             max=1048576)
+            dynamic_shapes += [{
+                1: (num_swa_pages if self.model.layers[i].self_attn.
+                    sliding_window_size > 0 else num_pages)
+            } for i in range(num_layers)]
+        else:
+            dynamic_shapes += [{1: num_pages} for _ in range(num_layers)]
         dynamic_shapes += [{
             0: tokens
         }, {
@@ -680,6 +714,11 @@ class Gemma4AssistantForCausalLM(nn.Module):
             0: page_batch,
             2: max_pages
         }]
+        if bounded:
+            dynamic_shapes += [{
+                0: torch.export.Dim("swa_page_batch", min=1, max=256),
+                2: torch.export.Dim("swa_max_pages_per_seq", min=1, max=32768)
+            }, {}]
 
         wrapped = _make_gemma4_assistant_flat_wrapper(self, num_layers)
         wrapped.eval()

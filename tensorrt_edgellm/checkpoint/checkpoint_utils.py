@@ -750,6 +750,8 @@ def build_runtime_llm_config_dict(
             config.sparse_logits_enabled,
             "sparse_candidate_count":
             _fixed_draft_candidate_count(config),
+            "bounded_swa_donor_read":
+            os.environ.get("EDGELLM_GEMMA4_BOUNDED_KV_SPEC") == "1",
             "layer_types":
             list(config.raw_layer_types or config.layer_types),
             "sliding_window":

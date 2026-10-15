@@ -742,12 +742,6 @@ bool LLMBuilder::parseConfig()
             LOG_ERROR("Reduced SWA KV pools do not support FP8 KV cache.");
             return false;
         }
-        if (specType != "none" || configRevealsSpecDecode(mModelConfig) || mBuilderConfig.specBase
-            || mBuilderConfig.specDraft)
-        {
-            LOG_ERROR("Reduced SWA KV pools do not support speculative decoding.");
-            return false;
-        }
         try
         {
             bool const autoSized = mBuilderConfig.numSwaPages == 0;
@@ -1422,6 +1416,15 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
         ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
             createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
             createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+        if (hasInputBinding(network, binding_names::kSwaKVPageTable))
+        {
+            // Bounded sliding-window donor pool: the assistant's sliding layers read it through the sparse SWA table.
+            ok &= setOptimizationProfile(&profile, binding_names::kSwaKVPageTable, createDims({1, 2, maxPagesPerSeq}),
+                createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+                createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+            ok &= setOptimizationProfile(
+                &profile, binding_names::kSwaKVCacheMode, createDims({0}), createDims({1}), createDims({1}));
+        }
 
         if (auto const rotaryDim = getStaticInputDim(network, binding_names::kRopeCosSinSliding, 1))
         {
@@ -1445,13 +1448,12 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
             int64_t const layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
             int32_t const layerCapacity
                 = mPerLayerKVCacheCapacity.empty() ? 0 : mPerLayerKVCacheCapacity[static_cast<size_t>(i)];
-            bool const reduced
-                = rt::isReducedKvCacheCapacity(layerCapacity, static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
-            int64_t const numPages = reduced ? mBuilderConfig.numSwaPages : mBuilderConfig.resolvedKVPoolPages();
-            nvinfer1::Dims const kvCacheShape
-                = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
-            ok &= setOptimizationProfile(
-                &profile, binding_names::formatKVCacheName(i, true).c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
+            // Same MIN/OPT/MAX page profile as the target's KV binding (bounded layers span bounded to full storage).
+            std::array<int64_t, 3> const pageProfile = mBuilderConfig.resolveKVPoolPageProfile(layerCapacity);
+            ok &= setOptimizationProfile(&profile, binding_names::formatKVCacheName(i, true).c_str(),
+                createDims({2, pageProfile[0], rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize}),
+                createDims({2, pageProfile[1], rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize}),
+                createDims({2, pageProfile[2], rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize}));
         }
 
         return ok;

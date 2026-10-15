@@ -79,6 +79,7 @@ void prepareSpecRaggedBindings(DecodingRuntimeContext& runtime, LLMEngineConfig 
         static_cast<size_t>(selectedRows) * sizeof(int64_t), cudaMemcpyDeviceToDevice, stream));
     check::check(io.contextSequenceCountCarrier.reshape({0}), "Tensor reshape failed");
     prepareRaggedKVPageTable(io, *runtime.base.sharedResources.kvPageTables.at(kvCacheIndex), batchSize, stream);
+    prepareRaggedBoundedSwaKVPageTable(io, runtime.base.sharedResources, kvCacheIndex, batchSize, stream);
     prepareRaggedRope(io, runtime.base.sharedResources, cfg, physicalTokens, batchSize, stream);
 }
 
@@ -153,6 +154,7 @@ void prepareSpecPrefillRaggedBindings(DecodingRuntimeContext& runtime, LLMEngine
     PipelineIO& io = runtime.base.pipelineIO;
     io.uploadRaggedMetadata(batch, stream);
     prepareRaggedKVPageTable(io, *runtime.base.sharedResources.kvPageTables.at(kvCacheIndex), batchSize, stream);
+    prepareRaggedBoundedSwaKVPageTable(io, runtime.base.sharedResources, kvCacheIndex, batchSize, stream);
     prepareRaggedRope(io, runtime.base.sharedResources, cfg, physicalTokens, batchSize, stream);
 }
 

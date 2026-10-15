@@ -44,6 +44,9 @@ constexpr int32_t kMAX_KV_CACHE_CAPACITY = (std::numeric_limits<int32_t>::max() 
 //! temporarily hold the old and new images until execution completes.
 constexpr int32_t kSWA_BOUNDARY_HEADROOM_PAGES{1};
 constexpr int32_t kSWA_REPLACEMENT_PAGES{1};
+//! Tokens one speculative verify step may write beyond the committed endpoint on a bounded SWA layer; the exporter
+//! adds one page of window slack for them.
+constexpr int32_t kSWA_LOOKAHEAD_SLACK_TOKENS{kTOKENS_PER_PAGE};
 
 //! Number of pages a single slot's padded token capacity spans.
 inline int32_t pagesPerSlot(int32_t maxCapPadded)

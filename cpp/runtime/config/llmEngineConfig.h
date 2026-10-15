@@ -107,6 +107,8 @@ struct LLMEngineConfig
     int32_t numSwaPages{};
     //! Runtime-only storage selection. The exported per-layer capacity markers remain unchanged.
     SwaKVCacheMode swaKVCacheMode{SwaKVCacheMode::kBounded};
+    //! Draft engines that read the target's bounded sliding-window pool through the sparse SWA table.
+    bool boundedSwaDonorRead{false};
     int32_t rotaryDim{};         //!< Rotary embedding dimension
     int32_t numDecoderLayers{};  //!< Total decoder layers (attention + linear)
     int32_t vocabSize{};         //!< Full vocabulary size

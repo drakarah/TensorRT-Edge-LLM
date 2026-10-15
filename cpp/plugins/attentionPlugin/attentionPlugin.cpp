@@ -646,9 +646,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
             + std::to_string(mQkvScales.size()) + " elements (expected 3). "
             "Re-export the model to include QKV scales [q, k, v].");
     ELLM_CHECK(!mSupportsBoundedKVCache
-            || (mSlidingWindowSize > 0 && !mEnableTreeAttention && !mEnableQKNorm
+            || (mSlidingWindowSize > 0 && !mEnableQKNorm
                 && !mEnableContextMaskSelector),
-        "Bounded KV cache capability requires FP16 vanilla sliding-window attention.");
+        "Bounded KV cache capability requires sliding-window attention without QK norm or a context mask selector.");
 
     mSMVersion = getSMVersion();
     ELLM_CHECK(!mEnableInt8KVCache || mSMVersion >= 80, "INT8 KV cache requires SM80 or newer.");
@@ -754,9 +754,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     ELLM_CHECK(!mEnableVisionBlockAttention || kvCacheDataType() == DataType::kHALF,
         "Vision block attention does not support a quantized KV cache.");
     ELLM_CHECK(!mSupportsBoundedKVCache
-            || (mSlidingWindowSize > 0 && !mEnableTreeAttention && !mEnableQKNorm
+            || (mSlidingWindowSize > 0 && !mEnableQKNorm
                 && !mEnableContextMaskSelector),
-        "Bounded KV cache capability requires FP16 vanilla sliding-window attention.");
+        "Bounded KV cache capability requires sliding-window attention without QK norm or a context mask selector.");
 
     // Parse qkv_scales float array
     for (int32_t i = 0; i < fc->nbFields; ++i)

@@ -125,7 +125,9 @@ public:
     SwaKVCacheStatus completePrefill(RequestHandle& request);
     //! Retires the pages a non-final chunked-prefill pass no longer needs; the caller has already waited for the pass.
     SwaKVCacheStatus completePrefillChunk(RequestHandle& request);
-    SwaKVCacheStatus prepareDecodeStep(RequestHandle& request);
+    //! `targetEndpoints` (one per sequence) are the mapping frontiers to bind before a step that writes several
+    //! positions (a speculative verify); empty selects one more token per sequence. Frontiers only move forward.
+    SwaKVCacheStatus prepareDecodeStep(RequestHandle& request, std::vector<int32_t> const& targetEndpoints = {});
     SwaKVCacheStatus completeDecodeStep(RequestHandle& request);
     SwaKVCacheStatus beginBatchCompaction(
         RequestHandle& request, std::vector<int32_t> const& oldToNew, int32_t newBatchSize, Tensor& deviceBatchMapping);

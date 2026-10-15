@@ -237,10 +237,11 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
         bundle.draft.has_value(), "SharedResources::createForSpecDecode requires DeploymentConfig.draft to be set");
     check::check(bundle.specConfig.has_value(),
         "SharedResources::createForSpecDecode requires DeploymentConfig.specConfig to be set");
-    check::check(!hasReducedKVLayer(bundle.base),
-        "SharedResources::createForSpecDecode does not support SWA-capable KV configuration on the base engine.");
-    check::check(!bundle.draft.has_value() || !hasReducedKVLayer(*bundle.draft),
-        "SharedResources::createForSpecDecode does not support SWA-capable KV configuration on the draft engine.");
+    check::check(!hasReducedKVLayer(bundle.base) || bundle.specDecodeMode() == SpecDecodeMode::kGemma4MTP,
+        "SharedResources::createForSpecDecode supports an SWA-capable base engine only with Gemma4 MTP.");
+    check::check(!bundle.draft.has_value() || !hasReducedKVLayer(*bundle.draft)
+            || bundle.specDecodeMode() == SpecDecodeMode::kGemma4MTP,
+        "SharedResources::createForSpecDecode supports an SWA-capable draft engine only with Gemma4 MTP.");
 
     auto resources = std::make_unique<SharedResources>();
 
@@ -365,6 +366,12 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             = maxBatch * std::max(maxDraftProposalSize, 1) * static_cast<int64_t>(sizeof(int32_t));
         int64_t const zeroBufferBytes = std::max({deepstackSize, attnPosIdSize, static_cast<int64_t>(256)});
         allocateZeroBuffer(*resources, zeroBufferBytes);
+    }
+
+    if (bundle.base.supportsBoundedSwaKVCache())
+    {
+        resources->swaKVCacheMode
+            = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "SharedResources::swaKVCacheMode");
     }
 
     return resources;

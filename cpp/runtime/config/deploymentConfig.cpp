@@ -293,7 +293,14 @@ void DeploymentConfig::selectSwaKVCacheMode(bool contextReuseEnabled) noexcept
     selectMode(base);
     if (draft.has_value())
     {
-        selectMode(*draft);
+        if (draft->boundedSwaDonorRead)
+        {
+            draft->setSwaKVCacheMode(base.usesBoundedSwaKVCache() ? SwaKVCacheMode::kBounded : SwaKVCacheMode::kFull);
+        }
+        else
+        {
+            selectMode(*draft);
+        }
     }
 }
 

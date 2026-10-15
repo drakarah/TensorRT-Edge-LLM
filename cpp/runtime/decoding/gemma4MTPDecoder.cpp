@@ -305,6 +305,8 @@ bool Gemma4MTPDecoder::captureCudaGraphs(cudaStream_t stream)
         mRuntime.base.pipelineIO.uploadRaggedMetadata(draftMetadata, stream);
         prepareRaggedKVPageTable(
             mRuntime.base.pipelineIO, *mRuntime.base.sharedResources.kvPageTables[0], batchSize, stream);
+        prepareRaggedBoundedSwaKVPageTable(
+            mRuntime.base.pipelineIO, mRuntime.base.sharedResources, 0, batchSize, stream);
         prepareRaggedRope(mRuntime.base.pipelineIO, mRuntime.base.sharedResources, *mRuntime.deployment.draft,
             batchSize, batchSize, stream);
 
@@ -632,6 +634,8 @@ bool Gemma4MTPDecoder::runAssistantDraftChain(DecodingInferenceContext& context)
     mRuntime.base.pipelineIO.uploadRaggedMetadata(metadata, context.stream);
     prepareRaggedKVPageTable(
         mRuntime.base.pipelineIO, *mRuntime.base.sharedResources.kvPageTables[0], activeBatchSize, context.stream);
+    prepareRaggedBoundedSwaKVPageTable(
+        mRuntime.base.pipelineIO, mRuntime.base.sharedResources, 0, activeBatchSize, context.stream);
     prepareRaggedRope(mRuntime.base.pipelineIO, mRuntime.base.sharedResources, *mRuntime.deployment.draft,
         activeBatchSize, activeBatchSize, context.stream);
 
@@ -936,6 +940,19 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
                 mRuntime.base.pipelineIO.stateIndices, group.deviceLayerInfos, group.numLayers, group.headDim,
                 group.maxKVHeads, activeBatchSize, mRuntime.deployment.base.recurrentPoolRows, maxAcceptDepth,
                 kvCacheType, context.stream, pageTablePtr, numPages, maxPagesPerSeq);
+        }
+        if (KVPageTable const* const swaPageTable = mRuntime.base.sharedResources.getSwaKVPageTable(0))
+        {
+            // Bounded sliding-window layers live in their own pool and are addressed through the sparse SWA table.
+            int32_t const* swaPageTablePtr = swaPageTable->kernelView().dataPointer<int32_t>();
+            for (auto const& group : cacheManager.getSwaKVHeadDimGroups())
+            {
+                kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths,
+                    mRuntime.base.pipelineIO.stateIndices, group.deviceLayerInfos, group.numLayers, group.headDim,
+                    group.maxKVHeads, activeBatchSize, mRuntime.deployment.base.recurrentPoolRows, maxAcceptDepth,
+                    kvCacheType, context.stream, swaPageTablePtr, swaPageTable->numPages(),
+                    swaPageTable->maxPagesPerSeq());
+            }
         }
         kernel::eagleBaseAssembleHiddenState(
             mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.baseHiddenStates, context.stream);

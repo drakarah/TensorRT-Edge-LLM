@@ -490,16 +490,24 @@ SwaKVCacheStatus BoundedSwaKVPageManager::completePrefill(RequestHandle& request
     return SwaKVCacheStatus::kOk;
 }
 
-SwaKVCacheStatus BoundedSwaKVPageManager::prepareDecodeStep(RequestHandle& request)
+SwaKVCacheStatus BoundedSwaKVPageManager::prepareDecodeStep(
+    RequestHandle& request, std::vector<int32_t> const& targetEndpoints)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
     ELLM_CHECK(impl.phase == RequestHandle::Impl::Phase::kExecuting && !impl.deviceWorkPending,
         "SWA KV cache decode preparation requires terminal prior work");
+    ELLM_CHECK(targetEndpoints.empty() || targetEndpoints.size() == impl.states.size(),
+        "SWA KV cache decode targets must describe every sequence");
     for (size_t slot = 0; slot < impl.states.size(); ++slot)
     {
         SwaKVCacheState& state = impl.states[slot];
-        if (state.exactResidentTokenCount == std::numeric_limits<int32_t>::max()
-            || !advance(state, state.exactResidentTokenCount + 1))
+        // A speculative step binds pages for the full verify window; the frontier never moves backward even when
+        // fewer tokens are committed, because the next frontier (committed + lookahead) is always further.
+        int32_t const target = targetEndpoints.empty()
+            ? state.exactResidentTokenCount + 1
+            : std::max(targetEndpoints[slot], state.exactResidentTokenCount);
+        if (state.exactResidentTokenCount == std::numeric_limits<int32_t>::max() || target >= std::numeric_limits<int32_t>::max()
+            || !advance(state, target))
         {
             impl.phase = RequestHandle::Impl::Phase::kFinishing;
             return SwaKVCacheStatus::kRequestFailed;

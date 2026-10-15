@@ -159,6 +159,10 @@ def _gemma4_uses_swa_kv_cache(config: ModelConfig) -> bool:
         "gemma4_mtp_draft",
         "shares_target_kv",
     )
+    if os.environ.get("EDGELLM_GEMMA4_BOUNDED_KV_SPEC") == "1":
+        spec_flags = tuple(flag for flag in spec_flags
+                           if flag not in ("gemma4_mtp_base", "mtp_tree_base",
+                                           "gemma4_mtp_draft", "shares_target_kv"))
     return not any(bool(getattr(config, flag, False)) for flag in spec_flags)
 
 
@@ -177,6 +181,9 @@ def _gemma4_kv_layer_config(config: ModelConfig, layer_idx: int) -> dict:
     }
     if _gemma4_uses_swa_pool(config, layer_idx):
         layer_config["kv_cache_capacity"] = config.sliding_window_size
+        if os.environ.get("EDGELLM_GEMMA4_BOUNDED_KV_SPEC") == "1":
+            # One page of window slack for the speculative verify lookahead (kSWA_LOOKAHEAD_SLACK_TOKENS).
+            layer_config["kv_cache_capacity"] += KV_PAGE_SIZE
     return layer_config
 
 
@@ -692,9 +699,11 @@ class Gemma4Attention(Attention):
             raise ValueError(
                 "Gemma4 vision block attention and tree attention are mutually exclusive."
             )
-        uses_bounded_swa = self.use_swa_pool and not enable_tree
+        bounded_tree = (os.environ.get("EDGELLM_GEMMA4_BOUNDED_KV_SPEC") == "1")
+        uses_bounded_swa = self.use_swa_pool and (not enable_tree
+                                                  or bounded_tree)
         layer_page_table = kv_page_table
-        if self.use_swa_pool and not enable_tree:
+        if uses_bounded_swa:
             if swa_kv_page_table is None:
                 raise ValueError(
                     "SWA-capable Gemma4 layers require swa_kv_page_table.")
@@ -814,8 +823,11 @@ class Gemma4Attention(Attention):
                         -1, (self.num_kv_heads, self.head_dim))).flatten(-2)
 
         enable_tree = packed_attention_mask is not None
+        uses_bounded_swa = self.use_swa_pool and (
+            not enable_tree
+            or os.environ.get("EDGELLM_GEMMA4_BOUNDED_KV_SPEC") == "1")
         layer_page_table = kv_page_table
-        if self.use_swa_pool and not enable_tree:
+        if uses_bounded_swa:
             if swa_kv_page_table is None:
                 raise ValueError(
                     "SWA-capable Gemma4 layers require swa_kv_page_table.")
@@ -847,7 +859,7 @@ class Gemma4Attention(Attention):
             kwargs.update(attention_mask=packed_attention_mask,
                           attention_pos_id=attention_position_ids)
             kwargs.update(self._tree_swa_kwargs())
-        if self.use_swa_pool and not enable_tree:
+        if uses_bounded_swa:
             if swa_kv_cache_mode is None:
                 raise ValueError(
                     "Bounded-capable Gemma4 SWA layers require swa_kv_cache_mode."

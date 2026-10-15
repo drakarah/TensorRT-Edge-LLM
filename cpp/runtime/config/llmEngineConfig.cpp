@@ -332,6 +332,7 @@ void parseGemma4MTPFields(Json const& configJson, LLMEngineConfig& cfg)
     cfg.returnsFeedbackHidden = configJson.value("returns_feedback_hidden", false);
     cfg.assistantHiddenSize = configJson.value("assistant_hidden_size", 0);
     cfg.sparseDraftLogits = configJson.value("sparse_logits_enabled", false);
+    cfg.boundedSwaDonorRead = configJson.value("bounded_swa_donor_read", false);
 
     if (!configJson.contains("kv_sharing_map"))
     {
@@ -773,8 +774,6 @@ void validateKVLayerCapacities(Json const& configJson, LLMEngineConfig const& cf
     {
         return;
     }
-    ELLM_CHECK(cfg.specDecodeType == SpecDecodeMode::kNONE && !configRevealsSpecDecode(configJson),
-        "parseEngineConfig: reduced SWA KV pools do not support speculative decoding");
     int64_t const minimumSwaPages = computeMinimumSwaPoolPages(cfg.maxSupportedBatchSize, *reducedCapacity);
     ELLM_CHECK(minimumSwaPages <= std::numeric_limits<int32_t>::max() && cfg.numSwaPages >= minimumSwaPages,
         "parseEngineConfig: num_swa_pages must cover every active slot's private SWA pages");
@@ -1235,7 +1234,7 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
 
 bool LLMEngineConfig::supportsBoundedSwaKVCache() const
 {
-    return std::any_of(kvLayerConfigs.begin(), kvLayerConfigs.end(), [&](KVLayerConfig const& layerConfig) {
+    return boundedSwaDonorRead || std::any_of(kvLayerConfigs.begin(), kvLayerConfigs.end(), [&](KVLayerConfig const& layerConfig) {
         return isReducedKvCacheCapacity(layerConfig.kvCacheCapacity, maxKVCacheCapacity);
     });
 }
@@ -1754,10 +1753,14 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                         std::string("Gemma4 MTP shared KV binding '") + kvPastName + "' must be rank-5.");
                     // Paged pool binding [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim];
                     // numPages (dim 1) is engine-specific.
-                    ELLM_CHECK(shape.d[0] == 2 && shape.d[1] == config.kvPoolPages && shape.d[2] == kTOKENS_PER_PAGE
+                    std::array<int32_t, 3> const pageProfile = config.getKVPoolPageProfileForLayer(kvConfig);
+                    int32_t const expectedPages = pageProfile[selector == nvinfer1::OptProfileSelector::kMIN ? 0U
+                            : selector == nvinfer1::OptProfileSelector::kOPT                                   ? 1U
+                                                                                                               : 2U];
+                    ELLM_CHECK(shape.d[0] == 2 && shape.d[1] == expectedPages && shape.d[2] == kTOKENS_PER_PAGE
                             && shape.d[3] == kvConfig.numKVHeads && shape.d[4] == kvConfig.headDim,
                         std::string("Gemma4 MTP shared KV profile shape mismatch for binding '") + kvPastName
-                            + "': expected static dims [2," + std::to_string(config.kvPoolPages) + ","
+                            + "': expected dims [2," + std::to_string(expectedPages) + ","
                             + std::to_string(kTOKENS_PER_PAGE) + "," + std::to_string(kvConfig.numKVHeads) + ","
                             + std::to_string(kvConfig.headDim) + "].");
                 }

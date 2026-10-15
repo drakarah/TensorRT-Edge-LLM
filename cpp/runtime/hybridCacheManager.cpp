@@ -83,6 +83,7 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
     {
         // Group KV layers by headDim, preserving insertion order via an auxiliary vector.
         std::unordered_map<int32_t, size_t> headDimToGroupIdx;
+        std::unordered_map<int32_t, size_t> swaHeadDimToGroupIdx;
         for (int32_t i = 0; i < mKVCache.numLayers(); ++i)
         {
             // A KV-sharing recipient holds no data of its own (its accessors resolve to the
@@ -92,36 +93,38 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
                 continue;
             }
             auto const& lc = mKVCache.getLayerConfig(i);
-            if (mKVCache.hasReducedKVCache()
-                && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.kvConfig.maxSequenceLength))
+            bool const reduced = mKVCache.hasReducedKVCache()
+                && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.kvConfig.maxSequenceLength);
+            auto& groups = reduced ? mSwaHeadDimGroups : mHeadDimGroups;
+            auto& groupIndex = reduced ? swaHeadDimToGroupIdx : headDimToGroupIdx;
+            auto it = groupIndex.find(lc.headDim);
+            if (it == groupIndex.end())
             {
-                continue;
-            }
-            auto it = headDimToGroupIdx.find(lc.headDim);
-            if (it == headDimToGroupIdx.end())
-            {
-                headDimToGroupIdx[lc.headDim] = mHeadDimGroups.size();
+                groupIndex[lc.headDim] = groups.size();
                 // Positional init to satisfy -Werror=missing-field-initializers; order matches
                 // the HeadDimGroup field declaration in hybridCacheManager.h.
-                mHeadDimGroups.push_back(HeadDimGroup{lc.headDim, 0, 0, {}, {}, {}, {}});
+                groups.push_back(HeadDimGroup{lc.headDim, 0, 0, {}, {}, {}, {}});
             }
-            size_t const gIdx = headDimToGroupIdx[lc.headDim];
-            auto& group = mHeadDimGroups[gIdx];
+            size_t const gIdx = groupIndex[lc.headDim];
+            auto& group = groups[gIdx];
             group.localKVIndices.push_back(i);
             group.maxKVHeads = std::max(group.maxKVHeads, lc.numKVHeads);
             group.numLayers++;
 
-            // Dense batched-copy operations only include full-capacity layers.
             kernel::KVLayerInfo info{};
             info.data = mKVCache.kPoolPtr(i);
             info.numKVHeads = lc.numKVHeads;
-            info.maxSeqLen = mKVCache.maxCapPadded(i);
+            // Bounded layers are addressed by logical position through the sparse table: bound by the full capacity.
+            info.maxSeqLen = reduced
+                ? (mConfig.kvConfig.maxSequenceLength + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE * kTOKENS_PER_PAGE
+                : mKVCache.maxCapPadded(i);
             group.hostInfos.push_back(info);
         }
 
         // Upload each group's layer info array to the device and pre-allocate a scratch buffer
         // for save/restore operations (avoids per-call cudaMalloc/cudaFree synchronisation).
-        for (auto& group : mHeadDimGroups)
+        for (auto* groups : {&mHeadDimGroups, &mSwaHeadDimGroups})
+        for (auto& group : *groups)
         {
             size_t const infoBytes = group.hostInfos.size() * sizeof(kernel::KVLayerInfo);
             group.deviceLayerInfos = rt::Tensor({static_cast<int64_t>(infoBytes)}, DeviceType::kGPU, DataType::kINT8,
@@ -263,6 +266,22 @@ KVCacheManager const& HybridCacheManager::getKVCacheManager() const noexcept
 MambaCacheManager& HybridCacheManager::getMambaCacheManager() noexcept
 {
     return mMambaCache;
+}
+
+std::vector<HybridCacheManager::KVHeadDimGroupView> HybridCacheManager::getSwaKVHeadDimGroups() const
+{
+    std::vector<KVHeadDimGroupView> views;
+    views.reserve(mSwaHeadDimGroups.size());
+    for (auto const& group : mSwaHeadDimGroups)
+    {
+        views.push_back(KVHeadDimGroupView{
+            static_cast<kernel::KVLayerInfo const*>(group.deviceLayerInfos.rawPointer()),
+            group.numLayers,
+            group.headDim,
+            group.maxKVHeads,
+        });
+    }
+    return views;
 }
 
 std::vector<HybridCacheManager::KVHeadDimGroupView> HybridCacheManager::getKVHeadDimGroups() const
