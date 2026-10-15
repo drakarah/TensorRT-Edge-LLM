@@ -104,6 +104,11 @@ _QSA_DECODE_THREADS = 128
 _QSA_DECODE_PIPE_DEPTH = 1
 
 
+# SMs whose per-block shared memory (99 KB: GeForce Ampere/Ada, RTX Blackwell) is below what the
+# warp-specialized D512 context kernel (fmha_d512_ws.py) needs.
+_SMEM_BELOW_D512_WS = frozenset({86, 89, 120})
+
+
 @dataclass
 class KernelVariant:
     """One compilable kernel variant in the CuTe DSL registry.
@@ -2087,6 +2092,11 @@ _INT4_FP16_GEMM_CONFIGS = [
 # `_g{gs}` suffix to the variant name below to ship both group sizes at once.
 _INT4_FP16_GEMM_GROUP_SIZE = 128
 
+# Opt-in FP16 accumulation for the large-M tiles (prefill): set EDGELLM_INT4_GEMM_FP16_ACC_MIN_BM=64 to build the
+# bM >= 64 variants with FP16 MMA accumulators (2x tensor rate on GeForce Ada; FP16 range and rounding in the K sum).
+# Default off: FP32 accumulation everywhere. The decode-regime tiles (bM 16 and 32) always stay FP32.
+_INT4_GEMM_FP16_ACC_MIN_BM = int(os.environ.get("EDGELLM_INT4_GEMM_FP16_ACC_MIN_BM", "0") or 0)
+
 for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
     _tile_tag = f"{_bm}x128x64"
     KERNEL_VARIANTS.append(
@@ -2102,6 +2112,7 @@ for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
                 "--num_stages", str(_stages),
                 "--split_k", str(_sk),
                 "--group_size", str(_INT4_FP16_GEMM_GROUP_SIZE),
+                *(["--acc_fp16"] if _INT4_GEMM_FP16_ACC_MIN_BM and _bm >= _INT4_GEMM_FP16_ACC_MIN_BM else []),
                 "--export_only",
             ],
         )
@@ -2510,7 +2521,12 @@ def _compile_command(
     else:
         cmd = [sys.executable, str(script)]
 
-    cmd += variant.script_args
+    script_args = variant.script_args
+    if sm in _SMEM_BELOW_D512_WS and "--d512_ws" in script_args:
+        # The warp-specialized D512 kernel needs 136 192 B of shared memory per block; these
+        # architectures allow 99 KB (101 376 B). They use the original two-pass kernel instead.
+        script_args = [a for a in script_args if a != "--d512_ws"]
+    cmd += script_args
     if variant.wants_target_sm:
         # The kernel script cannot resolve this itself: CUTE_DSL_ARCH is unset
         # for every target in build_cutedsl_tarballs.sh's matrix, so a device
