@@ -64,6 +64,8 @@ public:
     bool prepareSwaPrefill(std::vector<int32_t> const& effectiveInputLengths, bool continuation = false);
     //! Bounded-SWA backend: retire window pages after a non-final pass of a chunked prefill.
     bool completeSwaPrefillChunk();
+    //! Bounded-SWA backend: window state of sequence `sequence` (valid between passes).
+    SwaKVCacheState const& swaState(int32_t sequence);
     bool enqueuePrefillCaptures();
     bool completePrefill(DecodingInferenceContext const& context, std::vector<int32_t> const& commonStateLengths);
     bool prepareDecodeStep(DecodingInferenceContext const& context, DecodingKvHeadroom const& headroom);

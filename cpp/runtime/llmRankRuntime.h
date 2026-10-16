@@ -73,6 +73,7 @@ class ContextCacheCoordinator;
 class ContextCacheRequest;
 class ManagedKVCacheRequest;
 class BoundedSwaKVPageManager;
+class SwaPrefixCache;
 
 /*!
  * @brief Internal one-rank LLM execution runtime.
@@ -554,6 +555,9 @@ private:
     //! Set by the chunked prefill loop for the bounded-SWA backend: absolute endpoint of the running pass (-1 otherwise).
     int32_t mSwaPrefillAbsoluteEnd{-1};
     bool mSwaPrefillContinuation{false};
+    //! Tokens already in the KV cache from a restored prefix snapshot (bounded-SWA backend), 0 otherwise.
+    int32_t mSwaPrefillBaseOffset{0};
+    std::unique_ptr<SwaPrefixCache> mSwaPrefixCache;
 
     //! Admission-scoped MRope staging ([1, maxKVCacheCapacity, rotaryDim]): the admission
     //! preprocess writes here until the batch-one execution copies it to active-row scratch.

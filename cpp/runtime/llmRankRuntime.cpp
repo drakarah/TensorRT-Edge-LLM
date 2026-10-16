@@ -41,6 +41,7 @@
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/managedKVCacheRequest.h"
 #include "runtime/state/boundedSwaKVPageManager.h"
+#include "runtime/state/swaPrefixCache.h"
 #include "runtime/state/contextCache/blockHash.h"
 #include "runtime/state/contextCache/contextCacheCoordinator.h"
 #include "sampler/sampling.h"
@@ -684,6 +685,13 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         ELLM_CHECK(swaPageTable != nullptr, "Bounded SWA requires an independent sparse page table");
         mBoundedSwaKVPageManager = std::make_unique<BoundedSwaKVPageManager>(
             *mSharedResources->cacheManagers[0], *mSharedResources->kvPageTables[0], *swaPageTable, stream);
+        if (char const* mb = std::getenv("EDGELLM_SWA_PREFIX_CACHE_MB"); mb != nullptr && std::atoll(mb) > 0)
+        {
+            size_t const budget = static_cast<size_t>(std::atoll(mb)) << 20;
+            mSwaPrefixCache = std::make_unique<SwaPrefixCache>(
+                mSharedResources->cacheManagers[0]->getKVCacheManager(), *mSharedResources->kvPageTables[0], budget);
+            LOG_INFO("Bounded-SWA prefix cache enabled: %zu MiB of pinned host memory.", budget >> 20);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2079,6 +2087,42 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         LOG_ERROR("Prefill execution setup failed. This request cannot be handled.");
         return nullptr;
     }
+    mSwaPrefillBaseOffset = 0;
+    bool const swaPrefixEligible = mSwaPrefixCache != nullptr && managedRequest != nullptr
+        && !managedRequest->hasContextReuse() && context.activeBatchSize == 1 && context.loraWeightsName.empty()
+        && !context.visualEmbeddings.has_value() && !context.audioEmbeddings.has_value();
+    if (swaPrefixEligible)
+    {
+        std::vector<int32_t> const& fullPrompt = context.rawBatchedInputIds[0];
+        if (std::optional<SwaPrefixCache::Hit> const hit = mSwaPrefixCache->lookup(fullPrompt))
+        {
+            // Reuse hit.length - 1 tokens so the last cached token is recomputed, as the legacy system-prompt cache does.
+            int32_t const restoreLength = hit->length - 1;
+            if (restoreLength > 0 && managedRequest->prepareSwaPrefill({restoreLength}, false))
+            {
+                mSwaPrefixCache->restore(*hit, context.residentRefs.at(0).slot, restoreLength,
+                    managedRequest->swaState(0), context.stream);
+                CUDA_CHECK(cudaStreamSynchronize(context.stream));
+                if (!managedRequest->completeSwaPrefillChunk())
+                {
+                    return nullptr;
+                }
+                context.tokenIds[0].assign(fullPrompt.begin() + restoreLength, fullPrompt.end());
+                context.effectivePrefillLengths[0] = static_cast<int32_t>(context.tokenIds[0].size());
+                context.committedLengths[0] = restoreLength;
+                check::check(mHostReuseKVCacheLengths.reshape({1}), "Tensor reshape failed");
+                mHostReuseKVCacheLengths.dataPointer<int32_t>()[0] = restoreLength;
+                mSharedResources->cacheManagers[0]->resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+                if (decodingStrategy.isSpeculative())
+                {
+                    decodingStrategy.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+                }
+                mSwaPrefillBaseOffset = restoreLength;
+                LOG_DEBUG("Bounded-SWA prefix cache hit: %d of %zu prompt tokens restored.", restoreLength,
+                    fullPrompt.size());
+            }
+        }
+    }
     if (managedRequest != nullptr && !managedRequest->preparePrefill())
     {
         return nullptr;
@@ -2189,6 +2233,11 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     if (managedRequest != nullptr && !managedRequest->completePrefill(context, commonMaterializedStateLengths))
     {
         return nullptr;
+    }
+    if (swaPrefixEligible)
+    {
+        mSwaPrefixCache->capture(context.residentRefs.at(0).slot, context.rawBatchedInputIds[0],
+            managedRequest->swaState(0), context.stream);
     }
 
     // Streaming consumers (e.g. the Qwen3-Omni Talker) run concurrently with
@@ -3082,8 +3131,8 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
         // Bounded SWA windows follow absolute positions, so every pass binds its own window; the context-reuse backend
         // only participates in the final pass.
         bool const swaBackend = managedKVCacheRequest != nullptr && !managedKVCacheRequest->hasContextReuse();
-        mSwaPrefillAbsoluteEnd = swaBackend ? begin + length : -1;
-        mSwaPrefillContinuation = begin > 0;
+        mSwaPrefillAbsoluteEnd = swaBackend ? mSwaPrefillBaseOffset + begin + length : -1;
+        mSwaPrefillContinuation = mSwaPrefillBaseOffset + begin > 0;
         bool const passOk = runBaseModelPrefill(
             context, (lastPass || swaBackend) ? managedKVCacheRequest : nullptr, /*sampleOutput=*/lastPass);
         mSwaPrefillAbsoluteEnd = -1;
@@ -3099,6 +3148,14 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
             if (swaBackend && !managedKVCacheRequest->completeSwaPrefillChunk())
             {
                 return false;
+            }
+            if (swaBackend && mSwaPrefixCache != nullptr && context.loraWeightsName.empty())
+            {
+                std::vector<int32_t> const& fullPrompt = context.rawBatchedInputIds[0];
+                std::vector<int32_t> const prefix(
+                    fullPrompt.begin(), fullPrompt.begin() + (mSwaPrefillBaseOffset + begin + length));
+                mSwaPrefixCache->capture(
+                    context.residentRefs.at(0).slot, prefix, managedKVCacheRequest->swaState(0), context.stream);
             }
         }
     }
@@ -3381,11 +3438,22 @@ bool LLMRankRuntime::runBaseModelPrefill(
 
     // Bounded SWA admission reserves pages by batch size, but its sparse mappings must use the final executed lengths.
     // Visual pruning can shorten those lengths after embeddings are assembled, so bind the window only now.
+    std::vector<int32_t> swaPrefillEnds = batch.queryLengths;
+    bool swaPrefillContinuation = mSwaPrefillContinuation;
+    if (mSwaPrefillAbsoluteEnd > 0)
+    {
+        std::fill(swaPrefillEnds.begin(), swaPrefillEnds.end(), mSwaPrefillAbsoluteEnd);
+    }
+    else if (mSwaPrefillBaseOffset > 0)
+    {
+        for (int32_t& end : swaPrefillEnds)
+        {
+            end += mSwaPrefillBaseOffset;
+        }
+        swaPrefillContinuation = true;
+    }
     if (managedKVCacheRequest != nullptr
-        && !managedKVCacheRequest->prepareSwaPrefill(mSwaPrefillAbsoluteEnd > 0
-                ? std::vector<int32_t>(batch.queryLengths.size(), mSwaPrefillAbsoluteEnd)
-                : batch.queryLengths,
-            mSwaPrefillContinuation))
+        && !managedKVCacheRequest->prepareSwaPrefill(swaPrefillEnds, swaPrefillContinuation))
     {
         return false;
     }

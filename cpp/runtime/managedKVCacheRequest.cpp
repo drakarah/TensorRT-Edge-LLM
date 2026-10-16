@@ -154,6 +154,11 @@ bool ManagedKVCacheRequest::prepareSwaPrefill(std::vector<int32_t> const& effect
             "SWA prefill preparation");
 }
 
+SwaKVCacheState const& ManagedKVCacheRequest::swaState(int32_t sequence)
+{
+    return mBoundedSwaPageManager->state(swaRequest(), sequence);
+}
+
 bool ManagedKVCacheRequest::completeSwaPrefillChunk()
 {
     return hasContextReuse()
