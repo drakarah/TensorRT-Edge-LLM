@@ -151,8 +151,9 @@ class FMHAV2D512WSI8:
         sK_layout = cute.tile_to_shape(atom64, (_BC // 2, self._DQK, 4), (0, 1, 2))
         # V: (32 keys, 256 columns, stage * 2 + column half)
         sV_layout = cute.tile_to_shape(atom64, (_BC, self._DO, 4), (0, 1, 2))
-        # P: (32 rows, 32 keys, stage)
-        sP_layout = cute.tile_to_shape(atom32, (_BR, _BC, 2), (0, 1, 2))
+        # P: (32 rows, 32 keys), ONE stage: with two the CTA needs 103 424 B, over the 101 376 B of sm_86/89/120.
+        # The O role frees it right after reading P into registers, so only the softmax write waits for it.
+        sP_layout = cute.tile_to_shape(atom32, (_BR, _BC, 1), (0, 1, 2))
 
         @cute.struct
         class SharedStorage:
@@ -508,11 +509,11 @@ class FMHAV2D512WSI8:
         rP = cute.make_fragment_like(acc_s, cutlass.Float16)
         rP.store(acc_s.load().to(cutlass.Float16))
 
-        if i >= 2:
-            cute.arch.barrier(barrier_id=_BAR_P_EMPTY + s, number_of_threads=_THREADS)
+        if i >= 1:
+            cute.arch.barrier(barrier_id=_BAR_P_EMPTY, number_of_threads=_THREADS)
         for e in cutlass.range_constexpr(cute.size(rP)):
             coord = tScS[e]
-            sP[coord[0], grp * (_BC // 2) + coord[1], s] = rP[e]
+            sP[coord[0], grp * (_BC // 2) + coord[1], 0] = rP[e]
         if grp == 0:
             if lane % 4 == 0:
                 for r in cutlass.range_constexpr(cute.size(row_max)):
@@ -644,15 +645,15 @@ class FMHAV2D512WSI8:
                 acc_mn[r, None] = acc_mn[r, None].load() * a
 
         num_k = cute.size(tOsP.shape[2])
-        cute.copy(smem_copy_p, tOsP[None, None, None, s], tOrP_view)
+        cute.copy(smem_copy_p, tOsP[None, None, None, 0], tOrP_view)
+        if i + 1 < num_tiles:
+            cute.arch.barrier_arrive(barrier_id=_BAR_P_EMPTY, number_of_threads=_THREADS)
         cute.copy(smem_copy_v, tOsVt[None, None, 0, idx], tOrVt_view[None, None, 0])
         for k in cutlass.range_constexpr(num_k):
             if cutlass.const_expr(k + 1 < num_k):
                 cute.copy(smem_copy_v, tOsVt[None, None, k + 1, idx], tOrVt_view[None, None, k + 1])
             cute.gemm(tiled_mma, acc_O, tOrP[None, None, k], tOrVt[None, None, k], acc_O)
 
-        if i + 2 < num_tiles:
-            cute.arch.barrier_arrive(barrier_id=_BAR_P_EMPTY + s, number_of_threads=_THREADS)
         cute.arch.barrier(barrier_id=_BAR_O_GRP + grp, number_of_threads=64)
         if i + 2 < num_tiles:
             self._load_v(copy64, tVgV, tVcV, tVsV, num_tiles, i + 2, s, grp, seqlen_k, False)
