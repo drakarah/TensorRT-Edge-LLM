@@ -139,6 +139,15 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
         mSuffixMaxLength = std::max(
             0, std::min({std::atoi(env), draftingConfig.verifySize - 1, kernel::kEagleMaxAcceptedPathLength - 1}));
     }
+    mVerifySizeFull = draftingConfig.verifySize;
+    if (char const* env = std::getenv("EDGELLM_MTP_VERIFY_SMALL"); mSuffixMaxLength > 0 && env != nullptr)
+    {
+        int32_t const small = std::atoi(env);
+        if (small > maxDraftStep && small < mVerifySizeFull)
+        {
+            mVerifySizeSmall = small;
+        }
+    }
     if (char const* env = std::getenv("EDGELLM_MTP_SUFFIX_PROMPT"); env != nullptr)
     {
         mSuffixPromptMaxTokens = std::max(0, std::atoi(env));
@@ -238,7 +247,7 @@ DecodingKvHeadroom Gemma4MTPDecoder::requiredKvHeadroom() const
     auto const& config = *mRuntime.deployment.specConfig;
     ELLM_CHECK(
         config.verifySize > 0 && config.draftingStep > 0, "Gemma4 MTP KV headroom is outside the supported range");
-    return {config.verifySize, 0};
+    return {mVerifySizeFull, 0};
 }
 
 bool Gemma4MTPDecoder::decodeStep(DecodingInferenceContext& context)
@@ -290,7 +299,6 @@ bool Gemma4MTPDecoder::captureCudaGraphs(cudaStream_t stream)
         }
     }};
 
-    int32_t const verifySize = mRuntime.deployment.specConfig->verifySize;
     int32_t const baseHiddenSize = mRuntime.deployment.specConfig->baseOutputHiddenDim;
     int32_t const draftVocabSize = mRuntime.deployment.draft->outputVocabSize;
 
@@ -345,53 +353,63 @@ bool Gemma4MTPDecoder::captureCudaGraphs(cudaStream_t stream)
             }
         }
 
+        std::vector<int32_t> verifySizes{mVerifySizeFull};
+        if (mVerifySizeSmall > 0)
         {
-            int32_t const selectTokenSize = batchSize * verifySize;
-            check::check(mRuntime.preprocess.idsInput.reshape({batchSize, verifySize}), "Tensor reshape failed");
-            check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
-                             {batchSize * verifySize, mRuntime.deployment.base.hiddenSize}),
-                "Tensor reshape failed");
-            check::check(mRuntime.base.pipelineIO.outputLogits.reshape(
-                             {selectTokenSize, mRuntime.deployment.base.outputVocabSize}),
-                "Tensor reshape failed");
-            check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape({selectTokenSize, baseHiddenSize}),
-                "Tensor reshape failed");
-            check::check(mRuntime.base.pipelineIO.packedAttentionMask.reshape(
-                             {batchSize * verifySize, static_cast<int64_t>(divUp(verifySize, 32))}),
-                "Tensor reshape failed");
-            check::check(
-                mRuntime.base.pipelineIO.selectTokenIndices.reshape({batchSize * verifySize}), "Tensor reshape failed");
-            check::check(mRuntime.base.pipelineIO.contextLengths.reshape({batchSize}), "Tensor reshape failed");
-            check::check(mRuntime.base.pipelineIO.specDecodePositionIds.reshape({batchSize * verifySize}),
-                "Tensor reshape failed");
-            if (mRuntime.deployment.base.pleEnabled)
-            {
-                check::check(mRuntime.preprocess.gemma4Ple,
-                    "Gemma4 MTP base config has PLE enabled but the Gemma4 PLE preprocessor is missing.");
-                mRuntime.preprocess.gemma4Ple->reshapeOutputsTokenMajor(batchSize * verifySize);
-            }
-
-            Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
-            if (mUseTree)
-            {
-                buildTreeVerifyInputs(batchSize, stream);
-            }
-            else
-            {
-                kernel::launchDFlashPrepareBaseVerifyInputs(baseKVCacheLengths.dataPointer<int32_t>(), verifySize,
-                    mRuntime.base.pipelineIO.packedAttentionMask.dataPointer<int32_t>(),
-                    mRuntime.base.pipelineIO.specDecodePositionIds.dataPointer<int32_t>(),
-                    mRuntime.base.pipelineIO.selectTokenIndices.dataPointer<int64_t>(),
-                    mRuntime.base.pipelineIO.contextLengths.dataPointer<int32_t>(), batchSize, stream);
-            }
-
-            auto const verifyDims = mRuntime.deployment.base.specVerifyDims(batchSize, verifySize);
-            decoder_utils::prepareSpecRaggedBindings(mRuntime, mRuntime.deployment.base, 0,
-                mRuntime.base.pipelineIO.specDecodePositionIds, baseKVCacheLengths, mUseTree ? &mValidCounts : nullptr,
-                mRuntime.base.pipelineIO.selectTokenIndices, selectTokenSize, nullptr, batchSize, verifySize,
-                verifyDims, stream);
-            baseVerificationCaptureStatus &= mRuntime.base.captureGraph(verifyDims, stream);
+            verifySizes.push_back(mVerifySizeSmall);
         }
+        for (int32_t const verifySize : verifySizes)
+        {
+            mRuntime.deployment.specConfig->verifySize = verifySize;
+        {
+                int32_t const selectTokenSize = batchSize * verifySize;
+                check::check(mRuntime.preprocess.idsInput.reshape({batchSize, verifySize}), "Tensor reshape failed");
+                check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
+                                 {batchSize * verifySize, mRuntime.deployment.base.hiddenSize}),
+                    "Tensor reshape failed");
+                check::check(mRuntime.base.pipelineIO.outputLogits.reshape(
+                                 {selectTokenSize, mRuntime.deployment.base.outputVocabSize}),
+                    "Tensor reshape failed");
+                check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape({selectTokenSize, baseHiddenSize}),
+                    "Tensor reshape failed");
+                check::check(mRuntime.base.pipelineIO.packedAttentionMask.reshape(
+                                 {batchSize * verifySize, static_cast<int64_t>(divUp(verifySize, 32))}),
+                    "Tensor reshape failed");
+                check::check(
+                    mRuntime.base.pipelineIO.selectTokenIndices.reshape({batchSize * verifySize}), "Tensor reshape failed");
+                check::check(mRuntime.base.pipelineIO.contextLengths.reshape({batchSize}), "Tensor reshape failed");
+                check::check(mRuntime.base.pipelineIO.specDecodePositionIds.reshape({batchSize * verifySize}),
+                    "Tensor reshape failed");
+                if (mRuntime.deployment.base.pleEnabled)
+                {
+                    check::check(mRuntime.preprocess.gemma4Ple,
+                        "Gemma4 MTP base config has PLE enabled but the Gemma4 PLE preprocessor is missing.");
+                    mRuntime.preprocess.gemma4Ple->reshapeOutputsTokenMajor(batchSize * verifySize);
+                }
+    
+                Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
+                if (mUseTree)
+                {
+                    buildTreeVerifyInputs(batchSize, stream);
+                }
+                else
+                {
+                    kernel::launchDFlashPrepareBaseVerifyInputs(baseKVCacheLengths.dataPointer<int32_t>(), verifySize,
+                        mRuntime.base.pipelineIO.packedAttentionMask.dataPointer<int32_t>(),
+                        mRuntime.base.pipelineIO.specDecodePositionIds.dataPointer<int32_t>(),
+                        mRuntime.base.pipelineIO.selectTokenIndices.dataPointer<int64_t>(),
+                        mRuntime.base.pipelineIO.contextLengths.dataPointer<int32_t>(), batchSize, stream);
+                }
+    
+                auto const verifyDims = mRuntime.deployment.base.specVerifyDims(batchSize, verifySize);
+                decoder_utils::prepareSpecRaggedBindings(mRuntime, mRuntime.deployment.base, 0,
+                    mRuntime.base.pipelineIO.specDecodePositionIds, baseKVCacheLengths, mUseTree ? &mValidCounts : nullptr,
+                    mRuntime.base.pipelineIO.selectTokenIndices, selectTokenSize, nullptr, batchSize, verifySize,
+                    verifyDims, stream);
+                baseVerificationCaptureStatus &= mRuntime.base.captureGraph(verifyDims, stream);
+            }
+        }
+        mRuntime.deployment.specConfig->verifySize = mVerifySizeFull;
     }
 
     LOG_INFO("Gemma4MTPDecoder: CUDA graph capture complete (draft=%s, baseVerify=%s)",
@@ -1052,6 +1070,11 @@ void Gemma4MTPDecoder::proposeSuffixChains(DecodingInferenceContext& context)
         context.stream));
     CUDA_CHECK(cudaMemcpyAsync(mSuffixChainLengths.rawPointer(), hostLengths,
         static_cast<size_t>(activeBatchSize) * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+    if (mVerifySizeSmall > 0)
+    {
+        int32_t const longestChain = *std::max_element(hostLengths, hostLengths + activeBatchSize);
+        mRuntime.deployment.specConfig->verifySize = longestChain < mVerifySizeSmall ? mVerifySizeSmall : mVerifySizeFull;
+    }
 }
 
 bool Gemma4MTPDecoder::updateNextSeed(DecodingInferenceContext&)
