@@ -135,7 +135,9 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
     mUseTree = draftingConfig.draftingTopK > 1;
     if (char const* env = std::getenv("EDGELLM_MTP_SUFFIX_DRAFT"); mUseTree && env != nullptr)
     {
-        mSuffixMaxLength = std::max(0, std::min(std::atoi(env), draftingConfig.verifySize - 1));
+        // The accepted path (root + chain) must fit the KV-commit kernel's path buffer.
+        mSuffixMaxLength = std::max(
+            0, std::min({std::atoi(env), draftingConfig.verifySize - 1, kernel::kEagleMaxAcceptedPathLength - 1}));
     }
     if (char const* env = std::getenv("EDGELLM_MTP_SUFFIX_PROMPT"); env != nullptr)
     {
@@ -146,7 +148,8 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
     {
         mSuffixMinLength = std::max(1, std::atoi(env));
     }
-    mMaxAcceptDepth = mSuffixMaxLength > 0 ? draftingConfig.verifySize : maxDraftStep + 1;
+    mMaxAcceptDepth
+        = mSuffixMaxLength > 0 ? std::min(draftingConfig.verifySize, kernel::kEagleMaxAcceptedPathLength) : maxDraftStep + 1;
     int32_t const maxAcceptDepth = mMaxAcceptDepth;
     if (mSuffixMaxLength > 0)
     {
