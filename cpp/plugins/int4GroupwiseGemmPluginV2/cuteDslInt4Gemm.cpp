@@ -71,6 +71,17 @@ namespace
     X(int4_fp16_gemm_128x128x64_s2_sk4, 128, 128, 64, 2, 4)                                                            \
     X(int4_fp16_gemm_128x128x64_s4_sk1, 128, 128, 64, 4, 1)
 
+// W4A8 variants (must match build_cutedsl.py's int4_int8_gemm registration). X(prefix, bM, bN, bK, stages).
+#define INT4_INT8_GEMM_VARIANTS(X)                                                                                     \
+    X(int4_int8_gemm_64x128x64_s3, 64, 128, 64, 3)                                                                     \
+    X(int4_int8_gemm_32x128x64_s4, 32, 128, 64, 4)
+
+#define DECL_MODULE_W4A8(prefix, bM, bN, bK, st) prefix##_Kernel_Module_t g_##prefix{};
+INT4_INT8_GEMM_VARIANTS(DECL_MODULE_W4A8)
+#undef DECL_MODULE_W4A8
+
+bool gW4A8Loaded = false;
+
 // Module storage, loaded once.
 #define DECL_MODULE(prefix, bM, bN, bK, st, sk) prefix##_Kernel_Module_t g_##prefix{};
 INT4_FP16_GEMM_VARIANTS(DECL_MODULE)
@@ -141,6 +152,29 @@ bool cuteDslInt4GemmLoadModules()
     return true;
 }
 
+bool cuteDslInt4W4A8LoadModules()
+{
+    std::lock_guard<std::mutex> lock(gLoadMutex);
+    if (gW4A8Loaded)
+    {
+        return true;
+    }
+    cudaFree(nullptr);
+    (void) cudaGetLastError();
+    bool ok = true;
+#define LOAD_MODULE_W4A8(prefix, bM, bN, bK, st)                                                                       \
+    prefix##_Kernel_Module_Load(&g_##prefix);                                                                          \
+    ok = ok && (g_##prefix.module != nullptr);
+    INT4_INT8_GEMM_VARIANTS(LOAD_MODULE_W4A8)
+#undef LOAD_MODULE_W4A8
+    if (!ok || cudaGetLastError() != cudaSuccess)
+    {
+        return false;
+    }
+    gW4A8Loaded = true;
+    return true;
+}
+
 // Marshal tensor structs and call the variant's generated wrapper.
 #define SET_2D(t, ptr, d0, d1)                                                                                         \
     do                                                                                                                 \
@@ -189,9 +223,43 @@ int32_t cuteDslInt4GemmLaunch(CuteDslInt4Variant const& v, void const* A, void c
     return -1;
 }
 
+int32_t cuteDslInt4W4A8Launch(int32_t bM, void const* aInt8, void const* aScale, void const* fragW, void const* scales,
+    void* C, int32_t M, int32_t N, int32_t K, cudaStream_t stream)
+{
+    if (!gW4A8Loaded)
+    {
+        return -1;
+    }
+    int32_t const scaleRows = divUp(K, 128);
+#define DISPATCH_W4A8(prefix, bm, bn, bk, st)                                                                          \
+    if (bM == (bm))                                                                                                    \
+    {                                                                                                                  \
+        int32_t const qwRows = static_cast<int32_t>(cuteDslInt4RepackedWords(N, K, bn, bk) / 128);                     \
+        prefix##_Tensor_mA_t tA{};                                                                                     \
+        SET_2D(tA, aInt8, M, K / 2);                                                                                   \
+        prefix##_Tensor_mQW_t tW{};                                                                                    \
+        SET_2D(tW, fragW, qwRows, 128);                                                                                \
+        prefix##_Tensor_mScales_t tS{};                                                                                \
+        SET_2D(tS, scales, scaleRows, N);                                                                              \
+        prefix##_Tensor_mAScale_t tAs{};                                                                               \
+        SET_1D(tAs, aScale, M);                                                                                        \
+        prefix##_Tensor_mC_t tC{};                                                                                     \
+        SET_2D(tC, C, M, N);                                                                                           \
+        prefix##_Tensor_mWorkspace_t tWs{};                                                                            \
+        SET_2D(tWs, C, M, N);                                                                                          \
+        prefix##_Tensor_mLocks_t tL{};                                                                                 \
+        SET_1D(tL, C, 1);                                                                                              \
+        return cute_dsl_##prefix##_wrapper(&g_##prefix, &tA, &tW, &tS, &tAs, &tC, &tWs, &tL, 1, stream);               \
+    }
+    INT4_INT8_GEMM_VARIANTS(DISPATCH_W4A8)
+#undef DISPATCH_W4A8
+    return -1;
+}
+
 #undef SET_2D
 #undef SET_1D
 #undef INT4_FP16_GEMM_VARIANTS
+#undef INT4_INT8_GEMM_VARIANTS
 
 } // namespace plugins
 } // namespace trt_edgellm

@@ -19,6 +19,7 @@
 #include "common/cudaUtils.h"
 #include "cuteDslInt4Gemm.h"
 #include "cuteDslInt4Gemv.h"
+#include "kernels/int4W4A8/int4W4A8Quant.h"
 
 #include <cassert>
 #include <cstdlib>
@@ -399,6 +400,41 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
 #endif
 
 #ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
+        // Opt-in W4A8 prefill path (EDGELLM_INT4_W4A8_MIN_M=<rows>, 0 = off): INT8 tensor cores, INT4 weights from the same buffer.
+        static int32_t const kW4A8MinM = []() {
+            char const* value = std::getenv("EDGELLM_INT4_W4A8_MIN_M");
+            return value != nullptr ? std::atoi(value) : 0;
+        }();
+        if (kW4A8MinM > 0 && M >= kW4A8MinM && mGemmK % 128 == 0 && mGemmK <= 16384 && cuteDslInt4W4A8LoadModules())
+        {
+            // Scratch shared by every plugin instance (one stream runs them in order): INT8 activations plus row scales.
+            static std::mutex scratchMutex;
+            static void* scratch = nullptr;
+            static size_t scratchBytes = 0;
+            size_t const need = static_cast<size_t>(M) * mGemmK + static_cast<size_t>(M) * sizeof(float);
+            {
+                std::lock_guard<std::mutex> lock(scratchMutex);
+                if (need > scratchBytes)
+                {
+                    void* grown{nullptr};
+                    if (cudaMalloc(&grown, need) != cudaSuccess)
+                    {
+                        return -1;
+                    }
+                    if (scratch != nullptr)
+                    {
+                        cudaFree(scratch);
+                    }
+                    scratch = grown;
+                    scratchBytes = need;
+                }
+            }
+            auto* aInt8 = static_cast<int8_t*>(scratch);
+            auto* aScale = reinterpret_cast<float*>(aInt8 + static_cast<size_t>(M) * mGemmK);
+            kernel::launchQuantizeRowsInt8Permuted(
+                static_cast<half const*>(inputs[0]), aInt8, aScale, M, mGemmK, stream);
+            return cuteDslInt4W4A8Launch(64, aInt8, aScale, inputs[1], inputs[2], outputs[0], M, mGemmN, mGemmK, stream);
+        }
         if (!cuteDslInt4GemmLoadModules())
         {
             return -1;

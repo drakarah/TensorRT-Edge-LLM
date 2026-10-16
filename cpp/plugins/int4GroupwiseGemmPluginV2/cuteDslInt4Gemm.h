@@ -73,6 +73,16 @@ int64_t cuteDslInt4LockCount(int32_t M, int32_t N, int32_t bM, int32_t bN);
 int32_t cuteDslInt4GemmLaunch(CuteDslInt4Variant const& v, void const* A, void const* fragW, void const* scales,
     void* C, void* locks, int32_t M, int32_t N, int32_t K, int32_t swizzle, cudaStream_t stream);
 
+//! W4A8 variants (int4_int8_gemm_ampere.py): INT8 activations with a per-row scale against the same fragment weight buffer.
+//! Load once; returns false when a module is missing.
+bool cuteDslInt4W4A8LoadModules();
+
+//! Launch the W4A8 GEMM with CTA tile bM in {32, 64}. aInt8: [M,K] INT8 in the permuted column order of
+//! launchQuantizeRowsInt8Permuted, aScale: [M] fp32, fragW/scales/C as in cuteDslInt4GemmLaunch. K % 128 == 0.
+//! Returns 0 on success.
+int32_t cuteDslInt4W4A8Launch(int32_t bM, void const* aInt8, void const* aScale, void const* fragW, void const* scales,
+    void* C, int32_t M, int32_t N, int32_t K, cudaStream_t stream);
+
 } // namespace plugins
 } // namespace trt_edgellm
 

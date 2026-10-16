@@ -2118,6 +2118,28 @@ for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
         )
     )
 
+# W4A8 prefill GEMM (INT8 tensor cores, INT4 weights from the same repacked buffer; kernelSrcs/int4_fp16_gemm_cutedsl/int4_int8_gemm_ampere.py).
+# Keep in sync with INT4_INT8_GEMM_VARIANTS in cpp/plugins/int4GroupwiseGemmPluginV2/cuteDslInt4Gemm.cpp. Selected at runtime by
+# EDGELLM_INT4_W4A8_MIN_M.
+for _bm, _stages in ((64, 3), (32, 4)):
+    KERNEL_VARIANTS.append(
+        KernelVariant(
+            name=f"int4_int8_gemm_{_bm}x128x64_s{_stages}",
+            group="int4_fp16_gemm",
+            supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+            script="int4_fp16_gemm_cutedsl/int4_int8_gemm_ampere.py",
+            script_args=[
+                "--mnk", "256,512,1024",
+                "--cta_tiler_mnk", f"{_bm},128,64",
+                "--atom_layout_mnk", "1,4,1",
+                "--num_stages", str(_stages),
+                "--split_k", "1",
+                "--group_size", "128",
+                "--export_only",
+            ],
+        )
+    )
+
 # int4_fp16_gemm group also includes the W4A16 decode GEMV — a CUDA-core kernel
 # for the decode regime (small M) that consumes the SAME offline fragment weight
 # buffer as the GEMM.  Prefill (GEMM) and decode (GEMV) are always needed together
