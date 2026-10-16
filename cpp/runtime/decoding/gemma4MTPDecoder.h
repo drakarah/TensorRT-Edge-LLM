@@ -127,6 +127,8 @@ private:
     //! Suffix-cache drafting (EDGELLM_MTP_SUFFIX_DRAFT=<max chain length>, 0 = off): a chain proposed from
     //! earlier outputs is merged into each verify tree next to the assistant's drafts.
     SuffixDraftCache mSuffixCache;
+    bool mSuffixIndexPrompt{false};  //!< EDGELLM_MTP_SUFFIX_PROMPT=<max tokens>: also index the prompt of each request
+    int32_t mSuffixPromptMaxTokens{0};
     int32_t mSuffixMaxLength{0};
     int32_t mSuffixMinLength{2};                //!< Shorter proposals are not worth verify slots.
     std::vector<int32_t> mSuffixIndexedLengths; //!< [B] generated tokens already in the cache

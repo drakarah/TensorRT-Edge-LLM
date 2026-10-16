@@ -137,6 +137,11 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
     {
         mSuffixMaxLength = std::max(0, std::min(std::atoi(env), draftingConfig.verifySize - 1));
     }
+    if (char const* env = std::getenv("EDGELLM_MTP_SUFFIX_PROMPT"); env != nullptr)
+    {
+        mSuffixPromptMaxTokens = std::max(0, std::atoi(env));
+        mSuffixIndexPrompt = mSuffixPromptMaxTokens > 0;
+    }
     if (char const* env = std::getenv("EDGELLM_MTP_SUFFIX_MIN"); env != nullptr)
     {
         mSuffixMinLength = std::max(1, std::atoi(env));
@@ -1013,6 +1018,18 @@ void Gemma4MTPDecoder::proposeSuffixChains(DecodingInferenceContext& context)
         int32_t const generated = std::min<int32_t>(context.currentGenerateLengths[batchIdx], tokens.size());
         int32_t& indexed = mSuffixIndexedLengths[batchIdx];
         indexed = std::min(indexed, generated);
+        if (indexed == 0 && mSuffixIndexPrompt)
+        {
+            // New request: the prompt is a draft source too (code edits copy long spans from it).
+            size_t const promptEnd = tokens.size() - generated;
+            size_t const promptBegin = promptEnd > static_cast<size_t>(mSuffixPromptMaxTokens)
+                ? promptEnd - static_cast<size_t>(mSuffixPromptMaxTokens)
+                : 0;
+            for (size_t pos = promptBegin; pos < promptEnd; ++pos)
+            {
+                mSuffixCache.append(tokens[pos]);
+            }
+        }
         for (size_t pos = tokens.size() - generated + indexed; pos < tokens.size(); ++pos)
         {
             mSuffixCache.append(tokens[pos]);
