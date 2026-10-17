@@ -536,6 +536,28 @@ class Int4Int8GemmAmpere:
         k_tile_start = split_k_idx * cutlass.Int32(tiles_per_split)
         k_tile_index = k_tile_start
 
+        # B staging views built once (the per-tile ``_load_b_tile`` rebuilt tensors, layouts and the thread partition on every call):
+        # the global (word, thread, k-tile) view of this block_n's packed slab and the smem (word, thread, stage) view, partitioned for this thread;
+        # a tile then costs one index into each.
+        kn_words = self.k_blocks * self.n_pairs
+        tiled_copy_b = self._make_b_async_copy()
+        thr_copy_b = tiled_copy_b.get_slice(tidx)
+        gB_base = cute.domain_offset((block_n_idx * k_tile_count * Int32(kn_words), Int32(0)), mQW)
+        gB_all = cute.make_tensor(
+            gB_base.iterator.align(16),
+            cute.make_layout(
+                (kn_words, self.num_threads, k_tile_count), stride=(self.num_threads, 1, kn_words * self.num_threads)
+            ),
+        )
+        sB_all = cute.make_tensor(
+            sB_bytes.iterator.align(16),
+            cute.make_layout(
+                (kn_words, self.num_threads, self.num_stages), stride=(self.num_threads, 1, kn_words * self.num_threads)
+            ),
+        )
+        tBgB = thr_copy_b.partition_S(gB_all)
+        tBsB = thr_copy_b.partition_D(sB_all)
+
         cB = cute.make_identity_tensor((self.bN, self.bKv, self.num_stages))
 
         # Prologue: cp.async A, stage scales, and keep biased INT4 B packed in sB.
@@ -550,9 +572,7 @@ class Int4Int8GemmAmpere:
                     tAsA[None, None, k, 0],
                     pred=tApA[None, None, k],
                 )
-        self._load_b_tile(
-            mQW, sB_bytes, tidx, block_n_idx, residual_k, k_tile_index, 0, mA.shape[1], mC.shape[1], k_tile_count
-        )
+        cute.copy(tiled_copy_b, tBgB[None, None, None, cutlass.min(k_tile_index, k_tile_count - Int32(1))], tBsB[None, None, None, 0])
         k_tile_index = k_tile_index + 1
         cute.arch.cp_async_commit_group()
 
@@ -576,18 +596,7 @@ class Int4Int8GemmAmpere:
                 tAsA[None, None, None, stage],
                 pred=tApA,
             )
-            self._load_b_tile(
-                mQW,
-                sB_bytes,
-                tidx,
-                block_n_idx,
-                residual_k,
-                k_tile_index,
-                stage,
-                mA.shape[1],
-                mC.shape[1],
-                k_tile_count,
-            )
+            cute.copy(tiled_copy_b, tBgB[None, None, None, cutlass.min(k_tile_index, k_tile_count - Int32(1))], tBsB[None, None, None, stage])
             k_tile_index = k_tile_index + 1
             cute.arch.cp_async_commit_group()
 
@@ -682,17 +691,10 @@ class Int4Int8GemmAmpere:
                             tAsA[None, None, None, smem_pipe_write],
                             pred=tApA,
                         )
-                        self._load_b_tile(
-                            mQW,
-                            sB_bytes,
-                            tidx,
-                            block_n_idx,
-                            residual_k,
-                            k_tile_index,
-                            smem_pipe_write,
-                            mA.shape[1],
-                            mC.shape[1],
-                            k_tile_count,
+                        cute.copy(
+                            tiled_copy_b,
+                            tBgB[None, None, None, cutlass.min(k_tile_index, k_tile_count - Int32(1))],
+                            tBsB[None, None, None, smem_pipe_write],
                         )
 
                 cute.gemm(
