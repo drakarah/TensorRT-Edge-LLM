@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <random>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -1445,7 +1446,15 @@ void TestXQATreeMultiBlockMatchesSingleBlockSwa(int32_t headSize, int32_t kvSequ
     applyThorSMRenumberWAR(smVersion);
     int32_t const nbPages = kvSequenceLength / kTOKENS_PER_PAGE;
     std::vector<half> qInput(static_cast<size_t>(kQ_LEN) * kQ_HEADS * headSize);
-    uniformFloatInitialization(qInput, -1.0F, 1.0F);
+    {
+        // Fixed seed: output checksums must be comparable across runs and kernel variants.
+        std::mt19937 gen{12345U};
+        std::uniform_real_distribution<float> d{-1.0F, 1.0F};
+        for (auto& x : qInput)
+        {
+            x = half(d(gen));
+        }
+    }
     std::vector<int8_t> pool(static_cast<size_t>(2) * nbPages * kTOKENS_PER_PAGE * kKV_HEADS * headSize);
     for (size_t i = 0; i < pool.size(); ++i)
     {
@@ -1513,10 +1522,31 @@ void TestXQATreeMultiBlockMatchesSingleBlockSwa(int32_t headSize, int32_t kvSequ
         ASSERT_TRUE(std::isfinite(b)) << "non-finite multi-block output at " << i;
         maxDiff = std::max(maxDiff, std::fabs(a - b));
     }
+    // FNV-1a over the raw half bits: compare across kernel variants (EDGELLM_XQA_NVRTC_OPTS) for bit-exactness.
+    auto const fnv = [](thrust::host_vector<half> const& v)
+    {
+        uint64_t h = 1469598103934665603ULL;
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            h = (h ^ static_cast<uint64_t>(reinterpret_cast<uint16_t const&>(v[i]))) * 1099511628211ULL;
+        }
+        return h;
+    };
     std::cout << "XQA tree multi-block vs single-block (SWA " << slidingWindowSize << ", contiguous "
               << contiguousQuerySwa << ") head " << headSize << " kv " << kvSequenceLength << " splits " << splits
-              << " max_abs_diff " << maxDiff << std::endl;
+              << " max_abs_diff " << maxDiff << " checksum_single " << fnv(single) << " checksum_multi " << fnv(multi)
+              << std::endl;
     EXPECT_LE(maxDiff, 2e-3F);
+}
+
+//! Prints output checksums for a few INT8 shapes (random cache data). Run under two kernel variants and diff the CHECKSUM lines.
+TEST(XQATreeAttentionDecodingINT8Test, outputChecksums)
+{
+    TestXQATreeMultiBlockMatchesSingleBlockSwa(256, 3328, 512, true, 3);
+    TestXQATreeMultiBlockMatchesSingleBlockSwa(256, 3328, 512, false, 3);
+    TestXQATreeMultiBlockMatchesSingleBlockSwa(256, 1024, 512, true, 4);
+    TestXQATreeMultiBlockMatchesSingleBlockSwa(512, 3328, 4096, true, 3);
+    TestXQATreeMultiBlockMatchesSingleBlockSwa(512, 1024, 2048, false, 8);
 }
 
 TEST(XQATreeAttentionDecodingINT8Test, multiBlockMatchesSingleBlockSlidingWindow)
@@ -1534,9 +1564,19 @@ TEST(XQATreeAttentionDecodingINT8Test, multiBlockMatchesSingleBlockSlidingWindow
 //! contiguous-query SWA) for a KV length and split count; prints microseconds per launch.
 void BenchXQATreeSwaInt8(int32_t headSize, int32_t kvSequenceLength, int32_t slidingWindowSize, uint32_t splits)
 {
+    // Restrict a sweep to one configuration: XQA_BENCH_ONLY="head,kv,splits".
+    if (char const* only = std::getenv("XQA_BENCH_ONLY"))
+    {
+        int32_t h = 0, k = 0, sp = 0;
+        std::sscanf(only, "%d,%d,%d", &h, &k, &sp);
+        if (h != headSize || k != kvSequenceLength || sp != static_cast<int32_t>(splits))
+        {
+            return;
+        }
+    }
     constexpr int32_t kQ_HEADS = 8;
     constexpr int32_t kKV_HEADS = 2;
-    constexpr int32_t kQ_LEN = 8;
+    int32_t const kQ_LEN = std::getenv("XQA_BENCH_QLEN") != nullptr ? std::atoi(std::getenv("XQA_BENCH_QLEN")) : 8;
     constexpr int32_t kTOKENS_PER_PAGE = 128;
     constexpr int32_t kITERS = 200;
     initializeCudaContextForXQATest();
@@ -1628,7 +1668,7 @@ TEST(XQATreeAttentionDecodingINT8Benchmark, swaGemma4Shapes)
 {
     for (int32_t kvLength : {512, 1024, 3328, 7168})
     {
-        for (uint32_t splits : {1U, 2U, 4U, 7U, 8U, 16U})
+        for (uint32_t splits : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 16U})
         {
             BenchXQATreeSwaInt8(256, kvLength, 512, splits);
         }

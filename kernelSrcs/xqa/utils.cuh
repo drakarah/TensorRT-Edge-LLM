@@ -809,6 +809,10 @@ __device__ __host__ inline void assertClose(half a, half b, float threshold = 0.
     assertClose(__half2float(a), __half2float(b), threshold);
 }
 
+#ifndef XQA_INT8_FAST_CVT
+#define XQA_INT8_FAST_CVT 1
+#endif
+
 template <typename InputElem, typename CacheElem>
 __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data)
 {
@@ -826,6 +830,25 @@ __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data)
             "}"
             : "=r"(dst[0]), "=r"(dst[1])
             : "h"(src[0]), "h"(src[1]));
+        return ret;
+    }
+#endif
+#if XQA_INT8_FAST_CVT
+    if constexpr (mha::is_same_v<InputElem, half> && mha::is_same_v<CacheElem, int8_t>)
+    {
+        // Exact int8 -> f16 without I2F (a quarter-rate conversion): flip the sign bits so each byte is x + 128, place it in the
+        // low byte of a half whose high byte is 0x64 (= 1024 + x + 128), then subtract 1152. Output order: [b0, b1], [b2, b3].
+        uint32_t const biased = i8data ^ 0x80808080U;
+        uint32_t(&dst)[2] = reinterpret_cast<uint32_t(&)[2]>(ret);
+        asm("{\n"
+            ".reg .b32 t0, t1;\n"
+            "prmt.b32 t0, %2, 0x64646464, 0x5140;\n"
+            "prmt.b32 t1, %2, 0x64646464, 0x5342;\n"
+            "sub.rn.f16x2 %0, t0, %3;\n"
+            "sub.rn.f16x2 %1, t1, %3;\n"
+            "}"
+            : "=r"(dst[0]), "=r"(dst[1])
+            : "r"(biased), "r"(0x64806480U));
         return ret;
     }
 #endif
@@ -862,6 +885,24 @@ __device__ inline Vec<uint32_t, 2> convertVCacheWordToF16(uint32_t i8data)
             "}"
             : "=r"(dst[0]), "=r"(dst[1])
             : "r"(i8data));
+        return ret;
+    }
+#endif
+#if XQA_INT8_FAST_CVT
+    if constexpr (mha::is_same_v<InputElem, half> && mha::is_same_v<CacheElem, int8_t>)
+    {
+        // Same conversion; V words are 2x2 transposed: output [b0, b2], [b1, b3].
+        uint32_t const biased = i8data ^ 0x80808080U;
+        uint32_t(&dst)[2] = reinterpret_cast<uint32_t(&)[2]>(ret);
+        asm("{\n"
+            ".reg .b32 t0, t1;\n"
+            "prmt.b32 t0, %2, 0x64646464, 0x5240;\n"
+            "prmt.b32 t1, %2, 0x64646464, 0x5341;\n"
+            "sub.rn.f16x2 %0, t0, %3;\n"
+            "sub.rn.f16x2 %1, t1, %3;\n"
+            "}"
+            : "=r"(dst[0]), "=r"(dst[1])
+            : "r"(biased), "r"(0x64806480U));
         return ret;
     }
 #endif
