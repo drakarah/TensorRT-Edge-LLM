@@ -130,6 +130,10 @@ private:
     bool mSuffixIndexPrompt{false};  //!< EDGELLM_MTP_SUFFIX_PROMPT=<max tokens>: also index the prompt of each request
     int32_t mSuffixPromptMaxTokens{0};
     int32_t mSuffixMaxLength{0};
+    //! EDGELLM_MTP_VERIFY_SMALL=<nodes>: rounds whose suffix chain fits verify just that many nodes; longer chains use
+    //! the engine's full verify size. 0 = always the full size.
+    int32_t mVerifySizeFull{0};
+    int32_t mVerifySizeSmall{0};
     int32_t mSuffixMinLength{2};                //!< Shorter proposals are not worth verify slots.
     std::vector<int32_t> mSuffixIndexedLengths; //!< [B] generated tokens already in the cache
     Tensor mHostSuffixChainTokenIds;            //!< [B, maxLength] host staging
