@@ -148,6 +148,20 @@ def _int4_word_to_s8x4(q, *, loc=None, ip=None):
     return Uint32(out)
 
 
+@dsl_user_op
+def _i32_to_f32_exact(x, *, loc=None, ip=None):
+    """Exact INT32 -> FP32 for |x| < 2^22 without ``I2FP`` (a quarter-rate XU-pipe instruction on sm_87): adding 0x4B400000 puts x in the
+    mantissa of 1.5 * 2^23, and subtracting 12582912.0 leaves exactly x. The per-group sums here are at most 128 * 127 * 8 = 130 048."""
+    f32 = Float32.mlir_type
+    source = Int32(x).ir_value(loc=loc, ip=ip)
+    out = llvm.inline_asm(
+        f32, [source],
+        "{ .reg .s32 a; .reg .f32 b; add.s32 a, $1, 0x4B400000; mov.b32 b, a; sub.rn.f32 $0, b, 0f4B400000; }",
+        "=f,r", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Float32(out)
+
+
 def mark_vec_1d(arr, *, assumed_align: int = 16):
     tensor = from_dlpack(arr, assumed_align=assumed_align)
     return tensor.mark_compact_shape_dynamic(mode=0, stride_order=(0,), divisibility=1)
@@ -694,7 +708,7 @@ class Int4Int8GemmAmpere:
             if k_tile % 2 == 1:
                 for i in cutlass.range_constexpr(cute.size(tCrC)):
                     sc = sScale[current_smem_stage, Int32(0), tCcC_mma[i][1]].to(Float32)
-                    tCrC[i] = tCrC[i] + tCrI[i].to(Float32) * sc
+                    tCrC[i] = tCrC[i] + _i32_to_f32_exact(tCrI[i]) * sc
                 tCrI.fill(0)
 
         cute.arch.cp_async_wait_group(0)
