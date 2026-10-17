@@ -21,7 +21,12 @@
 #include "cuteDslInt4Gemv.h"
 #include "kernels/int4W4A8/int4W4A8Quant.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <map>
+#include <vector>
 #include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -433,6 +438,86 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             auto* aScale = reinterpret_cast<float*>(aInt8 + static_cast<size_t>(M) * mGemmK);
             kernel::launchQuantizeRowsInt8Permuted(
                 static_cast<half const*>(inputs[0]), aInt8, aScale, M, mGemmK, stream);
+            if (std::getenv("EDGELLM_W4A8_ERR") != nullptr)
+            {
+                // Debug probe: also run the W4A16 GEMM (variant 64x128x64 s3 sk1, valid for any K % 64 == 0) and compare.
+                static std::mutex probeMutex;
+                struct ProbeStat
+                {
+                    int32_t n{0}, k{0};
+                    double calls{0}, relSum{0}, relMax{0}, maxAbs{0}, ampSum{0}, ampMax{0}, grpSum{0};
+                };
+                static std::map<void const*, ProbeStat> table;
+                static std::vector<void const*> order;
+                static void* dbg = nullptr;
+                static size_t dbgBytes = 0;
+                static float* dev = nullptr;
+                static int64_t totalCalls = 0;
+                std::lock_guard<std::mutex> lock(probeMutex);
+                size_t const outBytes = static_cast<size_t>(M) * mGemmN * sizeof(half);
+                if (outBytes > dbgBytes)
+                {
+                    if (dbg != nullptr)
+                    {
+                        cudaFree(dbg);
+                    }
+                    if (cudaMalloc(&dbg, outBytes) != cudaSuccess)
+                    {
+                        return -1;
+                    }
+                    dbgBytes = outBytes;
+                }
+                if (dev == nullptr && cudaMalloc(reinterpret_cast<void**>(&dev), 8 * sizeof(float)) != cudaSuccess)
+                {
+                    return -1;
+                }
+                cudaMemsetAsync(dev, 0, 8 * sizeof(float), stream);
+                if (cuteDslInt4GemmLaunch(cuteDslInt4VariantAt(9), inputs[0], inputs[1], inputs[2], dbg, nullptr, M, mGemmN,
+                        mGemmK, /*swizzle=*/1, stream)
+                    != 0)
+                {
+                    return -1;
+                }
+                int32_t const status
+                    = cuteDslInt4W4A8Launch(64, aInt8, aScale, inputs[1], inputs[2], outputs[0], M, mGemmN, mGemmK, stream);
+                kernel::launchW4A8Probe(static_cast<half const*>(inputs[0]), static_cast<half const*>(outputs[0]),
+                    static_cast<half const*>(dbg), M, mGemmK, mGemmN, dev, stream);
+                float host[8];
+                cudaStreamSynchronize(stream);
+                cudaMemcpy(host, dev, sizeof(host), cudaMemcpyDeviceToHost);
+                auto& st = table[this];
+                if (st.calls == 0)
+                {
+                    order.push_back(this);
+                    st.n = mGemmN;
+                    st.k = mGemmK;
+                }
+                double const rel = host[1] > 0.F ? std::sqrt(static_cast<double>(host[0]) / host[1]) : 0.0;
+                st.calls += 1;
+                st.relSum += rel;
+                st.relMax = std::max(st.relMax, rel);
+                st.maxAbs = std::max(st.maxAbs, static_cast<double>(host[2]));
+                st.ampSum += host[3] / host[6];
+                st.ampMax = std::max(st.ampMax, static_cast<double>(host[5]));
+                st.grpSum += host[4] / host[6];
+                if (++totalCalls % 50 == 0)
+                {
+                    FILE* f = std::fopen(std::getenv("EDGELLM_W4A8_ERR"), "w");
+                    if (f != nullptr)
+                    {
+                        std::fprintf(f, "idx N K calls rel_err_mean rel_err_max max_abs_err amax_over_rms_mean amax_over_rms_max group_over_row_amax_mean\n");
+                        int32_t idx = 0;
+                        for (void const* key : order)
+                        {
+                            auto const& s = table[key];
+                            std::fprintf(f, "%d %d %d %.0f %.5f %.5f %.4f %.2f %.2f %.4f\n", idx++, s.n, s.k, s.calls,
+                                s.relSum / s.calls, s.relMax, s.maxAbs, s.ampSum / s.calls, s.ampMax, s.grpSum / s.calls);
+                        }
+                        std::fclose(f);
+                    }
+                }
+                return status;
+            }
             return cuteDslInt4W4A8Launch(64, aInt8, aScale, inputs[1], inputs[2], outputs[0], M, mGemmN, mGemmK, stream);
         }
         if (!cuteDslInt4GemmLoadModules())

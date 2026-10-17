@@ -33,5 +33,12 @@ namespace kernel
 void launchQuantizeRowsInt8Permuted(
     half const* activations, int8_t* out, float* rowScale, int32_t M, int32_t K, cudaStream_t stream);
 
+//! Debug probe (EDGELLM_W4A8_ERR): compares the W4A8 output with the W4A16 output of the same GEMM and measures how
+//! outlier-heavy the input rows are. stats (device, 8 floats, caller zeroes it): [0] sum (y8 - y16)^2, [1] sum y16^2,
+//! [2] max |y8 - y16|, [3] sum over rows of absmax / rms, [4] sum over rows of mean over 128-groups of group absmax / row
+//! absmax (how much a per-group activation scale would gain), [5] max over rows of absmax / rms, [6] M (rows counted).
+void launchW4A8Probe(half const* x, half const* y8, half const* y16, int32_t M, int32_t K, int32_t N, float* stats,
+    cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm
