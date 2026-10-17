@@ -416,8 +416,23 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             char const* value = std::getenv("EDGELLM_INT4_W4A8_MIN_N");
             return value != nullptr ? std::atoi(value) : 0;
         }();
+        static int32_t const kW4A8MaxN = []() {
+            char const* value = std::getenv("EDGELLM_INT4_W4A8_MAX_N");
+            return value != nullptr ? std::atoi(value) : 1 << 30;
+        }();
+        // Optional shape selectors for bisecting which ops carry the INT8-activation effect (METRICS 62b):
+        // EDGELLM_INT4_W4A8_ONLY_N=<n>: only GEMMs with exactly this N; EDGELLM_INT4_W4A8_SKIP_N=<n>: all but this N.
+        static int32_t const kW4A8OnlyN = []() {
+            char const* value = std::getenv("EDGELLM_INT4_W4A8_ONLY_N");
+            return value != nullptr ? std::atoi(value) : 0;
+        }();
+        static int32_t const kW4A8SkipN = []() {
+            char const* value = std::getenv("EDGELLM_INT4_W4A8_SKIP_N");
+            return value != nullptr ? std::atoi(value) : 0;
+        }();
         if (kW4A8MinM > 0 && M >= kW4A8MinM && mGemmK % 128 == 0 && mGemmK <= std::min(kW4A8MaxK, 16384)
-            && mGemmN >= kW4A8MinN && cuteDslInt4W4A8LoadModules())
+            && mGemmN >= kW4A8MinN && mGemmN <= kW4A8MaxN && (kW4A8OnlyN == 0 || mGemmN == kW4A8OnlyN)
+            && (kW4A8SkipN == 0 || mGemmN != kW4A8SkipN) && cuteDslInt4W4A8LoadModules())
         {
             // Scratch shared by every plugin instance (one stream runs them in order): INT8 activations plus row scales.
             static std::mutex scratchMutex;
