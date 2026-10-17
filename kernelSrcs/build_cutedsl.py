@@ -2084,6 +2084,8 @@ _INT4_FP16_GEMM_CONFIGS = [
     (32, 2, 1), (32, 3, 2), (32, 3, 4), (32, 4, 1),
     (64, 2, 1), (64, 3, 1), (64, 3, 4), (64, 4, 2), (64, 4, 4),
     (128, 2, 1), (128, 2, 4), (128, 4, 1),
+    # experiment: deep split-K for the tiny-N decode GEMMs (PLE gate N=256, o_proj); appended so tactic ids stay stable
+    (16, 4, 8), (16, 4, 16),
 ]
 # Quant group size, baked per variant (it sizes the in-kernel scale smem, so it
 # is compile-time, not a runtime arg). The kernel supports {16, 32, 64, 128, ...}

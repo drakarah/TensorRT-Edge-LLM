@@ -69,7 +69,9 @@ namespace
     X(int4_fp16_gemm_64x128x64_s4_sk4, 64, 128, 64, 4, 4)                                                              \
     X(int4_fp16_gemm_128x128x64_s2_sk1, 128, 128, 64, 2, 1)                                                            \
     X(int4_fp16_gemm_128x128x64_s2_sk4, 128, 128, 64, 2, 4)                                                            \
-    X(int4_fp16_gemm_128x128x64_s4_sk1, 128, 128, 64, 4, 1)
+    X(int4_fp16_gemm_128x128x64_s4_sk1, 128, 128, 64, 4, 1)                                                            \
+    X(int4_fp16_gemm_16x128x64_s4_sk8, 16, 128, 64, 4, 8)                                                              \
+    X(int4_fp16_gemm_16x128x64_s4_sk16, 16, 128, 64, 4, 16)
 
 // W4A8 variants (must match build_cutedsl.py's int4_int8_gemm registration). X(prefix, bM, bN, bK, stages).
 #define INT4_INT8_GEMM_VARIANTS(X)                                                                                     \
