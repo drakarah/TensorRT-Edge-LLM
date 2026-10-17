@@ -115,6 +115,12 @@ bool cuteDslInt4VariantValid(CuteDslInt4Variant const& v, int32_t N, int32_t K)
     {
         return false;
     }
+    // The group-flush kernels (EDGELLM_INT4_GEMM_GROUP_FLUSH build) flush the scaled partial sums every second K-tile (group 128 = 2 x bK 64),
+    // so every split needs a whole number of groups.
+    if (K % 128 != 0 || (divUp(K, v.bK) / v.splitK) % 2 != 0)
+    {
+        return false;
+    }
     return true;
 }
 
