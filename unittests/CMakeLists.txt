@@ -155,6 +155,9 @@ edgellm_add_unit_test(
   NAME unitTestKernelsAttention DIRS cpp/kernels/contextAttentionKernels
   cpp/kernels/decodeAttentionKernels cpp/kernels/audioAttentionKernels)
 
+# local: decode-attention tests only (the context-attention tests do not build against the fork's changed chunked-prefill signature)
+edgellm_add_unit_test(NAME unitTestXqa DIRS cpp/kernels/decodeAttentionKernels)
+
 edgellm_add_unit_test(NAME unitTestKernelsMoe DIRS cpp/kernels/moe)
 
 # CuTe DSL AOT wrappers lower extended launches through the runtime's

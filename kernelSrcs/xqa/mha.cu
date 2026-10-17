@@ -1575,6 +1575,12 @@ __device__ inline ThrdRegRowMax mergeAttentionSinks(ThrdRegRowMax& globalRowSum,
 }
 
 #ifdef XQA_TRACE
+#ifndef XQA_TRACE_SKIP
+#define XQA_TRACE_SKIP 0u
+#endif
+#ifndef XQA_TRACE_MAX
+#define XQA_TRACE_MAX 300u
+#endif
 // Experiment: per-phase cycle timestamps of one lane per warp. Warps store them to a global array (cheap); the last V warp of
 // a CTA prints all warps' rows after everything else is done, so printf does not disturb the timed phases.
 __device__ long long gXqaT[64 * 16 * 10];
@@ -1590,10 +1596,11 @@ __device__ unsigned gXqaPrints;
 #define XQA_TR_FLUSH() do { if (laneId() == 0) { uint32_t const cta_ = blockIdx.y * gridDim.x + blockIdx.x; \
     __threadfence(); \
     if (atomicAdd(&gXqaCnt[cta_], 1u) == ctaShapeInWarps.x - 1u) { gXqaCnt[cta_] = 0; \
-      if (atomicAdd(&gXqaPrints, 1u) < 300u) { \
+      unsigned const pc_ = atomicAdd(&gXqaPrints, 1u); \
+      if (pc_ >= XQA_TRACE_SKIP && pc_ < XQA_TRACE_SKIP + XQA_TRACE_MAX) { \
         for (uint32_t w_ = 0; w_ < 2 * ctaShapeInWarps.x; ++w_) { uint32_t const wz_ = w_ / ctaShapeInWarps.x; uint32_t const wx_ = w_ % ctaShapeInWarps.x; \
           long long const* t_ = &gXqaT[(cta_ * 16 + wz_ * 8 + wx_) * 10]; \
-          printf("TR cta %u,%u wz%u wx%u g0 %llu | %lld %lld %lld %lld %lld %lld %lld %lld %lld\n", blockIdx.x, blockIdx.y, wz_, wx_, gXqaG[cta_], \
+          printf("TR grid %u,%u hd%u cta %u,%u wz%u wx%u g0 %llu | %lld %lld %lld %lld %lld %lld %lld %lld %lld\n", gridDim.x, gridDim.y, ctaShapeInWarps.x * 64u, blockIdx.x, blockIdx.y, wz_, wx_, gXqaG[cta_], \
             t_[1] - t_[0], t_[2] - t_[0], t_[3] - t_[0], t_[4] - t_[0], t_[5] - t_[0], t_[6] - t_[0], t_[7] - t_[0], t_[8] - t_[0], t_[9] - t_[0]); } } } } } while (0)
 #else
 #define XQA_TR_DECL
