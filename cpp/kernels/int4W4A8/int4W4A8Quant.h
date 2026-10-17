@@ -30,8 +30,9 @@ namespace kernel
 //! out[m, 32 c + q] holds activation column 32 c + r(q), the column permutation that lets the INT8 A fragments
 //! meet the weight nibbles of the repacked INT4 buffer; rowScale[m] = absmax / 127. K must be a multiple of 128
 //! and at most 16384.
-void launchQuantizeRowsInt8Permuted(
-    half const* activations, int8_t* out, float* rowScale, int32_t M, int32_t K, cudaStream_t stream);
+//! ditherSeed != 0 rounds stochastically (floor(x + u), u from a hash of row, column and seed): unbiased, no dead zone (EDGELLM_W4A8_DITHER).
+void launchQuantizeRowsInt8Permuted(half const* activations, int8_t* out, float* rowScale, int32_t M, int32_t K,
+    cudaStream_t stream, uint32_t ditherSeed = 0);
 
 } // namespace kernel
 } // namespace trt_edgellm

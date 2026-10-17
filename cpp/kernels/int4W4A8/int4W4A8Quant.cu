@@ -29,8 +29,20 @@ constexpr int32_t kMaxK = 16384;
 // One CTA per row. The row is staged in shared memory (FP16), reduced to its absmax, then written as INT8 four bytes at a time in the
 // permuted column order: output quad i4 = 4 consecutive positions q..q+3 of 32-block c, q = 4 * (i4 % 8), half h = (i4 % 8) / 4,
 // thread-quad t4 = i4 % 4 and byte j stand for column 32 c + 16 h + {2 t4, 2 t4 + 8, 2 t4 + 1, 2 t4 + 9}[j].
-__global__ void quantizeRowsInt8PermutedKernel(
-    half const* __restrict__ activations, int8_t* __restrict__ out, float* __restrict__ rowScale, int32_t K)
+// Dither offset in [0, 1) from a 32-bit hash of (row, column, seed): floor(x + u) rounds up with probability frac(x), so E[q] = x (no dead zone).
+__device__ __forceinline__ float ditherOffset(uint32_t row, uint32_t col, uint32_t seed)
+{
+    uint32_t x = (row * 0x9E3779B1u) ^ (col * 0x85EBCA6Bu) ^ (seed * 0xC2B2AE35u + 0x27D4EB2Fu);
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return static_cast<float>(x >> 8) * (1.F / 16777216.F);
+}
+
+__global__ void quantizeRowsInt8PermutedKernel(half const* __restrict__ activations, int8_t* __restrict__ out,
+    float* __restrict__ rowScale, int32_t K, uint32_t ditherSeed)
 {
     __shared__ half row[kMaxK];
     __shared__ float partial[kThreads / 32];
@@ -83,7 +95,10 @@ __global__ void quantizeRowsInt8PermutedKernel(
 #pragma unroll
         for (int32_t j = 0; j < 4; ++j)
         {
-            int32_t const q = max(-127, min(127, __float2int_rn(__half2float(row[cols[j]]) * inv)));
+            float const scaled = __half2float(row[cols[j]]) * inv;
+            int32_t const rounded = ditherSeed == 0 ? __float2int_rn(scaled)
+                                                    : __float2int_rd(scaled + ditherOffset(m, cols[j], ditherSeed));
+            int32_t const q = max(-127, min(127, rounded));
             packed |= (static_cast<uint32_t>(q) & 0xFFu) << (8 * j);
         }
         *reinterpret_cast<uint32_t*>(dst + 4 * i4) = packed;
@@ -91,10 +106,10 @@ __global__ void quantizeRowsInt8PermutedKernel(
 }
 } // namespace
 
-void launchQuantizeRowsInt8Permuted(
-    half const* activations, int8_t* out, float* rowScale, int32_t M, int32_t K, cudaStream_t stream)
+void launchQuantizeRowsInt8Permuted(half const* activations, int8_t* out, float* rowScale, int32_t M, int32_t K,
+    cudaStream_t stream, uint32_t ditherSeed)
 {
-    quantizeRowsInt8PermutedKernel<<<M, kThreads, 0, stream>>>(activations, out, rowScale, K);
+    quantizeRowsInt8PermutedKernel<<<M, kThreads, 0, stream>>>(activations, out, rowScale, K, ditherSeed);
 }
 
 } // namespace kernel

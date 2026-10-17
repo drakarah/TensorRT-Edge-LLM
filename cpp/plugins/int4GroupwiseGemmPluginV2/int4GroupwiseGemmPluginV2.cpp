@@ -22,6 +22,7 @@
 #include "kernels/int4W4A8/int4W4A8Quant.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <cuda_fp16.h>
@@ -458,8 +459,12 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             }
             auto* aInt8 = static_cast<int8_t*>(scratch);
             auto* aScale = reinterpret_cast<float*>(aInt8 + static_cast<size_t>(M) * mGemmK);
+            // Opt-in dithered rounding of the INT8 activations (EDGELLM_W4A8_DITHER=1): unbiased in expectation.
+            static bool const kDither = std::getenv("EDGELLM_W4A8_DITHER") != nullptr;
+            static std::atomic<uint32_t> ditherCounter{0};
+            uint32_t const seed = kDither ? (ditherCounter.fetch_add(1) + 1) : 0;
             kernel::launchQuantizeRowsInt8Permuted(
-                static_cast<half const*>(inputs[0]), aInt8, aScale, M, mGemmK, stream);
+                static_cast<half const*>(inputs[0]), aInt8, aScale, M, mGemmK, stream, seed);
             return cuteDslInt4W4A8Launch(64, aInt8, aScale, inputs[1], inputs[2], outputs[0], M, mGemmN, mGemmK, stream);
         }
         if (!cuteDslInt4GemmLoadModules())
