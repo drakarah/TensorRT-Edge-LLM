@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <array>
 #include <stdexcept>
+#include <sstream>
+#include <cstdlib>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -141,6 +143,17 @@ std::vector<std::string> buildNvrtcOptions(XQAJitKey const& key)
     if (key.headSize == kHEAD_DIM_512 && (key.sm == 120 || key.sm == 121))
     {
         options.emplace_back("-DXQA_2CTA_HEAD_DIM512=1");
+    }
+
+    // Experiment hook: extra NVRTC options (space separated), e.g. EDGELLM_XQA_NVRTC_OPTS="-DXQA_POLL_MODE=1".
+    if (char const* extra = std::getenv("EDGELLM_XQA_NVRTC_OPTS"))
+    {
+        std::istringstream stream{extra};
+        std::string token;
+        while (stream >> token)
+        {
+            options.emplace_back(token);
+        }
     }
 
     return options;
