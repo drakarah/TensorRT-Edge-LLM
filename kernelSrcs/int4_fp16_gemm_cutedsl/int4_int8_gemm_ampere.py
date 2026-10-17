@@ -148,6 +148,27 @@ def _int4_word_to_s8x4(q, *, loc=None, ip=None):
     return Uint32(out)
 
 
+@dsl_user_op
+def _int4_word_to_s8x4_x16_pair(q, *, loc=None, ip=None):
+    """Widen the 8 biased nibbles of ``q`` into two registers of four INT8 bytes each that hold 16 * (nibble - 8) (a byte whose HIGH nibble is the
+    two's-complement nibble): regs[0] = nibbles (0, 1, 4, 5) (what ``_int4_word_to_s8x4(q)`` holds, times 16), regs[1] = nibbles (2, 3, 6, 7) (the same
+    for ``q >> 8``). u = q << 4 puts every even nibble in a high-nibble slot; one PRMT per register picks the byte with the wanted nibble in its
+    high half from u (even nibbles) or q (odd nibbles), and (x ^ 0x88888888) & 0xF0F0F0F0 turns the biased nibble into two's complement and clears the
+    stray low nibble. 5 instructions per word instead of ~7.6. The factor 16 is removed in the epilogue."""
+    i32 = Int32.mlir_type
+    source = Uint32(q).ir_value(loc=loc, ip=ip)
+    ty = llvm.StructType.get_literal([i32, i32])
+    both = llvm.inline_asm(
+        ty, [source],
+        "{ .reg .b32 u, a, b; shl.b32 u, $2, 4; prmt.b32 a, u, $2, 0x6240; prmt.b32 b, u, $2, 0x7351; "
+        "xor.b32 a, a, 0x88888888; xor.b32 b, b, 0x88888888; and.b32 $0, a, 0xF0F0F0F0; and.b32 $1, b, 0xF0F0F0F0; }",
+        "=r,=r,r", has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    lo = llvm.extractvalue(i32, both, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(i32, both, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
 def mark_vec_1d(arr, *, assumed_align: int = 16):
     tensor = from_dlpack(arr, assumed_align=assumed_align)
     return tensor.mark_compact_shape_dynamic(mode=0, stride_order=(0,), divisibility=1)
@@ -716,7 +737,7 @@ class Int4Int8GemmAmpere:
             row = block_m_idx * Int32(self.bM) + tCcC_mma[i][0]
             a_scale = Float32(0.0)
             if row < mC.shape[0]:
-                a_scale = mAScale[row].to(Float32)
+                a_scale = mAScale[row].to(Float32) * Float32(0.0625)  # the INT8 weights are 16 * value (widening)
             tCrC[i] = tCrC[i] * a_scale
         tCrD = cute.make_fragment_like(tCrC, self.c_dtype)
         tCrD[None] = tCrC.load().to(self.c_dtype)
@@ -926,10 +947,12 @@ class Int4Int8GemmAmpere:
             word1 = sB_bytes[tidx, Int32(2) * k_step + Int32(1), Int32(p), stage]
             g_lo = 2 * p
             g_hi = 2 * p + 1
-            tCrB_u32[g_lo * 2] = _int4_word_to_s8x4(word0)
-            tCrB_u32[g_lo * 2 + 1] = _int4_word_to_s8x4(word1)
-            tCrB_u32[g_hi * 2] = _int4_word_to_s8x4(word0 >> Uint32(8))
-            tCrB_u32[g_hi * 2 + 1] = _int4_word_to_s8x4(word1 >> Uint32(8))
+            lo0, hi0 = _int4_word_to_s8x4_x16_pair(word0)
+            lo1, hi1 = _int4_word_to_s8x4_x16_pair(word1)
+            tCrB_u32[g_lo * 2] = lo0
+            tCrB_u32[g_lo * 2 + 1] = lo1
+            tCrB_u32[g_hi * 2] = hi0
+            tCrB_u32[g_hi * 2 + 1] = hi1
 
     @cute.jit
     def _load_scale_tile(
