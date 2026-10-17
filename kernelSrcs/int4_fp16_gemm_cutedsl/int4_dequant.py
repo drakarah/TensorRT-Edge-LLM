@@ -81,3 +81,39 @@ def _dequant_int4_word(q, scale, *, loc=None, ip=None):
         Uint32(llvm.bitcast(i32, lo_s, loc=loc, ip=ip)),
         Uint32(llvm.bitcast(i32, hi_s, loc=loc, ip=ip)),
     )
+
+
+@dsl_user_op
+def _dequant_int4_word_noscale(q, *, loc=None, ip=None):
+    """``_dequant_int4_word`` without the scale multiply: the two ``f16x2`` words hold the exact integers (nibble - 8) of the four nibbles
+    (two ``lop3`` + ``sub.f16x2`` + ``fma.rn.f16x2``). The quant-group scale is applied to the FP32 partial sums once per group instead
+    (``Int4Fp16GemmAmpere.group_flush``)."""
+    i32 = Int32.mlir_type
+    u32 = Uint32.mlir_type
+    source = Uint32(q).ir_value(loc=loc, ip=ip)
+    ex = arith.constant(u32, 0x64006400, loc=loc, ip=ip)
+    lut = arith.constant(u32, (0xF0 & 0xCC) | 0xAA, loc=loc, ip=ip)
+    lo_mask = arith.constant(u32, 0x000F000F, loc=loc, ip=ip)
+    hi_mask = arith.constant(u32, 0x00F000F0, loc=loc, ip=ip)
+
+    def _lop3(mask):
+        return llvm.inline_asm(
+            i32, [source, mask, ex, lut], "lop3.b32 $0, $1, $2, $3, $4;",
+            "=r,r,n,n,n", has_side_effects=True, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+    lo = _lop3(lo_mask)
+    hi = _lop3(hi_mask)
+    sub = arith.constant(u32, 0x64086408, loc=loc, ip=ip)
+    lo = llvm.inline_asm(
+        i32, [lo, sub], "sub.f16x2 $0, $1, $2;", "=r,r,r",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    mul = arith.constant(u32, 0x2C002C00, loc=loc, ip=ip)
+    add = arith.constant(u32, 0xD480D480, loc=loc, ip=ip)
+    hi = llvm.inline_asm(
+        i32, [hi, mul, add], "fma.rn.f16x2 $0, $1, $2, $3;", "=r,r,r,r",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Uint32(lo), Uint32(hi)

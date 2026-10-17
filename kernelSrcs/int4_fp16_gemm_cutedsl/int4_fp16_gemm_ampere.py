@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from typing import Tuple, Type
@@ -85,7 +86,11 @@ from common import (
     mark_row_major_2d,
     parse_comma_separated_ints,
 )
-from int4_dequant import _dequant_int4_word
+from int4_dequant import _dequant_int4_word, _dequant_int4_word_noscale
+
+
+# Build-time switch (experiment): apply the quant-group scale to FP32 partial sums once per group instead of to every dequantised weight.
+_GROUP_FLUSH = os.environ.get("EDGELLM_INT4_GEMM_GROUP_FLUSH", "0") == "1"
 
 
 class Int4Fp16GemmAmpere:
@@ -111,6 +116,8 @@ class Int4Fp16GemmAmpere:
         self.atom_layout_mnk = atom_layout_mnk
         self.num_stages = num_stages
         self.group_size = group_size
+        # Group flush: FP32 accumulators, group 128 = two bK-64 K-tiles; the caller guarantees an even number of K-tiles per split (K % 128 == 0, tiles per split even).
+        self.group_flush = bool(_GROUP_FLUSH and acc_dtype == cutlass.Float32 and group_size == 128)
         # (Grouped-M threadblock swizzle is a *runtime* kernel arg, not a member;
         # see the ``swizzle`` parameter of ``__call__`` / ``kernel``.)
         # Split-K factor: how many ways the K reduction is partitioned across the
@@ -480,6 +487,10 @@ class Int4Fp16GemmAmpere:
         tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
         tCrC = tiled_mma.make_fragment_C(tCgC)
         tCrC.fill(0.0)
+        tCcC_mma = thr_mma.partition_C(cute.make_identity_tensor((self.bM, self.bN)))
+        if cutlass.const_expr(self.group_flush):
+            tCrP = tiled_mma.make_fragment_C(tCgC)  # partial sums of the current quant group (unscaled weights)
+            tCrP.fill(0.0)
 
         atom_copy_s2r_A = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(
@@ -514,7 +525,9 @@ class Int4Fp16GemmAmpere:
                 smem_pipe_read,
             )
 
-        for k_tile in range(tiles_per_split):
+        # Group flush: one quant group (128) = two K-tiles; unrolled by two the flush below is unconditional every second tile
+        # (a one-tile loop would predicate the whole block every tile, METRICS 46h).
+        for k_tile in cutlass.range(tiles_per_split, unroll=(2 if self.group_flush else 1)):
             current_smem_stage = smem_pipe_read
             for k_block in cutlass.range(num_k_block, unroll_full=True):
                 b_load_stage = current_smem_stage
@@ -570,13 +583,16 @@ class Int4Fp16GemmAmpere:
                             k_tile_count,
                         )
 
-                cute.gemm(
-                    tiled_mma,
-                    tCrC,
-                    tCrA[None, None, k_block],
-                    tCrB[None, None, k_block],
-                    tCrC,
-                )
+                if cutlass.const_expr(self.group_flush):
+                    cute.gemm(tiled_mma, tCrP, tCrA[None, None, k_block], tCrB[None, None, k_block], tCrP)
+                else:
+                    cute.gemm(
+                        tiled_mma,
+                        tCrC,
+                        tCrA[None, None, k_block],
+                        tCrB[None, None, k_block],
+                        tCrC,
+                    )
 
                 if k_block == 0:
                     k_tile_index = k_tile_index + 1
@@ -585,6 +601,14 @@ class Int4Fp16GemmAmpere:
                     smem_pipe_read = smem_pipe_read + 1
                     if smem_pipe_read == num_smem_stages:
                         smem_pipe_read = 0
+
+            if cutlass.const_expr(self.group_flush):
+                # Quant group complete: scale the FP32 partial sums by the group scale into the accumulator.
+                if k_tile % 2 == 1:
+                    for i in cutlass.range_constexpr(cute.size(tCrC)):
+                        sc = sScale[current_smem_stage, Int32(0), tCcC_mma[i][1]].to(Float32)
+                        tCrC[i] = tCrC[i] + tCrP[i] * sc
+                    tCrP.fill(0.0)
 
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
@@ -812,10 +836,14 @@ class Int4Fp16GemmAmpere:
             word = sB_bytes[tidx, kbl, Int32(p), stage]
             g_lo = 2 * p
             g_hi = 2 * p + 1
-            scale_lo = sScale[stage, sub, tCcB[g_lo * 4][0]]
-            scale_hi = sScale[stage, sub, tCcB[g_hi * 4][0]]
-            lo0, lo1 = _dequant_int4_word(word, scale_lo)
-            hi0, hi1 = _dequant_int4_word(word >> Uint32(8), scale_hi)
+            if cutlass.const_expr(self.group_flush):
+                lo0, lo1 = _dequant_int4_word_noscale(word)
+                hi0, hi1 = _dequant_int4_word_noscale(word >> Uint32(8))
+            else:
+                scale_lo = sScale[stage, sub, tCcB[g_lo * 4][0]]
+                scale_hi = sScale[stage, sub, tCcB[g_hi * 4][0]]
+                lo0, lo1 = _dequant_int4_word(word, scale_lo)
+                hi0, hi1 = _dequant_int4_word(word >> Uint32(8), scale_hi)
             tCrB_u32[g_lo * 2] = lo0
             tCrB_u32[g_lo * 2 + 1] = lo1
             tCrB_u32[g_hi * 2] = hi0
