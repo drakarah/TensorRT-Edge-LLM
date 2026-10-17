@@ -690,12 +690,19 @@ class Int4Int8GemmAmpere:
                     if smem_pipe_read == num_smem_stages:
                         smem_pipe_read = 0
 
-            # Quant group (128 = two K-tiles) complete: scale the INT32 sums into the FP32 accumulator.
+            # Quant group (128 = two K-tiles) complete. The INT32 sums are cumulative (never cleared): with A_g the running sum after group g,
+            # sum_g s_g (A_g - A_(g-1)) == sum_g (s_g - s_(g+1)) A_g (Abel summation, s_(G+1) = 0), so the flush scales the running sum by the
+            # difference of this group's and the next group's scale. The next tile (first of the next group) is already resident: the wait at the
+            # last k-block of this tile covers it, and smem_pipe_read has advanced to its stage. A_g stays below G * 128 * 127 * 8 < 2^24 (K <= 16384).
             if k_tile % 2 == 1:
+                next_stage = smem_pipe_read
+                has_next = Float32(1.0)
+                if k_tile + 1 >= tiles_per_split:
+                    has_next = Float32(0.0)
                 for i in cutlass.range_constexpr(cute.size(tCrC)):
                     sc = sScale[current_smem_stage, Int32(0), tCcC_mma[i][1]].to(Float32)
-                    tCrC[i] = tCrC[i] + tCrI[i].to(Float32) * sc
-                tCrI.fill(0)
+                    sn = sScale[next_stage, Int32(0), tCcC_mma[i][1]].to(Float32)
+                    tCrC[i] = tCrC[i] + tCrI[i].to(Float32) * (sc - sn * has_next)
 
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
