@@ -406,6 +406,21 @@ private:
         }
         else
         {
+#ifndef XQA_POLL_MODE
+#define XQA_POLL_MODE 0
+#endif
+#if XQA_POLL_MODE == 1
+            // pure spin: no NANOSLEEP
+            while (!func())
+            {
+            }
+#elif XQA_POLL_MODE == 2
+            // short fixed sleep
+            while (!func())
+            {
+                __nanosleep(XQA_POLL_SLEEP_NS);
+            }
+#else
             float sleepDuration = 0.125F;
             while (!func())
             {
@@ -414,6 +429,7 @@ private:
                 // }
                 sleepDuration = sleepDuration * 1.25F + 0.F;
             }
+#endif
         }
     }
 

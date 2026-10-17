@@ -1574,6 +1574,34 @@ __device__ inline ThrdRegRowMax mergeAttentionSinks(ThrdRegRowMax& globalRowSum,
     return rowScales;
 }
 
+#ifdef XQA_TRACE
+// Experiment: per-phase cycle timestamps of one lane per warp. Warps store them to a global array (cheap); the last V warp of
+// a CTA prints all warps' rows after everything else is done, so printf does not disturb the timed phases.
+__device__ long long gXqaT[64 * 16 * 10];
+__device__ unsigned long long gXqaG[64];
+__device__ unsigned gXqaCnt[64];
+__device__ unsigned gXqaPrints;
+#define XQA_TR_DECL long long xqaT[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; unsigned long long xqaG0 = 0
+#define XQA_TR(i) do { if (laneId() == 0) { xqaT[i] = clock64(); if ((i) == 0) { asm volatile("mov.u64 %0, %globaltimer;" : "=l"(xqaG0)); } } } while (0)
+#define XQA_TR_STORE() do { if (laneId() == 0) { uint32_t const cta_ = blockIdx.y * gridDim.x + blockIdx.x; \
+    uint32_t const w_ = cta_ * 16 + warpIdx.z * 8 + warpIdx.x; \
+    for (int i_ = 0; i_ < 10; ++i_) { gXqaT[w_ * 10 + i_] = xqaT[i_]; } \
+    if (warpIdx.z == 0 && warpIdx.x == 0) { gXqaG[cta_] = xqaG0; } } } while (0)
+#define XQA_TR_FLUSH() do { if (laneId() == 0) { uint32_t const cta_ = blockIdx.y * gridDim.x + blockIdx.x; \
+    __threadfence(); \
+    if (atomicAdd(&gXqaCnt[cta_], 1u) == ctaShapeInWarps.x - 1u) { gXqaCnt[cta_] = 0; \
+      if (atomicAdd(&gXqaPrints, 1u) < 300u) { \
+        for (uint32_t w_ = 0; w_ < 2 * ctaShapeInWarps.x; ++w_) { uint32_t const wz_ = w_ / ctaShapeInWarps.x; uint32_t const wx_ = w_ % ctaShapeInWarps.x; \
+          long long const* t_ = &gXqaT[(cta_ * 16 + wz_ * 8 + wx_) * 10]; \
+          printf("TR cta %u,%u wz%u wx%u g0 %llu | %lld %lld %lld %lld %lld %lld %lld %lld %lld\n", blockIdx.x, blockIdx.y, wz_, wx_, gXqaG[cta_], \
+            t_[1] - t_[0], t_[2] - t_[0], t_[3] - t_[0], t_[4] - t_[0], t_[5] - t_[0], t_[6] - t_[0], t_[7] - t_[0], t_[8] - t_[0], t_[9] - t_[0]); } } } } } while (0)
+#else
+#define XQA_TR_DECL
+#define XQA_TR(i)
+#define XQA_TR_STORE()
+#define XQA_TR_FLUSH()
+#endif
+
 #ifdef NDEBUG
 __device__ __forceinline__
 #else
@@ -1727,12 +1755,15 @@ CUBIN_EXPORT __global__
         init(smem.warpGrpBar(ctaThrdId), warp_size * gemm1WarpsPerGrp);
     }
 #endif
+    XQA_TR_DECL;
+    XQA_TR(0);
     __syncthreads();
 
 #if ENABLE_PDL
     preExit();
     acqBulk();
 #endif
+    XQA_TR(1);
 
     constexpr bool qkSwizzle = true;
     // load whole Q heads into shared memory
@@ -2198,6 +2229,7 @@ CUBIN_EXPORT __global__
 #endif
         bool splitScoreBarParityNext = false;
         unused(splitScoreBarParityNext);
+        XQA_TR(2);
         for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters; seqIter += seqStrideIters)
         {
 #if SHORT_SEQ_OPT && !TILED_QKV_STAGING_HEAD_DIM512
@@ -2404,7 +2436,10 @@ CUBIN_EXPORT __global__
             smem.warpRowMax[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, regRowMax);
             smem.warpRowSum[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, regRowSum);
             unused(xBar.produced.arrive());
+            XQA_TR(seqIter == seqIterInit ? 3 : 4);
         }
+        XQA_TR(5);
+        XQA_TR_STORE();
     }
     else
     {
@@ -2655,6 +2690,7 @@ CUBIN_EXPORT __global__
             unused(pWarpGrpBar->arrive());
         }
         bool xBarProducedParityNext = false;
+        XQA_TR(2);
         for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters; seqIter += seqStrideIters)
         {
 #pragma unroll
@@ -2816,6 +2852,7 @@ CUBIN_EXPORT __global__
             }     // xIter
             flip(xBarProducedParityNext);
         }         // seqIter
+        XQA_TR(5);
 
         auto const fullRescaleMask = UniformRescaleMask::filled(~0U);
 
@@ -2880,6 +2917,7 @@ CUBIN_EXPORT __global__
             rescaleAcc(warp, acc, fullRescaleMask, rcpRowSum * ThrdRegRowMax::filled(voScale));
         }
         GemmOutRegTile const outTile = toFp16(acc);
+        XQA_TR(3);
 
         auto mergeAndSaveOutTile = [&](GemmOutRegTile const& tile, bool reorder)
         {
@@ -2910,6 +2948,7 @@ CUBIN_EXPORT __global__
 
         // merge results from different warp groups
         SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, inputElemSize == 2 && cacheElemSize == 1);
+        XQA_TR(4);
         if (isMultiBlock)
         {
             static_assert(ctaShapeInWarps.y == 1, "not implemented");
@@ -2945,6 +2984,7 @@ CUBIN_EXPORT __global__
             copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
                 warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp](0, 0), &(*smemOutTile)(0, 0));
             __syncthreads();
+            XQA_TR(8);
             constexpr uint32_t nbTileBuffers = 2;
 
             struct MultiBlockSMem
@@ -2976,8 +3016,10 @@ CUBIN_EXPORT __global__
                              : "l"(&semaphores[idxSeq]), "r"(lastOld));
                 assert(old < nbSubSeqPerSeq);
                 mbsmem.isLastCta = (old == lastOld);
+                XQA_TR(9);
             }
             __syncthreads();
+            XQA_TR(6);
 
             // merge if we are the last CTA.
             bool const isLastCta = mbsmem.isLastCta;
@@ -3089,6 +3131,9 @@ CUBIN_EXPORT __global__
                 uint2{warpTile.x * warpIdxInGrp, nbValidRows * warpIdx.y}, *smemOutTile);
 #endif
         }
+        XQA_TR(7);
+        XQA_TR_STORE();
+        XQA_TR_FLUSH();
     }
 }
 
