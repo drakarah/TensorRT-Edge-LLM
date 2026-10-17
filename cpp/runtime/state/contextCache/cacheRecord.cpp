@@ -47,7 +47,7 @@ bool hasNegativePage(std::vector<PageId> const& pages) noexcept
 
 void validateSpecState(SpecPagedStateRecord const& state, size_t basePathSize)
 {
-    ELLM_CHECK(!state.pagePath.empty(), "Paged context-cache spec state requires at least one page");
+    ELLM_CHECK(!state.pagePath.empty() || basePathSize == 0, "Paged context-cache spec state requires at least one page");
     ELLM_CHECK(state.pagePath.size() == basePathSize, "Paged context-cache spec state must cover its full base path");
     ELLM_CHECK(!hasNegativePage(state.pagePath), "Context cache spec state page IDs must be non-negative");
 }
