@@ -92,6 +92,10 @@ public:
         int32_t numSwaPages{0};
         //! Runtime policy. False keeps capability markers but allocates every layer from the full page budget.
         bool useBoundedSwaKVCache{true};
+        //! Per attention layer: index of the donor layer whose KV it reads (cross-layer KV sharing,
+        //! e.g. Gemma 4), or -1. Empty means no sharing. A recipient owns no pool: its accessors
+        //! resolve to the donor's, which is what the attention plugins bind anyway.
+        std::vector<int32_t> kvSharingDonors{};
     };
     //! \endcond
 
@@ -126,6 +130,12 @@ public:
     //! @brief Move assignment operator
     //! @return Reference to this
     KVCacheManager& operator=(KVCacheManager&&) noexcept;
+
+    //! Layer whose pool backs @p attnLayerIdx: its KV-sharing donor, or the layer itself.
+    int32_t storageLayer(int32_t attnLayerIdx) const noexcept;
+
+    //! True when @p attnLayerIdx reads a donor's KV and owns no pool of its own.
+    bool isKVSharingRecipient(int32_t attnLayerIdx) const noexcept;
 
     //! Get the combined KV-cache page pool for the given attention layer.
     //! @param attnLayerIdx The index of the attention layer.
