@@ -321,6 +321,50 @@ TEST(GatherPagedKVToSplitTest, Fp8DequantMatchesHostReference)
     }
 }
 
+// INT8 pool -> FP16 dequant gather: the destination must equal a host-computed dequant reference
+// (int8_value * scale), NOT the raw INT8 bytes. Identity table, distinct K vs V scales. The scales are
+// not powers of two, so a dropped or swapped scale changes the FP16 result.
+TEST(GatherPagedKVToSplitTest, Int8DequantMatchesHostReference)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const B = 2, H = 2, D = 32, S = 200; // spans 2 logical pages.
+    int32_t const pagesPerBatch = (S + rt::kTOKENS_PER_PAGE - 1) / rt::kTOKENS_PER_PAGE;
+    int32_t const numPages = B * pagesPerBatch;
+    float const kScale = 0.0371f, vScale = 0.0213f;
+
+    // The KV-cache writer emits the symmetric range [-127, 127].
+    size_t const splitVol = (size_t) B * S * H * D;
+    std::vector<int8_t> refK(splitVol), refV(splitVol);
+    uniformIntInitialization(refK, -127, 127);
+    uniformIntInitialization(refV, -127, 127);
+
+    std::vector<int8_t> const poolHost = buildIdentityFlatPool(refK, refV, B, S, H, D, pagesPerBatch);
+    rt::Tensor poolTensor({(int64_t) poolHost.size()}, rt::DeviceType::kGPU, DataType::kINT8);
+    copyHostToDevice(poolTensor, poolHost);
+
+    rt::KVPageTable pageTable(B, pagesPerBatch, numPages);
+    pageTable.setIdentity();
+    pageTable.upload(stream);
+
+    rt::Tensor kDstTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vDstTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kvSeqLens = makeKvSeqLens(std::vector<int32_t>(B, S));
+    kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
+        pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), pagesPerBatch, B, S, H, D,
+        sizeof(int8_t), kernel::KVPoolQuant::kINT8, kScale, vScale, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<half> const kOutHost = copyDeviceToHost<half>(kDstTensor);
+    std::vector<half> const vOutHost = copyDeviceToHost<half>(vDstTensor);
+
+    for (size_t i = 0; i < splitVol; ++i)
+    {
+        half const expK = __float2half(static_cast<float>(refK[i]) * kScale);
+        half const expV = __float2half(static_cast<float>(refV[i]) * vScale);
+        ASSERT_EQ(__half_as_ushort(kOutHost[i]), __half_as_ushort(expK)) << "K dequant mismatch at flat idx " << i;
+        ASSERT_EQ(__half_as_ushort(vOutHost[i]), __half_as_ushort(expV)) << "V dequant mismatch at flat idx " << i;
+    }
+}
+
 // An unmapped page INSIDE the live range (a hole, not a trailing tail) cannot occur by construction
 // (the runtime guarantees mapped coverage for live positions); if it ever does, the kernel must fail
 // soft by zero-filling that page's destination span -- never reading a wild address or leaving
