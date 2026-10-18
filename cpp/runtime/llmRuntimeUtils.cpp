@@ -898,8 +898,9 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
 
     EmbeddingData result;
 
-    // Detect FP8 vs FP16 by checking dtype
-    if (embeddingPtr->getDataType() == nvinfer1::DataType::kFP8)
+    // Detect FP8 / INT8 (both with per-group fp32 scales) vs FP16 by checking dtype
+    bool const isInt8 = embeddingPtr->getDataType() == nvinfer1::DataType::kINT8;
+    if (embeddingPtr->getDataType() == nvinfer1::DataType::kFP8 || isInt8)
     {
         // FP8 format - requires scales
         ELLM_CHECK(scalesPtr != nullptr,
@@ -924,8 +925,8 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
         ELLM_CHECK(numGroups == expectedNumGroups,
             format::fmtstr("Scale groups mismatch: expected %ld, got %ld", expectedNumGroups, numGroups));
 
-        LOG_INFO(
-            "Loaded FP8 embedding: [%ld, %ld], scales: [%ld, %ld]", vocabSize, hiddenSize, scaleVocabSize, numGroups);
+        LOG_INFO("Loaded %s embedding: [%ld, %ld], scales: [%ld, %ld]", isInt8 ? "INT8" : "FP8", vocabSize,
+            hiddenSize, scaleVocabSize, numGroups);
 
         result.table = std::move(*embeddingPtr);
         result.tableScalingFactor = std::move(*scalesPtr);

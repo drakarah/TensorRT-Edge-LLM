@@ -47,6 +47,30 @@ struct Fp16EmbeddingLoader
     }
 };
 
+//! \brief INT8 embedding loader with per-group fp32 scales (same layout as the FP8 loader:
+//! "embedding" [vocab, hidden] int8 + "embedding_scale" [vocab, hidden / blockSize] fp32).
+//! Works on GPUs without FP8 support (e.g. Orin, sm_87).
+struct Int8EmbeddingLoader
+{
+    static constexpr uint32_t vecSize = DVec<half>::vec_size;
+    int8_t const* table{nullptr};
+    float const* scales{nullptr};
+    int64_t blockSize{0};
+    int64_t nGroups{0};
+
+    __device__ __forceinline__ void load(int32_t tokenId, int64_t hiddenSize, uint32_t offset, DVec<half>& out) const
+    {
+        int64_t const group = static_cast<int64_t>(offset) / blockSize;
+        float const scale = scales[static_cast<int64_t>(tokenId) * nGroups + group];
+        int8_t const* row = table + static_cast<int64_t>(tokenId) * hiddenSize + offset;
+#pragma unroll
+        for (uint32_t i = 0; i < vecSize; ++i)
+        {
+            out[i] = __float2half(static_cast<float>(row[i]) * scale);
+        }
+    }
+};
+
 #if SUPPORTS_FP8
 //! \brief FP8 embedding loader with per-group dequantization
 struct Fp8EmbeddingLoader
@@ -724,9 +748,30 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
             false, "FP8 multimodal embedding lookup is unavailable: build does not support FP8 (SUPPORTS_FP8=0)");
 #endif
     }
+    else if (embeddingTable.getDataType() == nvinfer1::DataType::kINT8)
+    {
+        constexpr uint32_t vecSize = Int8EmbeddingLoader::vecSize;
+        check::check(scales.has_value(), "scales must be provided for INT8 embedding table");
+        auto const& scalesTensor = scales.value().get();
+        auto const scaleShape = scalesTensor.getShape();
+        check::check(scaleShape.getNumDims() == 2 && scaleShape[0] == vocabSize && scaleShape[1] > 0,
+            "INT8 embedding scales must be [vocabSize, hiddenSize / blockSize]");
+        check::check(hiddenSize % scaleShape[1] == 0, "hiddenSize must be divisible by number of scale groups");
+        check::check(scalesTensor.getDataType() == nvinfer1::DataType::kFLOAT, "scales must be FP32");
+        int64_t const nGroups = scaleShape[1];
+        int64_t const blockSize = hiddenSize / nGroups;
+        check::check(blockSize % vecSize == 0, "INT8 embedding blockSize must be a multiple of the vector size");
+
+        Int8EmbeddingLoader loader{embeddingTable.dataPointer<int8_t>(), scalesTensor.dataPointer<float>(), blockSize,
+            nGroups};
+        launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
+            imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
+            hiddenSize, stream);
+    }
     else
     {
-        check::check(embeddingTable.getDataType() == nvinfer1::DataType::kHALF, "embeddingTable must be FP16 or FP8");
+        check::check(
+            embeddingTable.getDataType() == nvinfer1::DataType::kHALF, "embeddingTable must be FP16, FP8 or INT8");
         half const* embeddingTablePtr = embeddingTable.dataPointer<half>();
 
         Fp16EmbeddingLoader loader{embeddingTablePtr};
