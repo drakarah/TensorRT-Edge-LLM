@@ -283,6 +283,21 @@ __device__ __forceinline__ void storeVec(TCache* dst, int64_t base, DVec<half> c
     {
         vec.store(dst + base);
     }
+    else if constexpr (std::is_same_v<TCache, int8_t>)
+    {
+        // Symmetric INT8 with a per-layer scale (quant->orig): q = rn(x / scale), clamped to
+        // [-127, 127] so that negation stays representable, as in TensorRT-LLM's INT8 KV cache.
+        DVec<int8_t> out;
+        assert(scaleQuantOrig > 0.0f);
+        float const invScale = __frcp_rn(scaleQuantOrig);
+#pragma unroll
+        for (uint32_t i = 0; i < DVec<half>::vec_size; ++i)
+        {
+            float const scaled = __half2float(vec[i]) * invScale;
+            out[i] = static_cast<int8_t>(__float2int_rn(fminf(fmaxf(scaled, -127.0f), 127.0f)));
+        }
+        out.store(dst + base);
+    }
 #if SUPPORTS_FP8
     else if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
     {
@@ -495,6 +510,14 @@ static void launchApplyRopeWriteKVKernel(rt::Tensor& q, rt::Tensor& k, rt::Tenso
     {
         half* kvCachePtr = kvCache.dataPointer<half>();
         applyRopeWriteKV<half, half><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr, cosSinCachePtr,
+            kvCacheEndLensPtr, tokenPosIdsPtr, kScale, vScale, runtimeSeqLen, totalNumTokens, numPages, numQHeads,
+            numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, writeKInPlace, pageTable,
+            maxPagesPerSeq);
+    }
+    else if (dt == nvinfer1::DataType::kINT8)
+    {
+        int8_t* kvCachePtr = kvCache.dataPointer<int8_t>();
+        applyRopeWriteKV<half, int8_t><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr, cosSinCachePtr,
             kvCacheEndLensPtr, tokenPosIdsPtr, kScale, vScale, runtimeSeqLen, totalNumTokens, numPages, numQHeads,
             numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, writeKInPlace, pageTable,
             maxPagesPerSeq);
@@ -742,6 +765,16 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
         applyRopeWriteKVSplitQKVKernel<half, half><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr, nullptr,
             cosSinCachePtr, kvCacheEndLensPtr, 1.0f, kScale, vScale, runtimeSeqLen, totalNumTokens, numPages, numQHeads,
             numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, pageTable, maxPagesPerSeq);
+    }
+    else if (dt == nvinfer1::DataType::kINT8)
+    {
+        // INT8 KV keeps Q in FP16: the FP8-Q buffer belongs to the FP8 FMHA route only.
+        check::check(fp8QOut == nullptr, "INT8 KV cache does not support an FP8 Q output.");
+        int8_t* kvCachePtr = kvCache.dataPointer<int8_t>();
+        applyRopeWriteKVSplitQKVKernel<half, int8_t><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr,
+            fp8QOut, cosSinCachePtr, kvCacheEndLensPtr, qScale, kScale, vScale, runtimeSeqLen, totalNumTokens, numPages,
+            numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, pageTable,
+            maxPagesPerSeq);
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
@@ -1140,6 +1173,20 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
         else
         {
             launchKernel(kvCachePtr, nullptr /* fp8QOut */, 1.0f /* qScaleQuantOrig */, std::false_type{});
+        }
+    }
+    else if (dt == nvinfer1::DataType::kINT8)
+    {
+        // INT8 KV keeps Q in FP16: the FP8-Q buffer belongs to the FP8 FMHA route only.
+        check::check(fp8QOut == nullptr, "INT8 KV cache does not support an FP8 Q output.");
+        int8_t* kvCachePtr = kvCache.dataPointer<int8_t>();
+        if (enablePdl)
+        {
+            launchKernel(kvCachePtr, fp8QOut, qScale, std::true_type{});
+        }
+        else
+        {
+            launchKernel(kvCachePtr, fp8QOut, qScale, std::false_type{});
         }
     }
 #if SUPPORTS_FP8

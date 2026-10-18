@@ -171,6 +171,8 @@ def attention_plugin(
     attention_sinks: Optional[List[float]] = None,
     enable_attention_sink: int = 0,
     enable_contiguous_query_swa: int = 0,
+    # INT8 KV cache (symmetric, K/V scales from qkv_scales). Default 0 so torch.export strips it.
+    enable_int8_kv_cache: int = 0,
     query_start_offsets: Optional[torch.Tensor] = None,
     attention_sequence_lengths: Optional[torch.Tensor] = None,
     execution_phase_marker: Optional[torch.Tensor] = None,
@@ -285,6 +287,7 @@ def _(
     attention_sinks=None,
     enable_attention_sink=0,
     enable_contiguous_query_swa=0,
+    enable_int8_kv_cache=0,
     query_start_offsets=None,
     attention_sequence_lengths=None,
     execution_phase_marker=None,

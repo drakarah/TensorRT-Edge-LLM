@@ -870,7 +870,8 @@ def build_runtime_llm_config_dict(
     # KV cache dtype is baked in at export time. The C++ runtime parses it
     # strictly from config.json (no engine-introspection back-patching).
     # Mirrors llm_export.py: "fp8" when KV cache is quantised, otherwise "fp16".
-    out["kv_cache_dtype"] = ("fp8" if config.quant.kv_cache_quant == "fp8" else
+    out["kv_cache_dtype"] = (config.quant.kv_cache_quant
+                             if config.quant.kv_cache_quant in ("fp8", "int8") else
                              "fp16")
 
     # Hybrid models (Mamba / GDN / Nemotron-H) bake in recurrent-state and

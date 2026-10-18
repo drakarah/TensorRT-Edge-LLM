@@ -828,7 +828,8 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
     check::check(acceptedIndices.getDataType() == DataType::kINT32 && acceptLengths.getDataType() == DataType::kINT32
             && kvCacheLengths.getDataType() == DataType::kINT32 && stateIndices.getDataType() == DataType::kINT32,
         "acceptedIndices, acceptLengths, kvCacheLengths, and stateIndices should be INT32.");
-    check::check(kvCacheType == DataType::kHALF || kvCacheType == DataType::kFP8, "kvCacheType should be HALF or FP8.");
+    check::check(kvCacheType == DataType::kHALF || kvCacheType == DataType::kFP8 || kvCacheType == DataType::kINT8,
+        "kvCacheType should be HALF, FP8 or INT8.");
     check::check(deviceLayerInfos != nullptr, "deviceLayerInfos must not be null.");
     check::check(pageTable != nullptr, "pageTable must not be null.");
     check::check(numPages > 0, "numPages must be positive.");
@@ -883,6 +884,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
                     stateIndicesPtr, deviceLayerInfos, activeBatchSize, residentPoolRows, maxDepth, pageTable, numPages,
                     maxPagesPerSeq);
         }
+        else if (kvCacheType == DataType::kINT8)
+        {
+            // One-byte elements are moved as raw bytes, like FP8; no conversion happens here.
+            eagleBaseCommitKVCacheBatchedKernel<64, kEagleMaxAcceptedPathLength, int8_t>
+                <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
+                    stateIndicesPtr, deviceLayerInfos, activeBatchSize, residentPoolRows, maxDepth, pageTable, numPages,
+                    maxPagesPerSeq);
+        }
         else
         {
 #if SUPPORTS_FP8
@@ -899,6 +908,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
         if (kvCacheType == DataType::kHALF)
         {
             eagleBaseCommitKVCacheBatchedKernel<128, kEagleMaxAcceptedPathLength, half>
+                <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
+                    stateIndicesPtr, deviceLayerInfos, activeBatchSize, residentPoolRows, maxDepth, pageTable, numPages,
+                    maxPagesPerSeq);
+        }
+        else if (kvCacheType == DataType::kINT8)
+        {
+            // One-byte elements are moved as raw bytes, like FP8; no conversion happens here.
+            eagleBaseCommitKVCacheBatchedKernel<128, kEagleMaxAcceptedPathLength, int8_t>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
                     stateIndicesPtr, deviceLayerInfos, activeBatchSize, residentPoolRows, maxDepth, pageTable, numPages,
                     maxPagesPerSeq);
@@ -923,6 +940,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
                     stateIndicesPtr, deviceLayerInfos, activeBatchSize, residentPoolRows, maxDepth, pageTable, numPages,
                     maxPagesPerSeq);
         }
+        else if (kvCacheType == DataType::kINT8)
+        {
+            // One-byte elements are moved as raw bytes, like FP8; no conversion happens here.
+            eagleBaseCommitKVCacheBatchedKernel<256, kEagleMaxAcceptedPathLength, int8_t>
+                <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
+                    stateIndicesPtr, deviceLayerInfos, activeBatchSize, residentPoolRows, maxDepth, pageTable, numPages,
+                    maxPagesPerSeq);
+        }
         else
         {
 #if SUPPORTS_FP8
@@ -939,6 +964,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
         if (kvCacheType == DataType::kHALF)
         {
             eagleBaseCommitKVCacheBatchedKernel<512, kEagleMaxAcceptedPathLength, half>
+                <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
+                    stateIndicesPtr, deviceLayerInfos, activeBatchSize, residentPoolRows, maxDepth, pageTable, numPages,
+                    maxPagesPerSeq);
+        }
+        else if (kvCacheType == DataType::kINT8)
+        {
+            // One-byte elements are moved as raw bytes, like FP8; no conversion happens here.
+            eagleBaseCommitKVCacheBatchedKernel<512, kEagleMaxAcceptedPathLength, int8_t>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
                     stateIndicesPtr, deviceLayerInfos, activeBatchSize, residentPoolRows, maxDepth, pageTable, numPages,
                     maxPagesPerSeq);

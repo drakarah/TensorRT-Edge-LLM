@@ -83,6 +83,7 @@ def _attention_plugin_translation(
     attention_sinks: Sequence[float] = (),
     enable_attention_sink: int = 0,
     enable_contiguous_query_swa: int = 0,
+    enable_int8_kv_cache: int = 0,
     query_start_offsets: onnxscript.INT32 = None,
     attention_sequence_lengths: onnxscript.INT32 = None,
     execution_phase_marker: onnxscript.INT32 = None,
@@ -143,6 +144,7 @@ def _attention_plugin_translation(
         enable_kv_shared=enable_kv_shared,
         enable_attention_sink=enable_attention_sink,
         enable_contiguous_query_swa=enable_contiguous_query_swa,
+        enable_int8_kv_cache=enable_int8_kv_cache,
         plugin_version="1",
         _outputs=2,
     )
@@ -181,6 +183,7 @@ def _attention_plugin_dispatch(
     attention_sinks=(),
     enable_attention_sink=0,
     enable_contiguous_query_swa=0,
+    enable_int8_kv_cache=0,
     query_start_offsets=None,
     attention_sequence_lengths=None,
     execution_phase_marker=None,
@@ -202,7 +205,7 @@ def _attention_plugin_dispatch(
         q_norm_gamma, k_norm_gamma, rms_norm_eps, enable_qk_norm,
         qk_norm_post_rope, enable_kv_shared, skip_softmax_scale,
         swa_kv_cache_mode, attention_sinks, enable_attention_sink,
-        enable_contiguous_query_swa, query_start_offsets,
+        enable_contiguous_query_swa, enable_int8_kv_cache, query_start_offsets,
         attention_sequence_lengths, execution_phase_marker,
         context_sequence_count_carrier)
 

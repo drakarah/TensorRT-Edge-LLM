@@ -51,7 +51,8 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     : mConfig(config)
 {
     (void) stream;
-    check::check(mConfig.kvCacheType == nvinfer1::DataType::kHALF || mConfig.kvCacheType == nvinfer1::DataType::kFP8,
+    check::check(mConfig.kvCacheType == nvinfer1::DataType::kHALF || mConfig.kvCacheType == nvinfer1::DataType::kFP8
+            || mConfig.kvCacheType == nvinfer1::DataType::kINT8,
         "Unsupported KV cache dtype.");
     check::check(mConfig.numAttentionLayers >= 0, "numAttentionLayers must be non-negative.");
     check::check(mConfig.maxBatchSize > 0, "maxBatchSize must be positive.");
@@ -94,8 +95,8 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
             boundedCapability = resolvedCapacity;
         }
     }
-    check::check(!boundedCapability.has_value() || mConfig.kvCacheType != nvinfer1::DataType::kFP8,
-        "KVCacheManager: SWA-capable KV configurations do not support FP8 KV cache.");
+    check::check(!boundedCapability.has_value() || mConfig.kvCacheType == nvinfer1::DataType::kHALF,
+        "KVCacheManager: SWA-capable KV configurations do not support a quantized (FP8/INT8) KV cache.");
     if (boundedCapability.has_value())
     {
         int64_t const minimumSwaPages = computeMinimumSwaPoolPages(mConfig.maxBatchSize, *boundedCapability);
@@ -121,7 +122,9 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     }
 
     size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
-    char const* kvCacheTypeStr = (mConfig.kvCacheType == nvinfer1::DataType::kHALF) ? "kHALF" : "kFP8";
+    char const* kvCacheTypeStr = (mConfig.kvCacheType == nvinfer1::DataType::kHALF) ? "kHALF"
+        : (mConfig.kvCacheType == nvinfer1::DataType::kINT8)                         ? "kINT8"
+                                                                                      : "kFP8";
 
     // Determine uniformity: check if all layers share the same numKVHeads and headDim.
     mIsUniform = true;

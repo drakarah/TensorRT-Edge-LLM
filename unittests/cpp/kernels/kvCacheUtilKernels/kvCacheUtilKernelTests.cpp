@@ -110,7 +110,7 @@ TEST(GatherPagedKVToSplitTest, IdentityMatchesHostReference)
     rt::Tensor kvSeqLens = makeKvSeqLens(std::vector<int32_t>(B, S));
     kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
         pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), pagesPerBatch, B, S, H, D,
-        sizeof(half), /*dequantFp8=*/false, /*kScale=*/1.f, /*vScale=*/1.f, stream);
+        sizeof(half), kernel::KVPoolQuant::kNONE, /*kScale=*/1.f, /*vScale=*/1.f, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<half> const kOutHost = copyDeviceToHost<half>(kDstTensor);
     std::vector<half> const vOutHost = copyDeviceToHost<half>(vDstTensor);
@@ -151,7 +151,7 @@ TEST(GatherPagedKVToSplitTest, IdentityByteCopyIsDtypeAgnostic)
     rt::Tensor kvSeqLens = makeKvSeqLens(std::vector<int32_t>(B, S));
     kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
         pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), pagesPerBatch, B, S, H, D,
-        sizeof(uint8_t), /*dequantFp8=*/false, /*kScale=*/1.f, /*vScale=*/1.f, stream);
+        sizeof(uint8_t), kernel::KVPoolQuant::kNONE, /*kScale=*/1.f, /*vScale=*/1.f, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<uint8_t> const kOutHost = copyDeviceToHost<uint8_t>(kDstTensor);
     std::vector<uint8_t> const vOutHost = copyDeviceToHost<uint8_t>(vDstTensor);
@@ -226,7 +226,7 @@ TEST(GatherPagedKVToSplitTest, ScrambledTableMatchesHostGather)
     rt::Tensor kvSeqLens = makeKvSeqLens({S, 2 * rt::kTOKENS_PER_PAGE});
     kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
         pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), maxPagesPerSeq, B, S, H, D,
-        sizeof(half), /*dequantFp8=*/false, /*kScale=*/1.f, /*vScale=*/1.f, stream);
+        sizeof(half), kernel::KVPoolQuant::kNONE, /*kScale=*/1.f, /*vScale=*/1.f, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<half> const kOutHost = copyDeviceToHost<half>(kDstTensor);
     std::vector<half> const vOutHost = copyDeviceToHost<half>(vDstTensor);
@@ -263,7 +263,7 @@ TEST(GatherPagedKVToSplitTest, AllPagesUnallocatedZeroFills)
     rt::Tensor kvSeqLens = makeKvSeqLens({0}); // zero live tokens -> all pages are legal tail.
     kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
         pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), maxPagesPerSeq, B, S, H, D,
-        sizeof(half), /*dequantFp8=*/false, /*kScale=*/1.f, /*vScale=*/1.f, stream);
+        sizeof(half), kernel::KVPoolQuant::kNONE, /*kScale=*/1.f, /*vScale=*/1.f, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<half> const kOutHost = copyDeviceToHost<half>(kDstTensor);
     std::vector<half> const vOutHost = copyDeviceToHost<half>(vDstTensor);
@@ -307,7 +307,7 @@ TEST(GatherPagedKVToSplitTest, Fp8DequantMatchesHostReference)
     rt::Tensor kvSeqLens = makeKvSeqLens(std::vector<int32_t>(B, S));
     kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
         pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), pagesPerBatch, B, S, H, D,
-        sizeof(__nv_fp8_e4m3), /*dequantFp8=*/true, kScale, vScale, stream);
+        sizeof(__nv_fp8_e4m3), kernel::KVPoolQuant::kFP8, kScale, vScale, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<half> const kOutHost = copyDeviceToHost<half>(kDstTensor);
     std::vector<half> const vOutHost = copyDeviceToHost<half>(vDstTensor);
@@ -356,7 +356,7 @@ TEST(GatherPagedKVToSplitTest, InRangeUnmappedPageZeroFillsDestination)
     rt::Tensor kvSeqLens = makeKvSeqLens({S}); // all pages live.
     kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
         pageTableTensor.dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), maxPagesPerSeq, B, S, H, D,
-        sizeof(half), /*dequantFp8=*/false, /*kScale=*/1.f, /*vScale=*/1.f, stream);
+        sizeof(half), kernel::KVPoolQuant::kNONE, /*kScale=*/1.f, /*vScale=*/1.f, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const kOut = copyDeviceToHost<half>(kDstTensor);

@@ -48,9 +48,11 @@ void validateStateContract(LLMEngineConfig const& config, char const* label)
 
     if (config.numAttentionLayers > 0)
     {
-        // Snapshot byte copies and page-table rebinds preserve both supported KV storage layouts.
-        ELLM_CHECK(config.kvCacheDtype == nvinfer1::DataType::kHALF || config.kvCacheDtype == nvinfer1::DataType::kFP8,
-            std::string(label) + " uses a KV dtype outside the supported context-reuse boundary (FP16 or FP8 KV).");
+        // Snapshot byte copies and page-table rebinds preserve every supported KV storage layout.
+        ELLM_CHECK(config.kvCacheDtype == nvinfer1::DataType::kHALF || config.kvCacheDtype == nvinfer1::DataType::kFP8
+                || config.kvCacheDtype == nvinfer1::DataType::kINT8,
+            std::string(label)
+                + " uses a KV dtype outside the supported context-reuse boundary (FP16, FP8 or INT8 KV).");
         // SWA changes the kernel read mask, not physical retention: context reuse requires a full logical allocation
         // for every attention layer so cached pages remain valid when rebound across requests.
         int64_t const minimumActivePages

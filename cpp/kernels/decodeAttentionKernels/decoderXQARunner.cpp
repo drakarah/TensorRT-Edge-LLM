@@ -66,6 +66,7 @@ XQADataType trtToXqaDataType(nvinfer1::DataType type)
     case nvinfer1::DataType::kHALF: xqaType = XQADataType::DATA_TYPE_FP16; break;
     case nvinfer1::DataType::kBF16: xqaType = XQADataType::DATA_TYPE_BF16; break;
     case nvinfer1::DataType::kFP8: xqaType = XQADataType::DATA_TYPE_E4M3; break;
+    case nvinfer1::DataType::kINT8: xqaType = XQADataType::DATA_TYPE_INT8; break;
     default: throw std::runtime_error("Unsupported datatype for XQA.");
     }
     return xqaType;

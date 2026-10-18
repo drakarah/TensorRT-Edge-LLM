@@ -301,11 +301,11 @@ __global__ void gatherPagedKVToSplitKernel(uint8_t const* __restrict__ pool, uin
     }
 }
 
-#if SUPPORTS_FP8
-//! FP8 -> FP16 dequant gather. Same page addressing as the byte-copy kernel, but the pool is FP8 e4m3
-//! and each element is dequantized (value * scale) into the FP16 destination, so the downstream
-//! `dataPointer<half>()` consumers see real FP16 rather than reinterpreted FP8 bytes.
-__global__ void gatherDequantFp8PagedKVToSplitKernel(__nv_fp8_e4m3 const* __restrict__ pool, half* __restrict__ kDst,
+//! One-byte pool -> FP16 dequant gather (FP8 e4m3 or INT8). Same page addressing as the byte-copy kernel,
+//! but each element is dequantized (value * scale) into the FP16 destination, so the downstream
+//! `dataPointer<half>()` consumers see real FP16 rather than reinterpreted one-byte values.
+template <typename TCache>
+__global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ pool, half* __restrict__ kDst,
     half* __restrict__ vDst, int32_t const* __restrict__ pageTable, int32_t const* __restrict__ kvSeqLens,
     int32_t maxPagesPerSeq, int32_t seqLen, int32_t tokenElems, float kScale, float vScale)
 {
@@ -340,19 +340,18 @@ __global__ void gatherDequantFp8PagedKVToSplitKernel(__nv_fp8_e4m3 const* __rest
         }
         return;
     }
-    __nv_fp8_e4m3 const* kSrc = pool + static_cast<size_t>(kPage) * pageElems;
-    __nv_fp8_e4m3 const* vSrc = pool + static_cast<size_t>(vPage) * pageElems;
+    TCache const* kSrc = pool + static_cast<size_t>(kPage) * pageElems;
+    TCache const* vSrc = pool + static_cast<size_t>(vPage) * pageElems;
     for (size_t i = threadIdx.x; i < elemsToCopy; i += blockDim.x)
     {
         kDst[dstOffset + i] = __float2half(static_cast<float>(kSrc[i]) * kScale);
         vDst[dstOffset + i] = __float2half(static_cast<float>(vSrc[i]) * vScale);
     }
 }
-#endif // SUPPORTS_FP8
 
 void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t const* pageTable, int32_t const* kvSeqLens,
     int32_t maxPagesPerSeq, int32_t batchSize, int32_t seqLen, int32_t numKVHeads, int32_t headDim, size_t elemSize,
-    bool dequantFp8, float kScale, float vScale, cudaStream_t stream)
+    KVPoolQuant poolQuant, float kScale, float vScale, cudaStream_t stream)
 {
     check::check(batchSize > 0 && seqLen > 0 && numKVHeads > 0 && headDim > 0 && elemSize > 0,
         "gatherPagedKVToSplit: batchSize, seqLen, numKVHeads, headDim, and elemSize must all be positive.");
@@ -369,15 +368,21 @@ void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t cons
 
     constexpr int32_t kTHREADS_PER_BLOCK = 256;
     dim3 grid(static_cast<uint32_t>(batchSize), static_cast<uint32_t>(numLogicalPages));
-    if (dequantFp8)
+    if (poolQuant == KVPoolQuant::kFP8)
     {
 #if SUPPORTS_FP8
-        gatherDequantFp8PagedKVToSplitKernel<<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
+        gatherDequantPagedKVToSplitKernel<__nv_fp8_e4m3><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
             static_cast<__nv_fp8_e4m3 const*>(pool), static_cast<half*>(kDst), static_cast<half*>(vDst), pageTable,
             kvSeqLens, maxPagesPerSeq, seqLen, tokenElems, kScale, vScale);
 #else
         throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
 #endif
+    }
+    else if (poolQuant == KVPoolQuant::kINT8)
+    {
+        gatherDequantPagedKVToSplitKernel<int8_t><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
+            static_cast<int8_t const*>(pool), static_cast<half*>(kDst), static_cast<half*>(vDst), pageTable,
+            kvSeqLens, maxPagesPerSeq, seqLen, tokenElems, kScale, vScale);
     }
     else
     {

@@ -81,7 +81,11 @@ int32_t getKVCacheEnum(nvinfer1::DataType kvDataType)
     {
         return xqa::kernels::kKV_CACHE_ELEM_FP8_E4M3;
     }
-    throw std::runtime_error("XQA NVRTC JIT supports only FP16 and FP8 KV cache.");
+    if (kvDataType == nvinfer1::DataType::kINT8)
+    {
+        return xqa::kernels::kKV_CACHE_ELEM_INT8;
+    }
+    throw std::runtime_error("XQA NVRTC JIT supports only FP16, FP8 and INT8 KV cache.");
 }
 
 std::string getGpuArchitectureOption(int32_t sm)
@@ -282,7 +286,8 @@ bool canCompileXQAKernel(int32_t numQHeads, int32_t numKVHeads, int32_t headSize
     // NVRTC will happily compile CACHE_ELEM_ENUM=2 for an SM without native
     // FP8 converts, but they fall back to software emulation: the cubin comes
     // out ~3.6x larger and correspondingly slow, with no diagnostic.
-    bool const checkKVType = kvDataType == nvinfer1::DataType::kHALF
+    // INT8 converts are native on every SM listed above (SM80+), so INT8 KV needs no extra gate.
+    bool const checkKVType = kvDataType == nvinfer1::DataType::kHALF || kvDataType == nvinfer1::DataType::kINT8
         || (kvDataType == nvinfer1::DataType::kFP8 && contains(kFP8_CAPABLE_SM_VERSIONS, smVersion));
     bool const checkSMVersion = contains(kALLOWED_SM_VERSIONS, smVersion);
 
