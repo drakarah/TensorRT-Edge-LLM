@@ -564,6 +564,11 @@ def _repack_gptq_weights(model: nn.Module) -> None:
                 packed, perm = repack_gptq_to_plugin(
                     qw, qz, g_idx_buf, getattr(module, "zero_point_offset", 1))
                 module._buffers["qweight"] = packed
+                # An identity permutation (every checkpoint without desc_act) would still export as an ONNX Gather in front of the GEMM, which
+                # TensorRT fuses into the neighbouring kernel with its index table and a signed-index normalisation (a runtime integer division
+                # per element). GPTQLinear.forward skips a None permutation.
+                if perm is not None and torch.equal(perm, torch.arange(perm.numel(), dtype=perm.dtype, device=perm.device)):
+                    perm = None
                 module._buffers["int4_act_perm"] = perm
                 logger.debug("Repacked GPTQ qweight: %s -> %s", list(qw.shape),
                              list(packed.shape))
