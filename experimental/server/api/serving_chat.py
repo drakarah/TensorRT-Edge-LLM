@@ -18,6 +18,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -265,9 +266,13 @@ class OpenAIServingChat:
         num_logprobs = 0
         if request.logprobs:
             num_logprobs = max(1, request.top_logprobs or 0)
-        greedy = request.temperature == 0
+        # Gemma 4 MTP tree drafting verifies greedy requests only; with
+        # EDGELLM_FORCE_GREEDY=1 every request is served greedily instead of
+        # being refused (the seed and sampling fields are then ignored).
+        greedy = (request.temperature == 0
+                  or os.environ.get("EDGELLM_FORCE_GREEDY") == "1")
         sampling = SamplingParams(
-            temperature=request.temperature,
+            temperature=0.0 if greedy else request.temperature,
             top_p=1.0 if greedy else request.top_p,
             top_k=1 if greedy else request.top_k,
             seed=request.seed,
