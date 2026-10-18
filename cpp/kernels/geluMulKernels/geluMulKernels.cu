@@ -31,51 +31,71 @@ constexpr float kGELU_CUBIC{0.044715F};
 constexpr float kCLAMP{2048.0F};
 constexpr int32_t kTHREADS{256};
 
+//! tanh without the hardware approximation (MUFU.TANH has ~2^-11 relative error, which is a large relative error in 1 + tanh for negative arguments):
+//! a minimax polynomial for |x| < 0.6, 1 - 2 / (exp(2|x|) + 1) above, saturated at 9.0109 (the formulation of the TensorRT-generated kernel it replaces).
+__device__ __forceinline__ float tanhAccurate(float x)
+{
+    float const ax = fabsf(x);
+    float const x2 = x * x;
+    float poly = fmaf(x2, 0.015739683F, -0.052303962409496307F);
+    poly = fmaf(x2, poly, 0.13315297663211822F);
+    poly = fmaf(x2, poly, -0.33332768082618713F);
+    poly = x2 * poly;
+    float const small = fmaf(x, poly, x);
+    float e;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(ax * 2.8853900817779268F));
+    float const large = fmaf(__fdividef(1.0F, e + 1.0F), -2.0F, 1.0F);
+    float const t = ax >= 9.0109F ? 1.0F : large;
+    return ax < 0.6F ? small : copysignf(t, x);
+}
+
 __device__ __forceinline__ float geluTanhMulOne(float gate, float up)
 {
     float const inner = kSQRT_2_OVER_PI * (gate + kGELU_CUBIC * gate * gate * gate);
-    float const act = 0.5F * gate * (1.0F + tanhf(inner));
+    float const act = 0.5F * gate * (1.0F + tanhAccurate(inner));
     return fminf(fmaxf(act * up, -kCLAMP), kCLAMP);
 }
 
-//! width % 8 == 0 and 16-byte aligned rows: one thread per 8 consecutive output elements.
-__global__ void geluTanhMulVecKernel(uint4 const* __restrict__ input, uint4* __restrict__ output, int64_t vecPerRow, int64_t total)
+//! width % 8 == 0 and 16-byte aligned rows: one thread per 8 consecutive output elements; blockIdx.y strides over the rows (no division).
+__global__ void geluTanhMulVecKernel(uint4 const* __restrict__ input, uint4* __restrict__ output, int32_t vecPerRow, int64_t rows)
 {
-    int64_t const idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= total)
+    int32_t const col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= vecPerRow)
     {
         return;
     }
-    int64_t const row = idx / vecPerRow;
-    int64_t const col = idx - row * vecPerRow;
-    uint4 const gate = input[row * 2 * vecPerRow + col];
-    uint4 const up = input[row * 2 * vecPerRow + vecPerRow + col];
-    uint4 result;
-    auto const* g = reinterpret_cast<__half2 const*>(&gate);
-    auto const* u = reinterpret_cast<__half2 const*>(&up);
-    auto* r = reinterpret_cast<__half2*>(&result);
-#pragma unroll
-    for (int32_t i = 0; i < 4; ++i)
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y)
     {
-        float2 const gf = __half22float2(g[i]);
-        float2 const uf = __half22float2(u[i]);
-        r[i] = __floats2half2_rn(geluTanhMulOne(gf.x, uf.x), geluTanhMulOne(gf.y, uf.y));
+        uint4 const gate = input[row * 2 * vecPerRow + col];
+        uint4 const up = input[row * 2 * vecPerRow + vecPerRow + col];
+        uint4 result;
+        auto const* g = reinterpret_cast<__half2 const*>(&gate);
+        auto const* u = reinterpret_cast<__half2 const*>(&up);
+        auto* r = reinterpret_cast<__half2*>(&result);
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            float2 const gf = __half22float2(g[i]);
+            float2 const uf = __half22float2(u[i]);
+            r[i] = __floats2half2_rn(geluTanhMulOne(gf.x, uf.x), geluTanhMulOne(gf.y, uf.y));
+        }
+        output[row * vecPerRow + col] = result;
     }
-    output[idx] = result;
 }
 
-__global__ void geluTanhMulScalarKernel(__half const* __restrict__ input, __half* __restrict__ output, int32_t width, int64_t total)
+__global__ void geluTanhMulScalarKernel(__half const* __restrict__ input, __half* __restrict__ output, int32_t width, int64_t rows)
 {
-    int64_t const idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= total)
+    int32_t const col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= width)
     {
         return;
     }
-    int64_t const row = idx / width;
-    int64_t const col = idx - row * width;
-    float const gate = __half2float(input[row * 2 * width + col]);
-    float const up = __half2float(input[row * 2 * width + width + col]);
-    output[idx] = __float2half_rn(geluTanhMulOne(gate, up));
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y)
+    {
+        float const gate = __half2float(input[row * 2 * width + col]);
+        float const up = __half2float(input[row * 2 * width + width + col]);
+        output[row * width + col] = __float2half_rn(geluTanhMulOne(gate, up));
+    }
 }
 } // namespace
 
@@ -86,20 +106,19 @@ void launchGeluTanhMul(void const* input, void* output, int64_t rows, int32_t wi
         return;
     }
     bool const aligned = (reinterpret_cast<uintptr_t>(input) % 16 == 0) && (reinterpret_cast<uintptr_t>(output) % 16 == 0);
+    unsigned const gridY = static_cast<unsigned>(rows < 65535 ? rows : 65535);
     if (width % 8 == 0 && aligned)
     {
-        int64_t const vecPerRow = width / 8;
-        int64_t const total = rows * vecPerRow;
-        int64_t const blocks = (total + kTHREADS - 1) / kTHREADS;
-        geluTanhMulVecKernel<<<static_cast<unsigned>(blocks), kTHREADS, 0, stream>>>(
-            static_cast<uint4 const*>(input), static_cast<uint4*>(output), vecPerRow, total);
+        int32_t const vecPerRow = width / 8;
+        dim3 const grid((vecPerRow + kTHREADS - 1) / kTHREADS, gridY);
+        geluTanhMulVecKernel<<<grid, kTHREADS, 0, stream>>>(
+            static_cast<uint4 const*>(input), static_cast<uint4*>(output), vecPerRow, rows);
     }
     else
     {
-        int64_t const total = rows * width;
-        int64_t const blocks = (total + kTHREADS - 1) / kTHREADS;
-        geluTanhMulScalarKernel<<<static_cast<unsigned>(blocks), kTHREADS, 0, stream>>>(
-            static_cast<__half const*>(input), static_cast<__half*>(output), width, total);
+        dim3 const grid((width + kTHREADS - 1) / kTHREADS, gridY);
+        geluTanhMulScalarKernel<<<grid, kTHREADS, 0, stream>>>(
+            static_cast<__half const*>(input), static_cast<__half*>(output), width, rows);
     }
 }
 
