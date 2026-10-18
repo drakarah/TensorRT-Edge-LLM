@@ -53,6 +53,9 @@ public:
 private:
     LLMEngineConfig mConfig{};
     Tensor mPleTable{};
+    Tensor mPleScales{};                                           //!< fp16 [vocab, numPleInputs] when INT8
+    bool mPleInt8{false};                                          //!< table stored as INT8 + per-slice scales
+    nvinfer1::DataType mOutputDataType{nvinfer1::DataType::kHALF}; //!< dtype of the engine PLE inputs
     Tensor mPleOutputBuffer{}; //!< Unified owned backing buffer for all PLE layer outputs.
     //! Non-owned tensor views into mPleOutputBuffer. TensorMap stores pointers to these stable objects.
     std::vector<Tensor> mPleOutputViews{};
