@@ -696,6 +696,38 @@ _qkv_concat_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::GeluTanhMulPlugin
+# ---------------------------------------------------------------------------
+
+_gelu_tanh_mul_schema = OpSchema(
+    name="GeluTanhMulPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="clamp(gelu_tanh(gate) * up, -2048, 2048) of a fused FP16 gate/up tensor [..., 2 * width] -> FP16 [..., width] (FP32 arithmetic).",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="gate_up",
+            description="Fused gate and up projection output, gate in the first half",
+            type_str="T",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="activated",
+            description="clamp(gelu_tanh(gate) * up)",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)"],
+            "Input and output data type.",
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::Int4GroupwiseGemmPlugin (AWQ swizzled weights)
 # ---------------------------------------------------------------------------
 
@@ -2438,6 +2470,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _trt_mxfp8_dequantize_linear_schema,
     _int4_groupwise_gemm_schema,
     _qkv_concat_schema,
+    _gelu_tanh_mul_schema,
     _int4_groupwise_gemm_v2_schema,
     _nvfp4_a16_gemm_schema,
     _nvfp4_a16_blackwell_gemm_schema,

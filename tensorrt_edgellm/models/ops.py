@@ -1062,6 +1062,28 @@ def _(q, k, v):
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt::gelu_tanh_mul
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::gelu_tanh_mul", mutates_args=())
+def gelu_tanh_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    """clamp(gelu_tanh(gate) * up, -2048, 2048) of a fused [..., 2 * width] gate/up projection output, FP32 arithmetic, FP16 result.
+
+    One plugin kernel instead of the generated Cast / Gelu / Mul / Clip / Cast chain (which TensorRT may split into several kernels)."""
+    gate, up = gate_up.to(torch.float32).chunk(2, dim=-1)
+    out = torch.nn.functional.gelu(gate, approximate="tanh") * up
+    return out.clamp(-2048.0, 2048.0).to(torch.float16)
+
+
+@gelu_tanh_mul.register_fake
+def _(gate_up):
+    if gate_up.shape[-1] % 2 != 0:
+        raise ValueError("gate_up must have an even last dimension")
+    return torch.empty(*gate_up.shape[:-1], gate_up.shape[-1] // 2, dtype=torch.float16, device=gate_up.device)
+
+
+# ---------------------------------------------------------------------------
 # NVFP4-A16 export target selector (dense GEMM and Nemotron-H routed MoE)
 # ---------------------------------------------------------------------------
 

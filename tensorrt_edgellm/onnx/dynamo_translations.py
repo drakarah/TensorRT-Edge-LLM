@@ -496,6 +496,12 @@ def _qkv_concat_translation(
     )
 
 
+@script()
+def _gelu_tanh_mul_translation(
+    gate_up: onnxscript.FLOAT16, ) -> onnxscript.FLOAT16:
+    return _trt_edgellm.GeluTanhMulPlugin(gate_up)
+
+
 # ---------------------------------------------------------------------------
 # INT8 SmoothQuant ops
 # ---------------------------------------------------------------------------
@@ -1801,6 +1807,8 @@ def build_custom_translation_table() -> dict:
         _int4_groupwise_gemm_v2_translation,
         torch.ops.trt.qkv_concat.default:
         _qkv_concat_translation,
+        torch.ops.trt.gelu_tanh_mul.default:
+        _gelu_tanh_mul_translation,
         torch.ops.trt.nvfp4_a16_gemm.default:
         _nvfp4_a16_gemm_translation,
         torch.ops.trt.nvfp4_a16_blackwell_gemm.default:

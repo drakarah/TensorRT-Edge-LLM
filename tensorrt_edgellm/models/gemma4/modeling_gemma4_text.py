@@ -33,7 +33,7 @@ from ..default.modeling_default import (MLP, Attention, CausalLM, DecoderLayer,
                                         _concat_hidden_in_provider_order)
 from ..int8_kv_cache import int8_kv_qkv_scales, kv_cache_torch_dtype
 from ..linear import TPMode, make_linear
-from ..ops import (KV_PAGE_SIZE, attention_plugin, int4_moe_plugin,
+from ..ops import (KV_PAGE_SIZE, attention_plugin, gelu_tanh_mul, int4_moe_plugin,
                    nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
                    use_geforce_nvfp4_moe)
 
@@ -908,6 +908,10 @@ class Gemma4MLP(MLP):
             tp_mode=TPMode.ROW,
         )
         self.act_fn = _resolve_hidden_activation(config.hidden_activation)
+        # EDGELLM_GEMMA4_GELU_PLUGIN=1: one plugin kernel (GeluTanhMulPlugin) for gelu_tanh(gate) * up + clamp + FP16 cast of the fused gate/up output,
+        # instead of the exported Cast / Gelu / Mul / Clip / Cast chain that TensorRT lowers into one to three generated kernels.
+        self._gelu_plugin = (os.environ.get("EDGELLM_GEMMA4_GELU_PLUGIN", "0") == "1"
+                             and config.hidden_activation in ("gelu_pytorch_tanh", "gelu_tanh"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Compute gate*up in f32 to prevent fp16 overflow.
@@ -916,6 +920,8 @@ class Gemma4MLP(MLP):
         # (dot product of 21504 elements at +/-65504 overflows fp16 output range),
         # which then causes NaN in the subsequent RMSNorm (Inf*0=NaN).
         fused_gate_up = getattr(self, "gate_up_proj", None)
+        if fused_gate_up is not None and self._gelu_plugin:
+            return self.down_proj(gelu_tanh_mul(fused_gate_up(hidden_states)))
         if fused_gate_up is not None:
             # One INT4 GEMV for gate and up (see fuse_gemma4_int4_projections).
             gate, up = fused_gate_up(hidden_states).to(torch.float32).split(self.gate_up_split, dim=-1)
