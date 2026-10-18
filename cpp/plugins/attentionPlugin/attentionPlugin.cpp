@@ -84,6 +84,51 @@ bool requestRopePdl()
     return enabled;
 }
 
+//! XQA split-KV mode requested for engine builds: EDGELLM_XQA_MULTI_BLOCK unset/"0"/"off" = 1 (off),
+//! "auto" = 0, an integer N > 1 = N splits. Only read when an engine is built; the value is serialized.
+int32_t xqaMultiBlockFromEnv()
+{
+    char const* value = std::getenv("EDGELLM_XQA_MULTI_BLOCK");
+    if (value == nullptr || *value == '\0' || std::string(value) == "0" || std::string(value) == "off")
+    {
+        return 1;
+    }
+    if (std::string(value) == "auto")
+    {
+        return 0;
+    }
+    int32_t const splits = std::atoi(value);
+    return splits > 1 ? splits : 1;
+}
+
+//! Number of SMs of the current device (cached).
+int32_t currentDeviceSmCount()
+{
+    static int32_t const count = []() {
+        int32_t device{0};
+        int32_t smCount{0};
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
+        return smCount;
+    }();
+    return count;
+}
+
+//! Upper bound of the XQA merge scratch one launch of this plugin can need. Sequences per launch:
+//! KV heads x token blocks (at most 8 for spec-decode verify trees) x batch; splits: the SM count
+//! (auto) or the fixed split.
+size_t xqaMultiBlockScratchBound(int32_t multiBlock, int32_t numKVHeads, int32_t headSize, int64_t batchSize)
+{
+    if (multiBlock == 1)
+    {
+        return 0;
+    }
+    constexpr int64_t kMAX_TOKEN_BLOCKS_PER_KV_HEAD{8};
+    int64_t const splits = multiBlock == 0 ? currentDeviceSmCount() : multiBlock;
+    int64_t const nbSubSeq = splits * numKVHeads * kMAX_TOKEN_BLOCKS_PER_KV_HEAD * batchSize;
+    return xqaMultiBlockScratchUpperBound(headSize, static_cast<size_t>(nbSubSeq)) + kDEVICE_ALIGNMENT;
+}
+
 bool isFp8KVCacheSupportedSM(int32_t smVersion)
 {
     // FP8 KV cache needs an FP8 XQA decode kernel, which is available only for these SMs.
@@ -684,6 +729,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     , mEnableContiguousQuerySwa(parsePluginScalarField<int32_t>("enable_contiguous_query_swa", fc).value_or(0))
     , mEnableAttentionSink(parsePluginScalarField<int32_t>("enable_attention_sink", fc).value_or(0))
     , mEnableFp8KVCache(parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc).value_or(0))
+    // Absent when building from ONNX (read the build environment), present in a serialized engine.
+    , mXqaMultiBlock(parsePluginScalarField<int32_t>("xqa_multi_block", fc).value_or(xqaMultiBlockFromEnv()))
     , mSlidingWindowSize(parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1))
     , mSupportsBoundedKVCache(parsePluginScalarField<int32_t>("supports_bounded_kv_cache", fc).value_or(0) != 0)
     , mSkipSoftmaxScaleFactor(parsePluginScalarField<float>("skip_softmax_scale_factor", fc).value_or(0.f))
@@ -911,6 +958,7 @@ IPluginV3* AttentionPlugin::clone() noexcept
         p->mQKNormPostRope = mQKNormPostRope;
         p->mEnableKVShared = mEnableKVShared;
         p->mEnableContiguousQuerySwa = mEnableContiguousQuerySwa;
+        p->mXqaMultiBlock = mXqaMultiBlock;
         p->mEnableAttentionSink = mEnableAttentionSink;
         p->mRmsNormEps = mRmsNormEps;
         p->mSkipSoftmaxScaleFactor = mSkipSoftmaxScaleFactor;
@@ -1299,8 +1347,10 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
         mNumKVHeads, mHeadSize, mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, mEnableFp8KVCache,
         mEnableVisionBlockAttention != 0);
 
-    LOG_DEBUG("AttentionPlugin workspace size: %zu bytes", workspaceSize);
-    return workspaceSize;
+    size_t const xqaScratchBytes = xqaMultiBlockScratchBound(mXqaMultiBlock, mNumKVHeads, mHeadSize, maxBatchSize);
+    LOG_DEBUG("AttentionPlugin workspace size: %zu bytes (+%zu XQA multi-block scratch)", workspaceSize,
+        xqaScratchBytes);
+    return workspaceSize + xqaScratchBytes;
 }
 
 int32_t AttentionPlugin::getAliasedInput([[maybe_unused]] int32_t outputIndex) noexcept
@@ -2333,6 +2383,18 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         params.kvCache.tokensPerPage = static_cast<uint32_t>(rt::kTOKENS_PER_PAGE);
         params.slidingWinSize = mSlidingWindowSize > 0 ? static_cast<uint32_t>(mSlidingWindowSize) : 0U;
         params.attentionSinks = attentionSinkDevicePtr;
+        if (mXqaMultiBlock != 1 && mXqaSemaphores != nullptr)
+        {
+            size_t const scratchBytes
+                = xqaMultiBlockScratchBound(mXqaMultiBlock, mNumKVHeads, mHeadSize, runtimeBatchSize);
+            rt::Tensor scratchTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {static_cast<int64_t>(scratchBytes)}, DataType::kINT8);
+            params.nbSubSeqPerSeq
+                = mXqaMultiBlock == 0 ? kXQA_MULTI_BLOCK_AUTO : static_cast<uint32_t>(mXqaMultiBlock);
+            params.semaphores = static_cast<int32_t*>(mXqaSemaphores.get());
+            params.scratch = scratchTensor.rawPointer();
+            params.scratchBytes = scratchBytes;
+        }
         if (executionMode == AttentionExecutionMode::kTREE_DECODING)
         {
             // Execute tree attention decoding.
@@ -2378,7 +2440,23 @@ int32_t AttentionPlugin::onShapeChange(
 
 IPluginV3* AttentionPlugin::attachToContext([[maybe_unused]] IPluginResourceContext* context) noexcept
 {
-    return clone();
+    auto* plugin = static_cast<AttentionPlugin*>(clone());
+    if (plugin == nullptr || plugin->mXqaMultiBlock == 1)
+    {
+        return plugin;
+    }
+    // Zero once, outside any CUDA-graph capture; the kernel leaves every counter at zero after use.
+    void* semaphores{nullptr};
+    size_t const bytes = sizeof(uint32_t) * kXQA_MAX_SEMAPHORES;
+    if (cudaMalloc(&semaphores, bytes) != cudaSuccess || cudaMemset(semaphores, 0, bytes) != cudaSuccess)
+    {
+        LOG_ERROR("AttentionPlugin: failed to allocate XQA multi-block semaphores.");
+        cudaFree(semaphores);
+        delete plugin;
+        return nullptr;
+    }
+    plugin->mXqaSemaphores = std::shared_ptr<void>(semaphores, [](void* ptr) { cudaFree(ptr); });
+    return plugin;
 }
 
 PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
@@ -2396,6 +2474,7 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
         "enable_contiguous_query_swa", &mEnableContiguousQuerySwa, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_attention_sink", &mEnableAttentionSink, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_fp8_kv_cache", &mEnableFp8KVCache, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("xqa_multi_block", &mXqaMultiBlock, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
         "enable_vision_block_attention", &mEnableVisionBlockAttention, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
@@ -2443,6 +2522,8 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("enable_attention_sink", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_contiguous_query_swa", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_fp8_kv_cache", nullptr, PluginFieldType::kINT32, 0));
+    // Optional. XQA split-KV mode baked in at build (see mXqaMultiBlock); defaults to the build env.
+    mPluginAttributes.emplace_back(PluginField("xqa_multi_block", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_vision_block_attention", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_context_mask_selector", nullptr, PluginFieldType::kINT32, 0));
     // Sliding window size (-1 = no sliding window, >0 = window size)

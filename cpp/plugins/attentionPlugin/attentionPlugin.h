@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -200,6 +201,15 @@ protected:
     int32_t mSMVersion; //!< CUDA SM version
 
     int32_t mEnableFp8KVCache{}; //!< Whether FP8 KV cache is enabled
+    //! XQA decode/verify split-KV mode, fixed at engine build (EDGELLM_XQA_MULTI_BLOCK) because the
+    //! workspace reserved for the merge scratch is sized then: 1 = off (one CTA per sequence, the
+    //! default), 0 = auto (fill the SMs), N > 1 = N splits per sequence.
+    int32_t mXqaMultiBlock{1};
+    //! Multi-block merge semaphores, one per launch sequence; zeroed once at attach, the kernel's last
+    //! CTA resets each counter. Owned per execution context so overlapping layers never share them.
+    std::shared_ptr<void> mXqaSemaphores;
+    static constexpr int32_t kXQA_MAX_SEMAPHORES{1024};
+
     //! Whether the optional runtime context-mask selector input is present. Shape [0] keeps default causal/sliding
     //! context attention; shape [batch] selects padding/non-causal context attention. The tensor value is ignored.
     int32_t mEnableContextMaskSelector{};
