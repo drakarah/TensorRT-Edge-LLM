@@ -21,6 +21,7 @@
 #include "cuteDslInt4Gemv.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mutex>
@@ -384,7 +385,13 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         // extra weight and no repack -- one buffer serves prefill and decode.
         // Threshold kGemvDispatchMaxM=4 (the tensor-core crossover); the kernel
         // itself supports up to kGemvMaxM=8.
-        constexpr int32_t kGemvDispatchMaxM = 4;
+        // Overridable per process (EDGELLM_INT4_GEMV_MAX_M): the crossover is GPU-specific.
+        // On Jetson AGX Orin (sm_87) the GEMV cost grows ~linearly with M while the GEMM is
+        // ~flat, so speculative-decoding verification (M = 2-8) is faster on the GEMM path.
+        static int32_t const kGemvDispatchMaxM = []() {
+            char const* value = std::getenv("EDGELLM_INT4_GEMV_MAX_M");
+            return value != nullptr ? std::atoi(value) : 4;
+        }();
         if (M >= 1 && M <= kGemvDispatchMaxM && cuteDslInt4GemvSupported(M) && cuteDslInt4GemvLoadModules())
         {
             return cuteDslInt4GemvLaunch(M, inputs[0], inputs[1], inputs[2], outputs[0], mGemmN, mGemmK, stream);
