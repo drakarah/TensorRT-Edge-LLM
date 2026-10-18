@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <nlohmann/json.hpp>
 
@@ -632,16 +633,29 @@ xgrammar::CompiledGrammar GuidedDecoder::Impl::compile(GuidedDecodingParams cons
     // after </think> legal, strict_mode forbids properties the schema does not mention.
     constexpr bool kANY_WHITESPACE = true;
     constexpr bool kSTRICT_MODE = true;
+    // EDGELLM_JSON_MAX_WHITESPACE caps each whitespace run inside JSON (XGrammar
+    // max_whitespace_cnt). Unset keeps XGrammar's unlimited default. With it unset some models
+    // fall into emitting indentation until max_tokens (Gemma 4 E4B: "    \n" repeated); llama.cpp's
+    // JSON-schema grammar caps a run at about 20 characters.
+    static std::optional<int> const kMaxWhitespace = []() -> std::optional<int> {
+        char const* value = std::getenv("EDGELLM_JSON_MAX_WHITESPACE");
+        if (value == nullptr || *value == '\0')
+        {
+            return std::nullopt;
+        }
+        int const parsed = std::atoi(value);
+        return parsed > 0 ? std::optional<int>(parsed) : std::nullopt;
+    }();
 
     switch (params.type)
     {
     case GuideType::kJsonObject:
         // Not CompileBuiltinJSONGrammar(): that admits any JSON value, not just an object.
         return compiler->CompileJSONSchema(
-            R"({"type":"object"})", kANY_WHITESPACE, std::nullopt, std::nullopt, kSTRICT_MODE, std::nullopt);
+            R"({"type":"object"})", kANY_WHITESPACE, std::nullopt, std::nullopt, kSTRICT_MODE, kMaxWhitespace);
     case GuideType::kJsonSchema:
         return compiler->CompileJSONSchema(
-            params.guide, kANY_WHITESPACE, std::nullopt, std::nullopt, kSTRICT_MODE, std::nullopt);
+            params.guide, kANY_WHITESPACE, std::nullopt, std::nullopt, kSTRICT_MODE, kMaxWhitespace);
     case GuideType::kRegex: return compiler->CompileRegex(params.guide);
     case GuideType::kEbnf: return compiler->CompileGrammar(params.guide, "root");
     case GuideType::kStructuralTag: return compiler->CompileStructuralTag(params.guide);
