@@ -2462,9 +2462,26 @@ def _scope_exclusions(patterns: List[str], submodel_prefix: str) -> List[str]:
     return scoped
 
 
-def _parse_quant(model_dir: str,
-                 config: dict,
-                 submodel_prefix: str = "") -> QuantConfig:
+def _parse_quant(model_dir: str, *args, **kwargs) -> QuantConfig:
+    """Parse the checkpoint's quantisation config for any checkpoint format.
+
+    The KV-cache storage is not a property of the checkpoint for INT8: an INT8 KV cache is requested
+    for an export with ``EDGELLM_INT8_KV_SCALES`` (see models/int8_kv_cache.py) and applies to every
+    checkpoint format, so it is set here once rather than in each format branch.
+    """
+    from .models.int8_kv_cache import int8_kv_cache_requested
+    quant = _parse_checkpoint_quant(model_dir, *args, **kwargs)
+    if int8_kv_cache_requested():
+        if quant.kv_cache_quant not in (None, "int8"):
+            raise ValueError(
+                f"INT8 KV cache requested but the checkpoint carries a {quant.kv_cache_quant} KV cache")
+        quant.kv_cache_quant = "int8"
+    return quant
+
+
+def _parse_checkpoint_quant(model_dir: str,
+                            config: dict,
+                            submodel_prefix: str = "") -> QuantConfig:
     """Determine quantisation config from hf_quant_config.json or config.json.
 
     Checkpoint-provided W4A16 ``lm_head`` (``W4A16_NVFP4`` in

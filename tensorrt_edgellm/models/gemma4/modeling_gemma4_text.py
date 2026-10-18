@@ -30,6 +30,7 @@ from ...config import (QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
 from ..default.modeling_default import (MLP, Attention, CausalLM, DecoderLayer,
                                         OnnxSpec, RMSNorm,
                                         _concat_hidden_in_provider_order)
+from ..int8_kv_cache import int8_kv_qkv_scales, kv_cache_torch_dtype
 from ..linear import TPMode, make_linear
 from ..ops import (KV_PAGE_SIZE, attention_plugin, int4_moe_plugin,
                    nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
@@ -135,7 +136,7 @@ def _gemma4_uses_swa_kv_cache(config: ModelConfig) -> bool:
         return False
 
     quant = getattr(config, "quant", None)
-    if getattr(quant, "kv_cache_quant", None) == "fp8":
+    if getattr(quant, "kv_cache_quant", None) in ("fp8", "int8"):
         return False
 
     spec_flags = (
@@ -515,6 +516,7 @@ class Gemma4Attention(Attention):
         self.head_dim = _head_dim_for_attention_type(config,
                                                      self.attention_type)
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
+        self.enable_int8_kv_cache = config.quant.kv_cache_quant == "int8"
         hidden_size = int(config.hidden_size)
         qkv_in_features = int(in_features or hidden_size)
         module_prefix = f"layers.{layer_idx}.self_attn"
@@ -562,6 +564,10 @@ class Gemma4Attention(Attention):
         first_shared = (config.num_hidden_layers - num_kv_shared
                         if num_kv_shared > 0 else config.num_hidden_layers)
         self.is_kv_shared = layer_idx >= first_shared
+        if self.enable_int8_kv_cache:
+            # A KV-sharing layer reads its donor's cache, so it dequantizes with the donor's scales.
+            storage_layer = _compute_kv_donor_indices(config).get(layer_idx, layer_idx)
+            self._qkv_scales_float = int8_kv_qkv_scales(storage_layer)
 
         # KV-shared layers don't use k_proj/v_proj/k_norm — remove them
         # so their weights are not loaded from the checkpoint.
@@ -691,6 +697,8 @@ class Gemma4Attention(Attention):
             kwargs["attention_mask"] = vision_block_ids
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
+        if self.enable_int8_kv_cache:
+            kwargs["enable_int8_kv_cache"] = 1
         if uses_bounded_swa:
             if swa_kv_cache_mode is None:
                 raise ValueError(
@@ -793,6 +801,7 @@ class Gemma4Attention(Attention):
             "enable_vision_block_attention": vision_block_ids is not None,
             "skip_softmax_scale_factor": 0.0,
             "qkv_scales": getattr(self, "_qkv_scales_float", [1.0, 1.0, 1.0]),
+            "enable_int8_kv_cache": int(self.enable_int8_kv_cache),
             "query_start_offsets": query_start_offsets,
             "attention_sequence_lengths": attention_sequence_lengths,
             "execution_phase_marker": execution_phase_marker,
@@ -1948,8 +1957,8 @@ class Gemma4ForCausalLM(CausalLM):
         num_sequences = 2
         query_length = 2
         physical_tokens = num_sequences * query_length
-        kv_dtype = (torch.float8_e4m3fn
-                    if config.quant.kv_cache_quant == "fp8" else torch.float16)
+        kv_dtype = kv_cache_torch_dtype(config.quant.kv_cache_quant,
+                                        torch.float16)
         inputs_embeds = torch.zeros(physical_tokens,
                                     config.hidden_size,
                                     dtype=torch.float16,

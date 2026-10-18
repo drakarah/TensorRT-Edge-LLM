@@ -25,6 +25,7 @@ import torch.nn.functional as F
 
 from ...config import ModelConfig
 from ..default.modeling_default import OnnxSpec, RMSNorm
+from ..int8_kv_cache import int8_kv_qkv_scales, kv_cache_torch_dtype
 from ..linear import TPMode, make_linear
 from ..ops import KV_PAGE_SIZE, attention_plugin
 from .modeling_gemma4_text import Gemma4MLP, _rotary_dim_from_rope_config
@@ -104,6 +105,15 @@ class Gemma4SharedKVAttention(nn.Module):
                                   tp_mode=TPMode.ROW)
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
+        self.enable_int8_kv_cache = config.quant.kv_cache_quant == "int8"
+        self._qkv_scales = [1.0, 1.0, 1.0]
+        if self.enable_int8_kv_cache:
+            # The assistant reads the target's cache: dequantize with the target layer's scales.
+            target = [entry for entry in (getattr(config, "kv_sharing_map", None) or [])
+                      if int(entry["assistant_layer"]) == layer_idx]
+            if len(target) != 1:
+                raise ValueError(f"INT8 KV cache: no unique target layer for assistant layer {layer_idx}")
+            self._qkv_scales = int8_kv_qkv_scales(int(target[0]["target_layer"]))
         layer_type = self._layer_type_for_layer(config, layer_idx)
         self.attention_type = layer_type
         if layer_type == "full_attention":
@@ -185,7 +195,8 @@ class Gemma4SharedKVAttention(nn.Module):
             skip_softmax_scale_factor=0.0,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
-            qkv_scales=[1.0, 1.0, 1.0],
+            qkv_scales=self._qkv_scales,
+            enable_int8_kv_cache=int(self.enable_int8_kv_cache),
             enable_kv_shared=1,
         )
         return self.o_proj(
@@ -219,7 +230,8 @@ class Gemma4SharedKVAttention(nn.Module):
             enable_context_mask_selector=False,
             enable_vision_block_attention=False,
             skip_softmax_scale_factor=0.0,
-            qkv_scales=[1.0, 1.0, 1.0],
+            qkv_scales=self._qkv_scales,
+            enable_int8_kv_cache=int(self.enable_int8_kv_cache),
             enable_kv_shared=1,
             query_start_offsets=metadata["query_start_offsets"],
             attention_sequence_lengths=metadata["attention_sequence_lengths"],
@@ -462,8 +474,7 @@ class Gemma4AssistantForCausalLM(nn.Module):
                                                full_rotary_dim,
                                                dtype=torch.float32,
                                                device=device)
-        kv_dtype = (torch.float8_e4m3fn
-                    if config.quant.kv_cache_quant == "fp8" else dtype16)
+        kv_dtype = kv_cache_torch_dtype(config.quant.kv_cache_quant, dtype16)
         # Target paged KV pool binding: [2, num_pages, KV_PAGE_SIZE, num_kv_heads,
         # head_dim] — the assistant reads the TARGET model's pool, so the dummy
         # mirrors the target's per-layer pool shape.
