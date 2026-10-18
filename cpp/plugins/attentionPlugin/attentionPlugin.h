@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -202,6 +203,14 @@ protected:
 
     int32_t mEnableFp8KVCache{};  //!< Whether FP8 KV cache is enabled
     int32_t mEnableInt8KVCache{}; //!< Whether INT8 KV cache is enabled (symmetric, per-layer K/V scales)
+    //! XQA decode/verify split-KV mode, fixed at engine build (EDGELLM_XQA_MULTI_BLOCK) because the
+    //! workspace reserved for the merge scratch is sized then: 1 = off (one CTA per sequence, the
+    //! default), 0 = auto (fill the SMs), N > 1 = N splits per sequence.
+    int32_t mXqaMultiBlock{1};
+    //! Multi-block merge semaphores, one per launch sequence; zeroed once at attach, the kernel's last
+    //! CTA resets each counter. Owned per execution context so overlapping layers never share them.
+    std::shared_ptr<void> mXqaSemaphores;
+    static constexpr int32_t kXQA_MAX_SEMAPHORES{1024};
 
     //! True for a one-byte (FP8 or INT8) KV cache: K/V carry quant scales and FP16 consumers dequantize.
     bool quantizedKVCache() const noexcept
