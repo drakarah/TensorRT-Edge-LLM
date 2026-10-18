@@ -614,7 +614,13 @@ class Gemma4Attention(Attention):
                | None]:
         batch_size, seq_len, _ = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states)
+        fused_qkv = getattr(self, "qkv_proj_fused", None)
+        if fused_qkv is not None:
+            # One INT4 GEMV for q, k and v (see fuse_gemma4_int4_projections).
+            query_states, key_states, value_states = fused_qkv(hidden_states).split(
+                self.qkv_fused_split, dim=-1)
+        else:
+            query_states = self.q_proj(hidden_states)
 
         if self.is_kv_shared:
             # Bounded SWA consumers carry the donor's current K/V transiently so
@@ -625,7 +631,7 @@ class Gemma4Attention(Attention):
             else:
                 key_states = None
                 value_states = None
-        else:
+        elif fused_qkv is None:
             key_states = self.k_proj(hidden_states)
             if self.attention_k_eq_v:
                 value_states = key_states
@@ -747,14 +753,19 @@ class Gemma4Attention(Attention):
         valid_tree_counts: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]
                | None]:
-        query_states = self.q_proj(hidden_states)
+        fused_qkv = getattr(self, "qkv_proj_fused", None)
+        if fused_qkv is not None:
+            query_states, key_states, value_states = fused_qkv(hidden_states).split(
+                self.qkv_fused_split, dim=-1)
+        else:
+            query_states = self.q_proj(hidden_states)
         if self.is_kv_shared:
             if self.use_swa_pool and shared_key_value is not None:
                 key_states, value_states = shared_key_value
             else:
                 key_states = None
                 value_states = None
-        else:
+        elif fused_qkv is None:
             key_states = self.k_proj(hidden_states)
             value_states = (key_states if self.attention_k_eq_v else
                             self.v_proj(hidden_states))
@@ -861,8 +872,14 @@ class Gemma4MLP(MLP):
         # Without this clamp, the fp16 down_proj MatMul can produce Inf
         # (dot product of 21504 elements at +/-65504 overflows fp16 output range),
         # which then causes NaN in the subsequent RMSNorm (Inf*0=NaN).
-        gate = self.act_fn(self.gate_proj(hidden_states).to(torch.float32))
-        up = self.up_proj(hidden_states).to(torch.float32)
+        fused_gate_up = getattr(self, "gate_up_proj", None)
+        if fused_gate_up is not None:
+            # One INT4 GEMV for gate and up (see fuse_gemma4_int4_projections).
+            gate, up = fused_gate_up(hidden_states).to(torch.float32).split(self.gate_up_split, dim=-1)
+            gate = self.act_fn(gate)
+        else:
+            gate = self.act_fn(self.gate_proj(hidden_states).to(torch.float32))
+            up = self.up_proj(hidden_states).to(torch.float32)
         intermediate = (gate * up).clamp(-2048.0, 2048.0)
         return self.down_proj(intermediate.to(hidden_states.dtype))
 
@@ -2431,3 +2448,68 @@ def GEMMA4_FUSED_BF16_KEY_REMAP(key: str) -> "str | None":
     key = _ROUTER_RE.sub(r"\1moe_block.router.", key)
     key = _FUSED_EXPERTS_RE.sub(r"\1moe_block.experts.\2", key)
     return key
+
+
+def _concat_gptq_linears(linears: list) -> nn.Module:
+    """Concatenate GPTQLinear modules that share an input along the output axis.
+
+    Works in the checkpoint's GPTQ layout (before repacking): qweight [in/8, out],
+    qzeros [in/G, out/8] and scales [in/G, out] all concatenate on dim 1; g_idx is shared.
+    """
+    from ..linear import GPTQLinear
+    first = linears[0]
+    fused = GPTQLinear(first.in_features, sum(lin.out_features for lin in linears),
+                       group_size=first.group_size, zero_point_offset=first.zero_point_offset,
+                       bias=False)
+    for name in ("qweight", "qzeros", "scales"):
+        fused._buffers[name] = torch.cat([lin._buffers[name] for lin in linears], dim=1)
+    fused._buffers["g_idx"] = first._buffers["g_idx"]
+    fused._buffers["int4_act_perm"] = first._buffers["int4_act_perm"]
+    return fused
+
+
+def fuse_gemma4_int4_projections(model: nn.Module) -> int:
+    """Fuse q/k/v and gate/up GPTQ INT4 projections into single GEMMs (opt-in).
+
+    Enabled by EDGELLM_FUSE_GEMMA4_INT4=1. Must run after checkpoint load and before
+    ``_repack_gptq_weights``. Decode on Orin is weight-streaming bound and the small
+    k/v projections (512 rows) reach only ~37% of bandwidth per call; one fused call per
+    layer streams the same bytes with fewer, larger kernels. Layers whose projections are
+    not all unrepacked GPTQ int32 (or that share KV / have no v_proj) are left unchanged.
+    Returns the number of fused modules.
+    """
+    import os
+    from ..linear import GPTQLinear
+    if os.environ.get("EDGELLM_FUSE_GEMMA4_INT4") != "1":
+        return 0
+
+    def fusible(linears):
+        return all(isinstance(lin, GPTQLinear) and lin.bias is None
+                   and lin._buffers.get("qweight") is not None
+                   and lin._buffers["qweight"].dtype == torch.int32 for lin in linears)
+
+    fused_count = 0
+    for module in model.modules():
+        if isinstance(module, Gemma4Attention) and not module.is_kv_shared \
+                and not module.attention_k_eq_v and module.v_proj is not None \
+                and not module.enable_fp8_kv_cache:
+            parts = [module.q_proj, module.k_proj, module.v_proj]
+            if fusible(parts):
+                module.qkv_proj_fused = _concat_gptq_linears(parts)
+                module.qkv_fused_split = [lin.out_features for lin in parts]
+                module.k_proj = None
+                module.v_proj = None
+                module.q_proj = None
+                fused_count += 1
+        elif isinstance(module, Gemma4MLP):
+            parts = [module.gate_proj, module.up_proj]
+            if fusible(parts):
+                module.gate_up_proj = _concat_gptq_linears(parts)
+                module.gate_up_split = [lin.out_features for lin in parts]
+                module.gate_proj = None
+                module.up_proj = None
+                fused_count += 1
+    import logging
+    logging.getLogger(__name__).info("Fused %d Gemma4 INT4 projection groups (q/k/v, gate/up)",
+                                     fused_count)
+    return fused_count
