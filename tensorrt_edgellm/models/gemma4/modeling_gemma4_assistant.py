@@ -415,8 +415,52 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         return logits.scatter(-1, candidate_ids, candidate_logits)
 
 
+_DRAFT_HEAD_INT4_GROUP = 128
+_DRAFT_HEAD_CLIP_RATIOS = (1.0, 0.97, 0.94, 0.91, 0.88, 0.85, 0.82, 0.79, 0.76)
+
+
+def _int4_candidate_head(rows: torch.Tensor) -> nn.Module:
+    """Quantise ``rows`` [N, K] to a plugin-layout INT4 GPTQLinear (symmetric, group 128).
+
+    Round-to-nearest with an MSE-optimal clip per group (no calibration). The module
+    is repacked here, so it must not go through the checkpoint loader's repack again.
+    """
+    from ...checkpoint.repacking import _repack_gptq_weights
+    from ..linear import GPTQLinear
+    group = _DRAFT_HEAD_INT4_GROUP
+    n, k = rows.shape
+    groups = rows.float().reshape(n, k // group, group)
+    amax = groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    best_err = torch.full_like(amax, float("inf"))
+    best_scale = amax / 7
+    for ratio in _DRAFT_HEAD_CLIP_RATIOS:
+        scale = amax * ratio / 7
+        err = ((torch.clamp(torch.round(groups / scale), -8, 7) * scale -
+                groups)**2).sum(dim=-1, keepdim=True)
+        better = err < best_err
+        best_err = torch.where(better, err, best_err)
+        best_scale = torch.where(better, scale, best_scale)
+    q = torch.clamp(torch.round(groups / best_scale), -8, 7).reshape(n, k)
+    unsigned = (q.to(torch.int64) + 8).t().contiguous().reshape(k // 8, 8, n)
+    shifts = torch.arange(0, 32, 4, dtype=torch.int64).view(1, 8, 1)
+    qweight = (unsigned << shifts).sum(dim=1)
+    qweight = ((qweight + 2**31) % 2**32 - 2**31).to(torch.int32)
+    head = GPTQLinear(k, n, group, zero_point_offset=0)
+    head._buffers["qweight"] = qweight
+    head._buffers["qzeros"] = torch.full((k // group, n // 8),
+                                         0x88888888 - 2**32,
+                                         dtype=torch.int32)
+    head._buffers["scales"] = best_scale.squeeze(-1).t().contiguous().to(
+        torch.float16)
+    _repack_gptq_weights(head)
+    return head
+
+
 class Gemma4AssistantFixedCandidates(nn.Module):
     """Fixed candidate set for assistants without a centroid head (Gemma 4 12B).
+
+    ``EDGELLM_GEMMA4_DRAFT_HEAD_INT4=1`` scores the candidates with an INT4 GEMM (RTN, group 128)
+    instead of an FP16 one: a quarter of the bytes read three times per decode round.
 
     The draft step scores one fixed list of token ids (a reduced vocabulary, built from text of the target
     languages) instead of the whole tied embedding table, and emits them through the sparse-logits contract
@@ -433,21 +477,30 @@ class Gemma4AssistantFixedCandidates(nn.Module):
         self.register_buffer("candidate_rows",
                              torch.empty(0),
                              persistent=False)
+        self.candidate_head = None
 
     def prepare_for_export(self,
                            lm_head_weight: torch.Tensor | None = None) -> None:
         if lm_head_weight is not None:
             # One contiguous [N, hidden] slice: the draft graph no longer needs the full table.
-            self.candidate_rows = lm_head_weight.detach()[self.candidate_ids.to(
+            rows = lm_head_weight.detach()[self.candidate_ids.to(
                 lm_head_weight.device)].contiguous()
+            if os.environ.get("EDGELLM_GEMMA4_DRAFT_HEAD_INT4") == "1":
+                self.candidate_head = _int4_candidate_head(rows)
+            else:
+                self.candidate_rows = rows
 
     def candidates(
             self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (token ids, logits) of the fixed candidates."""
-        rows = (self.candidate_rows if self.candidate_rows.numel() else
-                F.embedding(self.candidate_ids, lm_head_weight))
-        candidate_logits = F.linear(hidden_states, rows.to(hidden_states.dtype))
+        if self.candidate_head is not None:
+            candidate_logits = self.candidate_head(hidden_states)
+        else:
+            rows = (self.candidate_rows if self.candidate_rows.numel() else
+                    F.embedding(self.candidate_ids, lm_head_weight))
+            candidate_logits = F.linear(hidden_states,
+                                        rows.to(hidden_states.dtype))
         candidate_ids = self.candidate_ids.expand(*hidden_states.shape[:-1],
                                                   -1)
         return candidate_ids, candidate_logits
