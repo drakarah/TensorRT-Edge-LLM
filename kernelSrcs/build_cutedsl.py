@@ -2084,6 +2084,8 @@ _INT4_FP16_GEMM_CONFIGS = [
     (32, 2, 1), (32, 3, 2), (32, 3, 4), (32, 4, 1),
     (64, 2, 1), (64, 3, 1), (64, 3, 4), (64, 4, 2), (64, 4, 4),
     (128, 2, 1), (128, 2, 4), (128, 4, 1),
+    # wave-quantisation fix for the 12B down GEMM (K = 15 360 = 240 K-tiles): 90 / 150 CTAs instead of 120 (METRICS 105 part 7); appended so tactic ids stay stable
+    (16, 4, 3), (16, 4, 5),
 ]
 # Quant group size, baked per variant (it sizes the in-kernel scale smem, so it
 # is compile-time, not a runtime arg). The kernel supports {16, 32, 64, 128, ...}
@@ -2099,6 +2101,8 @@ _INT4_GEMM_FP16_ACC_MIN_BM = int(os.environ.get("EDGELLM_INT4_GEMM_FP16_ACC_MIN_
 
 for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
     _tile_tag = f"{_bm}x128x64"
+    # export-only trace shape: split_k must divide ceil(K/64) (16 for K = 1024); K is a runtime argument of the AOT kernel
+    _trace_k = "1024" if 16 % _sk == 0 else "3840"
     KERNEL_VARIANTS.append(
         KernelVariant(
             name=f"int4_fp16_gemm_{_tile_tag}_s{_stages}_sk{_sk}",
@@ -2106,7 +2110,7 @@ for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
             supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
             script="int4_fp16_gemm_cutedsl/int4_fp16_gemm_ampere.py",
             script_args=[
-                "--mnk", "256,512,1024",
+                "--mnk", f"256,512,{_trace_k}",
                 "--cta_tiler_mnk", f"{_bm},128,64",
                 "--atom_layout_mnk", "1,4,1",
                 "--num_stages", str(_stages),
