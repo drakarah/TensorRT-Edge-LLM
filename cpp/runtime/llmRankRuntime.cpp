@@ -78,6 +78,18 @@ namespace rt
 
 namespace
 {
+//! Prompt-token spacing of the host prefix snapshots taken between prefill passes (EDGELLM_SWA_PREFIX_CAPTURE_INTERVAL);
+//! 0 snapshots after every pass. Each snapshot re-stores the whole bounded window.
+int32_t swaPrefixCaptureInterval()
+{
+    static int32_t const interval = []
+    {
+        char const* const value = std::getenv("EDGELLM_SWA_PREFIX_CAPTURE_INTERVAL");
+        return value != nullptr ? std::max(0, std::atoi(value)) : 0;
+    }();
+    return interval;
+}
+
 bool needsCachedBlockDraftTreeHybridBindings(DeploymentConfig const& deployment)
 {
     if (!deployment.specConfig.has_value() || deployment.base.numLinearAttnLayers == 0)
@@ -3149,11 +3161,13 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
             {
                 return false;
             }
-            if (swaBackend && mSwaPrefixCache != nullptr && context.loraWeightsName.empty())
+            int32_t const prefixEnd = mSwaPrefillBaseOffset + begin + length;
+            int32_t const captureInterval = swaPrefixCaptureInterval();
+            if (swaBackend && mSwaPrefixCache != nullptr && context.loraWeightsName.empty()
+                && (captureInterval == 0 || prefixEnd / captureInterval != (prefixEnd - length) / captureInterval))
             {
                 std::vector<int32_t> const& fullPrompt = context.rawBatchedInputIds[0];
-                std::vector<int32_t> const prefix(
-                    fullPrompt.begin(), fullPrompt.begin() + (mSwaPrefillBaseOffset + begin + length));
+                std::vector<int32_t> const prefix(fullPrompt.begin(), fullPrompt.begin() + prefixEnd);
                 mSwaPrefixCache->capture(
                     context.residentRefs.at(0).slot, prefix, managedKVCacheRequest->swaState(0), context.stream);
             }
