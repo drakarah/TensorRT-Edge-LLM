@@ -233,9 +233,31 @@ __global__ void stageRoutedExpertsKernel(uint8_t const* needed, ExpertStagingCop
     size_t const end = min(begin + chunk, bytes / 16);
     uint4 const* src = reinterpret_cast<uint4 const*>(copy.src[t] + bytes * expert);
     uint4* dst = reinterpret_cast<uint4*>(copy.dst[t] + bytes * expert);
-    for (size_t i = begin + threadIdx.x; i < end; i += blockDim.x)
+    // kUnroll independent loads per thread before the stores: reads through PCIe are latency-bound, so the bytes in flight
+    // (blocks x threads x kUnroll x 16 B) set the bandwidth.
+    constexpr int32_t kUnroll = 8;
+    size_t const stride = static_cast<size_t>(blockDim.x) * kUnroll;
+    for (size_t base = begin; base < end; base += stride)
     {
-        dst[i] = src[i];
+        uint4 v[kUnroll];
+#pragma unroll
+        for (int32_t u = 0; u < kUnroll; ++u)
+        {
+            size_t const i = base + threadIdx.x + static_cast<size_t>(u) * blockDim.x;
+            if (i < end)
+            {
+                v[u] = src[i];
+            }
+        }
+#pragma unroll
+        for (int32_t u = 0; u < kUnroll; ++u)
+        {
+            size_t const i = base + threadIdx.x + static_cast<size_t>(u) * blockDim.x;
+            if (i < end)
+            {
+                dst[i] = v[u];
+            }
+        }
     }
 }
 } // namespace
