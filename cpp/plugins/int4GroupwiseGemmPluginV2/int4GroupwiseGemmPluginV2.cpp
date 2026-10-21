@@ -27,6 +27,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mutex>
+#include <set>
+#include <tuple>
 
 using namespace nvinfer1;
 namespace trt_edgellm
@@ -474,6 +476,27 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             return -1;
         }
         CuteDslInt4Variant const v = cuteDslInt4VariantAt(idx);
+        // EDGELLM_LOG_INT4_TACTIC=1: print the variant each GEMM shape actually runs (once per N, K, M, tactic): the engine build logs no
+        // tactic choice, and the autotune result depends on the tuning M (the engine's max verify size).
+        static bool const logTactic = []() {
+            char const* e = std::getenv("EDGELLM_LOG_INT4_TACTIC");
+            return e != nullptr && *e != '\0' && *e != '0';
+        }();
+        if (logTactic)
+        {
+            static std::mutex logMutex;
+            static std::set<std::tuple<int64_t, int64_t, int64_t, int32_t>> seen;
+            std::lock_guard<std::mutex> lock(logMutex);
+            if (seen.emplace(M, mGemmN, mGemmK, mTactic).second)
+            {
+                int64_t const paddedRows = ((M + v.bM - 1) / v.bM) * v.bM;
+                LOG_INFO("Int4GroupwiseGemmPluginV2 tactic: M=%ld N=%ld K=%ld autotuneM=%d -> variant %d bM=%d bN=%d bK=%d stages=%d splitK=%d "
+                         "(%ld rows run, %.1f%% padding)",
+                    static_cast<long>(M), static_cast<long>(mGemmN), static_cast<long>(mGemmK), mAutotuneM, idx, v.bM, v.bN,
+                    v.bK, v.stages, v.splitK, static_cast<long>(paddedRows),
+                    100.0 * static_cast<double>(paddedRows - M) / static_cast<double>(paddedRows));
+            }
+        }
         if (v.splitK > 1)
         {
             int64_t const nLocks = cuteDslInt4LockCount(M, mGemmN, v.bM, v.bN);
