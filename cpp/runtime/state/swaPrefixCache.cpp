@@ -35,7 +35,8 @@ struct SwaPrefixCache::Entry
 {
     std::vector<int32_t> tokens;
     std::vector<int32_t> windowLogicalPages; //!< Logical pages of the bounded layers held by the snapshot.
-    void* host{};                            //!< Pinned buffer, layers in order, K then V per page.
+    void* host{};                            //!< Pinned buffer, layers in order, per layer the K plane then the V plane.
+    size_t capacity{};                       //!< Size of the pooled pinned block behind `host`.
     size_t bytes{};
     std::vector<size_t> layerOffsets;        //!< Per-layer byte offset into `host` (SIZE_MAX: layer not stored).
     int32_t globalPages{};                   //!< Pages per plane held for each full-capacity layer.
@@ -43,6 +44,9 @@ struct SwaPrefixCache::Entry
 
 namespace
 {
+
+constexpr size_t kPinnedBlockGranularity = size_t{32} << 20;
+constexpr size_t kPoolBudgetDivisor = 4; //!< Spare pinned blocks may hold up to a quarter of the budget on top of the entries.
 
 size_t pageBytes(KVCacheManager const& kv, int32_t layer)
 {
@@ -86,6 +90,10 @@ SwaPrefixCache::~SwaPrefixCache() noexcept
             cudaFreeHost(entry->host);
         }
     }
+    for (PinnedBlock const& block : mFreeBlocks)
+    {
+        cudaFreeHost(block.ptr);
+    }
 }
 
 size_t SwaPrefixCache::usedBytes() const noexcept
@@ -109,9 +117,49 @@ void SwaPrefixCache::evictFor(size_t bytes)
     {
         auto& victim = mEntries.back();
         mUsedBytes -= victim->bytes;
-        cudaFreeHost(victim->host);
+        releasePinned(victim->host, victim->capacity);
         mEntries.pop_back();
     }
+}
+
+void* SwaPrefixCache::acquirePinned(size_t bytes, size_t& capacity)
+{
+    capacity = (bytes + kPinnedBlockGranularity - 1) / kPinnedBlockGranularity * kPinnedBlockGranularity;
+    auto best = mFreeBlocks.end();
+    for (auto it = mFreeBlocks.begin(); it != mFreeBlocks.end(); ++it)
+    {
+        if (it->capacity >= capacity && it->capacity <= 2 * capacity
+            && (best == mFreeBlocks.end() || it->capacity < best->capacity))
+        {
+            best = it;
+        }
+    }
+    if (best != mFreeBlocks.end())
+    {
+        void* const ptr = best->ptr;
+        capacity = best->capacity;
+        mFreeBlockBytes -= best->capacity;
+        mFreeBlocks.erase(best);
+        return ptr;
+    }
+    void* ptr = nullptr;
+    if (cudaMallocHost(&ptr, capacity) != cudaSuccess)
+    {
+        static_cast<void>(cudaGetLastError());
+        return nullptr;
+    }
+    return ptr;
+}
+
+void SwaPrefixCache::releasePinned(void* ptr, size_t capacity) noexcept
+{
+    if (mFreeBlockBytes + capacity > mBudgetBytes / kPoolBudgetDivisor)
+    {
+        cudaFreeHost(ptr);
+        return;
+    }
+    mFreeBlocks.push_back({ptr, capacity});
+    mFreeBlockBytes += capacity;
 }
 
 void SwaPrefixCache::capture(
@@ -158,9 +206,9 @@ void SwaPrefixCache::capture(
         return;
     }
     evictFor(total);
-    if (cudaMallocHost(&entry->host, total) != cudaSuccess)
+    entry->host = acquirePinned(total, entry->capacity);
+    if (entry->host == nullptr)
     {
-        static_cast<void>(cudaGetLastError());
         return;
     }
 
@@ -174,27 +222,36 @@ void SwaPrefixCache::capture(
             continue;
         }
         size_t const pb = pageBytes(mKvCache, layer);
-        char* dst = host + offset;
+        char* const kDst = host + offset;
         if (isBoundedLayer(mKvCache, layer))
         {
-            for (SwaPageBinding const& binding : state.pageBindings)
+            size_t const numPages = state.pageBindings.size();
+            char* const vDst = kDst + numPages * pb;
+            for (size_t first = 0; first < numPages;)
             {
-                CUDA_CHECK(cudaMemcpyAsync(dst, kPagePtr(mKvCache, layer, binding.page), pb, cudaMemcpyDeviceToHost, stream));
-                dst += pb;
-                CUDA_CHECK(cudaMemcpyAsync(dst, vPagePtr(mKvCache, layer, binding.page), pb, cudaMemcpyDeviceToHost, stream));
-                dst += pb;
+                size_t run = 1;
+                while (first + run < numPages
+                    && state.pageBindings[first + run].page == state.pageBindings[first].page + static_cast<int64_t>(run))
+                {
+                    ++run;
+                }
+                int64_t const page = state.pageBindings[first].page;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    kDst + first * pb, kPagePtr(mKvCache, layer, page), run * pb, cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    vDst + first * pb, vPagePtr(mKvCache, layer, page), run * pb, cudaMemcpyDeviceToHost, stream));
+                first += run;
             }
         }
         else
         {
-            for (int32_t page = 0; page < entry->globalPages; ++page)
-            {
-                int64_t const physical = static_cast<int64_t>(slot) * maxPagesPerSeq + page;
-                CUDA_CHECK(cudaMemcpyAsync(dst, kPagePtr(mKvCache, layer, physical), pb, cudaMemcpyDeviceToHost, stream));
-                dst += pb;
-                CUDA_CHECK(cudaMemcpyAsync(dst, vPagePtr(mKvCache, layer, physical), pb, cudaMemcpyDeviceToHost, stream));
-                dst += pb;
-            }
+            // The pages of a slot are consecutive in the pool: one copy per plane.
+            int64_t const firstPage = static_cast<int64_t>(slot) * maxPagesPerSeq;
+            size_t const planeBytes = static_cast<size_t>(entry->globalPages) * pb;
+            CUDA_CHECK(cudaMemcpyAsync(
+                kDst, kPagePtr(mKvCache, layer, firstPage), planeBytes, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                kDst + planeBytes, vPagePtr(mKvCache, layer, firstPage), planeBytes, cudaMemcpyDeviceToHost, stream));
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -243,9 +300,10 @@ void SwaPrefixCache::restore(
             continue;
         }
         size_t const pb = pageBytes(mKvCache, layer);
-        char const* src = host + offset;
+        char const* const src = host + offset;
         if (isBoundedLayer(mKvCache, layer))
         {
+            size_t const numWindowPages = entry->windowLogicalPages.size();
             for (SwaPageBinding const& binding : state.pageBindings)
             {
                 auto const found = std::find(
@@ -255,21 +313,21 @@ void SwaPrefixCache::restore(
                     continue; // Page outside the snapshot's window: never read for the restored endpoint.
                 }
                 size_t const index = static_cast<size_t>(found - entry->windowLogicalPages.begin());
-                char const* k = src + 2 * index * pb;
-                CUDA_CHECK(cudaMemcpyAsync(kPagePtr(mKvCache, layer, binding.page), k, pb, cudaMemcpyHostToDevice, stream));
                 CUDA_CHECK(cudaMemcpyAsync(
-                    vPagePtr(mKvCache, layer, binding.page), k + pb, pb, cudaMemcpyHostToDevice, stream));
+                    kPagePtr(mKvCache, layer, binding.page), src + index * pb, pb, cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(vPagePtr(mKvCache, layer, binding.page),
+                    src + (numWindowPages + index) * pb, pb, cudaMemcpyHostToDevice, stream));
             }
         }
         else
         {
-            for (int32_t page = 0; page < restorePages; ++page)
-            {
-                int64_t const physical = static_cast<int64_t>(slot) * maxPagesPerSeq + page;
-                char const* k = src + 2 * static_cast<size_t>(page) * pb;
-                CUDA_CHECK(cudaMemcpyAsync(kPagePtr(mKvCache, layer, physical), k, pb, cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(vPagePtr(mKvCache, layer, physical), k + pb, pb, cudaMemcpyHostToDevice, stream));
-            }
+            int64_t const firstPage = static_cast<int64_t>(slot) * maxPagesPerSeq;
+            size_t const restoreBytes = static_cast<size_t>(restorePages) * pb;
+            size_t const planeBytes = static_cast<size_t>(entry->globalPages) * pb;
+            CUDA_CHECK(cudaMemcpyAsync(
+                kPagePtr(mKvCache, layer, firstPage), src, restoreBytes, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                vPagePtr(mKvCache, layer, firstPage), src + planeBytes, restoreBytes, cudaMemcpyHostToDevice, stream));
         }
     }
 }

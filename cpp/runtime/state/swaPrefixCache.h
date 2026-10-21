@@ -71,12 +71,23 @@ public:
 
 private:
     struct Entry;
+    struct PinnedBlock
+    {
+        void* ptr{};
+        size_t capacity{};
+    };
+
     void evictFor(size_t bytes);
+    //! Pinned memory is pooled: `cudaMallocHost` costs tens of milliseconds per snapshot.
+    void* acquirePinned(size_t bytes, size_t& capacity);
+    void releasePinned(void* ptr, size_t capacity) noexcept;
 
     KVCacheManager& mKvCache;
     KVPageTable const& mBasePageTable;
     size_t const mBudgetBytes;
     size_t mUsedBytes{};
+    size_t mFreeBlockBytes{};
+    std::vector<PinnedBlock> mFreeBlocks;
     int64_t mHits{};
     int64_t mLookups{};
     std::list<std::unique_ptr<Entry>> mEntries; //!< Front = most recently used.
