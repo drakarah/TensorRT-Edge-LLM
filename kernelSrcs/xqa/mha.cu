@@ -1134,6 +1134,41 @@ template <typename KElemType>
 __device__ inline void smemQKPartGemm(
     Warp const& warp, WarpAcc& acc, SharedMem::QSmemBuffer const& q, uint32_t qColBeg, SharedMem::KSmemBuffer const& k)
 {
+#if XQA_QK_INT8_PROBE
+    if constexpr (headElems == 512 && mha::is_same_v<KElemType, int8_t>)
+    {
+        // Speed probe: Q.K^T on INT8 tensor instructions with the K cache read raw (no fp16 conversion). Q is read as raw bytes (the first
+        // 32 B of each fp16 Q part row), so the scores are garbage; only the timing is meaningful.
+        constexpr uint32_t kExS8 = 2;
+        constexpr uint32_t mnExS8 = 2;
+        constexpr uint32_t gemmKSplitS8 = exactDiv(kHeadPartBytes, 16 * kExS8);
+#pragma unroll
+        for (uint32_t s = 0; s < gemmKSplitS8; s++)
+        {
+            constexpr uint32_t qSliceRowsS8 = exactDiv(warpTile.y, 8 * mnExS8);
+            Array2D<InstInMat<kExS8, mnExS8>, qSliceRowsS8, 1> const qSlice
+                = loadMatrix<kExS8, mnExS8, qSliceRowsS8, 1, false, false, false>(warp, q, 0, qColBeg + kExS8 * s);
+            constexpr uint32_t kSliceRowsS8 = exactDiv(warpTile.x, 8 * mnExS8);
+            Array2D<InstInMat<mnExS8, kExS8>, kSliceRowsS8, 1> const kSlice
+                = loadMatrix<kExS8, mnExS8, kSliceRowsS8, 1, false, true, false>(warp, k, 0, kExS8 * s);
+#pragma unroll
+            for (uint32_t i = 0; i < qSliceRowsS8; i++)
+            {
+#pragma unroll
+                for (uint32_t j = 0; j < kSliceRowsS8; j++)
+                {
+#pragma unroll
+                    for (uint32_t n = 0; n < mnExS8; n++)
+                    {
+                        uint32_t const b[2][1] = {kSlice(j, 0).data[n][0], kSlice(j, 0).data[n][1]};
+                        mmaS8Probe(acc(i, j * mnExS8 + n).data, qSlice(i, 0).data, b);
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
     assert(qColBeg % (SharedMem::KSmemBuffer::cols) == 0);
     constexpr uint32_t kEx = 2;
     constexpr uint32_t mnEx = 2;

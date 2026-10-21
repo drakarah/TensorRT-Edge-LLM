@@ -72,6 +72,28 @@ __device__ inline void mma(float (&acc)[2][2], uint32_t const (&a)[2][2], uint32
     }
 }
 
+#if XQA_QK_INT8_PROBE
+// Speed probe (METRICS R22): INT8 x INT8 -> int32 m16n8k32 on the accumulator registers of the fp32 tile (bits reinterpreted; results are not meaningful).
+__device__ inline void mmaS8Probe(float (&acc)[2][2], uint32_t const (&a)[2][2], uint32_t const (&b)[2][1])
+{
+    uint32_t c0 = __float_as_uint(acc[0][0]);
+    uint32_t c1 = __float_as_uint(acc[0][1]);
+    uint32_t c2 = __float_as_uint(acc[1][0]);
+    uint32_t c3 = __float_as_uint(acc[1][1]);
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 \n"
+        "    {%0, %1, %2, %3}, \n"
+        "    {%4, %5, %6, %7}, \n"
+        "    {%8, %9}, \n"
+        "    {%0, %1, %2, %3}; \n"
+        : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+        : "r"(a[0][0]), "r"(a[0][1]), "r"(a[1][0]), "r"(a[1][1]), "r"(b[0][0]), "r"(b[1][0]));
+    acc[0][0] = __uint_as_float(c0);
+    acc[0][1] = __uint_as_float(c1);
+    acc[1][0] = __uint_as_float(c2);
+    acc[1][1] = __uint_as_float(c3);
+}
+#endif
+
 #if SUPPORTS_FP8
 __device__ inline void mmaF8_k16(float (&acc)[2][2], uint32_t const (&a)[2], uint32_t const b)
 {
