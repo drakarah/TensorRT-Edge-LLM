@@ -72,8 +72,8 @@ __device__ inline void mma(float (&acc)[2][2], uint32_t const (&a)[2][2], uint32
     }
 }
 
-#if XQA_QK_INT8_PROBE
-// Speed probe (METRICS R22): INT8 x INT8 -> int32 m16n8k32 on the accumulator registers of the fp32 tile (bits reinterpreted; results are not meaningful).
+#if XQA_QK_INT8_PROBE || XQA_QK_INT8
+// Speed probe / INT8 Q.K^T (METRICS R22): INT8 x INT8 -> int32 m16n8k32 on the accumulator registers of the fp32 tile (bits reinterpreted; results are not meaningful).
 __device__ inline void mmaS8Probe(float (&acc)[2][2], uint32_t const (&a)[2][2], uint32_t const (&b)[2][1])
 {
     uint32_t c0 = __float_as_uint(acc[0][0]);

@@ -64,6 +64,10 @@
 #define SPEC_DEC 0
 #endif
 
+#ifndef XQA_QK_INT8
+#define XQA_QK_INT8 0
+#endif
+
 #ifndef XQA_QK_INT8_PROBE
 #define XQA_QK_INT8_PROBE 0
 #endif

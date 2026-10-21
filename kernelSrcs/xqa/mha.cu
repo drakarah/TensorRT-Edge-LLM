@@ -51,8 +51,17 @@
 #endif
 #endif
 
+// INT8 Q.K^T for the head-512 tree-verify kernel with an INT8 KV cache and tiled staging (sm_86 / sm_89): Q is quantised once per CTA into a persistent
+// INT8 copy in shared memory (per-row scale), Q.K^T runs on m16n8k32 s8 mma with int32 accumulation. The shared-memory budget needs the smaller
+// CTA row max array (method 4, already used for head dim 512 on sm_80).
+#if XQA_QK_INT8 && HEAD_ELEMS == 512 && TILED_QKV_STAGING_HEAD_DIM512 && SPEC_DEC && CACHE_ELEM_ENUM == TRT_EDGELLM_XQA_CACHE_ELEM_INT8
+#define QK_INT8_ACTIVE 1
+#else
+#define QK_INT8_ACTIVE 0
+#endif
+
 #ifndef CTA_ROW_MAX_BACKWARD_METHOD
-#define CTA_ROW_MAX_BACKWARD_METHOD (USE_SM80_HEAD_DIM512_ROW_MAX_METHOD4 ? 4 : 1)
+#define CTA_ROW_MAX_BACKWARD_METHOD ((USE_SM80_HEAD_DIM512_ROW_MAX_METHOD4 || QK_INT8_ACTIVE) ? 4 : 1)
 #endif
 
 static_assert(inputElemSize >= cacheElemSize);
@@ -363,13 +372,22 @@ static_assert(ctaShapeInWarps.y == 1);
 
 struct alignas(128) SharedMem
 {
+#if QK_INT8_ACTIVE
+    using QSmemBuffer = Array2D<LdGrain, 1, 1>; // fp16 Q parts are not staged
+    using QI8SmemBuffer = Array2D<LdGrain, warpTile.y, exactDiv(headElems, grainBytes)>; // whole INT8 head per row
+#else
     using QSmemBuffer = Array2D<LdGrain, warpTile.y, exactDiv(qHeadPartBytes, grainBytes)>;
+#endif
     using KSmemBuffer = Array2D<LdGrain, warpTile.x, exactDiv(kHeadPartBytes, grainBytes)>;
     using XSmemBuffer = Array2D<LdGrain, warpTile.y, exactDiv(inputElemSize* warpTile.x, grainBytes)>;
     using VSmemBuffer
         = Array2D<LdGrain, cacheVTileSeqLen, exactDiv(grpLoadV ? headElems : warpTile.x, cacheElemsPerGrain)>;
 
     QSmemBuffer q[ctaShapeInWarps.y][nbQBuffers];
+#if QK_INT8_ACTIVE
+    QI8SmemBuffer qI8[ctaShapeInWarps.y];
+    float qRowScale[ctaShapeInWarps.y][warpTile.y]; // INT8 Q row scale (absmax / 127)
+#endif
     KSmemBuffer k[ctaShapeInWarps.x][nbKBuffers];
     XSmemBuffer x[ctaShapeInWarps.y][ctaShapeInWarps.x];
     static_assert(nbXBuffers == 1);
@@ -1126,6 +1144,66 @@ loadMatrix(Warp const& warp, Array2D<LdGrain, srcRows, srcCols> const& src, uint
     }
     return dst;
 }
+
+#if QK_INT8_ACTIVE
+// Q.K^T part on INT8 tensor instructions. acc holds int32 partial sums (bits in the fp32 registers) until dequantAccS8.
+// qColBeg is in INT8 grains (16 channels) of the whole-head INT8 Q buffer; the K part is read raw (no fp16 conversion).
+__device__ inline void smemQKPartGemmS8(Warp const& warp, WarpAcc& acc, SharedMem::QI8SmemBuffer const& q,
+    uint32_t qColBeg, SharedMem::KSmemBuffer const& k)
+{
+    constexpr uint32_t kEx = 2;
+    constexpr uint32_t mnEx = 2;
+    constexpr uint32_t gemmKSplit = exactDiv(kHeadPartBytes, 16 * kEx);
+#pragma unroll
+    for (uint32_t s = 0; s < gemmKSplit; s++)
+    {
+        constexpr uint32_t qSliceRows = exactDiv(warpTile.y, 8 * mnEx);
+        Array2D<InstInMat<kEx, mnEx>, qSliceRows, 1> const qSlice
+            = loadMatrix<kEx, mnEx, qSliceRows, 1, false, false, false>(warp, q, 0, qColBeg + kEx * s);
+        constexpr uint32_t kSliceRows = exactDiv(warpTile.x, 8 * mnEx);
+        Array2D<InstInMat<mnEx, kEx>, kSliceRows, 1> const kSlice
+            = loadMatrix<kEx, mnEx, kSliceRows, 1, false, true, false>(warp, k, 0, kEx * s);
+#pragma unroll
+        for (uint32_t i = 0; i < qSliceRows; i++)
+        {
+#pragma unroll
+            for (uint32_t j = 0; j < kSliceRows; j++)
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < mnEx; n++)
+                {
+                    uint32_t const b[2][1] = {kSlice(j, 0).data[n][0], kSlice(j, 0).data[n][1]};
+                    mmaS8Probe(acc(i, j * mnEx + n).data, qSlice(i, 0).data, b);
+                }
+            }
+        }
+    }
+}
+
+// int32 accumulators (bits) -> float scores: row scale of Q x qkScale (attention scale x K dequant scale).
+__device__ inline void dequantAccS8(Warp const& warp, WarpAcc& acc, float const (&rowScale)[warpTile.y], float qkScale)
+{
+    uint32_t const g = laneId() / 4;
+#pragma unroll
+    for (uint32_t m = 0; m < WarpAcc::rows; m++)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < InstAcc::rows; i++)
+        {
+            float const scale = rowScale[(m * InstAcc::rows + i) * 8 + g] * qkScale;
+#pragma unroll
+            for (uint32_t n = 0; n < WarpAcc::cols; n++)
+            {
+#pragma unroll
+                for (uint32_t j = 0; j < InstAcc::cols; j++)
+                {
+                    acc(m, n)(i, j) = static_cast<float>(__float_as_int(acc(m, n)(i, j))) * scale;
+                }
+            }
+        }
+    }
+}
+#endif
 
 // acc is used as both input and output
 // qColBeg is in the unit of LdGrain
@@ -1889,6 +1967,83 @@ CUBIN_EXPORT __global__
 #endif
 #endif
 
+#if QK_INT8_ACTIVE
+    if (warpIdx.z == 0)
+    {
+        // Quantise the Q rows of this CTA to INT8 once: 8 consecutive lanes per row, 64 channels each, per-row absmax over the whole head.
+        auto const localQHeadTokenIdxMap
+            = [nbQHeads, headGrpSize, idxHeadTokenInGrp](uint32_t idxHeadTokenLocal) -> uint32_t
+        {
+            idxHeadTokenLocal += idxHeadTokenInGrp;
+            return (idxHeadTokenLocal / headGrpSize) * nbQHeads + idxHeadTokenLocal % headGrpSize;
+        };
+        auto const src = TinyPtr<IOHead const>{q, nbQHeads * reqSeqOffset + (idxHeadGrp * headGrpSize)};
+        constexpr uint32_t segsPerRow = 8;
+        constexpr uint32_t grainsPerSeg = exactDiv(headElems, 8 * segsPerRow); // fp16 grains (8 halves) per lane
+        uint32_t const tid = warp_size * warpIdx.x + laneId();
+        uint32_t const row = tid / segsPerRow;
+        uint32_t const seg = tid % segsPerRow;
+        bool const rowValid = row < nbValidHeadTokens;
+        IOHead const* const pQHead = rowValid ? (src + localQHeadTokenIdxMap(row)) : nullptr;
+        LdGrain const* const pRow = rowValid ? reinterpret_cast<LdGrain const*>(pQHead) + seg * grainsPerSeg : nullptr;
+        float amax = 0.F;
+        if (rowValid)
+        {
+#pragma unroll
+            for (uint32_t g = 0; g < grainsPerSeg; g++)
+            {
+                LdGrain const v = pRow[g];
+#pragma unroll
+                for (uint32_t w = 0; w < 4; w++)
+                {
+                    half2 const h = reinterpret_cast<half2 const&>(v[w]);
+                    amax = fmaxf(amax, fmaxf(fabsf(__low2float(h)), fabsf(__high2float(h))));
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t d = 1; d < segsPerRow; d <<= 1)
+        {
+            amax = fmaxf(amax, __shfl_xor_sync(~0U, amax, d));
+        }
+        float const rowScale = amax > 0.F ? amax * (1.F / 127.F) : 1.F;
+        float const rowInv = amax > 0.F ? 127.F / amax : 0.F;
+        if (seg == 0)
+        {
+            smem.qRowScale[warpIdx.y][row] = rowScale;
+        }
+#pragma unroll
+        for (uint32_t j = 0; j < grainsPerSeg / 2; j++) // one INT8 grain (16 channels) from two fp16 grains
+        {
+            LdGrain out;
+#pragma unroll
+            for (uint32_t hh = 0; hh < 2; hh++)
+            {
+                LdGrain v;
+                v[0] = v[1] = v[2] = v[3] = 0U;
+                if (rowValid)
+                {
+                    v = pRow[2 * j + hh];
+                }
+#pragma unroll
+                for (uint32_t w = 0; w < 2; w++) // 4 channels -> one 32-bit word of INT8
+                {
+                    half2 const a = reinterpret_cast<half2 const&>(v[2 * w]);
+                    half2 const b = reinterpret_cast<half2 const&>(v[2 * w + 1]);
+                    int32_t const q0 = max(-127, min(127, __float2int_rn(__low2float(a) * rowInv)));
+                    int32_t const q1 = max(-127, min(127, __float2int_rn(__high2float(a) * rowInv)));
+                    int32_t const q2 = max(-127, min(127, __float2int_rn(__low2float(b) * rowInv)));
+                    int32_t const q3 = max(-127, min(127, __float2int_rn(__high2float(b) * rowInv)));
+                    out[2 * hh + w] = (static_cast<uint32_t>(q0) & 0xFFU) | ((static_cast<uint32_t>(q1) & 0xFFU) << 8)
+                        | ((static_cast<uint32_t>(q2) & 0xFFU) << 16) | ((static_cast<uint32_t>(q3) & 0xFFU) << 24);
+                }
+            }
+            smem.qI8[warpIdx.y].template at<true>(row, seg * (grainsPerSeg / 2) + j) = out;
+        }
+        unused(smem.qBarrier[warpIdx.y].arrive());
+    }
+#endif
+
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #if SLIDING_WINDOW
 #if SPEC_DEC && CONTIGUOUS_QUERY_SWA
@@ -2098,6 +2253,10 @@ CUBIN_EXPORT __global__
 #if CACHE_ELEM_ENUM != TRT_EDGELLM_XQA_CACHE_ELEM_INPUT
         constexpr bool reorderForKCache = (useKVCache && inputElemSize == 2 && cacheElemSize == 1);
 #endif
+#if QK_INT8_ACTIVE
+        qBar.wait_parity(qBarParityNext); // INT8 Q published by every compute warp
+        qBarParityNext = !qBarParityNext;
+#else
         if constexpr (persistentQ)
         {
             qBar.wait_parity(qBarParityNext);
@@ -2227,6 +2386,7 @@ CUBIN_EXPORT __global__
 #endif
             }
         };
+#endif
 #if CTA_ROW_MAX_BACKWARD_METHOD == 2
         ThrdRegRowMax initRowMax;
         initRowMax.fill(safeInitRowMax);
@@ -2268,9 +2428,17 @@ CUBIN_EXPORT __global__
                         ? carryLE<nbPartsPerKHead, 1U>(p + 1, idxBeam, 0U)
                         : carryLE<nbPartsPerKHead, beamWidth>(p + 1, idxBeam, 0U);
 
+#if !QK_INT8_ACTIVE
                     loadQTilePart(p);
+#endif
                     auto computeCurrentKPart = [&]()
                     {
+#if QK_INT8_ACTIVE
+                        SharedMem::KSmemBuffer const& smemKPart = getSMemKTile(idxCurrSMemKBuf);
+                        smemQKPartGemmS8(warp, acc, smem.qI8[warpIdx.y], (kHeadPartBytes / grainBytes) * p, smemKPart);
+                        idxCurrSMemKBuf++;
+                    };
+#else
                         SharedMem::QSmemBuffer const& smemQ = smem.q[warpIdx.y][0];
                         constexpr uint32_t qOffsetPerPart = exactDiv(elemsPerKHeadPart, inputElemsPerGrain);
                         uint32_t const smemQOffset = persistentQ ? qOffsetPerPart * p : 0U;
@@ -2289,6 +2457,7 @@ CUBIN_EXPORT __global__
                         smemQKPartGemm<KElemType>(warp, acc, smemQ, smemQOffset, smemKPart);
                         idxCurrSMemKBuf++;
                     };
+#endif
                     if constexpr (nbKBuffers == 1)
                     {
                         if constexpr (!syncKTileEarly)
@@ -2332,11 +2501,15 @@ CUBIN_EXPORT __global__
                 pickAccRowsForBeamSearch(
                     warp, acc, tmp, isConvergedTile(seqIter), idxBeam, [](float& d, float s) { d = s; });
             }
+#if QK_INT8_ACTIVE
+            dequantAccS8(warp, acc, smem.qRowScale[warpIdx.y], qkScale);
+#else
             // Apply the combined semantic and K-dequant scale only when it changes the accumulator.
             if (qkScale != 1.0F)
             {
                 rescaleAcc(warp, acc, qkScale);
             }
+#endif
 #if XQA_2CTA_HEAD_DIM512
             xBar.consumed.wait_parity(getAndFlip(xBarConsumedParityNext));
             auto& splitScoreBar = smem.splitScoreBarriers[warpIdx.y][warpIdx.x];
