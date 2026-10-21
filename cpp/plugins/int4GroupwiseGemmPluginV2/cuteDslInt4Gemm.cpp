@@ -36,6 +36,8 @@ static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 
 #include "cutedsl_all.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace trt_edgellm
@@ -74,7 +76,23 @@ namespace
 // W4A8 variants (must match build_cutedsl.py's int4_int8_gemm registration). X(prefix, bM, bN, bK, stages).
 #define INT4_INT8_GEMM_VARIANTS(X)                                                                                     \
     X(int4_int8_gemm_64x128x64_s3, 64, 128, 64, 3)                                                                     \
+    X(int4_int8_gemm_64x128x64_s4, 64, 128, 64, 4)                                                                     \
     X(int4_int8_gemm_32x128x64_s4, 32, 128, 64, 4)
+
+// Stage 4 is the measured default for the 64-row prompt W4A8 tile. Keep stage
+// 3 available for paired A/B runs without rebuilding the plugin.
+int32_t w4a8Stages64()
+{
+    static int32_t const stages = [] {
+        char const* value = std::getenv("EDGELLM_INT4_W4A8_64_STAGES");
+        if (value != nullptr && std::strcmp(value, "3") == 0)
+        {
+            return 3;
+        }
+        return 4;
+    }();
+    return stages;
+}
 
 #define DECL_MODULE_W4A8(prefix, bM, bN, bK, st) prefix##_Kernel_Module_t g_##prefix{};
 INT4_INT8_GEMM_VARIANTS(DECL_MODULE_W4A8)
@@ -238,7 +256,7 @@ int32_t cuteDslInt4W4A8Launch(int32_t bM, void const* aInt8, void const* aScale,
     }
     int32_t const scaleRows = divUp(K, 128);
 #define DISPATCH_W4A8(prefix, bm, bn, bk, st)                                                                          \
-    if (bM == (bm))                                                                                                    \
+    if (bM == (bm) && ((bm) != 64 || (st) == w4a8Stages64()))                                                         \
     {                                                                                                                  \
         int32_t const qwRows = static_cast<int32_t>(cuteDslInt4RepackedWords(N, K, bn, bk) / 128);                     \
         prefix##_Tensor_mA_t tA{};                                                                                     \

@@ -2120,8 +2120,9 @@ for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
 
 # W4A8 prefill GEMM (INT8 tensor cores, INT4 weights from the same repacked buffer; kernelSrcs/int4_fp16_gemm_cutedsl/int4_int8_gemm_ampere.py).
 # Keep in sync with INT4_INT8_GEMM_VARIANTS in cpp/plugins/int4GroupwiseGemmPluginV2/cuteDslInt4Gemm.cpp. Selected at runtime by
-# EDGELLM_INT4_W4A8_MIN_M.
-for _bm, _stages in ((64, 3), (32, 4)):
+# EDGELLM_INT4_W4A8_MIN_M; the 64-row tile defaults to 4 stages and can use 3 via
+# EDGELLM_INT4_W4A8_64_STAGES=3 for A/B comparisons.
+for _bm, _stages in ((64, 3), (64, 4), (32, 4)):
     KERNEL_VARIANTS.append(
         KernelVariant(
             name=f"int4_int8_gemm_{_bm}x128x64_s{_stages}",
