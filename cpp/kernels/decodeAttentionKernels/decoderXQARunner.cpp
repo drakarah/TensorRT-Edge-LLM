@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cstdlib>
 #include "decoderXQARunner.h"
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
@@ -430,6 +431,23 @@ uint32_t resolveMultiBlock(XQAKernelFuncInfo const& kernelInfo, XQALaunchParams 
         nbSubSeqPerSeq = std::min<uint32_t>(
             std::max<uint32_t>(1U, static_cast<uint32_t>(smCount) / static_cast<uint32_t>(std::max<size_t>(nbSeq, 1))),
             maxPages);
+        // Experiment (METRICS 78b): layers whose grid already has >= SMs blocks along Y (12B: 8 KV heads x 2 query groups = 16 for
+        // sliding layers, the tree's 20 query rows for head-512 global layers) get one split and one block walks the whole
+        // window / context. EDGELLM_XQA_SLIDING_MIN_CTAS / EDGELLM_XQA_GLOBAL_MIN_CTAS=N ask for at least N blocks per launch.
+        static uint32_t const slidingMinCtas = []() {
+            char const* v = std::getenv("EDGELLM_XQA_SLIDING_MIN_CTAS");
+            return v != nullptr ? static_cast<uint32_t>(std::max(0, std::atoi(v))) : 0U;
+        }();
+        static uint32_t const globalMinCtas = []() {
+            char const* v = std::getenv("EDGELLM_XQA_GLOBAL_MIN_CTAS");
+            return v != nullptr ? static_cast<uint32_t>(std::max(0, std::atoi(v))) : 0U;
+        }();
+        uint32_t const minCtas = params.slidingWinSize > 0U ? slidingMinCtas : globalMinCtas;
+        if (minCtas > 0U)
+        {
+            uint32_t const want = (minCtas + static_cast<uint32_t>(nbSeq) - 1U) / static_cast<uint32_t>(nbSeq);
+            nbSubSeqPerSeq = std::min<uint32_t>(std::max(nbSubSeqPerSeq, want), maxPages);
+        }
     }
     if (kernelInfo.mRequiresClusterLaunch || nbSubSeqPerSeq <= 1)
     {
