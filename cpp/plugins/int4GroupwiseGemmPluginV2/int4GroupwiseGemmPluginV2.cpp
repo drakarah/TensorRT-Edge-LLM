@@ -24,6 +24,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <cstdio>
+#include <vector>
+#include <string>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mutex>
@@ -470,7 +473,47 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         }
         // Tactic id = variant index + 1; tactic 0 (default) maps to variant 0,
         // which is always valid for an eligible positive-N, K%64==0 problem.
-        int32_t const idx = (mTactic > 0) ? (mTactic - 1) : 0;
+        int32_t idx = (mTactic > 0) ? (mTactic - 1) : 0;
+        // EDGELLM_INT4_FORCE_TACTIC="N,K:variant;N,K:variant": run variant table index <variant> for decode-size launches (M < 64) of that (N, K),
+        // whatever the engine's autotune stored. A/B tool to read a variant's in-engine kernel time without rebuilding the engine; an invalid
+        // variant for the shape is ignored.
+        if (M < 64)
+        {
+            static std::vector<std::tuple<int32_t, int32_t, int32_t>> const forced = []() {
+                std::vector<std::tuple<int32_t, int32_t, int32_t>> out;
+                char const* e = std::getenv("EDGELLM_INT4_FORCE_TACTIC");
+                if (e != nullptr)
+                {
+                    std::string spec(e);
+                    size_t pos = 0;
+                    while (pos < spec.size())
+                    {
+                        size_t const end = spec.find(';', pos);
+                        std::string const item = spec.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+                        int n = 0, k = 0, v = 0;
+                        if (std::sscanf(item.c_str(), "%d,%d:%d", &n, &k, &v) == 3)
+                        {
+                            out.emplace_back(n, k, v);
+                        }
+                        if (end == std::string::npos)
+                        {
+                            break;
+                        }
+                        pos = end + 1;
+                    }
+                }
+                return out;
+            }();
+            for (auto const& f : forced)
+            {
+                if (std::get<0>(f) == mGemmN && std::get<1>(f) == mGemmK && std::get<2>(f) >= 0 && std::get<2>(f) < cuteDslInt4NumVariants()
+                    && cuteDslInt4VariantValid(cuteDslInt4VariantAt(std::get<2>(f)), mGemmN, mGemmK))
+                {
+                    idx = std::get<2>(f);
+                    break;
+                }
+            }
+        }
         if (idx >= cuteDslInt4NumVariants())
         {
             return -1;
