@@ -170,6 +170,17 @@ public:
     //! @param pluginNamespace Namespace string
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
+    //! @brief Stage routed experts from pinned host memory into the workspace before the GEMMs (serialized)
+    void setStageExperts(bool stage) noexcept
+    {
+        mStageExperts = stage ? 1 : 0;
+    }
+
+    bool hasStageExpertsField() const noexcept
+    {
+        return mStageExpertsFieldSeen;
+    }
+
 private:
     std::string mLayerName;
     std::string mNamespace;
@@ -179,6 +190,8 @@ private:
     int32_t mMoeInterSize{};
     nvinfer1::ActivationType mActivationType{};
     int32_t mQuantizationGroupSize{};
+    int32_t mStageExperts{0};
+    bool mStageExpertsFieldSeen{false};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;

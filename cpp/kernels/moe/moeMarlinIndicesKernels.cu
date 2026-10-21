@@ -201,5 +201,53 @@ void launchAggregateSlotOutputsBf16Kernel(void const* slotOutputs, void* aggrega
         static_cast<__nv_bfloat16*>(aggregatedOutput), numTokens, topK, outDim, stream);
 }
 
+
+namespace
+{
+__global__ void markRoutedExpertsKernel(int32_t const* topkIndices, int32_t count, int32_t numExperts, uint8_t* needed)
+{
+    int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count)
+    {
+        int32_t const e = topkIndices[idx];
+        if (e >= 0 && e < numExperts)
+        {
+            needed[e] = 1;
+        }
+    }
+}
+
+// grid = (experts, chunks, tensors); each block copies one chunk of one expert's slice of one tensor with 16-byte loads
+// (host memory is read through its UVA address, so many loads must be in flight to reach PCIe line rate).
+__global__ void stageRoutedExpertsKernel(uint8_t const* needed, ExpertStagingCopy copy)
+{
+    int32_t const expert = blockIdx.x;
+    if (needed[expert] == 0)
+    {
+        return;
+    }
+    int32_t const t = blockIdx.z;
+    size_t const bytes = copy.bytesPerExpert[t];
+    size_t const chunk = (bytes / 16 + gridDim.y - 1) / gridDim.y;
+    size_t const begin = chunk * blockIdx.y;
+    size_t const end = min(begin + chunk, bytes / 16);
+    uint4 const* src = reinterpret_cast<uint4 const*>(copy.src[t] + bytes * expert);
+    uint4* dst = reinterpret_cast<uint4*>(copy.dst[t] + bytes * expert);
+    for (size_t i = begin + threadIdx.x; i < end; i += blockDim.x)
+    {
+        dst[i] = src[i];
+    }
+}
+} // namespace
+
+void launchStageRoutedExperts(int32_t const* topkIndices, int32_t count, int32_t numExperts, uint8_t* neededWorkspace,
+    ExpertStagingCopy const& copy, cudaStream_t stream)
+{
+    cudaMemsetAsync(neededWorkspace, 0, numExperts, stream);
+    markRoutedExpertsKernel<<<(count + 255) / 256, 256, 0, stream>>>(topkIndices, count, numExperts, neededWorkspace);
+    dim3 const grid(numExperts, 16, copy.numTensors);
+    stageRoutedExpertsKernel<<<grid, 256, 0, stream>>>(neededWorkspace, copy);
+}
+
 } // namespace kernel
 } // namespace trt_edgellm

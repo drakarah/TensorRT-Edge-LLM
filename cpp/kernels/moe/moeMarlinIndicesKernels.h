@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -66,6 +67,24 @@ void launchAggregateSlotOutputsKernel(void const* slotOutputs, void* aggregatedO
  */
 void launchAggregateSlotOutputsBf16Kernel(void const* slotOutputs, void* aggregatedOutput, int32_t numTokens,
     int32_t topK, int32_t outDim, cudaStream_t stream);
+
+
+//! One staged tensor group: per-expert byte slices of up to four [numExperts, ...] tensors (each slice 16-byte multiple).
+struct ExpertStagingCopy
+{
+    uint8_t const* src[4];
+    uint8_t* dst[4];
+    size_t bytesPerExpert[4];
+    int32_t numTensors;
+};
+
+/**
+ * @brief Copy the experts selected by @p topkIndices from @p copy.src (typically pinned host memory) into @p copy.dst
+ * (device) at the same expert offsets; experts that no token selected are not copied. Graph-capture safe (no host sync).
+ * @param neededWorkspace numExperts bytes of device scratch.
+ */
+void launchStageRoutedExperts(int32_t const* topkIndices, int32_t count, int32_t numExperts, uint8_t* neededWorkspace,
+    ExpertStagingCopy const& copy, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

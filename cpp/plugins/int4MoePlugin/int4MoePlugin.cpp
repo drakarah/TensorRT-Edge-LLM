@@ -33,6 +33,7 @@
 #include <array>
 #include <cassert>
 #include <cuda_fp16.h>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <limits>
 #include <mutex>
@@ -98,6 +99,33 @@ bool hasValidRoutedRowCapacity(int64_t numTokens, int32_t numExperts, int32_t to
 
 // Workspace size for Int4 MoE plugin using accumulateWorkspaceSize (same order as assignTensorFromWorkspace in
 // enqueue).
+//! EDGELLM_MOE_STAGE_EXPERTS=1 at engine build: experts that live in pinned host memory (EDGELLM_HOST_EXTERNAL_WEIGHTS) are
+//! copied to a device staging area, only the ones the routing selected, instead of being read by the GEMM over PCIe.
+bool stageExpertsFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_STAGE_EXPERTS");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
+//! Bytes of one staged layer: the four per-expert weight / scale tensors (inputs 2..5), 256-byte aligned each.
+size_t stagedExpertBytes(nvinfer1::Dims const* const dims[4], nvinfer1::DataType const types[4]) noexcept
+{
+    size_t total = 0;
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        size_t bytes = 1;
+        for (int32_t d = 0; d < dims[i]->nbDims; ++d)
+        {
+            bytes *= static_cast<size_t>(dims[i]->d[d]);
+        }
+        bytes *= (types[i] == nvinfer1::DataType::kHALF || types[i] == nvinfer1::DataType::kBF16)
+            ? 2
+            : (types[i] == nvinfer1::DataType::kINT32 || types[i] == nvinfer1::DataType::kFLOAT) ? 4 : 1;
+        total += (bytes + 255) & ~static_cast<size_t>(255);
+    }
+    return total + 256; // + the routed-expert bitmap
+}
+
 size_t computeInt4MoeWorkspaceSize(
     int64_t numTokens, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize) noexcept
 {
@@ -224,6 +252,11 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
         {
             mQuantizationGroupSize = *static_cast<int32_t const*>(fc->fields[i].data);
         }
+        else if (fieldName == "stage_experts")
+        {
+            mStageExperts = *static_cast<int32_t const*>(fc->fields[i].data);
+            mStageExpertsFieldSeen = true;
+        }
     }
 
     if (std::find(kSUPPORTED_ACTIVATION_TYPES.begin(), kSUPPORTED_ACTIVATION_TYPES.end(), mActivationType)
@@ -256,6 +289,7 @@ IPluginV3* Int4MoePlugin::clone() noexcept
         auto* plugin = new Int4MoePlugin(
             mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType, mQuantizationGroupSize);
         plugin->setPluginNamespace(mNamespace.c_str());
+        plugin->setStageExperts(mStageExperts != 0);
         return plugin;
     }
     catch (std::exception const& e)
@@ -471,7 +505,14 @@ size_t Int4MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, in
         LOG_ERROR("Int4MoePlugin: invalid profile maximum shapes while computing workspace");
         return 0;
     }
-    return computeInt4MoeWorkspaceSize(maxTokens, mNumExperts, mTopK, mHiddenSize, mMoeInterSize);
+    size_t staged = 0;
+    if (mStageExperts != 0)
+    {
+        nvinfer1::Dims const* const dims[4] = {&inputs[2].desc.dims, &inputs[3].desc.dims, &inputs[4].desc.dims, &inputs[5].desc.dims};
+        nvinfer1::DataType const types[4] = {inputs[2].desc.type, inputs[3].desc.type, inputs[4].desc.type, inputs[5].desc.type};
+        staged = stagedExpertBytes(dims, types);
+    }
+    return computeInt4MoeWorkspaceSize(maxTokens, mNumExperts, mTopK, mHiddenSize, mMoeInterSize) + staged;
 }
 
 int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
@@ -514,18 +555,65 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor hiddenStatesTensor(const_cast<void*>(inputs[1]), rt::Coords{hiddenStatesDesc.dims},
             rt::DeviceType::kGPU, hiddenStatesDesc.type);
 
+        // With staging on, expert weights that live in pinned host memory are copied (routed experts only) into the head of the
+        // workspace and the GEMMs read that copy; otherwise the GEMMs read the engine input directly.
+        void const* weightPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
+        std::byte* alignedWorkspacePtr = static_cast<std::byte*>(workspace);
+        bool stageNow = false;
+        trt_edgellm::kernel::ExpertStagingCopy stagingCopy{};
+        uint8_t* neededPtr = nullptr;
+        if (mStageExperts != 0)
+        {
+            cudaPointerAttributes attributes{};
+            if (cudaPointerGetAttributes(&attributes, inputs[2]) != cudaSuccess)
+            {
+                cudaGetLastError();
+            }
+            else
+            {
+                stageNow = attributes.type == cudaMemoryTypeHost;
+            }
+        }
+        if (stageNow)
+        {
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                size_t bytes = 1;
+                for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+                {
+                    bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+                }
+                bytes *= inputDesc[2 + i].type == DataType::kHALF ? 2 : 1;
+                stagingCopy.src[i] = static_cast<uint8_t const*>(inputs[2 + i]);
+                stagingCopy.dst[i] = reinterpret_cast<uint8_t*>(alignedWorkspacePtr);
+                stagingCopy.bytesPerExpert[i] = bytes / mNumExperts;
+                weightPtrs[i] = alignedWorkspacePtr;
+                alignedWorkspacePtr += (bytes + 255) & ~static_cast<size_t>(255);
+            }
+            stagingCopy.numTensors = 4;
+            neededPtr = reinterpret_cast<uint8_t*>(alignedWorkspacePtr);
+            alignedWorkspacePtr += 256;
+        }
+        else if (mStageExperts != 0)
+        {
+            // staging space is reserved but unused; skip it so the later carving matches the size computation
+            nvinfer1::Dims const* const dims[4] = {&inputDesc[2].dims, &inputDesc[3].dims, &inputDesc[4].dims, &inputDesc[5].dims};
+            nvinfer1::DataType const types[4] = {inputDesc[2].type, inputDesc[3].type, inputDesc[4].type, inputDesc[5].type};
+            alignedWorkspacePtr += stagedExpertBytes(dims, types);
+        }
+
         // Weights arrive as INT8 (view of Marlin int32-packed); Marlin expects INT32
-        rt::Tensor gateUpQWeightsTensor(const_cast<void*>(inputs[2]),
+        rt::Tensor gateUpQWeightsTensor(const_cast<void*>(weightPtrs[0]),
             rt::Coords{mNumExperts, mHiddenSize / 16, 2 * mMoeInterSize}, rt::DeviceType::kGPU, DataType::kINT32);
 
         rt::Tensor gateUpScalesTensor(
-            const_cast<void*>(inputs[3]), rt::Coords{inputDesc[3].dims}, rt::DeviceType::kGPU, inputDesc[3].type);
+            const_cast<void*>(weightPtrs[1]), rt::Coords{inputDesc[3].dims}, rt::DeviceType::kGPU, inputDesc[3].type);
 
-        rt::Tensor downQWeightsTensor(const_cast<void*>(inputs[4]),
+        rt::Tensor downQWeightsTensor(const_cast<void*>(weightPtrs[2]),
             rt::Coords{mNumExperts, mMoeInterSize / 16, 2 * mHiddenSize}, rt::DeviceType::kGPU, DataType::kINT32);
 
         rt::Tensor downScalesTensor(
-            const_cast<void*>(inputs[5]), rt::Coords{inputDesc[5].dims}, rt::DeviceType::kGPU, inputDesc[5].type);
+            const_cast<void*>(weightPtrs[3]), rt::Coords{inputDesc[5].dims}, rt::DeviceType::kGPU, inputDesc[5].type);
 
         rt::Tensor outputTensor(outputs[0], rt::Coords{outputDesc[0].dims}, rt::DeviceType::kGPU, outputDesc[0].type);
 
@@ -534,8 +622,6 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         int32_t sms = 0;
         CUDA_CHECK(cudaGetDevice(&dev));
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-
-        std::byte* alignedWorkspacePtr = static_cast<std::byte*>(workspace);
 
         // ==================== Workspace Allocation ====================
         int32_t totalSlots = numTokens * mTopK;
@@ -605,6 +691,12 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         moeTopkSoftmax(routerLogitsTensor, topkWeightsTensor, topkIndicesTensor, mTopK, softmaxWorkspacePtr,
             softmaxWorkspaceSizeBytes, stream, true, 0.0f);
         CUDA_CHECK(cudaGetLastError());
+
+        if (stageNow)
+        {
+            kernel::launchStageRoutedExperts(topkIndicesPtr, numTokens * mTopK, mNumExperts, neededPtr, stagingCopy, stream);
+            CUDA_CHECK(cudaGetLastError());
+        }
 
         // Reshape hidden_states to 2D for expert GEMMs
         rt::Tensor hiddenStates2D(const_cast<void*>(hiddenStatesTensor.rawPointer()), {numTokens, mHiddenSize},
@@ -723,6 +815,7 @@ PluginFieldCollection const* Int4MoePlugin::getFieldsToSerialize() noexcept
         mDataToSerialize.emplace_back("moe_inter_size", &mMoeInterSize, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("activation_type", &mActivationType, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("quantization_group_size", &mQuantizationGroupSize, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("stage_experts", &mStageExperts, PluginFieldType::kINT32, 1);
 
         mFCToSerialize.nbFields = mDataToSerialize.size();
         mFCToSerialize.fields = mDataToSerialize.data();
@@ -747,6 +840,7 @@ Int4MoePluginCreator::Int4MoePluginCreator()
     mPluginAttributes.emplace_back(PluginField("moe_inter_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("activation_type", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("quantization_group_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("stage_experts", nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
@@ -778,11 +872,15 @@ char const* Int4MoePluginCreator::getPluginVersion() const noexcept
 }
 
 IPluginV3* Int4MoePluginCreator::createPlugin(
-    char const* name, PluginFieldCollection const* fc, [[maybe_unused]] TensorRTPhase phase) noexcept
+    char const* name, PluginFieldCollection const* fc, TensorRTPhase phase) noexcept
 {
     try
     {
         Int4MoePlugin* plugin = new Int4MoePlugin(std::string(name), fc);
+        if (!plugin->hasStageExpertsField() && phase == TensorRTPhase::kBUILD)
+        {
+            plugin->setStageExperts(stageExpertsFromEnv());
+        }
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
