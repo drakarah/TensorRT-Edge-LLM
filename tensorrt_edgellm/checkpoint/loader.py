@@ -540,6 +540,9 @@ def _set_tensor(model: nn.Module,
         return True
     if attr in module._parameters:
         module._parameters[attr] = nn.Parameter(tensor, requires_grad=False)
+        after_loaded = getattr(module, "after_tensor_loaded", None)
+        if after_loaded is not None:
+            after_loaded(attr)
         return True
 
     # Key resolves to a module-level attribute that is neither buffer nor
