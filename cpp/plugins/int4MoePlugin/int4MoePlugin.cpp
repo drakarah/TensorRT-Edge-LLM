@@ -41,7 +41,9 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include <limits>
+#include <map>
 #include <mutex>
+#include <set>
 
 using namespace nvinfer1;
 namespace trt_edgellm
@@ -106,10 +108,13 @@ bool hasValidRoutedRowCapacity(int64_t numTokens, int32_t numExperts, int32_t to
 // enqueue).
 //! EDGELLM_MOE_STAGE_EXPERTS=1 at engine build: experts that live in pinned host memory (EDGELLM_HOST_EXTERNAL_WEIGHTS) are
 //! copied to a device staging area, only the ones the routing selected, instead of being read by the GEMM over PCIe.
-bool stageExpertsFromEnv()
+//! 0 = off, 1 = stage into the head of the TRT workspace, 2 = stage into private device buffers (no workspace reservation; the buffers also serve the
+//! prefill prefetch, EDGELLM_MOE_PREFILL_OVERLAP).
+int32_t stageExpertsFromEnv()
 {
     char const* const value = std::getenv("EDGELLM_MOE_STAGE_EXPERTS");
-    return value != nullptr && std::atoi(value) != 0;
+    int32_t const mode = value != nullptr ? std::atoi(value) : 0;
+    return mode < 0 ? 0 : (mode > 2 ? 2 : mode);
 }
 
 //! Bytes of one staged layer: the four per-expert weight / scale tensors (inputs 2..5), 256-byte aligned each.
@@ -129,6 +134,255 @@ size_t stagedExpertBytes(nvinfer1::Dims const* const dims[4], nvinfer1::DataType
         total += (bytes + 255) & ~static_cast<size_t>(255);
     }
     return total + 256; // + the routed-expert bitmap
+}
+
+//! EDGELLM_MOE_PREFILL_OVERLAP=1 (runtime): during prefill passes (>= kPrefetchMinTokens tokens) the experts of layer L+1 are copied by DMA on a
+//! side stream into one of two private device buffers while layer L computes, so the PCIe copy that the routed-expert staging puts in front of every
+//! layer's GEMMs (about 40% of a 3k-token prefill, METRICS R25m) is hidden behind compute. With that many tokens nearly every expert is routed in
+//! every layer, so copying the whole layer is not wasteful. The first layer of a pass, chunks below the threshold and decode steps keep the staging
+//! kernel / the expert cache. With stage mode 2 (engine built with EDGELLM_MOE_STAGE_EXPERTS=2) the staging kernel writes into buffer 0 of the same
+//! private pair instead of the TRT workspace, so the pair replaces the workspace head (net cost: one layer of INT4 experts, ~386 MB for the 26B).
+constexpr int32_t kPrefetchMinTokens = 128;
+
+bool prefillOverlapFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_PREFILL_OVERLAP");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
+//! Layer position inside the engine: the trailing integer of the plugin node name ("n0_18" -> 18); layers run in ascending order.
+int32_t layerIdFromName(std::string const& name) noexcept
+{
+    size_t const pos = name.find_last_of('_');
+    return pos == std::string::npos ? -1 : std::atoi(name.c_str() + pos + 1);
+}
+
+//! Layer ids of the MoE plugins of this process (for the automatic cache sizing). The node name carries a " [profile N]" suffix per optimisation
+//! profile, so the layers are counted by their id, not by the name string.
+std::set<int32_t>& moeLayerNames()
+{
+    static std::set<int32_t> names;
+    return names;
+}
+
+std::mutex& moeLayerNamesMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+void registerMoeLayerName(std::string const& name)
+{
+    std::lock_guard<std::mutex> lock(moeLayerNamesMutex());
+    moeLayerNames().insert(layerIdFromName(name));
+}
+
+size_t moeLayerCount()
+{
+    std::lock_guard<std::mutex> lock(moeLayerNamesMutex());
+    return moeLayerNames().size();
+}
+
+class PrefillExpertPrefetcher
+{
+public:
+    enum class Result
+    {
+        kNone,       //!< no private buffer available
+        kPrefetched, //!< ptrs hold this layer's experts, copied during the previous layer: no staging needed
+        kTarget      //!< ptrs is an empty private buffer the staging kernel must fill (mode 2 only)
+    };
+
+    static PrefillExpertPrefetcher& get()
+    {
+        static PrefillExpertPrefetcher instance;
+        return instance;
+    }
+
+    //! Allocate the private buffers (one, or two when prefetching) for layers of `bytes` bytes; false when the device is full.
+    bool reserve(size_t bytes, bool two) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return ensure(bytes, two);
+    }
+
+    //! Called at the start of a layer's enqueue that needs staged experts (main stream `stream`). `prefetch` = this pass is long enough to prefetch the
+    //! next layer; `wantTarget` = stage mode 2, a not-prefetched layer is staged into buffer 0 by the staging kernel.
+    Result begin(int32_t layerId, void const* const src[4], size_t const bytes[4], cudaStream_t stream, bool prefetch, bool wantTarget,
+        uint8_t* outPtrs[4]) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (layerId < 0)
+        {
+            return Result::kNone;
+        }
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess)
+        {
+            cudaGetLastError();
+        }
+        bool const capturing = capture != cudaStreamCaptureStatusNone; // graph capture: no cross-stream events, no prefetch
+        if (capturing)
+        {
+            prefetch = false;
+        }
+        Layer& layer = mLayers[layerId];
+        size_t total = 0;
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            layer.src[i] = src[i];
+            layer.bytes[i] = bytes[i];
+            layer.offset[i] = total;
+            total += (bytes[i] + 255) & ~static_cast<size_t>(255);
+        }
+        layer.total = total;
+        if (!ensure(total, prefetch || mTwo))
+        {
+            return Result::kNone;
+        }
+        int32_t current = -1;
+        if (prefetch && mPendingLayer == layerId && mPendingBuf >= 0)
+        {
+            cudaStreamWaitEvent(stream, mCopyDone[mPendingBuf], 0);
+            current = mPendingBuf;
+        }
+        else if (wantTarget && !capturing)
+        {
+            // a stale prefetch into buffer 0 may still be in flight: the staging kernel must not overwrite it before it lands
+            for (int32_t b = 0; b < 2; ++b)
+            {
+                if (mCopyRecorded[b])
+                {
+                    cudaStreamWaitEvent(stream, mCopyDone[b], 0);
+                }
+            }
+        }
+        mPendingLayer = -1;
+        mPendingBuf = -1;
+        int32_t const used = current >= 0 ? current : 0;
+        if (current >= 0 || wantTarget)
+        {
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                outPtrs[i] = mBuf[used] + layer.offset[i];
+            }
+        }
+        auto next = mLayers.upper_bound(layerId);
+        if (prefetch && mTwo && next != mLayers.end() && next->second.total <= mBufBytes)
+        {
+            int32_t const target = 1 - used;
+            // everything queued on the main stream so far (the previous layer's GEMMs, which may still read this buffer) must finish first
+            cudaEventRecord(mBufFree, stream);
+            cudaStreamWaitEvent(mSide, mBufFree, 0);
+            bool ok = true;
+            for (int32_t i = 0; i < 4 && ok; ++i)
+            {
+                ok = cudaMemcpyAsync(mBuf[target] + next->second.offset[i], next->second.src[i], next->second.bytes[i], cudaMemcpyHostToDevice, mSide)
+                    == cudaSuccess;
+            }
+            if (ok && cudaEventRecord(mCopyDone[target], mSide) == cudaSuccess)
+            {
+                mPendingLayer = next->first;
+                mPendingBuf = target;
+                mCopyRecorded[target] = true;
+            }
+            else
+            {
+                cudaGetLastError();
+            }
+        }
+        if (current >= 0)
+        {
+            return Result::kPrefetched;
+        }
+        return wantTarget ? Result::kTarget : Result::kNone;
+    }
+
+    //! A decode step (or any non-prefill call) breaks the layer sequence: a prefetch issued for a layer that now will not run must not be consumed.
+    void invalidate() noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mPendingLayer = -1;
+        mPendingBuf = -1;
+    }
+
+private:
+    struct Layer
+    {
+        void const* src[4]{};
+        size_t bytes[4]{};
+        size_t offset[4]{};
+        size_t total{0};
+    };
+
+    bool ensure(size_t needed, bool two) noexcept
+    {
+        if (mFailed)
+        {
+            return false;
+        }
+        if (mReady && (mTwo || !two))
+        {
+            return needed <= mBufBytes;
+        }
+        // layer sizes are equal across the layers of this model; sized for the first layer seen
+        size_t const size = mReady ? mBufBytes : needed;
+        if (mBuf[0] == nullptr && cudaMalloc(reinterpret_cast<void**>(&mBuf[0]), size) != cudaSuccess)
+        {
+            cudaGetLastError();
+            mFailed = true;
+            LOG_WARNING("Int4MoePlugin: private expert buffer (%zu bytes) not allocated", size);
+            return false;
+        }
+        if (two)
+        {
+            if (cudaMalloc(reinterpret_cast<void**>(&mBuf[1]), size) != cudaSuccess || cudaStreamCreateWithFlags(&mSide, cudaStreamNonBlocking) != cudaSuccess
+                || cudaEventCreateWithFlags(&mCopyDone[0], cudaEventDisableTiming) != cudaSuccess
+                || cudaEventCreateWithFlags(&mCopyDone[1], cudaEventDisableTiming) != cudaSuccess
+                || cudaEventCreateWithFlags(&mBufFree, cudaEventDisableTiming) != cudaSuccess)
+            {
+                cudaGetLastError();
+                if (mBuf[1] != nullptr)
+                {
+                    cudaFree(mBuf[1]);
+                    mBuf[1] = nullptr;
+                }
+                LOG_WARNING("Int4MoePlugin: prefill prefetch buffer (%zu bytes) not allocated; staging without overlap", size);
+                two = false;
+            }
+            else
+            {
+                mTwo = true;
+            }
+        }
+        if (!mReady)
+        {
+            mBufBytes = size;
+            mReady = true;
+            LOG_INFO("Int4MoePlugin: private expert buffers %d x %.1f MiB (prefill overlap %s)", mTwo ? 2 : 1, size / 1048576.0, mTwo ? "on" : "off");
+        }
+        return needed <= mBufBytes;
+    }
+
+    std::mutex mMutex;
+    std::map<int32_t, Layer> mLayers;
+    uint8_t* mBuf[2]{nullptr, nullptr};
+    size_t mBufBytes{0};
+    cudaStream_t mSide{nullptr};
+    cudaEvent_t mCopyDone[2]{nullptr, nullptr};
+    cudaEvent_t mBufFree{nullptr};
+    bool mCopyRecorded[2]{false, false};
+    int32_t mPendingLayer{-1};
+    int32_t mPendingBuf{-1};
+    bool mReady{false};
+    bool mTwo{false};
+    bool mFailed{false};
+};
+
+//! Workspace bytes reserved for staging: the whole layer in mode 1, only the routed-expert bitmap in mode 2.
+size_t stagedWorkspaceBytes(int32_t mode, nvinfer1::Dims const* const dims[4], nvinfer1::DataType const types[4]) noexcept
+{
+    return mode == 1 ? stagedExpertBytes(dims, types) : (mode == 2 ? 256 : 0);
 }
 
 size_t computeInt4MoeWorkspaceSize(
@@ -219,6 +473,7 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, int32_t const numExperts, 
     , mActivationType(activationType)
     , mQuantizationGroupSize(quantizationGroupSize)
 {
+    registerMoeLayerName(mLayerName);
     if (std::find(kSUPPORTED_ACTIVATION_TYPES.begin(), kSUPPORTED_ACTIVATION_TYPES.end(), mActivationType)
         == kSUPPORTED_ACTIVATION_TYPES.end())
     {
@@ -230,6 +485,7 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, int32_t const numExperts, 
 Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection const* fc)
     : mLayerName(name)
 {
+    registerMoeLayerName(mLayerName);
     for (int32_t i = 0; i < fc->nbFields; ++i)
     {
         std::string fieldName(fc->fields[i].name);
@@ -338,7 +594,54 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
     if (mCacheSlots < 0)
     {
         char const* value = std::getenv("EDGELLM_MOE_CACHE_SLOTS");
-        mCacheSlots = value != nullptr ? std::atoi(value) : 0;
+        if (value != nullptr && std::string(value) == "auto")
+        {
+            // EDGELLM_MOE_CACHE_SLOTS=auto: as many slots per layer as the free device memory holds, decided once (first decode step: the engine,
+            // KV and every plugin workspace exist by then), after the private staging / prefetch buffers are reserved. EDGELLM_MOE_CACHE_RESERVE_MB
+            // (default 250) stays free for transient allocations.
+            static std::mutex autoMutex;
+            static int32_t autoSlots = -1;
+            std::lock_guard<std::mutex> lock(autoMutex);
+            if (autoSlots < 0)
+            {
+                size_t perSlot = 0;
+                size_t layerBytes = 0;
+                for (int32_t i = 0; i < 4; ++i)
+                {
+                    size_t bytes = 1;
+                    for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+                    {
+                        bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+                    }
+                    bytes *= inputDesc[2 + i].type == DataType::kHALF ? 2 : 1;
+                    perSlot += bytes / mNumExperts + 256;
+                    layerBytes += (bytes + 255) & ~static_cast<size_t>(255);
+                }
+                if (mStageExperts == 2 || prefillOverlapFromEnv())
+                {
+                    PrefillExpertPrefetcher::get().reserve(layerBytes, prefillOverlapFromEnv());
+                }
+                size_t freeBytes = 0;
+                size_t totalBytes = 0;
+                cudaMemGetInfo(&freeBytes, &totalBytes);
+                char const* reserveEnv = std::getenv("EDGELLM_MOE_CACHE_RESERVE_MB");
+                size_t const reserve = (reserveEnv != nullptr ? static_cast<size_t>(std::atoi(reserveEnv)) : 250) << 20;
+                size_t const layers = std::max<size_t>(1, moeLayerCount());
+                size_t const fit = freeBytes > reserve ? (freeBytes - reserve) / (layers * perSlot) : 0;
+                autoSlots = static_cast<int32_t>(std::min<size_t>(fit, static_cast<size_t>(mNumExperts)));
+                if (autoSlots < static_cast<int32_t>(mTopK))
+                {
+                    autoSlots = 0;
+                }
+                LOG_INFO("Int4MoePlugin: automatic expert cache size %d slots per layer x %zu layers (free %.0f MiB, reserve %.0f MiB, %.2f MiB per slot-layer)",
+                    autoSlots, layers, freeBytes / 1048576.0, reserve / 1048576.0, perSlot / 1048576.0);
+            }
+            mCacheSlots = autoSlots;
+        }
+        else
+        {
+            mCacheSlots = value != nullptr ? std::atoi(value) : 0;
+        }
     }
     if (mCacheSlots <= 0)
     {
@@ -425,7 +728,7 @@ IPluginV3* Int4MoePlugin::clone() noexcept
         auto* plugin = new Int4MoePlugin(
             mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType, mQuantizationGroupSize);
         plugin->setPluginNamespace(mNamespace.c_str());
-        plugin->setStageExperts(mStageExperts != 0);
+        plugin->setStageExperts(mStageExperts);
         return plugin;
     }
     catch (std::exception const& e)
@@ -646,7 +949,7 @@ size_t Int4MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, in
     {
         nvinfer1::Dims const* const dims[4] = {&inputs[2].desc.dims, &inputs[3].desc.dims, &inputs[4].desc.dims, &inputs[5].desc.dims};
         nvinfer1::DataType const types[4] = {inputs[2].desc.type, inputs[3].desc.type, inputs[4].desc.type, inputs[5].desc.type};
-        staged = stagedExpertBytes(dims, types);
+        staged = stagedWorkspaceBytes(mStageExperts, dims, types);
     }
     return computeInt4MoeWorkspaceSize(maxTokens, mNumExperts, mTopK, mHiddenSize, mMoeInterSize) + staged;
 }
@@ -711,7 +1014,49 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             }
         }
         bool useCache = false;
-        if (stageNow && numTokens <= 4 && ensureExpertCache(inputDesc) && numTokens * mTopK <= mCacheSlots)
+        static bool const prefillOverlap = prefillOverlapFromEnv();
+        nvinfer1::Dims const* const stageDims[4] = {&inputDesc[2].dims, &inputDesc[3].dims, &inputDesc[4].dims, &inputDesc[5].dims};
+        nvinfer1::DataType const stageTypes[4] = {inputDesc[2].type, inputDesc[3].type, inputDesc[4].type, inputDesc[5].type};
+        size_t tensorBytes[4];
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            size_t bytes = 1;
+            for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+            {
+                bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+            }
+            tensorBytes[i] = bytes * (inputDesc[2 + i].type == DataType::kHALF ? 2 : 1);
+        }
+        // decode steps served by the expert cache never stage
+        bool const cacheStep = stageNow && numTokens <= 4 && ensureExpertCache(inputDesc) && numTokens * mTopK <= mCacheSlots;
+        auto pfResult = PrefillExpertPrefetcher::Result::kNone;
+        uint8_t* privatePtrs[4]{};
+        if (stageNow && !cacheStep && (prefillOverlap || mStageExperts == 2))
+        {
+            void const* srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
+            pfResult = PrefillExpertPrefetcher::get().begin(layerIdFromName(mLayerName), srcPtrs, tensorBytes, stream,
+                prefillOverlap && numTokens >= kPrefetchMinTokens, mStageExperts == 2, privatePtrs);
+            if (mStageExperts == 2 && pfResult == PrefillExpertPrefetcher::Result::kNone)
+            {
+                LOG_ERROR("Int4MoePlugin %s: private staging buffer unavailable", mLayerName.c_str());
+                return 1;
+            }
+        }
+        else if (stageNow && prefillOverlap)
+        {
+            PrefillExpertPrefetcher::get().invalidate();
+        }
+        if (pfResult == PrefillExpertPrefetcher::Result::kPrefetched)
+        {
+            // this layer's experts were copied during the previous layer: the GEMMs read the private buffer, the staging kernel is skipped
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                weightPtrs[i] = privatePtrs[i];
+            }
+            alignedWorkspacePtr += stagedWorkspaceBytes(mStageExperts, stageDims, stageTypes); // the staging region stays unused
+            stageNow = false;
+        }
+        else if (cacheStep)
         {
             useCache = true;
             for (int32_t i = 0; i < 4; ++i)
@@ -722,25 +1067,26 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                 weightPtrs[i] = mCacheTensors[i];
             }
             stagingCopy.numTensors = 4;
-            nvinfer1::Dims const* const dims[4] = {&inputDesc[2].dims, &inputDesc[3].dims, &inputDesc[4].dims, &inputDesc[5].dims};
-            nvinfer1::DataType const types[4] = {inputDesc[2].type, inputDesc[3].type, inputDesc[4].type, inputDesc[5].type};
-            alignedWorkspacePtr += stagedExpertBytes(dims, types); // the staging region stays unused
+            alignedWorkspacePtr += stagedWorkspaceBytes(mStageExperts, stageDims, stageTypes); // the staging region stays unused
         }
         else if (stageNow)
         {
             for (int32_t i = 0; i < 4; ++i)
             {
-                size_t bytes = 1;
-                for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
-                {
-                    bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
-                }
-                bytes *= inputDesc[2 + i].type == DataType::kHALF ? 2 : 1;
+                size_t const bytes = tensorBytes[i];
                 stagingCopy.src[i] = static_cast<uint8_t const*>(inputs[2 + i]);
-                stagingCopy.dst[i] = reinterpret_cast<uint8_t*>(alignedWorkspacePtr);
                 stagingCopy.bytesPerExpert[i] = bytes / mNumExperts;
-                weightPtrs[i] = alignedWorkspacePtr;
-                alignedWorkspacePtr += (bytes + 255) & ~static_cast<size_t>(255);
+                if (mStageExperts == 2)
+                {
+                    stagingCopy.dst[i] = privatePtrs[i];
+                    weightPtrs[i] = privatePtrs[i];
+                }
+                else
+                {
+                    stagingCopy.dst[i] = reinterpret_cast<uint8_t*>(alignedWorkspacePtr);
+                    weightPtrs[i] = alignedWorkspacePtr;
+                    alignedWorkspacePtr += (bytes + 255) & ~static_cast<size_t>(255);
+                }
             }
             stagingCopy.numTensors = 4;
             neededPtr = reinterpret_cast<uint8_t*>(alignedWorkspacePtr);
@@ -749,9 +1095,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         else if (mStageExperts != 0)
         {
             // staging space is reserved but unused; skip it so the later carving matches the size computation
-            nvinfer1::Dims const* const dims[4] = {&inputDesc[2].dims, &inputDesc[3].dims, &inputDesc[4].dims, &inputDesc[5].dims};
-            nvinfer1::DataType const types[4] = {inputDesc[2].type, inputDesc[3].type, inputDesc[4].type, inputDesc[5].type};
-            alignedWorkspacePtr += stagedExpertBytes(dims, types);
+            alignedWorkspacePtr += stagedWorkspaceBytes(mStageExperts, stageDims, stageTypes);
         }
 
         // Weights arrive as INT8 (view of Marlin int32-packed); Marlin expects INT32

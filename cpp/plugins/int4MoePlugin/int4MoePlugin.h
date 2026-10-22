@@ -173,9 +173,9 @@ public:
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
     //! @brief Stage routed experts from pinned host memory into the workspace before the GEMMs (serialized)
-    void setStageExperts(bool stage) noexcept
+    void setStageExperts(int32_t mode) noexcept
     {
-        mStageExperts = stage ? 1 : 0;
+        mStageExperts = mode;
     }
 
     bool hasStageExpertsField() const noexcept
