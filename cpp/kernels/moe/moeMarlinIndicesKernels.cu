@@ -204,7 +204,8 @@ void launchAggregateSlotOutputsBf16Kernel(void const* slotOutputs, void* aggrega
 
 namespace
 {
-__global__ void markRoutedExpertsKernel(int32_t const* topkIndices, int32_t count, int32_t numExperts, uint8_t* needed)
+__global__ void markRoutedExpertsKernel(
+    int32_t const* topkIndices, int32_t count, int32_t numExperts, uint8_t* needed, int32_t* stats)
 {
     int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count)
@@ -213,6 +214,10 @@ __global__ void markRoutedExpertsKernel(int32_t const* topkIndices, int32_t coun
         if (e >= 0 && e < numExperts)
         {
             needed[e] = 1;
+            if (stats != nullptr)
+            {
+                atomicAdd(&stats[e], 1);
+            }
         }
     }
 }
@@ -263,10 +268,10 @@ __global__ void stageRoutedExpertsKernel(uint8_t const* needed, ExpertStagingCop
 } // namespace
 
 void launchStageRoutedExperts(int32_t const* topkIndices, int32_t count, int32_t numExperts, uint8_t* neededWorkspace,
-    ExpertStagingCopy const& copy, cudaStream_t stream)
+    ExpertStagingCopy const& copy, cudaStream_t stream, int32_t* stats)
 {
     cudaMemsetAsync(neededWorkspace, 0, numExperts, stream);
-    markRoutedExpertsKernel<<<(count + 255) / 256, 256, 0, stream>>>(topkIndices, count, numExperts, neededWorkspace);
+    markRoutedExpertsKernel<<<(count + 255) / 256, 256, 0, stream>>>(topkIndices, count, numExperts, neededWorkspace, stats);
     dim3 const grid(numExperts, 16, copy.numTensors);
     stageRoutedExpertsKernel<<<grid, 256, 0, stream>>>(neededWorkspace, copy);
 }

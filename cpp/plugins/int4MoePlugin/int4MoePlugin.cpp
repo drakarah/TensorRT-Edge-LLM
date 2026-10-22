@@ -33,7 +33,10 @@
 #include <array>
 #include <cassert>
 #include <cuda_fp16.h>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <vector>
 #include <cuda_runtime.h>
 #include <limits>
 #include <mutex>
@@ -267,7 +270,47 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
     }
 }
 
-Int4MoePlugin::~Int4MoePlugin() noexcept {}
+Int4MoePlugin::~Int4MoePlugin() noexcept
+{
+    if (mStats != nullptr)
+    {
+        // EDGELLM_MOE_STATS=<file>: one JSON line per layer instance with how often each expert was selected
+        // (decode passes of <= 16 rows, prompt passes), appended when the engine context is destroyed.
+        try
+        {
+            std::vector<int32_t> host(2 * static_cast<size_t>(mNumExperts));
+            cudaDeviceSynchronize();
+            if (cudaMemcpy(host.data(), mStats, host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess)
+            {
+                std::string line = "{\"layer\":\"" + mLayerName + "\",\"decode\":[";
+                for (int32_t e = 0; e < mNumExperts; ++e)
+                {
+                    line += (e ? "," : "") + std::to_string(host[e]);
+                }
+                line += "],\"prefill\":[";
+                for (int32_t e = 0; e < mNumExperts; ++e)
+                {
+                    line += (e ? "," : "") + std::to_string(host[mNumExperts + e]);
+                }
+                line += "]}\n";
+                char const* path = std::getenv("EDGELLM_MOE_STATS");
+                if (path != nullptr)
+                {
+                    FILE* file = std::fopen(path, "a");
+                    if (file != nullptr)
+                    {
+                        std::fputs(line.c_str(), file);
+                        std::fclose(file);
+                    }
+                }
+            }
+        }
+        catch (...)
+        {
+        }
+        cudaFree(mStats);
+    }
+}
 
 IPluginCapability* Int4MoePlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
 {
@@ -694,7 +737,8 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
 
         if (stageNow)
         {
-            kernel::launchStageRoutedExperts(topkIndicesPtr, numTokens * mTopK, mNumExperts, neededPtr, stagingCopy, stream);
+            kernel::launchStageRoutedExperts(topkIndicesPtr, numTokens * mTopK, mNumExperts, neededPtr, stagingCopy, stream,
+                mStats == nullptr ? nullptr : mStats + (numTokens > 16 ? mNumExperts : 0));
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -801,7 +845,20 @@ int32_t Int4MoePlugin::onShapeChange(
 
 IPluginV3* Int4MoePlugin::attachToContext([[maybe_unused]] IPluginResourceContext* context) noexcept
 {
-    return clone();
+    auto* plugin = static_cast<Int4MoePlugin*>(clone());
+    if (plugin != nullptr && mStageExperts != 0 && std::getenv("EDGELLM_MOE_STATS") != nullptr)
+    {
+        size_t const bytes = 2 * static_cast<size_t>(mNumExperts) * sizeof(int32_t);
+        if (cudaMalloc(reinterpret_cast<void**>(&plugin->mStats), bytes) == cudaSuccess)
+        {
+            cudaMemset(plugin->mStats, 0, bytes);
+        }
+        else
+        {
+            plugin->mStats = nullptr;
+        }
+    }
+    return plugin;
 }
 
 PluginFieldCollection const* Int4MoePlugin::getFieldsToSerialize() noexcept

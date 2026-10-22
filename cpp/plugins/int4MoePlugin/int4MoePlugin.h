@@ -191,6 +191,7 @@ private:
     nvinfer1::ActivationType mActivationType{};
     int32_t mQuantizationGroupSize{};
     int32_t mStageExperts{0};
+    int32_t* mStats{nullptr}; // device, [2][numExperts] selection counters (EDGELLM_MOE_STATS)
     bool mStageExpertsFieldSeen{false};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;

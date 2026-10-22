@@ -82,9 +82,10 @@ struct ExpertStagingCopy
  * @brief Copy the experts selected by @p topkIndices from @p copy.src (typically pinned host memory) into @p copy.dst
  * (device) at the same expert offsets; experts that no token selected are not copied. Graph-capture safe (no host sync).
  * @param neededWorkspace numExperts bytes of device scratch.
+ * @param stats optional device counters [numExperts], incremented once per (token, selected expert).
  */
 void launchStageRoutedExperts(int32_t const* topkIndices, int32_t count, int32_t numExperts, uint8_t* neededWorkspace,
-    ExpertStagingCopy const& copy, cudaStream_t stream);
+    ExpertStagingCopy const& copy, cudaStream_t stream, int32_t* stats = nullptr);
 
 } // namespace kernel
 } // namespace trt_edgellm
