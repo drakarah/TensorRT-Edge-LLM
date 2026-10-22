@@ -201,7 +201,8 @@ private:
     void* mCacheMem{nullptr};
     uint8_t* mCacheTensors[4]{};
     size_t mCacheBytesPerExpert[4]{};
-    int32_t* mCacheState{nullptr}; // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S]
+    int32_t* mCacheState{nullptr}; // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S], tally[3]
+    std::atomic<int32_t*> mCacheTally{nullptr};
     bool ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc) noexcept;
     std::thread mStatsThread;
     std::atomic<bool> mStatsStop{false};

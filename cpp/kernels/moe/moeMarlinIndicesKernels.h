@@ -96,6 +96,7 @@ void launchStageRoutedExperts(int32_t const* topkIndices, int32_t count, int32_t
 
 //! Per-layer device-side LRU cache of experts: slotOf[numExperts] (-1 = not cached), expertOf[numSlots] (-1 = free),
 //! lastUse[numSlots] (call stamp), counter[1], missList[1 + 2 * numSlots] = {count, (expert, slot)...}.
+//! tally[3] (optional, may be null) accumulates {lookups, distinct experts needed, misses} over all calls.
 struct ExpertCacheState
 {
     int32_t* slotOf;
@@ -104,6 +105,7 @@ struct ExpertCacheState
     int32_t* counter;
     int32_t* missList;
     int32_t numSlots;
+    int32_t* tally{nullptr};
 };
 
 //! Look the selected experts up, assign slots to misses (LRU, never a slot used by this call) and rewrite topkIndices to slot ids.
