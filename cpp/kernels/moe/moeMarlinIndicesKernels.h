@@ -26,6 +26,12 @@ namespace trt_edgellm
 namespace kernel
 {
 
+//! Compact copy of the Marlin routing arrays of the experts [e0, e1) (expert ids rebased to e - e0), for running the expert GEMMs chunk by chunk.
+void launchBuildChunkMarlinIndicesKernel(int32_t const* paddedOffsets, int32_t const* numTokensPostPadded,
+    int32_t const* sortedTokenIds, int32_t const* expertIds, int32_t e0, int32_t e1, int32_t numExperts,
+    int32_t moeBlockSize, int32_t maxPaddedSlots, int32_t* outSortedTokenIds, int32_t* outExpertIds,
+    int32_t* outNumTokensPostPadded, cudaStream_t stream);
+
 /**
  * @brief Launch kernel to build Marlin indices from slot lists (per-expert).
  */
