@@ -3134,10 +3134,19 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
     ELLM_CHECK(maxPassLength > 0 && suffixLength <= static_cast<int32_t>(completeSuffix.size()),
         "Chunked prefill: invalid suffix or max input length");
     LOG_DEBUG("Chunked prefill: %d tokens in passes of at most %d", suffixLength, maxPassLength);
-    for (int32_t begin = 0; begin < suffixLength; begin += maxPassLength)
+    int32_t lastPassLength = 0;
+    int32_t begin = 0;
+    for (int32_t length = 0; begin < suffixLength; begin += length)
     {
-        int32_t const length = std::min(maxPassLength, suffixLength - begin);
+        length = std::min(maxPassLength, suffixLength - begin);
+        // A one-token last pass would be a decode-shaped prefill (SWA chunked prefill needs runtimeSeqLen > 1): shorten this
+        // pass by one so the last pass has two tokens.
+        if (maxPassLength > 2 && suffixLength - begin - length == 1)
+        {
+            --length;
+        }
         bool const lastPass = begin + length == suffixLength;
+        lastPassLength = length;
         context.tokenIds[0].assign(completeSuffix.begin() + begin, completeSuffix.begin() + begin + length);
         context.effectivePrefillLengths[0] = length;
         // Bounded SWA windows follow absolute positions, so every pass binds its own window; the context-reuse backend
@@ -3176,7 +3185,7 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
     int32_t const sampledToken = context.tokenIds[0].back();
     context.tokenIds[0] = completeSuffix;
     context.tokenIds[0].push_back(sampledToken);
-    context.prefillLastPassLength = suffixLength - (suffixLength - 1) / maxPassLength * maxPassLength;
+    context.prefillLastPassLength = lastPassLength;
     context.effectivePrefillLengths[0] = suffixLength;
     return true;
 }
