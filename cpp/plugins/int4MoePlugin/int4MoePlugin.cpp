@@ -624,6 +624,15 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                 size_t freeBytes = 0;
                 size_t totalBytes = 0;
                 cudaMemGetInfo(&freeBytes, &totalBytes);
+                // EDGELLM_MOE_MAX_VRAM_MB: total device memory the server may occupy (what is in use now, the engine, KV, workspaces and the private
+                // buffers, counts against it); makes the slot count independent of other GPU tenants and emulates a smaller card.
+                if (char const* maxEnv = std::getenv("EDGELLM_MOE_MAX_VRAM_MB"))
+                {
+                    size_t const maxBytes = static_cast<size_t>(std::atoll(maxEnv)) << 20;
+                    size_t const usedBytes = totalBytes - freeBytes;
+                    size_t const capFree = maxBytes > usedBytes ? maxBytes - usedBytes : 0;
+                    freeBytes = std::min(freeBytes, capFree);
+                }
                 char const* reserveEnv = std::getenv("EDGELLM_MOE_CACHE_RESERVE_MB");
                 size_t const reserve = (reserveEnv != nullptr ? static_cast<size_t>(std::atoi(reserveEnv)) : 250) << 20;
                 size_t const layers = std::max<size_t>(1, moeLayerCount());
@@ -633,7 +642,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                 {
                     autoSlots = 0;
                 }
-                LOG_INFO("Int4MoePlugin: automatic expert cache size %d slots per layer x %zu layers (free %.0f MiB, reserve %.0f MiB, %.2f MiB per slot-layer)",
+                LOG_INFO("Int4MoePlugin: automatic expert cache size %d slots per layer x %zu layers (usable free %.0f MiB, reserve %.0f MiB, %.2f MiB per slot-layer)",
                     autoSlots, layers, freeBytes / 1048576.0, reserve / 1048576.0, perSlot / 1048576.0);
             }
             mCacheSlots = autoSlots;
