@@ -201,5 +201,214 @@ void launchAggregateSlotOutputsBf16Kernel(void const* slotOutputs, void* aggrega
         static_cast<__nv_bfloat16*>(aggregatedOutput), numTokens, topK, outDim, stream);
 }
 
+
+namespace
+{
+__global__ void markRoutedExpertsKernel(
+    int32_t const* topkIndices, int32_t count, int32_t numExperts, uint8_t* needed, int32_t* stats)
+{
+    int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count)
+    {
+        int32_t const e = topkIndices[idx];
+        if (e >= 0 && e < numExperts)
+        {
+            needed[e] = 1;
+            if (stats != nullptr)
+            {
+                atomicAdd(&stats[e], 1);
+            }
+        }
+    }
+}
+
+// grid = (experts, chunks, tensors); each block copies one chunk of one expert's slice of one tensor with 16-byte loads
+// (host memory is read through its UVA address, so many loads must be in flight to reach PCIe line rate).
+__global__ void stageRoutedExpertsKernel(uint8_t const* needed, ExpertStagingCopy copy)
+{
+    int32_t const expert = blockIdx.x;
+    if (needed[expert] == 0)
+    {
+        return;
+    }
+    int32_t const t = blockIdx.z;
+    size_t const bytes = copy.bytesPerExpert[t];
+    size_t const chunk = (bytes / 16 + gridDim.y - 1) / gridDim.y;
+    size_t const begin = chunk * blockIdx.y;
+    size_t const end = min(begin + chunk, bytes / 16);
+    uint4 const* src = reinterpret_cast<uint4 const*>(copy.src[t] + bytes * expert);
+    uint4* dst = reinterpret_cast<uint4*>(copy.dst[t] + bytes * expert);
+    // kUnroll independent loads per thread before the stores: reads through PCIe are latency-bound, so the bytes in flight
+    // (blocks x threads x kUnroll x 16 B) set the bandwidth.
+    constexpr int32_t kUnroll = 8;
+    size_t const stride = static_cast<size_t>(blockDim.x) * kUnroll;
+    for (size_t base = begin; base < end; base += stride)
+    {
+        uint4 v[kUnroll];
+#pragma unroll
+        for (int32_t u = 0; u < kUnroll; ++u)
+        {
+            size_t const i = base + threadIdx.x + static_cast<size_t>(u) * blockDim.x;
+            if (i < end)
+            {
+                v[u] = src[i];
+            }
+        }
+#pragma unroll
+        for (int32_t u = 0; u < kUnroll; ++u)
+        {
+            size_t const i = base + threadIdx.x + static_cast<size_t>(u) * blockDim.x;
+            if (i < end)
+            {
+                dst[i] = v[u];
+            }
+        }
+    }
+}
+} // namespace
+
+void launchStageRoutedExperts(int32_t const* topkIndices, int32_t count, int32_t numExperts, uint8_t* neededWorkspace,
+    ExpertStagingCopy const& copy, cudaStream_t stream, int32_t* stats)
+{
+    cudaMemsetAsync(neededWorkspace, 0, numExperts, stream);
+    markRoutedExpertsKernel<<<(count + 255) / 256, 256, 0, stream>>>(topkIndices, count, numExperts, neededWorkspace, stats);
+    dim3 const grid(numExperts, 16, copy.numTensors);
+    stageRoutedExpertsKernel<<<grid, 256, 0, stream>>>(neededWorkspace, copy);
+}
+
+
+namespace
+{
+// One block: looks the experts selected by the (<= a few) tokens up in a per-layer slot cache, assigns the least recently used
+// slot (not used by this call) to every miss, records the misses and rewrites the top-k expert ids to slot ids.
+__global__ void expertCacheLookupKernel(int32_t* topkIndices, int32_t count, int32_t numExperts, ExpertCacheState cache)
+{
+    __shared__ int32_t stamp;
+    extern __shared__ uint8_t needed[]; // [numExperts]
+    for (int32_t e = threadIdx.x; e < numExperts; e += blockDim.x)
+    {
+        needed[e] = 0;
+    }
+    __syncthreads();
+    for (int32_t i = threadIdx.x; i < count; i += blockDim.x)
+    {
+        int32_t const e = topkIndices[i];
+        if (e >= 0 && e < numExperts)
+        {
+            needed[e] = 1;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        stamp = ++cache.counter[0];
+        int32_t misses = 0;
+        for (int32_t e = 0; e < numExperts; ++e)
+        {
+            if (needed[e] == 0)
+            {
+                continue;
+            }
+            int32_t slot = cache.slotOf[e];
+            if (slot < 0)
+            {
+                int32_t best = -1;
+                int32_t bestUse = 0x7fffffff;
+                for (int32_t s = 0; s < cache.numSlots; ++s)
+                {
+                    int32_t const use = cache.lastUse[s];
+                    if (use != stamp && use < bestUse)
+                    {
+                        bestUse = use;
+                        best = s;
+                    }
+                }
+                if (best < 0)
+                {
+                    continue; // more distinct experts than slots: the caller keeps this path to <= numSlots / topK tokens
+                }
+                int32_t const old = cache.expertOf[best];
+                if (old >= 0)
+                {
+                    cache.slotOf[old] = -1;
+                }
+                cache.slotOf[e] = best;
+                cache.expertOf[best] = e;
+                cache.missList[1 + 2 * misses] = e;
+                cache.missList[2 + 2 * misses] = best;
+                ++misses;
+                slot = best;
+            }
+            cache.lastUse[slot] = stamp;
+        }
+        cache.missList[0] = misses;
+    }
+    __syncthreads();
+    for (int32_t i = threadIdx.x; i < count; i += blockDim.x)
+    {
+        int32_t const e = topkIndices[i];
+        if (e >= 0 && e < numExperts)
+        {
+            int32_t const slot = cache.slotOf[e];
+            topkIndices[i] = slot >= 0 ? slot : 0;
+        }
+    }
+}
+
+// grid = (numSlots, chunks, tensors): copies the experts listed as misses from host memory into their cache slots.
+__global__ void expertCacheFillKernel(ExpertCacheState cache, ExpertStagingCopy copy)
+{
+    if (static_cast<int32_t>(blockIdx.x) >= cache.missList[0])
+    {
+        return;
+    }
+    int32_t const expert = cache.missList[1 + 2 * blockIdx.x];
+    int32_t const slot = cache.missList[2 + 2 * blockIdx.x];
+    int32_t const t = blockIdx.z;
+    size_t const bytes = copy.bytesPerExpert[t];
+    size_t const chunk = (bytes / 16 + gridDim.y - 1) / gridDim.y;
+    size_t const begin = chunk * blockIdx.y;
+    size_t const end = min(begin + chunk, bytes / 16);
+    uint4 const* src = reinterpret_cast<uint4 const*>(copy.src[t] + bytes * expert);
+    uint4* dst = reinterpret_cast<uint4*>(copy.dst[t] + bytes * slot);
+    constexpr int32_t kUnroll = 8;
+    size_t const stride = static_cast<size_t>(blockDim.x) * kUnroll;
+    for (size_t base = begin; base < end; base += stride)
+    {
+        uint4 v[kUnroll];
+#pragma unroll
+        for (int32_t u = 0; u < kUnroll; ++u)
+        {
+            size_t const i = base + threadIdx.x + static_cast<size_t>(u) * blockDim.x;
+            if (i < end)
+            {
+                v[u] = src[i];
+            }
+        }
+#pragma unroll
+        for (int32_t u = 0; u < kUnroll; ++u)
+        {
+            size_t const i = base + threadIdx.x + static_cast<size_t>(u) * blockDim.x;
+            if (i < end)
+            {
+                dst[i] = v[u];
+            }
+        }
+    }
+}
+} // namespace
+
+void launchExpertCacheLookup(
+    int32_t* topkIndices, int32_t count, int32_t numExperts, ExpertCacheState const& cache, cudaStream_t stream)
+{
+    expertCacheLookupKernel<<<1, 128, numExperts, stream>>>(topkIndices, count, numExperts, cache);
+}
+
+void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy const& copy, cudaStream_t stream)
+{
+    dim3 const grid(cache.numSlots, 16, copy.numTensors);
+    expertCacheFillKernel<<<grid, 256, 0, stream>>>(cache, copy);
+}
+
 } // namespace kernel
 } // namespace trt_edgellm

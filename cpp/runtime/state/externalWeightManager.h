@@ -101,6 +101,7 @@ private:
     // storage.
     Tensor mWeightStorage{};
     std::vector<Tensor> mWeights{};
+    std::vector<Tensor> mHostWeights{}; // pinned-host owners of sidecar tensors the engine reads over PCIe
     std::vector<Tensor> mPluginResourceTensors{};
     std::vector<PluginResourceRegistration> mPluginResourceRegistrations{};
     std::optional<Tensor> mEmbedding{};
