@@ -177,6 +177,49 @@ void launchBuildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, int32
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace
+{
+//! Slice of the Marlin routing arrays that belongs to the experts [e0, e1): experts own contiguous padded blocks, so a chunk of experts is a contiguous
+//! range of sorted token ids / block expert ids. The slice is copied to compact arrays (expert ids rebased to e - e0) so the Marlin GEMM can run on a
+//! chunk of the expert weights without any change to its kernel.
+__global__ void buildChunkMarlinIndicesKernel(int32_t const* paddedOffsets, int32_t const* numTokensPostPadded,
+    int32_t const* sortedTokenIds, int32_t const* expertIds, int32_t e0, int32_t e1, int32_t numExperts,
+    int32_t moeBlockSize, int32_t* outSortedTokenIds, int32_t* outExpertIds, int32_t* outNumTokensPostPadded)
+{
+    int32_t const start = paddedOffsets[e0];
+    int32_t const end = e1 >= numExperts ? numTokensPostPadded[0] : paddedOffsets[e1];
+    int32_t const n = end - start;
+    int32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t const stride = gridDim.x * blockDim.x;
+    for (int32_t i = tid; i < n; i += stride)
+    {
+        outSortedTokenIds[i] = sortedTokenIds[start + i];
+    }
+    int32_t const numBlocks = n / moeBlockSize;
+    int32_t const blockStart = start / moeBlockSize;
+    for (int32_t b = tid; b < numBlocks; b += stride)
+    {
+        outExpertIds[b] = expertIds[blockStart + b] - e0;
+    }
+    if (tid == 0)
+    {
+        outNumTokensPostPadded[0] = n;
+    }
+}
+} // namespace
+
+void launchBuildChunkMarlinIndicesKernel(int32_t const* paddedOffsets, int32_t const* numTokensPostPadded,
+    int32_t const* sortedTokenIds, int32_t const* expertIds, int32_t e0, int32_t e1, int32_t numExperts,
+    int32_t moeBlockSize, int32_t maxPaddedSlots, int32_t* outSortedTokenIds, int32_t* outExpertIds,
+    int32_t* outNumTokensPostPadded, cudaStream_t stream)
+{
+    constexpr int32_t kThreads = 256;
+    int32_t const blocks = std::max(1, std::min(static_cast<int32_t>(trt_edgellm::divUp(maxPaddedSlots, kThreads)), 64));
+    buildChunkMarlinIndicesKernel<<<blocks, kThreads, 0, stream>>>(paddedOffsets, numTokensPostPadded, sortedTokenIds,
+        expertIds, e0, e1, numExperts, moeBlockSize, outSortedTokenIds, outExpertIds, outNumTokensPostPadded);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launchBuildDenseMarlinIndicesKernel(int32_t* sortedTokenIds, int32_t* expertIds, int32_t* numTokensPostPadded,
     float* topkWeights, int32_t numTokens, int32_t paddedRows, int32_t moeBlockSize, cudaStream_t stream)
 {
