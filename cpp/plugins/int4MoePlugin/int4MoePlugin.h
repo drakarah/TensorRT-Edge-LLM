@@ -194,6 +194,15 @@ private:
     int32_t mQuantizationGroupSize{};
     int32_t mStageExperts{0};
     int32_t* mStats{nullptr}; // device, [2][numExperts] selection counters (EDGELLM_MOE_STATS)
+    // EDGELLM_MOE_CACHE_SLOTS=<n>: per-layer device cache of the n most recently used experts (decode steps of <= 4 tokens);
+    // allocated at the first enqueue, outside graph capture.
+    int32_t mCacheSlots{-1}; // -1 = env not read yet
+    bool mCacheReady{false};
+    void* mCacheMem{nullptr};
+    uint8_t* mCacheTensors[4]{};
+    size_t mCacheBytesPerExpert[4]{};
+    int32_t* mCacheState{nullptr}; // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S]
+    bool ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc) noexcept;
     std::thread mStatsThread;
     std::atomic<bool> mStatsStop{false};
     void startStats(std::string const& prefix);

@@ -323,6 +323,63 @@ Int4MoePlugin::~Int4MoePlugin() noexcept
     {
         cudaFree(mStats);
     }
+    if (mCacheMem != nullptr)
+    {
+        cudaFree(mCacheMem);
+    }
+    if (mCacheState != nullptr)
+    {
+        cudaFree(mCacheState);
+    }
+}
+
+bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc) noexcept
+{
+    if (mCacheSlots < 0)
+    {
+        char const* value = std::getenv("EDGELLM_MOE_CACHE_SLOTS");
+        mCacheSlots = value != nullptr ? std::atoi(value) : 0;
+    }
+    if (mCacheSlots <= 0)
+    {
+        return false;
+    }
+    if (mCacheReady)
+    {
+        return true;
+    }
+    size_t total = 0;
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        size_t bytes = 1;
+        for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+        {
+            bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+        }
+        bytes *= inputDesc[2 + i].type == DataType::kHALF ? 2 : 1;
+        mCacheBytesPerExpert[i] = bytes / mNumExperts;
+        total += (mCacheBytesPerExpert[i] * mCacheSlots + 255) & ~static_cast<size_t>(255);
+    }
+    size_t const stateInts = mNumExperts + 2 * static_cast<size_t>(mCacheSlots) + 1 + 1 + 2 * mCacheSlots;
+    if (cudaMalloc(&mCacheMem, total) != cudaSuccess || cudaMalloc(reinterpret_cast<void**>(&mCacheState), stateInts * 4) != cudaSuccess)
+    {
+        cudaGetLastError();
+        LOG_WARNING("Int4MoePlugin %s: expert cache of %d slots not allocated (%zu bytes); using staging", mLayerName.c_str(),
+            mCacheSlots, total);
+        mCacheSlots = 0;
+        return false;
+    }
+    uint8_t* cursor = static_cast<uint8_t*>(mCacheMem);
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        mCacheTensors[i] = cursor;
+        cursor += (mCacheBytesPerExpert[i] * mCacheSlots + 255) & ~static_cast<size_t>(255);
+    }
+    cudaMemset(mCacheState, 0xFF, (static_cast<size_t>(mNumExperts) + mCacheSlots) * 4); // slotOf, expertOf = -1
+    cudaMemset(mCacheState + mNumExperts + mCacheSlots, 0, (stateInts - mNumExperts - mCacheSlots) * 4);
+    mCacheReady = true;
+    LOG_INFO("Int4MoePlugin %s: expert cache %d slots, %.1f MiB", mLayerName.c_str(), mCacheSlots, total / 1048576.0);
+    return true;
 }
 
 void Int4MoePlugin::startStats(std::string const& prefix)
@@ -653,7 +710,23 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                 stageNow = attributes.type == cudaMemoryTypeHost;
             }
         }
-        if (stageNow)
+        bool useCache = false;
+        if (stageNow && numTokens <= 4 && ensureExpertCache(inputDesc) && numTokens * mTopK <= mCacheSlots)
+        {
+            useCache = true;
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                stagingCopy.src[i] = static_cast<uint8_t const*>(inputs[2 + i]);
+                stagingCopy.dst[i] = mCacheTensors[i];
+                stagingCopy.bytesPerExpert[i] = mCacheBytesPerExpert[i];
+                weightPtrs[i] = mCacheTensors[i];
+            }
+            stagingCopy.numTensors = 4;
+            nvinfer1::Dims const* const dims[4] = {&inputDesc[2].dims, &inputDesc[3].dims, &inputDesc[4].dims, &inputDesc[5].dims};
+            nvinfer1::DataType const types[4] = {inputDesc[2].type, inputDesc[3].type, inputDesc[4].type, inputDesc[5].type};
+            alignedWorkspacePtr += stagedExpertBytes(dims, types); // the staging region stays unused
+        }
+        else if (stageNow)
         {
             for (int32_t i = 0; i < 4; ++i)
             {
@@ -771,7 +844,15 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             softmaxWorkspaceSizeBytes, stream, true, 0.0f);
         CUDA_CHECK(cudaGetLastError());
 
-        if (stageNow)
+        if (useCache)
+        {
+            kernel::ExpertCacheState state{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
+                mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots};
+            kernel::launchExpertCacheLookup(topkIndicesPtr, numTokens * mTopK, mNumExperts, state, stream);
+            kernel::launchExpertCacheFill(state, stagingCopy, stream);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        else if (stageNow)
         {
             kernel::launchStageRoutedExperts(topkIndicesPtr, numTokens * mTopK, mNumExperts, neededPtr, stagingCopy, stream,
                 mStats == nullptr ? nullptr : mStats + (numTokens > 16 ? mNumExperts : 0));

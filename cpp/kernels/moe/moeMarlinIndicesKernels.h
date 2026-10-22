@@ -87,5 +87,25 @@ struct ExpertStagingCopy
 void launchStageRoutedExperts(int32_t const* topkIndices, int32_t count, int32_t numExperts, uint8_t* neededWorkspace,
     ExpertStagingCopy const& copy, cudaStream_t stream, int32_t* stats = nullptr);
 
+
+//! Per-layer device-side LRU cache of experts: slotOf[numExperts] (-1 = not cached), expertOf[numSlots] (-1 = free),
+//! lastUse[numSlots] (call stamp), counter[1], missList[1 + 2 * numSlots] = {count, (expert, slot)...}.
+struct ExpertCacheState
+{
+    int32_t* slotOf;
+    int32_t* expertOf;
+    int32_t* lastUse;
+    int32_t* counter;
+    int32_t* missList;
+    int32_t numSlots;
+};
+
+//! Look the selected experts up, assign slots to misses (LRU, never a slot used by this call) and rewrite topkIndices to slot ids.
+void launchExpertCacheLookup(
+    int32_t* topkIndices, int32_t count, int32_t numExperts, ExpertCacheState const& cache, cudaStream_t stream);
+
+//! Copy the missed experts (copy.src = host expert arrays) into their slots of copy.dst (slot arrays, same per-expert sizes).
+void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy const& copy, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm
