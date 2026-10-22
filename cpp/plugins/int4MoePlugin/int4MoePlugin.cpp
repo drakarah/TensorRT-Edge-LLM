@@ -33,9 +33,11 @@
 #include <array>
 #include <cassert>
 #include <cuda_fp16.h>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 #include <cuda_runtime.h>
 #include <limits>
@@ -270,46 +272,80 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
     }
 }
 
+namespace
+{
+//! EDGELLM_MOE_STATS=<prefix>: every 15 s (and at destruction) the selection counters of a layer instance are written
+//! to <prefix>.<layer>.json: {"decode":[per expert], "prefill":[per expert]} (decode = passes of <= 16 rows).
+void writeMoeStats(std::string const& prefix, std::string const& layer, int32_t const* device, int32_t numExperts)
+{
+    std::vector<int32_t> host(2 * static_cast<size_t>(numExperts));
+    if (cudaMemcpy(host.data(), device, host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess)
+    {
+        cudaGetLastError();
+        return;
+    }
+    std::string text = "{\"decode\":[";
+    for (int32_t e = 0; e < numExperts; ++e)
+    {
+        text += (e ? "," : "") + std::to_string(host[e]);
+    }
+    text += "],\"prefill\":[";
+    for (int32_t e = 0; e < numExperts; ++e)
+    {
+        text += (e ? "," : "") + std::to_string(host[numExperts + e]);
+    }
+    text += "]}\n";
+    std::string safe = layer;
+    for (char& c : safe)
+    {
+        if (c == '/' || c == ' ')
+        {
+            c = '_';
+        }
+    }
+    FILE* file = std::fopen((prefix + "." + safe + ".json").c_str(), "w");
+    if (file != nullptr)
+    {
+        std::fputs(text.c_str(), file);
+        std::fclose(file);
+    }
+}
+} // namespace
+
 Int4MoePlugin::~Int4MoePlugin() noexcept
 {
+    if (mStatsThread.joinable())
+    {
+        mStatsStop = true;
+        mStatsThread.join();
+    }
     if (mStats != nullptr)
     {
-        // EDGELLM_MOE_STATS=<file>: one JSON line per layer instance with how often each expert was selected
-        // (decode passes of <= 16 rows, prompt passes), appended when the engine context is destroyed.
-        try
-        {
-            std::vector<int32_t> host(2 * static_cast<size_t>(mNumExperts));
-            cudaDeviceSynchronize();
-            if (cudaMemcpy(host.data(), mStats, host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess)
-            {
-                std::string line = "{\"layer\":\"" + mLayerName + "\",\"decode\":[";
-                for (int32_t e = 0; e < mNumExperts; ++e)
-                {
-                    line += (e ? "," : "") + std::to_string(host[e]);
-                }
-                line += "],\"prefill\":[";
-                for (int32_t e = 0; e < mNumExperts; ++e)
-                {
-                    line += (e ? "," : "") + std::to_string(host[mNumExperts + e]);
-                }
-                line += "]}\n";
-                char const* path = std::getenv("EDGELLM_MOE_STATS");
-                if (path != nullptr)
-                {
-                    FILE* file = std::fopen(path, "a");
-                    if (file != nullptr)
-                    {
-                        std::fputs(line.c_str(), file);
-                        std::fclose(file);
-                    }
-                }
-            }
-        }
-        catch (...)
-        {
-        }
         cudaFree(mStats);
     }
+}
+
+void Int4MoePlugin::startStats(std::string const& prefix)
+{
+    size_t const bytes = 2 * static_cast<size_t>(mNumExperts) * sizeof(int32_t);
+    if (cudaMalloc(reinterpret_cast<void**>(&mStats), bytes) != cudaSuccess)
+    {
+        mStats = nullptr;
+        return;
+    }
+    cudaMemset(mStats, 0, bytes);
+    mStatsThread = std::thread([this, prefix]() {
+        int32_t waited = 0;
+        while (!mStatsStop)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (++waited % 30 == 0 || mStatsStop)
+            {
+                writeMoeStats(prefix, mLayerName, mStats, mNumExperts);
+            }
+        }
+        writeMoeStats(prefix, mLayerName, mStats, mNumExperts);
+    });
 }
 
 IPluginCapability* Int4MoePlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
@@ -848,15 +884,7 @@ IPluginV3* Int4MoePlugin::attachToContext([[maybe_unused]] IPluginResourceContex
     auto* plugin = static_cast<Int4MoePlugin*>(clone());
     if (plugin != nullptr && mStageExperts != 0 && std::getenv("EDGELLM_MOE_STATS") != nullptr)
     {
-        size_t const bytes = 2 * static_cast<size_t>(mNumExperts) * sizeof(int32_t);
-        if (cudaMalloc(reinterpret_cast<void**>(&plugin->mStats), bytes) == cudaSuccess)
-        {
-            cudaMemset(plugin->mStats, 0, bytes);
-        }
-        else
-        {
-            plugin->mStats = nullptr;
-        }
+        plugin->startStats(std::getenv("EDGELLM_MOE_STATS"));
     }
     return plugin;
 }

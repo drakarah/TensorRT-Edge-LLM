@@ -18,7 +18,9 @@
 #pragma once
 
 #include <NvInferRuntime.h>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace trt_edgellm
@@ -192,6 +194,9 @@ private:
     int32_t mQuantizationGroupSize{};
     int32_t mStageExperts{0};
     int32_t* mStats{nullptr}; // device, [2][numExperts] selection counters (EDGELLM_MOE_STATS)
+    std::thread mStatsThread;
+    std::atomic<bool> mStatsStop{false};
+    void startStats(std::string const& prefix);
     bool mStageExpertsFieldSeen{false};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
