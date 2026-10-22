@@ -26,6 +26,7 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace trt_edgellm
@@ -72,11 +73,15 @@ public:
 private:
     struct Entry;
     void evictFor(size_t bytes);
+    void* acquireHost(size_t bytes, size_t& capacity);
+    void releaseHost(void* host, size_t capacity);
 
     KVCacheManager& mKvCache;
     KVPageTable const& mBasePageTable;
     size_t const mBudgetBytes;
     size_t mUsedBytes{};
+    size_t mPooledBytes{};
+    std::vector<std::pair<void*, size_t>> mPool; //!< Pinned blocks of evicted entries, kept for reuse (pinned allocation costs ~35 ms each).
     int64_t mHits{};
     int64_t mLookups{};
     std::list<std::unique_ptr<Entry>> mEntries; //!< Front = most recently used.

@@ -37,6 +37,7 @@ struct SwaPrefixCache::Entry
     std::vector<int32_t> windowLogicalPages; //!< Logical pages of the bounded layers held by the snapshot.
     void* host{};                            //!< Pinned buffer, layers in order, K then V per page.
     size_t bytes{};
+    size_t capacity{};                       //!< Size of the pinned block behind `host` (>= bytes); the budget is charged by capacity.
     std::vector<size_t> layerOffsets;        //!< Per-layer byte offset into `host` (SIZE_MAX: layer not stored).
     int32_t globalPages{};                   //!< Pages per plane held for each full-capacity layer.
 };
@@ -86,6 +87,10 @@ SwaPrefixCache::~SwaPrefixCache() noexcept
             cudaFreeHost(entry->host);
         }
     }
+    for (auto const& block : mPool)
+    {
+        cudaFreeHost(block.first);
+    }
 }
 
 size_t SwaPrefixCache::usedBytes() const noexcept
@@ -108,10 +113,52 @@ void SwaPrefixCache::evictFor(size_t bytes)
     while (!mEntries.empty() && mUsedBytes + bytes > mBudgetBytes)
     {
         auto& victim = mEntries.back();
-        mUsedBytes -= victim->bytes;
-        cudaFreeHost(victim->host);
+        mUsedBytes -= victim->capacity;
+        releaseHost(victim->host, victim->capacity);
         mEntries.pop_back();
     }
+}
+
+void SwaPrefixCache::releaseHost(void* host, size_t capacity)
+{
+    mPool.emplace_back(host, capacity);
+    mPooledBytes += capacity;
+}
+
+//! Reuses the smallest pooled block that fits within 25% slack; otherwise frees pooled blocks (oldest first) until the
+//! pinned total stays within the budget and allocates a new one. Pooled blocks count against the budget.
+void* SwaPrefixCache::acquireHost(size_t bytes, size_t& capacity)
+{
+    auto best = mPool.end();
+    for (auto it = mPool.begin(); it != mPool.end(); ++it)
+    {
+        if (it->second >= bytes && it->second <= bytes + bytes / 4 && (best == mPool.end() || it->second < best->second))
+        {
+            best = it;
+        }
+    }
+    if (best != mPool.end())
+    {
+        void* host = best->first;
+        capacity = best->second;
+        mPooledBytes -= capacity;
+        mPool.erase(best);
+        return host;
+    }
+    while (!mPool.empty() && mUsedBytes + mPooledBytes + bytes > mBudgetBytes)
+    {
+        cudaFreeHost(mPool.front().first);
+        mPooledBytes -= mPool.front().second;
+        mPool.erase(mPool.begin());
+    }
+    void* host{};
+    if (cudaMallocHost(&host, bytes) != cudaSuccess)
+    {
+        static_cast<void>(cudaGetLastError());
+        return nullptr;
+    }
+    capacity = bytes;
+    return host;
 }
 
 void SwaPrefixCache::capture(
@@ -158,9 +205,9 @@ void SwaPrefixCache::capture(
         return;
     }
     evictFor(total);
-    if (cudaMallocHost(&entry->host, total) != cudaSuccess)
+    entry->host = acquireHost(total, entry->capacity);
+    if (entry->host == nullptr)
     {
-        static_cast<void>(cudaGetLastError());
         return;
     }
 
@@ -198,7 +245,7 @@ void SwaPrefixCache::capture(
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    mUsedBytes += total;
+    mUsedBytes += entry->capacity;
     mEntries.push_front(std::move(entry));
 }
 
