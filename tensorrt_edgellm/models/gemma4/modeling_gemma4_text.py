@@ -1177,6 +1177,16 @@ class Gemma4FusedBF16MoEExperts(nn.Module):
             torch.empty(E, 2 * intermediate_size, H, dtype=torch.bfloat16))
         self.down_proj = nn.Parameter(
             torch.empty(E, H, intermediate_size, dtype=torch.bfloat16))
+        self._loaded: set = set()
+        self.on_loaded = None
+
+    def after_tensor_loaded(self, name: str) -> None:
+        """Calls ``on_loaded`` once both fused tensors of the layer are in memory."""
+        self._loaded.add(name)
+        if self.on_loaded is not None and self._loaded >= {
+                "gate_up_proj", "down_proj"
+        }:
+            self.on_loaded()
 
 
 class Gemma4Int4MoEBlock(nn.Module):
@@ -1214,10 +1224,19 @@ class Gemma4Int4MoEBlock(nn.Module):
                                                   False)
 
         self.router = Gemma4Router(config, layer_idx)
+        self._experts_packed = False
         if self.quantize_experts_from_bf16:
             self.experts = Gemma4FusedBF16MoEExperts(config)
+            self.experts.on_loaded = self._pack_loaded_experts
         else:
             self.experts = Gemma4NvFP4MoEExperts(config)
+
+    def _pack_loaded_experts(self) -> None:
+        """Quantizes this layer's BF16 experts as soon as they are loaded, so the
+        checkpoint never has to be resident in full (the 26B is 51 GB in BF16)."""
+        self._prepare_from_fused_bf16()
+        self._experts_packed = True
+        self.experts = nn.ModuleList()
 
     def _prepare_moe_weights(self) -> None:
         """Quantize (if BF16) and repack expert weights to Marlin INT4 format.
@@ -1234,7 +1253,8 @@ class Gemma4Int4MoEBlock(nn.Module):
         self.gate_linear.weight.data = self.router.proj.weight.data
 
         if self.quantize_experts_from_bf16:
-            self._prepare_from_fused_bf16()
+            if not self._experts_packed:
+                self._prepare_from_fused_bf16()
         else:
             self._prepare_from_gptq()
 
