@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <limits>
@@ -86,7 +87,14 @@ bool hasSameDims(Dims const& lhs, Dims const& rhs) noexcept
 //! routing semantics and do not identify the execution phase.
 int32_t getTunedMoeBlockSize(int64_t numTokens) noexcept
 {
-    return numTokens <= kTOKEN_MAJOR_SMALL_TOKEN_THRESHOLD ? kSMALL_TOKEN_BLOCK_SIZE : kLARGE_TOKEN_BLOCK_SIZE;
+    //! EDGELLM_MOE_SMALL_THRESHOLD (read once at run time): token count up to which the 8-row block is used (default 8). With a
+    //! verify tree of 16 the MoE sees 16 tokens x top-k rows spread over all experts, about one row per expert, so the 8-row
+    //! block (smaller activation tile, no padding to 32 rows) is faster: 26B-A4B on the Orin decode +13-17% (METRICS 112).
+    static int64_t const threshold = []() {
+        char const* const env = std::getenv("EDGELLM_MOE_SMALL_THRESHOLD");
+        return static_cast<int64_t>(env != nullptr ? std::atoi(env) : kTOKEN_MAJOR_SMALL_TOKEN_THRESHOLD);
+    }();
+    return numTokens <= threshold ? kSMALL_TOKEN_BLOCK_SIZE : kLARGE_TOKEN_BLOCK_SIZE;
 }
 
 bool hasValidRoutedRowCapacity(int64_t numTokens, int32_t numExperts, int32_t topK) noexcept
