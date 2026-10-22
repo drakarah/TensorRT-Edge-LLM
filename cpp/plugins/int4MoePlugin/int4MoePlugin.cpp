@@ -821,8 +821,10 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
 namespace
 {
 //! EDGELLM_MOE_STATS=<prefix>: every 15 s (and at destruction) the selection counters of a layer instance are written
-//! to <prefix>.<layer>.json: {"decode":[per expert], "prefill":[per expert]} (decode = passes of <= 16 rows).
-void writeMoeStats(std::string const& prefix, std::string const& layer, int32_t const* device, int32_t numExperts)
+//! to <prefix>.<layer>.json: {"decode":[per expert], "prefill":[per expert], "cache":{lookups, needed, misses}} (decode = passes of <= 16 rows;
+//! cache = device expert cache lookups, distinct experts needed and misses summed over all calls, present once the cache is allocated).
+void writeMoeStats(std::string const& prefix, std::string const& layer, int32_t const* device, int32_t numExperts,
+    int32_t const* cacheTally)
 {
     std::vector<int32_t> host(2 * static_cast<size_t>(numExperts));
     if (cudaMemcpy(host.data(), device, host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess)
@@ -840,7 +842,14 @@ void writeMoeStats(std::string const& prefix, std::string const& layer, int32_t 
     {
         text += (e ? "," : "") + std::to_string(host[numExperts + e]);
     }
-    text += "]}\n";
+    text += "]";
+    int32_t tally[3]{};
+    if (cacheTally != nullptr && cudaMemcpy(tally, cacheTally, sizeof(tally), cudaMemcpyDeviceToHost) == cudaSuccess)
+    {
+        text += ",\"cache\":{\"lookups\":" + std::to_string(tally[0]) + ",\"needed\":" + std::to_string(tally[1])
+            + ",\"misses\":" + std::to_string(tally[2]) + "}";
+    }
+    text += "}\n";
     std::string safe = layer;
     for (char& c : safe)
     {
@@ -976,7 +985,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
         mCacheBytesPerExpert[i] = bytes / mNumExperts;
         total += (mCacheBytesPerExpert[i] * mCacheSlots + 255) & ~static_cast<size_t>(255);
     }
-    size_t const stateInts = mNumExperts + 2 * static_cast<size_t>(mCacheSlots) + 1 + 1 + 2 * mCacheSlots;
+    size_t const stateInts = mNumExperts + 2 * static_cast<size_t>(mCacheSlots) + 1 + 1 + 2 * mCacheSlots + 3;
     if (cudaMalloc(&mCacheMem, total) != cudaSuccess || cudaMalloc(reinterpret_cast<void**>(&mCacheState), stateInts * 4) != cudaSuccess)
     {
         cudaGetLastError();
@@ -993,6 +1002,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
     }
     cudaMemset(mCacheState, 0xFF, (static_cast<size_t>(mNumExperts) + mCacheSlots) * 4); // slotOf, expertOf = -1
     cudaMemset(mCacheState + mNumExperts + mCacheSlots, 0, (stateInts - mNumExperts - mCacheSlots) * 4);
+    mCacheTally = mCacheState + stateInts - 3;
     mCacheReady = true;
     LOG_INFO("Int4MoePlugin %s: expert cache %d slots, %.1f MiB", mLayerName.c_str(), mCacheSlots, total / 1048576.0);
     return true;
@@ -1014,10 +1024,10 @@ void Int4MoePlugin::startStats(std::string const& prefix)
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             if (++waited % 30 == 0 || mStatsStop)
             {
-                writeMoeStats(prefix, mLayerName, mStats, mNumExperts);
+                writeMoeStats(prefix, mLayerName, mStats, mNumExperts, mCacheTally.load());
             }
         }
-        writeMoeStats(prefix, mLayerName, mStats, mNumExperts);
+        writeMoeStats(prefix, mLayerName, mStats, mNumExperts, mCacheTally.load());
     });
 }
 
@@ -1540,7 +1550,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         if (useCache)
         {
             kernel::ExpertCacheState state{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
-                mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots};
+                mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
             kernel::launchExpertCacheLookup(topkIndicesPtr, numTokens * mTopK, mNumExperts, state, stream);
             kernel::launchExpertCacheFill(state, stagingCopy, stream);
             CUDA_CHECK(cudaGetLastError());

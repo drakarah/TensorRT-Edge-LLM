@@ -346,12 +346,14 @@ __global__ void expertCacheLookupKernel(int32_t* topkIndices, int32_t count, int
     {
         stamp = ++cache.counter[0];
         int32_t misses = 0;
+        int32_t distinct = 0;
         for (int32_t e = 0; e < numExperts; ++e)
         {
             if (needed[e] == 0)
             {
                 continue;
             }
+            ++distinct;
             int32_t slot = cache.slotOf[e];
             if (slot < 0)
             {
@@ -385,6 +387,12 @@ __global__ void expertCacheLookupKernel(int32_t* topkIndices, int32_t count, int
             cache.lastUse[slot] = stamp;
         }
         cache.missList[0] = misses;
+        if (cache.tally != nullptr)
+        {
+            cache.tally[0] += 1;
+            cache.tally[1] += distinct;
+            cache.tally[2] += misses;
+        }
     }
     __syncthreads();
     for (int32_t i = threadIdx.x; i < count; i += blockDim.x)
