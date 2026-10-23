@@ -115,5 +115,10 @@ void launchExpertCacheLookup(
 //! Copy the missed experts (copy.src = host expert arrays) into their slots of copy.dst (slot arrays, same per-expert sizes).
 void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy const& copy, cudaStream_t stream);
 
+//! Cache-aware router for decode steps (<= a few tokens): selects top-k experts by logit + bias * [resident in the cache], weights = softmax of the
+//! original logits over the selected experts. Replaces the top-k softmax kernel; writes expert ids (not slot ids) and fp32 weights.
+void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExperts, int32_t topK, float bias, ExpertCacheState const& cache,
+    int32_t* topkIndices, float* topkWeights, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

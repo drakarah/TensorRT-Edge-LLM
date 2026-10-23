@@ -160,6 +160,18 @@ bool prefillOverlapFromEnv()
     return value != nullptr && std::atoi(value) != 0;
 }
 
+//! EDGELLM_MOE_CACHE_BIAS=<beta> (lossy, decode only): the router prefers experts that are resident in the per-layer GPU expert cache by adding beta to their
+//! logits before the top-k selection (combine weights stay the softmax of the original logits over the selected experts). 0 / unset = exact routing.
+//! beta 0.5: ~65% fewer cache misses for +0.09% perplexity, beta 1: 85% fewer for +1.5% (METRICS R25ar/R25av, Qwen3.6).
+float cacheBiasFromEnv()
+{
+    static float const beta = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_CACHE_BIAS");
+        return v != nullptr ? std::max(0.0f, static_cast<float>(std::atof(v))) : 0.0f;
+    }();
+    return beta;
+}
+
 //! Layer position inside the engine: the trailing integer of the plugin node name ("n0_18" -> 18); layers run in ascending order.
 int32_t layerIdFromName(std::string const& name) noexcept
 {
@@ -1553,8 +1565,18 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor topkIndicesTensor(
             topkIndicesPtr, {numTokens, mTopK}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
-        moeTopkSoftmax(routerLogitsTensor, topkWeightsTensor, topkIndicesTensor, mTopK, softmaxWorkspacePtr,
-            softmaxWorkspaceSizeBytes, stream, true, 0.0f);
+        if (useCache && cacheBiasFromEnv() > 0.0f && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
+        {
+            kernel::ExpertCacheState const biasState{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
+                mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
+            kernel::launchCacheAwareTopk(static_cast<float const*>(inputs[0]), numTokens, mNumExperts, mTopK, cacheBiasFromEnv(), biasState,
+                topkIndicesPtr, topkWeightsPtr, stream);
+        }
+        else
+        {
+            moeTopkSoftmax(routerLogitsTensor, topkWeightsTensor, topkIndicesTensor, mTopK, softmaxWorkspacePtr,
+                softmaxWorkspaceSizeBytes, stream, true, 0.0f);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         if (useCache && hostRoundTripProbeFromEnv())
