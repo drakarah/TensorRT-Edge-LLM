@@ -2211,6 +2211,16 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         }
     }
 
+    // Non-speculative hybrid with context reuse: publish the checkpoint at a stable boundary inside the prefill (EDGELLM_HYBRID_PLAIN_REUSE=0 disables).
+    static bool const plainReuseEnabled = [] {
+        char const* env = std::getenv("EDGELLM_HYBRID_PLAIN_REUSE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    bool const plainHybridContextReuse = plainReuseEnabled && !hybridMtpContextReuse && requestCacheEnabled
+        && decodingStrategy.kind() == DecodingStrategyKind::kVanilla && mDeployment.base.numLinearAttnLayers > 0
+        && context.activeBatchSize == 1 && !context.visualEmbeddings.has_value() && !context.audioEmbeddings.has_value()
+        && request.recurrentCaptureInterval == 0;
+
     // Prefill from the base model; subsequent iterations are delegated to the selected strategy.
     context.prefillLastPassLength = 0;
     bool prefillStatus;
@@ -2219,6 +2229,11 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         context.hybridMtpEndpointReuse = true;
         context.contextCacheReplayTailLength = request.contextCacheReplayTailLength;
         prefillStatus = runHybridMtpPrefill(context, decodingStrategy, *managedRequest);
+    }
+    else if (plainHybridContextReuse)
+    {
+        context.contextCacheReplayTailLength = request.contextCacheReplayTailLength;
+        prefillStatus = runHybridPlainPrefill(context, *managedRequest);
     }
     else if (canChunkPrefill(context, decodingStrategy)
         && context.effectivePrefillLengths[0] > mDeployment.base.maxSupportedInputLength)
@@ -3115,6 +3130,68 @@ bool LLMRankRuntime::runHybridMtpPrefill(
     }
     context.tokenIds[0].erase(context.tokenIds[0].begin());
     context.effectivePrefillLengths[0] = suffixLen;
+    return true;
+}
+
+bool LLMRankRuntime::runHybridPlainPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest& managedKVCacheRequest)
+{
+    int32_t const reuseLength = managedKVCacheRequest.reuseTokenLength(0);
+    int32_t const inputLength = math::cast<int32_t>(context.rawBatchedInputIds[0].size());
+    int32_t const suffixLenOrig = context.effectivePrefillLengths[0];
+
+    // Stable boundary: the prompt without the volatile generation-prompt tail, or the prefix this input shares with an earlier request when that is
+    // longer than the checkpoint it restored from (divergence checkpoint, as in runHybridMtpPrefill).
+    int32_t replayTailLength = context.contextCacheReplayTailLength;
+    static int32_t const divergenceMinTokens = [] {
+        char const* env = std::getenv("EDGELLM_HYBRID_DIVERGENCE_CHECKPOINT");
+        return env != nullptr ? std::max(0, std::atoi(env)) : 0;
+    }();
+    if (divergenceMinTokens > 0)
+    {
+        int32_t const sharedPrefix = managedKVCacheRequest.hybridSharedPrefixLength(0);
+        int32_t const stableEnd = inputLength - std::max(replayTailLength, 0);
+        if (sharedPrefix >= reuseLength + divergenceMinTokens && sharedPrefix < stableEnd)
+        {
+            LOG_DEBUG("Hybrid prefill: divergence checkpoint at %d (reuse %d, input %d)", sharedPrefix, reuseLength, inputLength);
+            replayTailLength = inputLength - sharedPrefix;
+        }
+    }
+    bool const hasVolatileTail = replayTailLength > 0 && suffixLenOrig > replayTailLength;
+    if (!hasVolatileTail)
+    {
+        // nothing to split: single pass, the end-of-prompt checkpoint is captured by the prefill itself (serves exact continuations only)
+        return runBaseModelPrefill(context, &managedKVCacheRequest, /*sampleOutput=*/true);
+    }
+
+    std::vector<int32_t> const completeSuffix = context.tokenIds[0];
+    int32_t const predecessorLength = inputLength - replayTailLength;
+    int32_t const predecessorChunkLength = suffixLenOrig - replayTailLength;
+    auto const replayBegin = completeSuffix.end() - replayTailLength;
+
+    // Chunk 1: the stable predecessor [reuseLength, predecessorLength), no sampling, then publish the checkpoint at its end.
+    context.tokenIds[0].assign(completeSuffix.begin(), replayBegin);
+    context.effectivePrefillLengths[0] = predecessorChunkLength;
+    if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/false))
+    {
+        return false;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(context.stream));
+    if (!managedKVCacheRequest.publishHybridEndpoint(0, predecessorLength))
+    {
+        return false;
+    }
+
+    // Chunk 2: replay the volatile tail with sampling, then restore the bookkeeping for the decode loop.
+    context.tokenIds[0].assign(replayBegin, completeSuffix.end());
+    context.effectivePrefillLengths[0] = replayTailLength;
+    if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/true))
+    {
+        return false;
+    }
+    int32_t const sampledToken = context.tokenIds[0].back();
+    context.tokenIds[0] = completeSuffix;
+    context.tokenIds[0].push_back(sampledToken);
+    context.effectivePrefillLengths[0] = suffixLenOrig;
     return true;
 }
 

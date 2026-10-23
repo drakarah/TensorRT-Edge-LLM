@@ -56,6 +56,8 @@ public:
     //! Longest page-aligned prefix shared with a cached hybrid record (context reuse only).
     int32_t hybridSharedPrefixLength(int32_t slot);
 
+    //! Publish a recurrent + partial-KV checkpoint of a non-speculative hybrid at a stable boundary during a prefill.
+    bool publishHybridEndpoint(int32_t slot, int32_t residentStateLength);
     bool publishHybridMtpEndpoint(
         int32_t slot, int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow);
     bool restoreHybridMtpBoundaryHidden(int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow);

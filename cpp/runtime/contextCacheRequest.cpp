@@ -310,6 +310,12 @@ bool ContextCacheRequest::finalizeSequenceAdmission(
         "sequence-admission finalization");
 }
 
+bool ContextCacheRequest::publishHybridEndpoint(int32_t slot, int32_t residentStateLength)
+{
+    return contextCacheOperationSucceeded(
+        mCoordinator.publishHybridEndpoint(mRequest, slot, residentStateLength), "hybrid endpoint publication");
+}
+
 bool ContextCacheRequest::publishHybridMtpEndpoint(
     int32_t slot, int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow)
 {

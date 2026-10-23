@@ -685,6 +685,12 @@ private:
     bool runHybridMtpPrefill(
         DecodingInferenceContext& context, DecodingStrategy& strategy, ManagedKVCacheRequest& managedKVCacheRequest);
 
+    //! Non-speculative hybrid (e.g. Qwen3.5/3.6 GDN + attention) prefill with prefix reuse (rtx4060/hybrid-prefix-reuse): the checkpoint of the plain
+    //! hybrid path was only taken at the end of the prompt, including the volatile generation-prompt tail, so it never matched a later request.
+    //! Here the prefill is split at the stable boundary (the prompt without the replay tail, or the prefix shared with an earlier request, see
+    //! EDGELLM_HYBRID_DIVERGENCE_CHECKPOINT) and the recurrent + partial-KV checkpoint is published there, as runHybridMtpPrefill does for MTP.
+    bool runHybridPlainPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest& managedKVCacheRequest);
+
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);
 
