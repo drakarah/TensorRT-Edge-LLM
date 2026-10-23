@@ -820,6 +820,16 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
 
 namespace
 {
+//! EDGELLM_MOE_HOSTFUNC_PROBE=1: add a device-to-host copy of the router ids and an empty host node to every cached decode layer (cost probe for a CPU miss path).
+bool hostRoundTripProbeFromEnv()
+{
+    static bool const on = []() { char const* v = std::getenv("EDGELLM_MOE_HOSTFUNC_PROBE"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+} // namespace
+
+namespace
+{
 //! EDGELLM_MOE_STATS=<prefix>: every 15 s (and at destruction) the selection counters of a layer instance are written
 //! to <prefix>.<layer>.json: {"decode":[per expert], "prefill":[per expert], "cache":{lookups, needed, misses}} (decode = passes of <= 16 rows;
 //! cache = device expert cache lookups, distinct experts needed and misses summed over all calls, present once the cache is allocated).
@@ -1547,6 +1557,13 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             softmaxWorkspaceSizeBytes, stream, true, 0.0f);
         CUDA_CHECK(cudaGetLastError());
 
+        if (useCache && hostRoundTripProbeFromEnv())
+        {
+            // rtx4060/moe-cpu-miss step 1: cost of the host round trip a CPU miss path needs (router ids to pinned host memory + a stream-blocking host node), no compute
+            static int32_t* const probeHost = []() { void* p = nullptr; cudaMallocHost(&p, 4096); return static_cast<int32_t*>(p); }();
+            cudaMemcpyAsync(probeHost, topkIndicesPtr, static_cast<size_t>(numTokens) * mTopK * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+            cudaLaunchHostFunc(stream, [](void*) {}, nullptr);
+        }
         if (useCache)
         {
             kernel::ExpertCacheState state{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
