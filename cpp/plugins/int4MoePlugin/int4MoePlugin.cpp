@@ -1591,7 +1591,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             kernel::ExpertCacheState state{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
                 mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
             kernel::launchExpertCacheLookup(topkIndicesPtr, numTokens * mTopK, mNumExperts, state, stream);
-            kernel::launchExpertCacheFill(state, stagingCopy, stream);
+            kernel::launchExpertCacheFill(state, stagingCopy, numTokens * mTopK, stream);
             CUDA_CHECK(cudaGetLastError());
         }
         else if (stageNow)

@@ -18,6 +18,7 @@
 #include "common/cudaUtils.h"
 #include "moeMarlinIndicesKernels.h"
 
+#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -455,9 +456,10 @@ void launchExpertCacheLookup(
     expertCacheLookupKernel<<<1, 128, numExperts, stream>>>(topkIndices, count, numExperts, cache);
 }
 
-void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy const& copy, cudaStream_t stream)
+void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy const& copy, int32_t maxMisses, cudaStream_t stream)
 {
-    dim3 const grid(cache.numSlots, 16, copy.numTensors);
+    // at most one miss per selected expert: blocks beyond that exit at once but still cost a launch wave each (137 us per call with 60 slots, METRICS R25ax)
+    dim3 const grid(std::min(cache.numSlots, std::max(maxMisses, 1)), 16, copy.numTensors);
     expertCacheFillKernel<<<grid, 256, 0, stream>>>(cache, copy);
 }
 
