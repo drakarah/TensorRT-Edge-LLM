@@ -3121,8 +3121,15 @@ bool LLMRankRuntime::runHybridMtpPrefill(
 bool LLMRankRuntime::canChunkPrefill(
     DecodingInferenceContext const& context, DecodingStrategy const& strategy) const noexcept
 {
+    // Hybrid (gated-delta-net) bases carry their recurrent and convolution state in the request's resident slot, so a
+    // later pass continues from the earlier one exactly like a context-reuse suffix prefill. Opt-in until the chunked
+    // output is verified equal to the single-pass output (EDGELLM_HYBRID_CHUNKED_PREFILL=1).
+    static bool const kHybridChunkedPrefill = [] {
+        char const* value = std::getenv("EDGELLM_HYBRID_CHUNKED_PREFILL");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
     return strategy.supportsChunkedPrefill() && context.activeBatchSize == 1 && mVisionRunner == nullptr && mAudioRunner == nullptr
-        && mDeployment.base.numLinearAttnLayers == 0 && !mDeployment.base.isDiffusionBackbone;
+        && (mDeployment.base.numLinearAttnLayers == 0 || kHybridChunkedPrefill) && !mDeployment.base.isDiffusionBackbone;
 }
 
 bool LLMRankRuntime::runChunkedBaseModelPrefill(
