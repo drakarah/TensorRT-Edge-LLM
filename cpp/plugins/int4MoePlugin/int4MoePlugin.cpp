@@ -169,6 +169,17 @@ bool prefillOverlapFromEnv()
     return value != nullptr && std::atoi(value) != 0;
 }
 
+//! EDGELLM_MOE_PREFILL_FROM_CACHE (default on, 0 = off): the prefill prefetch copies the experts that the decode cache already holds with a device-to-device copy
+//! from their cache slot instead of over PCIe (the cache is not modified during prefill).
+bool prefillFromCacheFromEnv()
+{
+    static bool const on = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_PREFILL_FROM_CACHE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 //! EDGELLM_MOE_CACHE_BIAS=<beta> (lossy, decode only; default 0.5, measured on Qwen3.6 only, set 0 for exact routing): the router prefers experts that are resident in the per-layer GPU expert cache by adding beta to their
 //! logits before the top-k selection (combine weights stay the softmax of the original logits over the selected experts). Default 0.5 when unset; EDGELLM_MOE_CACHE_BIAS=0 gives exact routing.
 //! beta 0.5: ~65% fewer cache misses for +0.09% perplexity, beta 1: 85% fewer for +1.5% (METRICS R25ar/R25av, Qwen3.6).
@@ -306,10 +317,35 @@ public:
             cudaEventRecord(mBufFree, stream);
             cudaStreamWaitEvent(mSide, mBufFree, 0);
             bool ok = true;
+            CacheView const* const view = prefillFromCacheFromEnv() && snapshotCaches(stream) ? cacheView(next->first, next->second) : nullptr;
             for (int32_t i = 0; i < 4 && ok; ++i)
             {
-                ok = cudaMemcpyAsync(mBuf[target] + next->second.offset[i], next->second.src[i], next->second.bytes[i], cudaMemcpyHostToDevice, mSide)
-                    == cudaSuccess;
+                uint8_t* const dst = mBuf[target] + next->second.offset[i];
+                if (view == nullptr)
+                {
+                    ok = cudaMemcpyAsync(dst, next->second.src[i], next->second.bytes[i], cudaMemcpyHostToDevice, mSide) == cudaSuccess;
+                    continue;
+                }
+                size_t const bpe = view->bytesPerExpert[i];
+                int32_t const* const slots = mSnapshot.data() + static_cast<size_t>(view->snapshotAt) * view->numExperts;
+                for (int32_t e = 0; e < view->numExperts && ok;)
+                {
+                    if (slots[e] >= 0)
+                    {
+                        ok = cudaMemcpyAsync(dst + e * bpe, view->tensors[i] + static_cast<size_t>(slots[e]) * bpe, bpe, cudaMemcpyDeviceToDevice, mSide)
+                            == cudaSuccess;
+                        ++e;
+                        continue;
+                    }
+                    int32_t run = e;
+                    while (run < view->numExperts && slots[run] < 0)
+                    {
+                        ++run;
+                    }
+                    ok = cudaMemcpyAsync(dst + e * bpe, static_cast<uint8_t const*>(next->second.src[i]) + e * bpe, (run - e) * bpe, cudaMemcpyHostToDevice, mSide)
+                        == cudaSuccess;
+                    e = run;
+                }
             }
             if (ok && cudaEventRecord(mCopyDone[target], mSide) == cudaSuccess)
             {
@@ -329,15 +365,40 @@ public:
         return wantTarget ? Result::kTarget : Result::kNone;
     }
 
+    //! The decode cache of a layer (device slotOf[numExperts] and the four slot-major tensors); called by the plugin once its cache is allocated.
+    void registerCache(int32_t layerId, int32_t const* slotOf, uint8_t const* const tensors[4], size_t const bytesPerExpert[4], int32_t numExperts) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        CacheView& view = mCache[layerId];
+        view.slotOf = slotOf;
+        view.numExperts = numExperts;
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            view.tensors[i] = tensors[i];
+            view.bytesPerExpert[i] = bytesPerExpert[i];
+        }
+        mSnapshotValid = false;
+    }
+
     //! A decode step (or any non-prefill call) breaks the layer sequence: a prefetch issued for a layer that now will not run must not be consumed.
     void invalidate() noexcept
     {
         std::lock_guard<std::mutex> lock(mMutex);
         mPendingLayer = -1;
         mPendingBuf = -1;
+        mSnapshotValid = false;
     }
 
 private:
+    struct CacheView
+    {
+        int32_t const* slotOf{nullptr};
+        uint8_t const* tensors[4]{};
+        size_t bytesPerExpert[4]{};
+        int32_t numExperts{0};
+        int32_t snapshotAt{-1}; //!< index of this layer's slotOf copy in the host snapshot
+    };
+
     struct Layer
     {
         void const* src[4]{};
@@ -395,7 +456,80 @@ private:
         return needed <= mBufBytes;
     }
 
+    //! Copies every registered layer's slotOf to the host once per run of prefill passes (decode steps invalidate it); the stream is synchronised once.
+    bool snapshotCaches(cudaStream_t stream) noexcept
+    {
+        if (mSnapshotValid)
+        {
+            return true;
+        }
+        if (mCache.empty())
+        {
+            return false;
+        }
+        size_t const perLayer = mCache.begin()->second.numExperts;
+        size_t const needed = perLayer * mCache.size();
+        if (mSnapshotHost == nullptr || mSnapshotCapacity < needed)
+        {
+            if (mSnapshotHost != nullptr)
+            {
+                cudaFreeHost(mSnapshotHost);
+            }
+            mSnapshotHost = nullptr;
+            if (cudaMallocHost(reinterpret_cast<void**>(&mSnapshotHost), needed * sizeof(int32_t)) != cudaSuccess)
+            {
+                cudaGetLastError();
+                return false;
+            }
+            mSnapshotCapacity = needed;
+        }
+        int32_t index = 0;
+        for (auto& entry : mCache)
+        {
+            CacheView& view = entry.second;
+            if (view.numExperts != static_cast<int32_t>(perLayer)
+                || cudaMemcpyAsync(mSnapshotHost + static_cast<size_t>(index) * perLayer, view.slotOf, perLayer * sizeof(int32_t), cudaMemcpyDeviceToHost, stream)
+                    != cudaSuccess)
+            {
+                cudaGetLastError();
+                return false;
+            }
+            view.snapshotAt = index++;
+        }
+        if (cudaStreamSynchronize(stream) != cudaSuccess)
+        {
+            cudaGetLastError();
+            return false;
+        }
+        mSnapshot.assign(mSnapshotHost, mSnapshotHost + needed);
+        mSnapshotValid = true;
+        return true;
+    }
+
+    //! The cache view of a layer when its tensors have the cache's per-expert sizes, else null.
+    CacheView const* cacheView(int32_t layerId, Layer const& layer) const noexcept
+    {
+        auto const it = mCache.find(layerId);
+        if (it == mCache.end() || it->second.snapshotAt < 0 || it->second.numExperts <= 0)
+        {
+            return nullptr;
+        }
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            if (layer.bytes[i] != it->second.bytesPerExpert[i] * it->second.numExperts)
+            {
+                return nullptr;
+            }
+        }
+        return &it->second;
+    }
+
     std::mutex mMutex;
+    std::map<int32_t, CacheView> mCache;
+    int32_t* mSnapshotHost{nullptr};
+    size_t mSnapshotCapacity{0};
+    std::vector<int32_t> mSnapshot;
+    bool mSnapshotValid{false};
     std::map<int32_t, Layer> mLayers;
     uint8_t* mBuf[2]{nullptr, nullptr};
     size_t mBufBytes{0};
@@ -1041,6 +1175,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
     cudaMemset(mCacheState + mNumExperts + mCacheSlots, 0, (stateInts - mNumExperts - mCacheSlots) * 4);
     mCacheTally = mCacheState + stateInts - 3;
     mCacheReady = true;
+    PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
     LOG_INFO("Int4MoePlugin %s: expert cache %d slots, %.1f MiB", mLayerName.c_str(), mCacheSlots, total / 1048576.0);
     return true;
 }
