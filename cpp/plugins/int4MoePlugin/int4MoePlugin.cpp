@@ -160,6 +160,18 @@ bool prefillOverlapFromEnv()
     return value != nullptr && std::atoi(value) != 0;
 }
 
+//! EDGELLM_MOE_CACHE_BIAS=<beta> (lossy, decode only; default 0.5, measured on Qwen3.6 only, set 0 for exact routing): the router prefers experts that are resident in the per-layer GPU expert cache by adding beta to their
+//! logits before the top-k selection (combine weights stay the softmax of the original logits over the selected experts). Default 0.5 when unset; EDGELLM_MOE_CACHE_BIAS=0 gives exact routing.
+//! beta 0.5: ~65% fewer cache misses for +0.09% perplexity, beta 1: 85% fewer for +1.5% (METRICS R25ar/R25av, Qwen3.6).
+float cacheBiasFromEnv()
+{
+    static float const beta = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_CACHE_BIAS");
+        return v != nullptr ? std::max(0.0f, static_cast<float>(std::atof(v))) : 0.5f;
+    }();
+    return beta;
+}
+
 //! Layer position inside the engine: the trailing integer of the plugin node name ("n0_18" -> 18); layers run in ascending order.
 int32_t layerIdFromName(std::string const& name) noexcept
 {
@@ -817,6 +829,16 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
             static_cast<int32_t>(mActivationType));
     }
 }
+
+namespace
+{
+//! EDGELLM_MOE_HOSTFUNC_PROBE=1: add a device-to-host copy of the router ids and an empty host node to every cached decode layer (cost probe for a CPU miss path).
+bool hostRoundTripProbeFromEnv()
+{
+    static bool const on = []() { char const* v = std::getenv("EDGELLM_MOE_HOSTFUNC_PROBE"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+} // namespace
 
 namespace
 {
@@ -1543,16 +1565,33 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor topkIndicesTensor(
             topkIndicesPtr, {numTokens, mTopK}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
-        moeTopkSoftmax(routerLogitsTensor, topkWeightsTensor, topkIndicesTensor, mTopK, softmaxWorkspacePtr,
-            softmaxWorkspaceSizeBytes, stream, true, 0.0f);
+        if (useCache && cacheBiasFromEnv() > 0.0f && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
+        {
+            kernel::ExpertCacheState const biasState{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
+                mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
+            kernel::launchCacheAwareTopk(static_cast<float const*>(inputs[0]), numTokens, mNumExperts, mTopK, cacheBiasFromEnv(), biasState,
+                topkIndicesPtr, topkWeightsPtr, stream);
+        }
+        else
+        {
+            moeTopkSoftmax(routerLogitsTensor, topkWeightsTensor, topkIndicesTensor, mTopK, softmaxWorkspacePtr,
+                softmaxWorkspaceSizeBytes, stream, true, 0.0f);
+        }
         CUDA_CHECK(cudaGetLastError());
 
+        if (useCache && hostRoundTripProbeFromEnv())
+        {
+            // rtx4060/moe-cpu-miss step 1: cost of the host round trip a CPU miss path needs (router ids to pinned host memory + a stream-blocking host node), no compute
+            static int32_t* const probeHost = []() { void* p = nullptr; cudaMallocHost(&p, 4096); return static_cast<int32_t*>(p); }();
+            cudaMemcpyAsync(probeHost, topkIndicesPtr, static_cast<size_t>(numTokens) * mTopK * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+            cudaLaunchHostFunc(stream, [](void*) {}, nullptr);
+        }
         if (useCache)
         {
             kernel::ExpertCacheState state{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
                 mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
             kernel::launchExpertCacheLookup(topkIndicesPtr, numTokens * mTopK, mNumExperts, state, stream);
-            kernel::launchExpertCacheFill(state, stagingCopy, stream);
+            kernel::launchExpertCacheFill(state, stagingCopy, numTokens * mTopK, stream);
             CUDA_CHECK(cudaGetLastError());
         }
         else if (stageNow)

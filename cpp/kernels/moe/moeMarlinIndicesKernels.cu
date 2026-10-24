@@ -18,6 +18,7 @@
 #include "common/cudaUtils.h"
 #include "moeMarlinIndicesKernels.h"
 
+#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -455,10 +456,108 @@ void launchExpertCacheLookup(
     expertCacheLookupKernel<<<1, 128, numExperts, stream>>>(topkIndices, count, numExperts, cache);
 }
 
-void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy const& copy, cudaStream_t stream)
+void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy const& copy, int32_t maxMisses, cudaStream_t stream)
 {
-    dim3 const grid(cache.numSlots, 16, copy.numTensors);
+    // at most one miss per selected expert: blocks beyond that exit at once but still cost a launch wave each (137 us per call with 60 slots, METRICS R25ax)
+    dim3 const grid(std::min(cache.numSlots, std::max(maxMisses, 1)), 16, copy.numTensors);
     expertCacheFillKernel<<<grid, 256, 0, stream>>>(cache, copy);
+}
+
+
+namespace
+{
+// Cache-aware top-k routing for decode steps (rtx4060/moe-cache-aware-routing): one block per token. The experts are selected by
+// logit + bias * [resident in this layer's cache], the combine weights are the softmax of the ORIGINAL logits over the selected experts (what an
+// unbiased router with the same selection would give), so only WHICH experts run changes. bias = 0 reproduces the exact router.
+__global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, int32_t topK, float bias, int32_t const* slotOf, int32_t* topkIndices,
+    float* topkWeights)
+{
+    extern __shared__ float scoreSmem[]; // [numExperts] biased scores
+    __shared__ float warpBest[32];
+    __shared__ int32_t warpIdx[32];
+    __shared__ int32_t chosen[16];
+    __shared__ float chosenLogit[16];
+    float const* row = logits + static_cast<size_t>(blockIdx.x) * numExperts;
+    for (int32_t e = threadIdx.x; e < numExperts; e += blockDim.x)
+    {
+        scoreSmem[e] = row[e] + (slotOf[e] >= 0 ? bias : 0.0f);
+    }
+    __syncthreads();
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const warp = threadIdx.x >> 5;
+    for (int32_t k = 0; k < topK; ++k)
+    {
+        float best = -3.0e38f;
+        int32_t bestIdx = 0x7fffffff;
+        for (int32_t e = threadIdx.x; e < numExperts; e += blockDim.x)
+        {
+            float const v = scoreSmem[e];
+            if (v > best || (v == best && e < bestIdx))
+            {
+                best = v;
+                bestIdx = e;
+            }
+        }
+        for (int32_t off = 16; off > 0; off >>= 1)
+        {
+            float const ov = __shfl_xor_sync(0xffffffffu, best, off);
+            int32_t const oi = __shfl_xor_sync(0xffffffffu, bestIdx, off);
+            if (ov > best || (ov == best && oi < bestIdx))
+            {
+                best = ov;
+                bestIdx = oi;
+            }
+        }
+        if (lane == 0)
+        {
+            warpBest[warp] = best;
+            warpIdx[warp] = bestIdx;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            float b = warpBest[0];
+            int32_t bi = warpIdx[0];
+            for (int32_t w = 1; w < (blockDim.x >> 5); ++w)
+            {
+                if (warpBest[w] > b || (warpBest[w] == b && warpIdx[w] < bi))
+                {
+                    b = warpBest[w];
+                    bi = warpIdx[w];
+                }
+            }
+            chosen[k] = bi;
+            chosenLogit[k] = row[bi];
+            scoreSmem[bi] = -3.4e38f;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        float mx = chosenLogit[0];
+        for (int32_t k = 1; k < topK; ++k)
+        {
+            mx = fmaxf(mx, chosenLogit[k]);
+        }
+        float sum = 0.0f;
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            chosenLogit[k] = __expf(chosenLogit[k] - mx);
+            sum += chosenLogit[k];
+        }
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            topkIndices[static_cast<size_t>(blockIdx.x) * topK + k] = chosen[k];
+            topkWeights[static_cast<size_t>(blockIdx.x) * topK + k] = chosenLogit[k] / sum;
+        }
+    }
+}
+} // namespace
+
+void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExperts, int32_t topK, float bias, ExpertCacheState const& cache,
+    int32_t* topkIndices, float* topkWeights, cudaStream_t stream)
+{
+    cacheAwareTopkKernel<<<numTokens, 256, numExperts * sizeof(float), stream>>>(logits, numExperts, topK, bias, cache.slotOf, topkIndices, topkWeights);
 }
 
 } // namespace kernel
