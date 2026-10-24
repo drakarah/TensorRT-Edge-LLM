@@ -3141,15 +3141,27 @@ bool LLMRankRuntime::runHybridPlainPrefill(DecodingInferenceContext& context, Ma
 
     // Stable boundary: the prompt without the volatile generation-prompt tail, or the prefix this input shares with an earlier request when that is
     // longer than the checkpoint it restored from (divergence checkpoint, as in runHybridMtpPrefill).
-    int32_t replayTailLength = context.contextCacheReplayTailLength;
+    // A split costs a second prefill pass (which streams the experts of the tail again) and a checkpoint capture, about 1 s on a 3k-token prompt with host-streamed
+    // experts, so it is only made where a later request is likely to reuse it: the prefix this input shares with a recent request (divergence checkpoint,
+    // EDGELLM_HYBRID_DIVERGENCE_CHECKPOINT=<min tokens>, which is how a family of prompts with a common system prompt + tools gets its checkpoint on its
+    // second member), or, with EDGELLM_HYBRID_PLAIN_TAIL_CHECKPOINT=1, always at the end of the prompt without its volatile tail (multi-turn continuations).
+    int32_t replayTailLength = 0;
     static int32_t const divergenceMinTokens = [] {
         char const* env = std::getenv("EDGELLM_HYBRID_DIVERGENCE_CHECKPOINT");
         return env != nullptr ? std::max(0, std::atoi(env)) : 0;
     }();
+    static bool const tailCheckpoint = [] {
+        char const* env = std::getenv("EDGELLM_HYBRID_PLAIN_TAIL_CHECKPOINT");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (tailCheckpoint)
+    {
+        replayTailLength = context.contextCacheReplayTailLength;
+    }
     if (divergenceMinTokens > 0)
     {
         int32_t const sharedPrefix = managedKVCacheRequest.hybridSharedPrefixLength(0);
-        int32_t const stableEnd = inputLength - std::max(replayTailLength, 0);
+        int32_t const stableEnd = inputLength - std::max(context.contextCacheReplayTailLength, 0);
         if (sharedPrefix >= reuseLength + divergenceMinTokens && sharedPrefix < stableEnd)
         {
             LOG_DEBUG("Hybrid prefill: divergence checkpoint at %d (reuse %d, input %d)", sharedPrefix, reuseLength, inputLength);
