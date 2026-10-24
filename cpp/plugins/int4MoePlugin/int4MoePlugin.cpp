@@ -299,6 +299,11 @@ public:
                 }
             }
         }
+        if (current < 0)
+        {
+            // first layer of a pass (nothing was prefetched for it): decode steps replay as a CUDA graph, so no host call tells us the cache changed since the snapshot
+            mSnapshotValid = false;
+        }
         mPendingLayer = -1;
         mPendingBuf = -1;
         int32_t const used = current >= 0 ? current : 0;
