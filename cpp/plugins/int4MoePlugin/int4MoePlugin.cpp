@@ -127,6 +127,15 @@ int32_t stageExpertsFromEnv()
     return mode < 0 ? 0 : (mode > 2 ? 2 : mode);
 }
 
+//! EDGELLM_MOE_TOKEN_TILE=<tokens> at engine build: the expert GEMM pipeline of a prefill pass runs over tiles of that many tokens (the experts are
+//! staged once per layer for all tokens), so the workspace holds the intermediates of one tile instead of the whole prompt. 0 = off (default).
+int32_t tokenTileFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_TOKEN_TILE");
+    int32_t const tile = value != nullptr ? std::atoi(value) : 0;
+    return tile < 16 ? 0 : tile;
+}
+
 //! Bytes of one staged layer: the four per-expert weight / scale tensors (inputs 2..5), 256-byte aligned each.
 size_t stagedExpertBytes(nvinfer1::Dims const* const dims[4], nvinfer1::DataType const types[4]) noexcept
 {
@@ -684,7 +693,7 @@ size_t stagedWorkspaceBytes(int32_t mode, nvinfer1::Dims const* const dims[4], n
 }
 
 size_t computeInt4MoeWorkspaceSize(
-    int64_t numTokens, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize) noexcept
+    int64_t numTokens, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize, int32_t tokenTile) noexcept
 {
     try
     {
@@ -698,7 +707,8 @@ size_t computeInt4MoeWorkspaceSize(
         CUDA_CHECK(cudaGetDevice(&dev));
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
 
-        int32_t const totalSlots = static_cast<int32_t>(numTokens) * topK;
+        int32_t const tileTokens = tokenTile > 0 ? static_cast<int32_t>(std::min<int64_t>(numTokens, tokenTile)) : static_cast<int32_t>(numTokens);
+        int32_t const totalSlots = tileTokens * topK;
         int32_t const maxPaddedSlots = totalSlots + numExperts * kLARGE_TOKEN_BLOCK_SIZE;
         int32_t const maxPaddedBlocks = std::max(
             static_cast<int32_t>(divUp(totalSlots + numExperts * kSMALL_TOKEN_BLOCK_SIZE, kSMALL_TOKEN_BLOCK_SIZE)),
@@ -819,6 +829,11 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
         {
             mStageExperts = *static_cast<int32_t const*>(fc->fields[i].data);
             mStageExpertsFieldSeen = true;
+        }
+        else if (fieldName == "token_tile")
+        {
+            mTokenTile = *static_cast<int32_t const*>(fc->fields[i].data);
+            mTokenTileFieldSeen = true;
         }
     }
 
@@ -1074,6 +1089,7 @@ IPluginV3* Int4MoePlugin::clone() noexcept
             mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType, mQuantizationGroupSize);
         plugin->setPluginNamespace(mNamespace.c_str());
         plugin->setStageExperts(mStageExperts);
+        plugin->setTokenTile(mTokenTile);
         return plugin;
     }
     catch (std::exception const& e)
@@ -1296,7 +1312,7 @@ size_t Int4MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, in
         nvinfer1::DataType const types[4] = {inputs[2].desc.type, inputs[3].desc.type, inputs[4].desc.type, inputs[5].desc.type};
         staged = stagedWorkspaceBytes(mStageExperts, dims, types);
     }
-    return computeInt4MoeWorkspaceSize(maxTokens, mNumExperts, mTopK, mHiddenSize, mMoeInterSize) + staged;
+    return computeInt4MoeWorkspaceSize(maxTokens, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mTokenTile) + staged;
 }
 
 int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
@@ -1334,7 +1350,8 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             return -1;
         }
         int32_t const numTokens = static_cast<int32_t>(numTokens64);
-        int32_t const moeBlockSize = getTunedMoeBlockSize(numTokens64);
+        int32_t const tileTokens = mTokenTile > 0 ? std::min(numTokens, mTokenTile) : numTokens;
+        int32_t const moeBlockSize = getTunedMoeBlockSize(tileTokens);
 
         rt::Tensor hiddenStatesTensor(const_cast<void*>(inputs[1]), rt::Coords{hiddenStatesDesc.dims},
             rt::DeviceType::kGPU, hiddenStatesDesc.type);
@@ -1378,7 +1395,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         uint8_t* privatePtrs[4]{};
         static int32_t const chunkExperts = prefillChunkFromEnv();
         bool chunkMode = false;
-        if (chunkExperts > 0 && mStageExperts == 2 && stageNow && !cacheStep)
+        if (chunkExperts > 0 && mStageExperts == 2 && stageNow && !cacheStep && tileTokens == numTokens)
         {
             cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
             if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess)
@@ -1495,7 +1512,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
 
         // ==================== Workspace Allocation ====================
-        int32_t totalSlots = numTokens * mTopK;
+        int32_t totalSlots = tileTokens * mTopK;
         int32_t maxPaddedSlots = totalSlots + mNumExperts * moeBlockSize;
         int32_t maxPaddedBlocks = divUp(maxPaddedSlots, moeBlockSize);
 
@@ -1601,14 +1618,25 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             CUDA_CHECK(cudaGetLastError());
         }
 
+        float* const topkWeightsPaddedPtr = static_cast<float*>(
+            assignTensorFromWorkspace(alignedWorkspacePtr, {maxPaddedSlots}, DataType::kFLOAT).rawPointer());
+
+        // Everything below runs once per tile of tokens: the workspace holds the intermediates of one tile.
+        auto runTile = [&](int32_t t0, int32_t tokens)
+        {
+            int32_t const tileSlots = tokens * mTopK;
+            int32_t const tilePadded = tileSlots + mNumExperts * moeBlockSize;
+            int32_t const tileBlocks = divUp(tilePadded, moeBlockSize);
+            int32_t* const tileTopkIdx = topkIndicesPtr + static_cast<int64_t>(t0) * mTopK;
+            float* const tileTopkW = topkWeightsPtr + static_cast<int64_t>(t0) * mTopK;
         // Reshape hidden_states to 2D for expert GEMMs
-        rt::Tensor hiddenStates2D(const_cast<void*>(hiddenStatesTensor.rawPointer()), {numTokens, mHiddenSize},
-            rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::Tensor hiddenStates2D(const_cast<half*>(static_cast<half const*>(hiddenStatesTensor.rawPointer())) + static_cast<int64_t>(t0) * mHiddenSize,
+            {tokens, mHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // ==================== Step 2: Prepare Marlin GEMM Indices ====================
         CUDA_CHECK(cudaMemsetAsync(slotsPerExpertWorkspace, 0, mNumExperts * sizeof(int32_t), stream));
         kernel::launchCountSlotsPerExpertKernel(
-            topkIndicesPtr, slotsPerExpertWorkspace, numTokens, mTopK, mNumExperts, stream);
+            tileTopkIdx, slotsPerExpertWorkspace, tokens, mTopK, mNumExperts, stream);
         CUDA_CHECK(cudaGetLastError());
 
         kernel::launchComputePaddedOffsetsKernel(slotsPerExpertWorkspace, paddedCountsPtr, paddedOffsetsPtr,
@@ -1617,26 +1645,26 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
 
         CUDA_CHECK(cudaMemsetAsync(slotsPerExpertWorkspace, 0, mNumExperts * sizeof(int32_t), stream));
         kernel::launchBuildSlotListsKernel(
-            topkIndicesPtr, slotsByExpertWorkspace, slotsPerExpertWorkspace, numTokens, mTopK, mNumExperts, stream);
+            tileTopkIdx, slotsByExpertWorkspace, slotsPerExpertWorkspace, tokens, mTopK, mNumExperts, stream);
         CUDA_CHECK(cudaGetLastError());
 
         rt::Tensor sortedTokenIdsTensor(
-            sortedTokenIdsPtr, {maxPaddedSlots}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-        rt::Tensor expertIdsTensor(expertIdsPtr, {maxPaddedBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+            sortedTokenIdsPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+        rt::Tensor expertIdsTensor(expertIdsPtr, {tileBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
         rt::Tensor numTokensPostPaddedTensor(
             numTokensPostPaddedPtr, {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
         rt::Tensor topkWeightsFlatTensor(
-            topkWeightsFlatPtr, {maxPaddedSlots}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+            topkWeightsFlatPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
         rt::Tensor marlinWorkspaceTensor(
             marlinWorkspacePtr, {marlinWorkspaceSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
         kernel::launchBuildMarlinIndicesKernel(slotsByExpertWorkspace, slotsPerExpertWorkspace, paddedCountsPtr,
-            paddedOffsetsPtr, topkWeightsPtr, sortedTokenIdsPtr, topkWeightsFlatPtr, expertIdsPtr, numTokens, mTopK,
+            paddedOffsetsPtr, tileTopkW, sortedTokenIdsPtr, topkWeightsFlatPtr, expertIdsPtr, tokens, mTopK,
             mNumExperts, moeBlockSize, stream);
 
         // ==================== Step 3: Gate-Up Projection (Marlin INT4 GEMM) ====================
         rt::Tensor gateUpOutputTensor(
-            gateUpOutputPtr, {totalSlots, 2 * mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+            gateUpOutputPtr, {tileSlots, 2 * mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // Chunked prefill (EDGELLM_MOE_PREFILL_CHUNK): the same GEMM once per chunk of experts, weights from the ring, routing arrays sliced per chunk.
         // phase 0 = gate-up, 1 = down; the weight tensors are the chunk's slice with the chunk's expert count as leading dimension.
@@ -1650,7 +1678,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             {
                 int32_t const e1 = std::min(e0 + chunk, mNumExperts);
                 kernel::launchBuildChunkMarlinIndicesKernel(paddedOffsetsPtr, numTokensPostPaddedPtr, sortedTokenIdsPtr, expertIdsPtr, e0, e1,
-                    mNumExperts, moeBlockSize, maxPaddedSlots, chunkSortedIdsPtr, chunkExpertIdsPtr, chunkNumPostPtr, stream);
+                    mNumExperts, moeBlockSize, tilePadded, chunkSortedIdsPtr, chunkExpertIdsPtr, chunkNumPostPtr, stream);
                 uint8_t* base = nullptr;
                 int32_t weightsOffset = 0;
                 int32_t scalesOffset = 0;
@@ -1662,8 +1690,8 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                 rt::Tensor chunkWeights(base + weightsOffset, rt::Coords{count, kTile, nOut}, rt::DeviceType::kGPU, DataType::kINT32);
                 rt::Tensor chunkScales(base + scalesOffset, rt::Coords{count, scalesDesc.dims.d[1], scalesDesc.dims.d[2]}, rt::DeviceType::kGPU,
                     scalesDesc.type);
-                rt::Tensor chunkSortedIds(chunkSortedIdsPtr, {maxPaddedSlots}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-                rt::Tensor chunkExpertIds(chunkExpertIdsPtr, {maxPaddedBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                rt::Tensor chunkSortedIds(chunkSortedIdsPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                rt::Tensor chunkExpertIds(chunkExpertIdsPtr, {tileBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
                 rt::Tensor chunkNumPost(chunkNumPostPtr, {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
                 moeAwqW4A16MarlinGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, chunkSortedIds, chunkExpertIds, chunkNumPost,
                     gemmTopkWeights, marlinWorkspaceTensor, moeBlockSize, gemmTopK, mulTopkWeights, stream);
@@ -1686,27 +1714,25 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
 
         // ==================== Step 4: Gated Activation ====================
         rt::Tensor activationOutputTensor(
-            activationOutputPtr, {totalSlots, mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+            activationOutputPtr, {tileSlots, mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         int32_t const kernelActivationType = (mActivationType == kACTIVATION_GEGLU)
             ? trt_edgellm::kernel::MoeActivationType::kMoeGeGlu
             : trt_edgellm::kernel::MoeActivationType::kMoeSwiGlu;
         moeActivation(
-            gateUpOutputTensor, activationOutputTensor, totalSlots, mMoeInterSize, kernelActivationType, stream);
+            gateUpOutputTensor, activationOutputTensor, tileSlots, mMoeInterSize, kernelActivationType, stream);
         CUDA_CHECK(cudaGetLastError());
 
         // ==================== Step 5: Down Projection (Marlin INT4 GEMM) ====================
         rt::Tensor downOutputTensor(
-            downOutputPtr, {totalSlots, mHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+            downOutputPtr, {tileSlots, mHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // Routing weights in padded slot order for down GEMM (mulTopkWeights=true)
-        float* topkWeightsPaddedPtr = static_cast<float*>(
-            assignTensorFromWorkspace(alignedWorkspacePtr, {maxPaddedSlots}, DataType::kFLOAT).rawPointer());
-        cudaMemsetAsync(topkWeightsPaddedPtr, 0, maxPaddedSlots * sizeof(float), stream);
+        cudaMemsetAsync(topkWeightsPaddedPtr, 0, tilePadded * sizeof(float), stream);
         cudaMemcpyAsync(
-            topkWeightsPaddedPtr, topkWeightsPtr, totalSlots * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+            topkWeightsPaddedPtr, tileTopkW, tileSlots * sizeof(float), cudaMemcpyDeviceToDevice, stream);
         rt::Tensor topkWeightsPaddedTensor(
-            topkWeightsPaddedPtr, {maxPaddedSlots}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+            topkWeightsPaddedPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
 
         if (chunkMode)
         {
@@ -1722,7 +1748,12 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
 
         // ==================== Step 6: Aggregate Slots to Tokens ====================
         kernel::launchAggregateSlotOutputsKernel(
-            downOutputPtr, outputTensor.rawPointer(), numTokens, mTopK, mHiddenSize, stream);
+            downOutputPtr, static_cast<half*>(outputTensor.rawPointer()) + static_cast<int64_t>(t0) * mHiddenSize, tokens, mTopK, mHiddenSize, stream);
+        };
+        for (int32_t t0 = 0; t0 < numTokens; t0 += tileTokens)
+        {
+            runTile(t0, std::min(tileTokens, numTokens - t0));
+        }
         return 0;
     }
     catch (std::exception const& e)
@@ -1772,6 +1803,7 @@ PluginFieldCollection const* Int4MoePlugin::getFieldsToSerialize() noexcept
         mDataToSerialize.emplace_back("activation_type", &mActivationType, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("quantization_group_size", &mQuantizationGroupSize, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("stage_experts", &mStageExperts, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("token_tile", &mTokenTile, PluginFieldType::kINT32, 1);
 
         mFCToSerialize.nbFields = mDataToSerialize.size();
         mFCToSerialize.fields = mDataToSerialize.data();
@@ -1797,6 +1829,7 @@ Int4MoePluginCreator::Int4MoePluginCreator()
     mPluginAttributes.emplace_back(PluginField("activation_type", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("quantization_group_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("stage_experts", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("token_tile", nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
@@ -1836,6 +1869,10 @@ IPluginV3* Int4MoePluginCreator::createPlugin(
         if (!plugin->hasStageExpertsField() && phase == TensorRTPhase::kBUILD)
         {
             plugin->setStageExperts(stageExpertsFromEnv());
+        }
+        if (!plugin->hasTokenTileField() && phase == TensorRTPhase::kBUILD)
+        {
+            plugin->setTokenTile(tokenTileFromEnv());
         }
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
