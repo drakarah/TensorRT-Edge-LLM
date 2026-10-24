@@ -676,6 +676,10 @@ private:
     //! equals one prefill over the whole suffix. Restores tokenIds/effectivePrefillLengths to the whole suffix.
     //! @throws std::runtime_error if a CUDA error occurs
     bool runChunkedBaseModelPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest);
+    //! Single pass when the suffix fits maxSupportedInputLength, otherwise passes of at most that length (hybrid bases).
+    bool runBoundedBaseModelPrefill(
+        DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest, bool sampleOutput);
+    static bool hybridChunkedPrefillEnabled() noexcept;
 
     //! Hybrid+MTP endpoint-reuse prefill. Mirrors the reference llmInferenceRuntime.cpp::runHybridMtpPrefill: a
     //! two-chunk base prefill publishing at the stable predecessor boundary, folding the reused checkpoint's boundary

@@ -3172,7 +3172,7 @@ bool LLMRankRuntime::runHybridPlainPrefill(DecodingInferenceContext& context, Ma
     if (!hasVolatileTail)
     {
         // nothing to split: single pass, the end-of-prompt checkpoint is captured by the prefill itself (serves exact continuations only)
-        return runBaseModelPrefill(context, &managedKVCacheRequest, /*sampleOutput=*/true);
+        return runBoundedBaseModelPrefill(context, &managedKVCacheRequest, /*sampleOutput=*/true);
     }
 
     std::vector<int32_t> const completeSuffix = context.tokenIds[0];
@@ -3183,7 +3183,7 @@ bool LLMRankRuntime::runHybridPlainPrefill(DecodingInferenceContext& context, Ma
     // Chunk 1: the stable predecessor [reuseLength, predecessorLength), no sampling, then publish the checkpoint at its end.
     context.tokenIds[0].assign(completeSuffix.begin(), replayBegin);
     context.effectivePrefillLengths[0] = predecessorChunkLength;
-    if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/false))
+    if (!runBoundedBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/false))
     {
         return false;
     }
@@ -3196,7 +3196,7 @@ bool LLMRankRuntime::runHybridPlainPrefill(DecodingInferenceContext& context, Ma
     // Chunk 2: replay the volatile tail with sampling, then restore the bookkeeping for the decode loop.
     context.tokenIds[0].assign(replayBegin, completeSuffix.end());
     context.effectivePrefillLengths[0] = replayTailLength;
-    if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/true))
+    if (!runBoundedBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/true))
     {
         return false;
     }
@@ -3211,14 +3211,69 @@ bool LLMRankRuntime::canChunkPrefill(
     DecodingInferenceContext const& context, DecodingStrategy const& strategy) const noexcept
 {
     // Hybrid (gated-delta-net) bases carry their recurrent and convolution state in the request's resident slot, so a
-    // later pass continues from the earlier one exactly like a context-reuse suffix prefill. Opt-in until the chunked
-    // output is verified equal to the single-pass output (EDGELLM_HYBRID_CHUNKED_PREFILL=1).
-    static bool const kHybridChunkedPrefill = [] {
-        char const* value = std::getenv("EDGELLM_HYBRID_CHUNKED_PREFILL");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
-    }();
+    // later pass continues from the earlier one exactly like a context-reuse suffix prefill. A prompt that fits one pass
+    // never takes this path, so enabling it only turns a refused prompt into an accepted one (EDGELLM_HYBRID_CHUNKED_PREFILL=0
+    // restores the refusal).
     return strategy.supportsChunkedPrefill() && context.activeBatchSize == 1 && mVisionRunner == nullptr && mAudioRunner == nullptr
-        && (mDeployment.base.numLinearAttnLayers == 0 || kHybridChunkedPrefill) && !mDeployment.base.isDiffusionBackbone;
+        && (mDeployment.base.numLinearAttnLayers == 0 || hybridChunkedPrefillEnabled()) && !mDeployment.base.isDiffusionBackbone;
+}
+
+bool LLMRankRuntime::hybridChunkedPrefillEnabled() noexcept
+{
+    static bool const enabled = [] {
+        char const* value = std::getenv("EDGELLM_HYBRID_CHUNKED_PREFILL");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool LLMRankRuntime::runBoundedBaseModelPrefill(
+    DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest, bool sampleOutput)
+{
+    int32_t const suffixLength = context.effectivePrefillLengths[0];
+    int32_t const maxPassLength = mDeployment.base.maxSupportedInputLength;
+    if (suffixLength <= maxPassLength || !hybridChunkedPrefillEnabled())
+    {
+        return runBaseModelPrefill(context, managedKVCacheRequest, sampleOutput);
+    }
+    // Longer than one pass: passes of at most maxPassLength, each continuing from the recurrent state and the KV the
+    // previous one left in the resident slot. Only the last pass samples and carries the request (its end-of-prompt capture).
+    std::vector<int32_t> const completeSuffix = context.tokenIds[0];
+    ELLM_CHECK(maxPassLength > 0 && suffixLength <= static_cast<int32_t>(completeSuffix.size()),
+        "Chunked hybrid prefill: invalid suffix or max input length");
+    LOG_DEBUG("Chunked hybrid prefill: %d tokens in passes of at most %d", suffixLength, maxPassLength);
+    int32_t lastPassLength = 0;
+    int32_t begin = 0;
+    for (int32_t length = 0; begin < suffixLength; begin += length)
+    {
+        length = std::min(maxPassLength, suffixLength - begin);
+        if (maxPassLength > 2 && suffixLength - begin - length == 1)
+        {
+            --length;
+        }
+        bool const lastPass = begin + length == suffixLength;
+        lastPassLength = length;
+        context.tokenIds[0].assign(completeSuffix.begin() + begin, completeSuffix.begin() + begin + length);
+        context.effectivePrefillLengths[0] = length;
+        if (!runBaseModelPrefill(context, lastPass ? managedKVCacheRequest : nullptr, sampleOutput && lastPass))
+        {
+            return false;
+        }
+        if (!lastPass)
+        {
+            // The next pass restages the shared pinned token buffer.
+            CUDA_CHECK(cudaStreamSynchronize(context.stream));
+        }
+    }
+    int32_t const sampledToken = sampleOutput ? context.tokenIds[0].back() : 0;
+    context.tokenIds[0] = completeSuffix;
+    if (sampleOutput)
+    {
+        context.tokenIds[0].push_back(sampledToken);
+    }
+    context.prefillLastPassLength = lastPassLength;
+    context.effectivePrefillLengths[0] = suffixLength;
+    return true;
 }
 
 bool LLMRankRuntime::runChunkedBaseModelPrefill(
