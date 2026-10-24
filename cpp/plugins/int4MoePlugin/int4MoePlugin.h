@@ -183,6 +183,17 @@ public:
         return mStageExpertsFieldSeen;
     }
 
+    //! @brief Token tile of the expert GEMM pipeline in prefill passes (serialized, 0 = whole pass)
+    void setTokenTile(int32_t tile) noexcept
+    {
+        mTokenTile = tile;
+    }
+
+    bool hasTokenTileField() const noexcept
+    {
+        return mTokenTileFieldSeen;
+    }
+
 private:
     std::string mLayerName;
     std::string mNamespace;
@@ -193,6 +204,7 @@ private:
     nvinfer1::ActivationType mActivationType{};
     int32_t mQuantizationGroupSize{};
     int32_t mStageExperts{0};
+    int32_t mTokenTile{0};
     int32_t* mStats{nullptr}; // device, [2][numExperts] selection counters (EDGELLM_MOE_STATS)
     // EDGELLM_MOE_CACHE_SLOTS=<n>: per-layer device cache of the n most recently used experts (decode steps of <= 4 tokens);
     // allocated at the first enqueue, outside graph capture.
@@ -208,6 +220,7 @@ private:
     std::atomic<bool> mStatsStop{false};
     void startStats(std::string const& prefix);
     bool mStageExpertsFieldSeen{false};
+    bool mTokenTileFieldSeen{false};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;
