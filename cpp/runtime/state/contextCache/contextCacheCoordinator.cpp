@@ -451,6 +451,13 @@ public:
         ELLM_CHECK(false, "Hybrid+MTP endpoint publication requires a Hybrid+MTP request");
         return ContextCacheCoordinatorStatus::kRequestFailed;
     }
+    //! Hybrid (non-speculative) only: publish a recurrent + partial-KV checkpoint at a stable boundary in the middle of a prefill.
+    virtual ContextCacheCoordinatorStatus publishHybridBoundary(
+        RequestHandle& /*request*/, int32_t /*slot*/, int32_t /*residentStateLength*/)
+    {
+        ELLM_CHECK(false, "Hybrid boundary publication requires a hybrid snapshot request");
+        return ContextCacheCoordinatorStatus::kRequestFailed;
+    }
     //! Hybrid+MTP-only: restore the checkpoint's saved boundary hidden row. Unreachable for other flavors.
     virtual ContextCacheCoordinatorStatus restoreMtpBoundary(
         RequestHandle& /*request*/, int32_t /*slot*/, Tensor& /*hidden*/, int32_t /*row*/)
@@ -564,6 +571,75 @@ public:
         {
             impl.markDeviceWorkResolvedWithoutSync();
         }
+        return ContextCacheCoordinatorStatus::kOk;
+    }
+
+    //! Mid-prefill checkpoint for a non-speculative hybrid (rtx4060/hybrid-prefix-reuse): the same capture + publish as the end-of-prefill
+    //! endpoint, but at a stable boundary before the end (the prompt without its volatile generation-prompt tail, or the prefix shared with an
+    //! earlier request). The recurrent state and the partial KV page are captured on the request's stream, drained, then committed.
+    ContextCacheCoordinatorStatus publishHybridBoundary(
+        RequestHandle& request, int32_t slot, int32_t residentStateLength) override
+    {
+        auto& impl = mCoordinator.checkedImpl(request);
+        ELLM_CHECK(slot >= 0 && slot < static_cast<int32_t>(impl.sequences.size()),
+            "Hybrid boundary publication slot is outside the active batch");
+        auto& sequence = impl.sequences[static_cast<size_t>(slot)];
+        if (sequence.lookupPolicy == ContextCacheLookupPolicy::kBypass || residentStateLength <= 0
+            || residentStateLength <= sequence.publishedExactLength)
+        {
+            return ContextCacheCoordinatorStatus::kOk;
+        }
+        ELLM_CHECK(static_cast<size_t>(residentStateLength) <= sequence.tokenIds.size(),
+            "Hybrid boundary length exceeds the logical token history");
+        mCoordinator.mManager.releaseRestoredHybridSnapshots(sequence.lease);
+        bool const needsPartialKvSnapshot = mCoordinator.deploymentHasAttention() && residentStateLength % kTOKENS_PER_PAGE != 0;
+        std::optional<HybridSnapshotReservation> const reservation
+            = mCoordinator.mManager.reserveHybridSnapshots(sequence.lease, needsPartialKvSnapshot);
+        if (!reservation.has_value())
+        {
+            ++mCoordinator.mMetrics.hybridSnapshotPressureSkips;
+            if (shouldLogDegradation(mCoordinator.mMetrics.hybridSnapshotPressureSkips))
+            {
+                LOG_WARNING("Context cache hybrid snapshot-pressure skip count reached %llu",
+                    static_cast<unsigned long long>(mCoordinator.mMetrics.hybridSnapshotPressureSkips));
+            }
+            return ContextCacheCoordinatorStatus::kOk;
+        }
+        mCoordinator.mHybridSnapshots->captureRecurrent(
+            reservation->recurrentSnapshotSlot, sequence.resident.slot, impl.stream);
+        if (reservation->partialKvSnapshotSlot.has_value())
+        {
+            int32_t const validTokenCount = residentStateLength % kTOKENS_PER_PAGE;
+            size_t const sourceIndex = static_cast<size_t>(residentStateLength / kTOKENS_PER_PAGE);
+            ELLM_CHECK(validTokenCount > 0 && sourceIndex < sequence.lease.basePages().size(),
+                "Hybrid partial-KV capture has no materialized source page");
+            mCoordinator.mHybridSnapshots->capturePartialKv(
+                *reservation->partialKvSnapshotSlot, sequence.lease.basePages()[sourceIndex], validTokenCount, impl.stream);
+        }
+        impl.markDeviceWorkEnqueued();
+
+        size_t const fullTokenCount = static_cast<size_t>(residentStateLength / kTOKENS_PER_PAGE) * static_cast<size_t>(kTOKENS_PER_PAGE);
+        Hash128 const* seqMediaPtr
+            = sequence.perPositionMediaHash.empty() ? nullptr : sequence.perPositionMediaHash.data();
+        std::vector<BlockHash> hashes
+            = hashRequestFullBlocks(sequence.tokenIds.data(), fullTokenCount, sequence.keyExtras, seqMediaPtr);
+        HybridCheckpointKey const checkpoint{hashRequestExactPrefix(sequence.tokenIds.data(),
+                                                 static_cast<size_t>(residentStateLength), sequence.keyExtras, seqMediaPtr),
+            residentStateLength};
+        ++mCoordinator.mMetrics.hybridCaptureSynchronizations;
+        ContextCacheCoordinatorStatus const syncStatus = mCoordinator.synchronizeRequest(request);
+        if (syncStatus != ContextCacheCoordinatorStatus::kOk)
+        {
+            return syncStatus;
+        }
+        PublishResult const result = mCoordinator.mManager.publishHybrid(
+            sequence.lease, HybridPublishRequest{std::move(hashes), checkpoint, *reservation});
+        mCoordinator.recordPublication(result.status);
+        mCoordinator.mManager.retireHybridSnapshotReservation(sequence.lease, *reservation);
+        sequence.publishedExactLength = residentStateLength;
+        sequence.publishedFullBlockCount = result.publishedBaseFullBlockCount;
+        // like the MTP endpoint: the prefill lifecycle is not finalized yet, more prefill work follows
+        impl.markDeviceWorkEnqueued();
         return ContextCacheCoordinatorStatus::kOk;
     }
 
@@ -1874,6 +1950,15 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridMtpEndpoint(
         "Hybrid+MTP endpoint publication requires a Hybrid+MTP deployment with snapshot storage");
     return checkedImpl(request).publicationPolicy->publishMtpBoundary(
         request, slot, residentStateLength, baseHiddenStates, boundaryHiddenRow);
+}
+
+ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridEndpoint(
+    RequestHandle& request, int32_t slot, int32_t residentStateLength)
+{
+    checkedImpl(request);
+    ELLM_CHECK(mProfile.isHybrid() && !mProfile.isSpeculative() && mHybridSnapshots != nullptr,
+        "Hybrid boundary publication requires a non-speculative hybrid deployment with snapshot storage");
+    return checkedImpl(request).publicationPolicy->publishHybridBoundary(request, slot, residentStateLength);
 }
 
 int32_t ContextCacheCoordinator::hybridSharedPrefixLength(RequestHandle& request, int32_t slot)

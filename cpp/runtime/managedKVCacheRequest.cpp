@@ -130,6 +130,11 @@ int32_t ManagedKVCacheRequest::hybridSharedPrefixLength(int32_t slot)
     return contextRequest().hybridSharedPrefixLength(slot);
 }
 
+bool ManagedKVCacheRequest::publishHybridEndpoint(int32_t slot, int32_t residentStateLength)
+{
+    return contextRequest().publishHybridEndpoint(slot, residentStateLength);
+}
+
 bool ManagedKVCacheRequest::publishHybridMtpEndpoint(
     int32_t slot, int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow)
 {

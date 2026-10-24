@@ -211,6 +211,10 @@ public:
     //! base-hidden row, then commits the exact checkpoint. Skipped for bypass, already-published, or empty prefixes.
     ContextCacheCoordinatorStatus publishHybridMtpEndpoint(RequestHandle& request, int32_t slot,
         int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow);
+    //! Publish one recurrent + partial-KV checkpoint of a NON-speculative hybrid at a stable boundary in the middle of a prefill (the prompt
+    //! without its volatile generation-prompt tail, or the prefix shared with an earlier request). Skipped for bypass, already published or
+    //! empty prefixes; a snapshot-pool shortage is a soft skip.
+    ContextCacheCoordinatorStatus publishHybridEndpoint(RequestHandle& request, int32_t slot, int32_t residentStateLength);
     //! Longest page-aligned prefix the slot's input shares with a cached hybrid record (see
     //! ReusePlan::hybridSharedPrefixTokens); 0 for a bypassed lookup.
     int32_t hybridSharedPrefixLength(RequestHandle& request, int32_t slot);
