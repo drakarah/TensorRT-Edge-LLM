@@ -318,6 +318,9 @@ public:
             cudaStreamWaitEvent(mSide, mBufFree, 0);
             bool ok = true;
             CacheView const* const view = prefillFromCacheFromEnv() && snapshotCaches(stream) ? cacheView(next->first, next->second) : nullptr;
+            mBatchDst.clear();
+            mBatchSrc.clear();
+            mBatchSize.clear();
             for (int32_t i = 0; i < 4 && ok; ++i)
             {
                 uint8_t* const dst = mBuf[target] + next->second.offset[i];
@@ -328,12 +331,13 @@ public:
                 }
                 size_t const bpe = view->bytesPerExpert[i];
                 int32_t const* const slots = mSnapshot.data() + static_cast<size_t>(view->snapshotAt) * view->numExperts;
-                for (int32_t e = 0; e < view->numExperts && ok;)
+                for (int32_t e = 0; e < view->numExperts;)
                 {
                     if (slots[e] >= 0)
                     {
-                        ok = cudaMemcpyAsync(dst + e * bpe, view->tensors[i] + static_cast<size_t>(slots[e]) * bpe, bpe, cudaMemcpyDeviceToDevice, mSide)
-                            == cudaSuccess;
+                        mBatchDst.push_back(dst + e * bpe);
+                        mBatchSrc.push_back(view->tensors[i] + static_cast<size_t>(slots[e]) * bpe);
+                        mBatchSize.push_back(bpe);
                         ++e;
                         continue;
                     }
@@ -342,9 +346,23 @@ public:
                     {
                         ++run;
                     }
-                    ok = cudaMemcpyAsync(dst + e * bpe, static_cast<uint8_t const*>(next->second.src[i]) + e * bpe, (run - e) * bpe, cudaMemcpyHostToDevice, mSide)
-                        == cudaSuccess;
+                    mBatchDst.push_back(dst + e * bpe);
+                    mBatchSrc.push_back(static_cast<uint8_t const*>(next->second.src[i]) + e * bpe);
+                    mBatchSize.push_back((run - e) * bpe);
                     e = run;
+                }
+            }
+            if (ok && !mBatchDst.empty())
+            {
+                // one driver call for the whole layer instead of a few hundred cudaMemcpyAsync calls
+                if (cudaMemcpyBatchAsync(mBatchDst.data(), mBatchSrc.data(), mBatchSize.data(), mBatchDst.size(), nullptr, nullptr, 0, mSide)
+                    != cudaSuccess)
+                {
+                    cudaGetLastError();
+                    for (size_t k = 0; k < mBatchDst.size() && ok; ++k)
+                    {
+                        ok = cudaMemcpyAsync(mBatchDst[k], mBatchSrc[k], mBatchSize[k], cudaMemcpyDefault, mSide) == cudaSuccess;
+                    }
                 }
             }
             if (ok && cudaEventRecord(mCopyDone[target], mSide) == cudaSuccess)
@@ -529,6 +547,9 @@ private:
     int32_t* mSnapshotHost{nullptr};
     size_t mSnapshotCapacity{0};
     std::vector<int32_t> mSnapshot;
+    std::vector<void*> mBatchDst;
+    std::vector<void const*> mBatchSrc;
+    std::vector<size_t> mBatchSize;
     bool mSnapshotValid{false};
     std::map<int32_t, Layer> mLayers;
     uint8_t* mBuf[2]{nullptr, nullptr};
