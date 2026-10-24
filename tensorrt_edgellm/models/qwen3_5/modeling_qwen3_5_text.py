@@ -61,6 +61,7 @@ from ...config import LAYER_GDN, GdnConfig, ModelConfig
 from ...dflash import DFlashVersion
 from ..default.modeling_default import (MLP, OnnxSpec, RMSNorm,
                                         _concat_hidden_in_provider_order)
+from ..int8_kv_cache import int8_kv_qkv_scales, kv_cache_torch_dtype
 from ..linear import (ColumnParallelLinear, FP16Linear, NVFP4LinearMethod,
                       ReplicatedLinear, TPMode, is_int4_linear,
                       is_nvfp4_a16_linear, is_nvfp4_linear, make_linear)
@@ -487,6 +488,10 @@ class GatedAttention(nn.Module):
         self.head_dim = head_dim
         self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
+        self.enable_int8_kv_cache = config.quant.kv_cache_quant == "int8"
+        if self.enable_int8_kv_cache:
+            # per-layer scales measured offline (EDGELLM_INT8_KV_SCALES); indexed by the absolute decoder layer
+            self._qkv_scales_float = int8_kv_qkv_scales(layer_idx)
         self.sliding_window_size = -1
         self.skip_softmax_scale_factor = config.skip_softmax_scale_factor
         module_prefix = f"layers.{layer_idx}.self_attn"
@@ -587,6 +592,8 @@ class GatedAttention(nn.Module):
         # value in the FX graph for the unified ONNX translation.
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
+        if self.enable_int8_kv_cache:
+            kwargs["enable_int8_kv_cache"] = 1
 
         qkv = (qkv_concat(query_states, key_states, value_states)
                if self._uses_qkv_concat else torch.cat(
@@ -659,6 +666,7 @@ class GatedAttention(nn.Module):
             enable_vision_block_attention=False,
             skip_softmax_scale_factor=self.skip_softmax_scale_factor,
             qkv_scales=getattr(self, "_qkv_scales_float", [1.0, 1.0, 1.0]),
+            enable_int8_kv_cache=int(self.enable_int8_kv_cache),
             query_start_offsets=query_start_offsets,
             attention_sequence_lengths=attention_sequence_lengths,
             execution_phase_marker=execution_phase_marker,
@@ -1361,7 +1369,8 @@ class Qwen3_5CausalLM(nn.Module):
         pool_rows = 4
         dtype16 = torch.float16
         kv_dtype = (torch.float8_e4m3fn
-                    if config.quant.kv_cache_quant == "fp8" else dtype16)
+                    if config.quant.kv_cache_quant == "fp8" else
+                    kv_cache_torch_dtype(config.quant.kv_cache_quant, dtype16))
 
         inputs_embeds = torch.zeros(physical_tokens,
                                     config.hidden_size,
