@@ -118,7 +118,8 @@ void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy cons
 
 //! Cache-aware router for decode steps (<= a few tokens): selects top-k experts by logit + bias * [resident in the cache], weights = softmax of the
 //! original logits over the selected experts. Replaces the top-k softmax kernel; writes expert ids (not slot ids) and fp32 weights.
-void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExperts, int32_t topK, float bias, ExpertCacheState const& cache,
+//! tailSkip > 0: a non-resident expert at rank tailSkip+1 or lower gets weight 0 and the top-ranked expert's id (no fetch, no renormalisation).
+void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, ExpertCacheState const& cache,
     int32_t* topkIndices, float* topkWeights, cudaStream_t stream);
 
 } // namespace kernel

@@ -469,8 +469,8 @@ namespace
 // Cache-aware top-k routing for decode steps (rtx4060/moe-cache-aware-routing): one block per token. The experts are selected by
 // logit + bias * [resident in this layer's cache], the combine weights are the softmax of the ORIGINAL logits over the selected experts (what an
 // unbiased router with the same selection would give), so only WHICH experts run changes. bias = 0 reproduces the exact router.
-__global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, int32_t topK, float bias, int32_t const* slotOf, int32_t* topkIndices,
-    float* topkWeights)
+__global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, int32_t const* slotOf,
+    int32_t* topkIndices, float* topkWeights)
 {
     extern __shared__ float scoreSmem[]; // [numExperts] biased scores
     __shared__ float warpBest[32];
@@ -547,17 +547,26 @@ __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, in
         }
         for (int32_t k = 0; k < topK; ++k)
         {
-            topkIndices[static_cast<size_t>(blockIdx.x) * topK + k] = chosen[k];
-            topkWeights[static_cast<size_t>(blockIdx.x) * topK + k] = chosenLogit[k] / sum;
+            int32_t id = chosen[k];
+            float w = chosenLogit[k] / sum;
+            // Tail skip (lossy, opt-in): a non-resident expert ranked at place tailSkip+1 or lower is not fetched; its slot is pointed at the
+            // top-ranked expert with weight 0 (nothing is renormalised), so the cache lookup sees no miss for it.
+            if (tailSkip > 0 && k >= tailSkip && slotOf[id] < 0)
+            {
+                id = chosen[0];
+                w = 0.0f;
+            }
+            topkIndices[static_cast<size_t>(blockIdx.x) * topK + k] = id;
+            topkWeights[static_cast<size_t>(blockIdx.x) * topK + k] = w;
         }
     }
 }
 } // namespace
 
-void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExperts, int32_t topK, float bias, ExpertCacheState const& cache,
+void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, ExpertCacheState const& cache,
     int32_t* topkIndices, float* topkWeights, cudaStream_t stream)
 {
-    cacheAwareTopkKernel<<<numTokens, 256, numExperts * sizeof(float), stream>>>(logits, numExperts, topK, bias, cache.slotOf, topkIndices, topkWeights);
+    cacheAwareTopkKernel<<<numTokens, 256, numExperts * sizeof(float), stream>>>(logits, numExperts, topK, bias, tailSkip, cache.slotOf, topkIndices, topkWeights);
 }
 
 } // namespace kernel

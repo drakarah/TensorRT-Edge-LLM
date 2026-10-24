@@ -192,6 +192,18 @@ float cacheBiasFromEnv()
     return beta;
 }
 
+//! EDGELLM_MOE_TAIL_SKIP=<N> (lossy, opt-in, decode only; default 0 = off): with N > 0 an expert that is not resident in the cache and ranks at place N+1 or lower of the top-k is skipped
+//! (not fetched, its weight dropped without renormalising), the rule of PolyStrata's --tail-skip. Measured offline on Qwen3.6 at 55 slots (METRICS R25bw): N=6 on exact routing removes 38% of the loaded
+//! misses for +0.04% perplexity, N=5 54% for +0.26%; on top of EDGELLM_MOE_CACHE_BIAS=0.5 it adds +0.56% perplexity for 2.7 fewer miss points, so it is meant for exact routing (beta 0).
+int32_t tailSkipFromEnv()
+{
+    static int32_t const n = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_TAIL_SKIP");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+    }();
+    return n;
+}
+
 //! Layer position inside the engine: the trailing integer of the plugin node name ("n0_18" -> 18); layers run in ascending order.
 int32_t layerIdFromName(std::string const& name) noexcept
 {
@@ -1743,11 +1755,11 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor topkIndicesTensor(
             topkIndicesPtr, {numTokens, mTopK}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
-        if (useCache && cacheBiasFromEnv() > 0.0f && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
+        if (useCache && (cacheBiasFromEnv() > 0.0f || tailSkipFromEnv() > 0) && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
         {
             kernel::ExpertCacheState const biasState{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
                 mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
-            kernel::launchCacheAwareTopk(static_cast<float const*>(inputs[0]), numTokens, mNumExperts, mTopK, cacheBiasFromEnv(), biasState,
+            kernel::launchCacheAwareTopk(static_cast<float const*>(inputs[0]), numTokens, mNumExperts, mTopK, cacheBiasFromEnv(), tailSkipFromEnv(), biasState,
                 topkIndicesPtr, topkWeightsPtr, stream);
         }
         else
