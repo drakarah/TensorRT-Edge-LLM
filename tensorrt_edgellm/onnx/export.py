@@ -848,6 +848,38 @@ def _capture_attention_sinks_for_export(model: "CausalLM") -> None:
             )
 
 
+_LAZY_FIXUP_MIN_BYTES = int(
+    float(os.environ.get("EDGELLM_EXPORT_LAZY_FIXUP_GB", "8")) * (1 << 30))
+
+
+def _append_to_external_data(model, names: set, ext_data_path: str,
+                             data_file: str) -> None:
+    """Move the in-memory bytes of the initializers in *names* to the end of the external data file (4 KiB aligned)."""
+    import onnx
+
+    with open(ext_data_path, "ab") as out:
+        for init in model.graph.initializer:
+            if init.name not in names:
+                continue
+            offset = out.tell()
+            pad = (-offset) % 4096
+            out.write(b"\0" * pad)
+            offset += pad
+            data = init.raw_data
+            out.write(data)
+            init.ClearField("raw_data")
+            del init.external_data[:]
+            init.data_location = onnx.TensorProto.EXTERNAL
+            for key, value in (("location", data_file),
+                               ("offset", str(offset)),
+                               ("length", str(len(data)))):
+                entry = init.external_data.add()
+                entry.key = key
+                entry.value = value
+        out.flush()
+        os.fsync(out.fileno())
+
+
 def _fix_initializer_dtypes(
     onnx_path: str,
     dedup_dql_scales: bool = False,
@@ -910,7 +942,30 @@ def _fix_initializer_dtypes(
     del metadata_model
     gc.collect()
 
-    model = _onnx.load(onnx_path)
+    # A large export (for example a 35B MoE with ~20 GB of weights) cannot be loaded whole next to the exporter's own
+    # working set. The fixups below only touch a few small initializers (plugin FP32 inputs, FP32 weights to FP16), so
+    # in lazy mode their bytes are read one tensor at a time and the converted tensors are appended to the existing
+    # external data file; the rest of the data file is never read. Not used for the whole-model passes (DQL dedup,
+    # MatMul / element-wise FP32 matching), which need the full model.
+    base_dir = os.path.dirname(os.path.abspath(onnx_path))
+    data_file = os.path.basename(onnx_path) + ".data"
+    ext_data_path = os.path.join(base_dir, data_file)
+    lazy = (not dedup_dql_scales and not match_fp32_matmul_initializers
+            and not match_fp32_elementwise_initializers
+            and os.path.isfile(ext_data_path)
+            and os.path.getsize(ext_data_path) >= _LAZY_FIXUP_MIN_BYTES)
+    changed_names: set = set()
+
+    def _load_raw(init) -> None:
+        if lazy and not init.raw_data:
+            _onnx.external_data_helper.load_external_data_for_tensor(
+                init, base_dir)
+
+    model = _onnx.load(onnx_path, load_external_data=not lazy)
+    if lazy:
+        logger.info(
+            "_fix_initializer_dtypes: %.2f GB external data, lazy per-tensor fixup",
+            os.path.getsize(ext_data_path) / 1e9)
 
     # --- Dedup shared DQL scale initializers (NVFP4 dynamo fix) ---
     n_deduped = 0
@@ -995,9 +1050,11 @@ def _fix_initializer_dtypes(
         # --- Plugin-required FP32 input: ensure FP32 ---
         if init.name in plugin_fp32_init_names and init.data_type == 10:  # FP16
             dims = list(init.dims)
+            _load_raw(init)
             data = np.frombuffer(init.raw_data, dtype=np.float16).reshape(dims)
             init.data_type = 1  # FLOAT (FP32)
             init.raw_data = data.astype(np.float32).tobytes()
+            changed_names.add(init.name)
             n_to_fp32 += 1
             logger.info(
                 "_fix_initializer_dtypes: %s %s FP16→FP32 (plugin FP32 input)",
@@ -1035,9 +1092,11 @@ def _fix_initializer_dtypes(
                 or init.name.endswith("_scale")
                 or init.name.endswith("_scale_2")):
             continue  # keep quantization scales as FP32
+        _load_raw(init)
         data = np.frombuffer(init.raw_data, dtype=np.float32).reshape(dims)
         init.data_type = 10  # FLOAT16
         init.raw_data = data.astype(np.float16).tobytes()
+        changed_names.add(init.name)
         n_to_fp16 += 1
         logger.info("_fix_initializer_dtypes: %s %s FP32→FP16", init.name,
                     dims)
@@ -1101,13 +1160,18 @@ def _fix_initializer_dtypes(
     logger.info(
         "_fix_initializer_dtypes: %d→FP16, %d→FP32, %d DQL deduped, "
         "saving...", n_to_fp16, n_to_fp32, n_deduped)
+    if lazy:
+        _append_to_external_data(model, changed_names, ext_data_path, data_file)
+        _onnx.save_model(model, onnx_path)  # metadata only: every initializer references the data file
+        logger.info("_fix_initializer_dtypes: %d tensor(s) appended to %s",
+                    len(changed_names), data_file)
+        return
     # Delete existing external data file before re-saving.  onnx.save_model
     # opens the file in r+b mode and appends new tensors at the end, so the
     # old data would remain as unreferenced garbage, doubling the file size.
     # Derive the data filename from onnx_path so per-rank TP exports
     # (model_world{N}_rank{R}.onnx) get distinct .data files instead of
     # all overwriting the same model.onnx.data.
-    data_file = os.path.basename(onnx_path) + ".data"
     ext_path = os.path.join(os.path.dirname(onnx_path), data_file)
     if os.path.isfile(ext_path):
         old_size = os.path.getsize(ext_path)
