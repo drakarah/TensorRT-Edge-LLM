@@ -160,14 +160,14 @@ bool prefillOverlapFromEnv()
     return value != nullptr && std::atoi(value) != 0;
 }
 
-//! EDGELLM_MOE_CACHE_BIAS=<beta> (lossy, decode only): the router prefers experts that are resident in the per-layer GPU expert cache by adding beta to their
-//! logits before the top-k selection (combine weights stay the softmax of the original logits over the selected experts). 0 / unset = exact routing.
+//! EDGELLM_MOE_CACHE_BIAS=<beta> (lossy, decode only; default 0.5, measured on Qwen3.6 only, set 0 for exact routing): the router prefers experts that are resident in the per-layer GPU expert cache by adding beta to their
+//! logits before the top-k selection (combine weights stay the softmax of the original logits over the selected experts). Default 0.5 when unset; EDGELLM_MOE_CACHE_BIAS=0 gives exact routing.
 //! beta 0.5: ~65% fewer cache misses for +0.09% perplexity, beta 1: 85% fewer for +1.5% (METRICS R25ar/R25av, Qwen3.6).
 float cacheBiasFromEnv()
 {
     static float const beta = []() {
         char const* const v = std::getenv("EDGELLM_MOE_CACHE_BIAS");
-        return v != nullptr ? std::max(0.0f, static_cast<float>(std::atof(v))) : 0.0f;
+        return v != nullptr ? std::max(0.0f, static_cast<float>(std::atof(v))) : 0.5f;
     }();
     return beta;
 }
