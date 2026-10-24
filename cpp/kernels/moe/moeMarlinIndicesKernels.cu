@@ -480,7 +480,9 @@ __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, in
     float const* row = logits + static_cast<size_t>(blockIdx.x) * numExperts;
     for (int32_t e = threadIdx.x; e < numExperts; e += blockDim.x)
     {
-        scoreSmem[e] = row[e] + (slotOf[e] >= 0 ? bias : 0.0f);
+        float const l = row[e];
+        // a NaN logit (e.g. garbage activations in a draft/warm-up pass) would never win a comparison and leave bestIdx out of range
+        scoreSmem[e] = (l == l ? l : -3.0e38f) + (slotOf[e] >= 0 ? bias : 0.0f);
     }
     __syncthreads();
     int32_t const lane = threadIdx.x & 31;
@@ -492,7 +494,7 @@ __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, in
         for (int32_t e = threadIdx.x; e < numExperts; e += blockDim.x)
         {
             float const v = scoreSmem[e];
-            if (v > best || (v == best && e < bestIdx))
+            if (bestIdx == 0x7fffffff || v > best || (v == best && e < bestIdx))
             {
                 best = v;
                 bestIdx = e;
@@ -526,8 +528,9 @@ __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, in
                     bi = warpIdx[w];
                 }
             }
+            bi = bi < numExperts ? bi : 0;
             chosen[k] = bi;
-            chosenLogit[k] = row[bi];
+            chosenLogit[k] = row[bi] == row[bi] ? row[bi] : -3.0e38f;
             scoreSmem[bi] = -3.4e38f;
         }
         __syncthreads();
