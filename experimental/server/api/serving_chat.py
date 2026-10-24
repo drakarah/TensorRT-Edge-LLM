@@ -324,6 +324,8 @@ class OpenAIServingChat:
             self._model_dir,
             tool_parser=self._config.tool_call_parser,
             reasoning_parser=prepared.reasoning_parser,
+            # a reasoning parser is only active when thinking is on, and the template then opens the block
+            implicit_reasoning=prepared.reasoning_parser != "none",
         )
 
     async def create_chat_completion(
