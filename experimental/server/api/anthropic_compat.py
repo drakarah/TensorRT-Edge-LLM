@@ -138,8 +138,12 @@ def _convert_message(message: Any, index: int) -> List[Dict[str, Any]]:
     if not isinstance(message, dict):
         raise ValueError(f"messages[{index}] must be an object")
     role = message.get("role")
+    if role in {"system", "developer"}:
+        # newer clients put system reminders inside messages; chat templates only allow a system turn first, so it goes in as a user turn
+        text = _blocks_to_text(message.get("content"))
+        return [{"role": "user", "content": text}] if text else []
     if role not in {"user", "assistant"}:
-        raise ValueError(f"messages[{index}].role must be user or assistant")
+        raise ValueError(f"messages[{index}].role must be user or assistant, got {role!r}")
     content = message.get("content", "")
     if isinstance(content, str):
         return [{"role": role, "content": content}]

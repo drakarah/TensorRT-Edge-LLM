@@ -181,7 +181,8 @@ class OpenAIServingChat:
         if not capabilities.chat:
             raise UnsupportedFeatureError(
                 "this runtime only supports /v1/audio/speech")
-        if request.model and request.model != self._client.model_name:
+        if (request.model and request.model != self._client.model_name
+                and os.environ.get("EDGELLM_ACCEPT_ANY_MODEL") != "1"):
             raise ModelNotFoundError(
                 f"model {request.model!r} is not served by this process")
         from ..media.media_source import (enforce_local_media_policy,
