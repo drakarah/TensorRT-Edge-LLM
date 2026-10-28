@@ -159,6 +159,11 @@ class FlintAttention(Attention):
         self._attention_sinks_list = self.softmax_offset.detach().to(
             torch.float32).cpu().flatten().tolist()
 
+    def _capture_attention_sink_list(self) -> None:
+        # Hook name ``onnx.export._capture_attention_sinks_for_export`` calls before tracing; the
+        # checkpoint loader assigns buffers directly, so the load_state_dict hook never fires.
+        self._capture_attention_sinks()
+
     def forward_ragged(
         self,
         hidden_states: torch.Tensor,
@@ -182,9 +187,6 @@ class FlintAttention(Attention):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         del positions, state_indices, tree_parent_ids, tree_depths
         del valid_tree_counts, skip_softmax_scale
-        # The checkpoint loader assigns buffers directly (no load_state_dict), so the
-        # post-load hook never fires: read the sink logits from the buffer at trace time.
-        self._capture_attention_sinks()
         if hasattr(self, "qkv_proj_fused"):
             qkv = self.qkv_proj_fused(hidden_states)
         else:
