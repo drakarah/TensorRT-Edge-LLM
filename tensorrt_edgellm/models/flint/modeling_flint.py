@@ -159,6 +159,11 @@ class FlintAttention(Attention):
         self._attention_sinks_list = self.softmax_offset.detach().to(
             torch.float32).cpu().flatten().tolist()
 
+    def _capture_attention_sink_list(self) -> None:
+        # Hook name ``onnx.export._capture_attention_sinks_for_export`` calls before tracing; the
+        # checkpoint loader assigns buffers directly, so the load_state_dict hook never fires.
+        self._capture_attention_sinks()
+
     def forward_ragged(
         self,
         hidden_states: torch.Tensor,
