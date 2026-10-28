@@ -344,6 +344,8 @@ def write_sidecar(path: str, model_dir: str, layers: List[int], dims,
                 dt, shape = shapes[slot]
                 assert tuple(t.shape) == shape, (layer, slot, t.shape, shape)
                 f.write(memoryview(t.cpu().contiguous().numpy()).cast("B"))
+            # Drop the checkpoint mappings: their resident file pages count as RSS.
+            handles.clear()
             f.flush()
             os.fsync(f.fileno())
             os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
