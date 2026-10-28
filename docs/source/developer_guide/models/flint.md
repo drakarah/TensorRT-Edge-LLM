@@ -106,10 +106,11 @@ python3 -m tensorrt_edgellm.scripts.export <flint-int4 dir> <onnx dir> [--num-de
   --outputFile <out.json> --dumpOutput --dumpProfile
 ```
 
-The engine that was validated has `builder_config`: `max_batch_size 4`, `max_input_len 1024`,
-`max_kv_cache_capacity 4096`, FP16 KV cache. The exact `llm_build` flags that produced it were not recorded, so
-treat the values above as the resulting limits, not as a recipe. **Contexts longer than 4096 tokens have not
-been built or tested.** The 49-layer export took about 2 minutes and the build about 1.5 minutes (implementing session).
+The first validated engine was built with the builder's defaults (`llm_build` without limit flags), which give
+`builder_config`: `max_batch_size 4`, `max_input_len 1024`, `max_kv_cache_capacity 4096`, FP16 KV cache. A second
+engine built with `--maxBatchSize 1 --maxInputLen 12288 --maxKVCacheCapacity 16384` served a recorded
+coding-agent session up to 13,222 prompt tokens (prefill about 2.1k tokens/s, decode 50.7 falling to 42.8 tokens/s
+over that range, untuned). **Contexts longer than about 13k tokens have not been built or tested.** The 49-layer export took about 2 minutes and the build about 1.5 minutes (implementing session).
 
 Build prerequisites that bit during bring-up:
 
