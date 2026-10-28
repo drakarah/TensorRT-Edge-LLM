@@ -1039,6 +1039,43 @@ def _(hidden_states, qweight, scales, gemm_n, gemm_k, group_size):
                        device=hidden_states.device)
 
 
+# Custom op: trt::int4_affine_gemm_plugin (MLX affine INT4, cuteDSL fragment-layout weights)
+# ---------------------------------------------------------------------------
+# W4A16 GEMM for checkpoints quantised with MLX affine INT4 (group size 64,
+# ``w = scale * q + bias``, q in 0..15). ``qweight`` is the cuteDSL fragment-order
+# buffer (INT8 [rows, 512]) holding raw nibbles; ``scales`` and ``bias_prime`` are
+# fp16 [in_features // 64, out_features] with ``bias_prime = fp16(bias + 8 * scale)``.
+# Maps to the ``Int4AffineGroupwiseGemmPlugin`` ONNX node; see
+# ``checkpoint/mlx_affine_repack.py`` for the weight contract.
+
+
+@torch.library.custom_op("trt::int4_affine_gemm_plugin", mutates_args=())
+def int4_affine_gemm_plugin(
+    hidden_states: torch.Tensor,  # [*, in_features] float16
+    qweight: torch.Tensor,  # cuteDSL fragment buffer, INT8 [rows, 512]
+    scales: torch.Tensor,  # [in_features // 64, out_features] float16
+    bias_prime: torch.Tensor,  # [in_features // 64, out_features] float16
+    gemm_n: int,
+    gemm_k: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Stub: affine INT4 groupwise GEMM - returns zero tensor of correct shape."""
+    *leading, _ = hidden_states.shape
+    return torch.zeros(*leading,
+                       gemm_n,
+                       dtype=hidden_states.dtype,
+                       device=hidden_states.device)
+
+
+@int4_affine_gemm_plugin.register_fake
+def _(hidden_states, qweight, scales, bias_prime, gemm_n, gemm_k, group_size):
+    *leading, _ = hidden_states.shape
+    return torch.empty(*leading,
+                       gemm_n,
+                       dtype=hidden_states.dtype,
+                       device=hidden_states.device)
+
+
 # ---------------------------------------------------------------------------
 # Custom op: trt::qkv_concat
 # ---------------------------------------------------------------------------
