@@ -64,7 +64,12 @@ from ..qwen3_moe.modeling_qwen3_moe import Qwen3MoERouter
 
 logger = logging.getLogger(__name__)
 
+# ``config.QUANT_INT4_MLX_AFFINE`` (branch feat/flint-int4-affine-gemm); spelled out here so
+# this module imports without that branch merged (the INT8 embedding then simply never matches).
+_MLX_AFFINE_QUANT = "int4_mlx_affine"
+
 __all__ = [
+    "FlintRuntimeEmbedding",
     "FlintAttention",
     "FlintSparseMoeBlock",
     "FlintDecoderLayer",
@@ -77,6 +82,52 @@ def _is_moe_layer(config: ModelConfig, layer_idx: int) -> bool:
     """Flint: every layer outside ``mlp_only_layers`` is a sparse MoE layer."""
     return (layer_idx not in config.mlp_only_layers
             and config.num_experts > 0)
+
+
+# ---------------------------------------------------------------------------
+# Embedding
+# ---------------------------------------------------------------------------
+class FlintRuntimeEmbedding(nn.Module):
+    """INT8 affine embedding table, materialised as FP16 for the C++ runtime.
+
+    The ``flint-int4`` checkpoint stores ``model.embed_tokens`` as MLX affine INT8
+    (``weight`` uint8 ``[V, H]``, BF16 ``scales`` / ``biases`` ``[V, H/group]``,
+    ``w = scale * q + bias`` with ``q`` the byte). The runtime looks tokens up in an
+    FP16 ``embedding.safetensors``, so the export asks :meth:`runtime_weight` for the
+    dequantised table (the lookup is not part of the engine graph).
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        group = max(int(config.quant.group_size), 1)
+        self.register_buffer(
+            "weight",
+            torch.zeros(config.vocab_size,
+                        config.hidden_size,
+                        dtype=torch.uint8))
+        for name in ("scales", "biases"):
+            self.register_buffer(
+                name,
+                torch.zeros(config.vocab_size,
+                            config.hidden_size // group,
+                            dtype=torch.bfloat16))
+
+    def runtime_weight(self) -> torch.Tensor:
+        """FP16 table ``fp16(scale * q + bias)`` evaluated in float32."""
+        vocab, hidden = self.weight.shape
+        groups = self.scales.shape[1]
+        group = hidden // groups
+        out = torch.empty(vocab, hidden, dtype=torch.float16)
+        chunk = 8192
+        for r0 in range(0, vocab, chunk):
+            r1 = min(r0 + chunk, vocab)
+            q = self.weight[r0:r1].to(torch.float32).view(
+                r1 - r0, groups, group)
+            scale = self.scales[r0:r1].to(torch.float32).unsqueeze(-1)
+            bias = self.biases[r0:r1].to(torch.float32).unsqueeze(-1)
+            out[r0:r1] = (q * scale + bias).view(r1 - r0,
+                                                 hidden).to(torch.float16)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +361,11 @@ class FlintTransformer(nn.Module):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        if config.quant.quant_type == _MLX_AFFINE_QUANT:
+            self.embed_tokens = FlintRuntimeEmbedding(config)
+        else:
+            self.embed_tokens = nn.Embedding(config.vocab_size,
+                                             config.hidden_size)
         self.layers = nn.ModuleList([
             FlintDecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
