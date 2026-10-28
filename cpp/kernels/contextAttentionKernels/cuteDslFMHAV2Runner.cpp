@@ -56,6 +56,8 @@ detail::LazyKernelModule<fmha_v2_d64_sw_paged_Kernel_Module_t> CuteDslFMHAV2Runn
 detail::LazyKernelModule<fmha_v2_d128_sw_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128SwPaged{};
 detail::LazyKernelModule<fmha_v2_d256_sw_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256SwPaged{};
 detail::LazyKernelModule<fmha_v2_d512_sw_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d512SwPaged{};
+detail::LazyKernelModule<fmha_v2_d128_sink_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128SinkPaged{};
+detail::LazyKernelModule<fmha_v2_d128_sw_sink_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128SwSinkPaged{};
 #if CUDA_VERSION >= 12000
 detail::LazyKernelModule<fmha_v2_d64_paged_ragged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64PagedRagged{};
 detail::LazyKernelModule<fmha_v2_d128_paged_ragged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128PagedRagged{};
@@ -141,6 +143,13 @@ bool CuteDslFMHAV2Runner::canImplementPaged(int32_t numQHeads, int32_t numKVHead
     return false;
 }
 
+bool CuteDslFMHAV2Runner::canImplementPagedSink(int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+    int32_t smVersion, nvinfer1::DataType dataType, CuteDslFMHAV2MaskType maskType)
+{
+    // Learned-sink variants are built for head_dim 128 only.
+    return headSize == 128 && canImplementPaged(numQHeads, numKVHeads, headSize, smVersion, dataType, maskType);
+}
+
 bool CuteDslFMHAV2Runner::canImplementPagedRagged(int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t smVersion, nvinfer1::DataType dataType, CuteDslFMHAV2MaskType maskType)
 {
@@ -204,9 +213,24 @@ bool CuteDslFMHAV2Runner::preflightLlm(cudaStream_t stream, int32_t slidingWindo
     }
 }
 
-bool CuteDslFMHAV2Runner::preflightPaged(cudaStream_t stream, int32_t slidingWindowSize)
+bool CuteDslFMHAV2Runner::preflightPaged(cudaStream_t stream, int32_t slidingWindowSize, bool useAttentionSinks)
 {
     bool const useSlidingWindow = slidingWindowSize < INT_MAX;
+
+    if (useAttentionSinks)
+    {
+        if (mHeadDim != 128)
+        {
+            LOG_ERROR("FMHA-v2 native paged FMHA with attention sinks: unsupported head_dim=%d.", mHeadDim);
+            return false;
+        }
+        return useSlidingWindow
+            ? preflightVariant<fmha_v2_d128_sw_sink_paged_Kernel_Module_Load,
+                  fmha_v2_d128_sw_sink_paged_Kernel_Module_Unload>(
+                  sLLM_d128SwSinkPaged, "fmha_v2_d128_sw_sink_paged", stream)
+            : preflightVariant<fmha_v2_d128_sink_paged_Kernel_Module_Load, fmha_v2_d128_sink_paged_Kernel_Module_Unload>(
+                  sLLM_d128SinkPaged, "fmha_v2_d128_sink_paged", stream);
+    }
 
     switch (mHeadDim)
     {
@@ -504,6 +528,48 @@ int32_t callFmhaV2Paged(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDsl
 
     return cuteDslKernelWrapper(&module, &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenQ, &cumSeqlenK,
         params.windowSizeLeft, params.attentionScale, getDeviceMultiProcessorCount(), params.stream);
+}
+
+//! Launch an FMHA-v2 *_sink_paged LLM variant: callFmhaV2Paged plus the per-query-head FP32 sink logits.
+template <auto cuteDslKernelWrapper, auto moduleLoader, auto moduleUnloader>
+int32_t callFmhaV2PagedSink(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKernelWrapper)>>& state,
+    char const* moduleName, LlmFmhaPagedParams const& params)
+{
+    static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 12,
+        "callFmhaV2PagedSink: not an FMHA-v2 paged sink wrapper (module, q_tensor, kv_cache_pool, "
+        "kv_cache_page_list, o_tensor, cum_seqlen_q, cum_seqlen_k, sink_tensor, window_size_left, attention_scale, "
+        "sm_count, stream).");
+
+    if (!detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, params.stream))
+    {
+        return -1;
+    }
+    auto& module = state.module;
+
+    auto qTensor = makeBsndTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
+        params.qPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
+    auto kvPoolTensor = makeStridedTensor<WrapperArgT<2, decltype(cuteDslKernelWrapper)>>(params.pagedKVPoolPtr,
+        {params.numPages, params.numKVHeads, params.tokensPerPage, params.headDim},
+        {static_cast<int64_t>(params.tokensPerPage) * params.numKVHeads * params.headDim,
+            static_cast<int64_t>(params.headDim), static_cast<int64_t>(params.numKVHeads) * params.headDim});
+    auto pageListTensor = makePackedTensor<WrapperArgT<3, decltype(cuteDslKernelWrapper)>>(
+        params.kvCachePageList, {params.batchSize, 2, params.maxPagesPerSeq});
+    auto oTensor = makeBsndTensor<WrapperArgT<4, decltype(cuteDslKernelWrapper)>>(
+        params.oPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
+    auto cumSeqlenQ
+        = makeCuSeqLenTensor<WrapperArgT<5, decltype(cuteDslKernelWrapper)>>(params.cuQSeqLens, params.batchSize + 1);
+    auto cumSeqlenK
+        = makeCuSeqLenTensor<WrapperArgT<6, decltype(cuteDslKernelWrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
+
+    // Rank-1 FP32 descriptor (data pointer + one dynamic extent), like the cumulative-length tensors.
+    using SinkTensorT = WrapperArgT<7, decltype(cuteDslKernelWrapper)>;
+    static_assert(kShapeRank<SinkTensorT> == 1, "The attention-sink descriptor must be rank 1.");
+    SinkTensorT sinkTensor{};
+    sinkTensor.data = const_cast<float*>(params.attentionSinks);
+    sinkTensor.dynamic_shapes[0] = params.numQHeads;
+
+    return cuteDslKernelWrapper(&module, &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenQ, &cumSeqlenK,
+        &sinkTensor, params.windowSizeLeft, params.attentionScale, getDeviceMultiProcessorCount(), params.stream);
 }
 
 //! Launch a packed-Q/O FMHA-v2 LLM variant directly against the Edge-LLM NHD paged KV pool.
@@ -821,7 +887,8 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
 
 bool CuteDslFMHAV2Runner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList,
     void* oPtr, int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens, int32_t numFlatPages, int32_t maxPagesPerSeq,
-    int32_t tokensPerPage, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize)
+    int32_t tokensPerPage, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize,
+    float const* attentionSinks)
 {
     check::check(qPtr != nullptr, "FMHA-v2 native paged FMHA qPtr must not be null.");
     check::check(pagedKVPoolPtr != nullptr, "FMHA-v2 native paged FMHA KV pool must not be null.");
@@ -862,9 +929,31 @@ bool CuteDslFMHAV2Runner::runPaged(void const* qPtr, void const* pagedKVPoolPtr,
     params.tokensPerPage = tokensPerPage;
     params.windowSizeLeft = useSlidingWindow ? slidingWindowSize : kNO_LIMIT;
     params.attentionScale = attentionScale;
+    params.attentionSinks = attentionSinks;
     params.stream = stream;
 
     int32_t ret = -1;
+
+    if (attentionSinks != nullptr)
+    {
+        if (mHeadDim != 128)
+        {
+            LOG_ERROR("FMHA-v2 native paged FMHA with attention sinks: unsupported head_dim=%d.", mHeadDim);
+            return false;
+        }
+        ret = useSlidingWindow
+            ? callFmhaV2PagedSink<cute_dsl_fmha_v2_d128_sw_sink_paged_wrapper,
+                  fmha_v2_d128_sw_sink_paged_Kernel_Module_Load, fmha_v2_d128_sw_sink_paged_Kernel_Module_Unload>(
+                  sLLM_d128SwSinkPaged, "fmha_v2_d128_sw_sink_paged", params)
+            : callFmhaV2PagedSink<cute_dsl_fmha_v2_d128_sink_paged_wrapper, fmha_v2_d128_sink_paged_Kernel_Module_Load,
+                  fmha_v2_d128_sink_paged_Kernel_Module_Unload>(sLLM_d128SinkPaged, "fmha_v2_d128_sink_paged", params);
+        if (ret != 0)
+        {
+            LOG_ERROR("FMHA-v2 native paged FMHA kernel with attention sinks (d=%d, sw=%s) failed with error code: %d",
+                mHeadDim, useSlidingWindow ? "true" : "false", ret);
+        }
+        return ret == 0;
+    }
 
     switch (mHeadDim)
     {
@@ -1211,6 +1300,12 @@ bool CuteDslFMHAV2Runner::canImplementPaged(
     return false;
 }
 
+bool CuteDslFMHAV2Runner::canImplementPagedSink(
+    int32_t, int32_t, int32_t, int32_t, nvinfer1::DataType, CuteDslFMHAV2MaskType)
+{
+    return false;
+}
+
 bool CuteDslFMHAV2Runner::canImplementPagedRagged(
     int32_t, int32_t, int32_t, int32_t, nvinfer1::DataType, CuteDslFMHAV2MaskType)
 {
@@ -1227,7 +1322,7 @@ bool CuteDslFMHAV2Runner::preflightLlm(cudaStream_t, int32_t)
     return false;
 }
 
-bool CuteDslFMHAV2Runner::preflightPaged(cudaStream_t, int32_t)
+bool CuteDslFMHAV2Runner::preflightPaged(cudaStream_t, int32_t, bool)
 {
     return false;
 }
@@ -1259,7 +1354,7 @@ bool CuteDslFMHAV2Runner::run(
 }
 
 bool CuteDslFMHAV2Runner::runPaged(void const*, void const*, int32_t const*, void*, int32_t const*, int32_t const*,
-    int32_t, int32_t, int32_t, cudaStream_t, float, int32_t)
+    int32_t, int32_t, int32_t, cudaStream_t, float, int32_t, float const*)
 {
     return false;
 }
