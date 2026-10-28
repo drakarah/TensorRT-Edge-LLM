@@ -42,6 +42,7 @@ from .models.cosmos3_reasoner.modeling_cosmos3_reasoner_text import \
     Cosmos3ReasonerCausalLM
 from .models.diffusion_gemma import DiffusionGemmaBackbone
 from .models.gemma4.modeling_gemma4_text import Gemma4ForCausalLM
+from .models.flint.modeling_flint import FlintForCausalLM
 from .models.muse_glimmer.modeling_muse_glimmer_text import \
     MuseGlimmerForCausalLM
 from .models.nemotron_h.modeling_nemotron_h import NemotronHCausalLM
@@ -81,6 +82,8 @@ register_model("diffusiongemma", DiffusionGemmaBackbone,
                _identity_attention_scale)
 register_attention_scale_default("gemma4_assistant", _identity_attention_scale)
 register_model("nemotron_h", NemotronHCausalLM, standard_attention_scale)
+# Flint hybrid sliding/NoPE sparse-MoE text decoder.
+register_model("flint", FlintForCausalLM, standard_attention_scale)
 # Muse-Glimmer dense text decoder.
 # attention_scaling (qk_scale_factor/sqrt(head_dim)) is resolved in
 # ModelConfig.from_pretrained, so a standard default scale is fine here.
