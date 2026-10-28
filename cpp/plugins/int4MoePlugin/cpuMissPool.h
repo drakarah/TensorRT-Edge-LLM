@@ -222,7 +222,7 @@ private:
             for (int32_t m = 0; m < numMiss; ++m)
             {
                 size_t const e = static_cast<size_t>(mb.expert[m]);
-                gemvTile(tab, reinterpret_cast<int32_t const*>(layer.guW + e * layer.guWBytes), reinterpret_cast<uint16_t const*>(layer.guS + e * layer.guSBytes),
+                gemvTileFast(tab, reinterpret_cast<int32_t const*>(layer.guW + e * layer.guWBytes), reinterpret_cast<uint16_t const*>(layer.guS + e * layer.guSBytes),
                     xf.data() + static_cast<size_t>(mb.token[m]) * hidden, hidden, guN, tile, &mGateUp[m][tile * 64]);
             }
         }
@@ -250,7 +250,7 @@ private:
             {
                 size_t const e = static_cast<size_t>(mb.expert[m]);
                 float out[64];
-                gemvTile(tab, reinterpret_cast<int32_t const*>(layer.dnW + e * layer.dnWBytes), reinterpret_cast<uint16_t const*>(layer.dnS + e * layer.dnSBytes),
+                gemvTileFast(tab, reinterpret_cast<int32_t const*>(layer.dnW + e * layer.dnWBytes), reinterpret_cast<uint16_t const*>(layer.dnS + e * layer.dnSBytes),
                     mAct[m], inter, hidden, tile, out);
                 float* y = mb.y + static_cast<size_t>(mb.token[m]) * hidden + tile * 64;
                 float const w = mb.weight[m];
