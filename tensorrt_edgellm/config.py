@@ -77,6 +77,10 @@ QUANT_NVFP4_A16 = "nvfp4_a16"
 QUANT_INT4_AWQ = "int4_awq"
 QUANT_INT4_AWQ_MODELOPT = "int4_awq_modelopt"
 QUANT_INT4_GPTQ = "int4_gptq"
+# MLX affine INT4 (``w = scale * q + bias``, q in 0..15, group 64; ``weight`` uint8
+# [N, K/2], BF16 ``scales`` / ``biases`` [N, K/64]). Served by the
+# Int4AffineGroupwiseGemmPlugin; see ``checkpoint/mlx_affine_repack.py``.
+QUANT_INT4_MLX_AFFINE = "int4_mlx_affine"
 QUANT_INT8_SQ = "int8_sq"
 # ``quant_algo`` value in hf_quant_config for MIXED_PRECISION only.
 # After parsing, :attr:`QuantConfig.quant_type` is always a concrete type
@@ -2562,6 +2566,11 @@ def _parse_checkpoint_quant(model_dir: str,
             excluded=excluded,
         )
 
+    # ---- MLX affine INT4 (config.json "quantization" + MLX sidecar) ----------
+    mlx_affine = _parse_mlx_affine_int4(model_dir, config)
+    if mlx_affine is not None:
+        return mlx_affine
+
     # ---- Embedded quantization_config in config.json ------------------------
     qc = config.get("quantization_config")
     if qc is None:
@@ -2643,6 +2652,44 @@ def _parse_checkpoint_quant(model_dir: str,
         )
 
     return QuantConfig()
+
+
+def _parse_mlx_affine_int4(model_dir: str,
+                           config: dict) -> Optional[QuantConfig]:
+    """Recognise an MLX affine INT4 checkpoint (Flint), or return None.
+
+    Requires the MLX ``quantization: {bits: 4, group_size: G}`` block in
+    ``config.json`` together with either the ``weight_format: mlx-affine-int4``
+    marker of the sidecar json shipped with the checkpoint (``flint-int4.json``)
+    or a model type known to ship in this format (``flint``). The dense kernels
+    only support group size 64.
+    """
+    qm = config.get("quantization")
+    if not isinstance(qm, dict) or int(qm.get("bits", 0)) != 4:
+        return None
+    marked = str(config.get("model_type", "")) == "flint"
+    if not marked:
+        for name in sorted(os.listdir(model_dir)):
+            if not name.endswith(".json") or name in ("config.json", ):
+                continue
+            try:
+                with open(os.path.join(model_dir, name)) as f:
+                    side = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if (isinstance(side, dict)
+                    and side.get("weight_format") == "mlx-affine-int4"):
+                marked = True
+                break
+    if not marked:
+        return None
+    group_size = int(qm.get("group_size", 64))
+    if group_size != 64:
+        raise ValueError(
+            f"MLX affine INT4 checkpoints are supported with group_size 64 only, got {group_size}"
+        )
+    return QuantConfig(quant_type=QUANT_INT4_MLX_AFFINE,
+                       group_size=group_size)
 
 
 def _detect_gptq_zero_point_offset(model_dir: str, qc: dict) -> int:
