@@ -14,10 +14,11 @@
 # limitations under the License.
 """Flint (Recursive) hybrid sliding/NoPE sparse-MoE text decoder."""
 from .modeling_flint import (FlintAttention, FlintDecoderLayer,
-                             FlintForCausalLM, FlintSparseMoeBlock,
-                             FlintTransformer)
+                             FlintForCausalLM, FlintRuntimeEmbedding,
+                             FlintSparseMoeBlock, FlintTransformer)
 
 __all__ = [
+    "FlintRuntimeEmbedding",
     "FlintAttention",
     "FlintSparseMoeBlock",
     "FlintDecoderLayer",
