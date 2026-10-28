@@ -377,10 +377,47 @@ def apply_all_repacking(model: nn.Module) -> None:
     from ..models.gemma4.modeling_gemma4_text import fuse_gemma4_int4_projections
     fuse_gemma4_int4_projections(model)
     _repack_gptq_weights(model)
+    _repack_mlx_affine_linears(model)
     _cast_modelopt_awq_prepacked(model)
     _cast_fp8_linear_scales(model)
     _cast_nvfp4_weights(model)
     _repack_nvfp4_a16_linears(model)
+
+
+def _repack_mlx_affine_linears(model: nn.Module) -> None:
+    """Rewrite MLX affine INT4 linear buffers into the plugin inputs (idempotent).
+
+    ``weight`` uint8 ``[N, K/2]`` -> fragment-layout int8 ``[rows, 512]``;
+    ``scales`` / ``biases`` ``[N, K/64]`` -> fp16 ``[K/64, N]`` with the bias shifted by
+    ``8 * scale`` (see :mod:`.mlx_affine_repack`). The (large) lm_head repack runs on CUDA
+    when available.
+    """
+    from ..models.linear import MlxAffineInt4Linear  # local import
+    from .mlx_affine_repack import (repack_mlx_affine_scales_biases,
+                                    repack_mlx_affine_weights)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for name, module in model.named_modules():
+        if not isinstance(module, MlxAffineInt4Linear):
+            continue
+        w = module._buffers.get("weight")
+        if w is None or w.dtype != torch.uint8:
+            continue  # already repacked (or not loaded)
+        if w.device.type == "meta":
+            raise RuntimeError(
+                f"MlxAffineInt4Linear '{name}' was not loaded from the checkpoint"
+            )
+        expected = (module.out_features, module.in_features // 2)
+        if tuple(w.shape) != expected:
+            raise ValueError(
+                f"MLX affine weight '{name}' has shape {tuple(w.shape)}, expected {expected}"
+            )
+        out_dev = w.device
+        scales_t, bias_t = repack_mlx_affine_scales_biases(
+            module._buffers["scales"], module._buffers["biases"])
+        module._buffers["weight"] = repack_mlx_affine_weights(
+            w.to(device)).to(out_dev)
+        module._buffers["scales"] = scales_t.to(out_dev)
+        module._buffers["biases"] = bias_t.to(out_dev)
 
 
 def _cast_modelopt_awq_prepacked(model: nn.Module) -> None:
