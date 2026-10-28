@@ -134,7 +134,8 @@ public:
         }
     }
 
-    static constexpr int32_t kMaxLayers = 128;
+    // Indexed by the trailing integer of the plugin node name, which counts graph nodes (n0_9 ... n0_477 for 40 layers), not layers.
+    static constexpr int32_t kMaxLayers = 1024;
 
     ~Pool()
     {
@@ -204,10 +205,11 @@ private:
             mPhaseNs[tid].ns[phase] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
             mark = now;
         };
-        int32_t const numMiss = mb.numMiss;
         int32_t const tokens = mb.numTokens;
         int32_t const hidden = mb.hidden;
-        LayerWeights const& layer = (mb.layer >= 0 && mb.layer < kMaxLayers) ? mLayers[mb.layer] : mLayers[0];
+        bool const known = mb.layer >= 0 && mb.layer < kMaxLayers && mLayers[mb.layer].guW != nullptr;
+        LayerWeights const& layer = mLayers[known ? mb.layer : 0];
+        int32_t const numMiss = known ? mb.numMiss : 0;
         int32_t const inter = layer.inter;
         Tables const& tab = tables();
         thread_local std::vector<float> xf(static_cast<size_t>(kernel::kCpuMissMaxTokens) * kernel::kCpuMissMaxHidden);
@@ -222,7 +224,7 @@ private:
             for (int32_t m = 0; m < numMiss; ++m)
             {
                 size_t const e = static_cast<size_t>(mb.expert[m]);
-                gemvTileFast(tab, reinterpret_cast<int32_t const*>(layer.guW + e * layer.guWBytes), reinterpret_cast<uint16_t const*>(layer.guS + e * layer.guSBytes),
+                gemvTile(tab, reinterpret_cast<int32_t const*>(layer.guW + e * layer.guWBytes), reinterpret_cast<uint16_t const*>(layer.guS + e * layer.guSBytes),
                     xf.data() + static_cast<size_t>(mb.token[m]) * hidden, hidden, guN, tile, &mGateUp[m][tile * 64]);
             }
         }
@@ -250,7 +252,7 @@ private:
             {
                 size_t const e = static_cast<size_t>(mb.expert[m]);
                 float out[64];
-                gemvTileFast(tab, reinterpret_cast<int32_t const*>(layer.dnW + e * layer.dnWBytes), reinterpret_cast<uint16_t const*>(layer.dnS + e * layer.dnSBytes),
+                gemvTile(tab, reinterpret_cast<int32_t const*>(layer.dnW + e * layer.dnWBytes), reinterpret_cast<uint16_t const*>(layer.dnS + e * layer.dnSBytes),
                     mAct[m], inter, hidden, tile, out);
                 float* y = mb.y + static_cast<size_t>(mb.token[m]) * hidden + tile * 64;
                 float const w = mb.weight[m];
@@ -268,6 +270,7 @@ private:
             std::atomic_thread_fence(std::memory_order_release);
             mb.done = seq;
             mCalls += 1;
+            mUnregistered += known ? 0 : 1;
             mMissSum += static_cast<uint64_t>(numMiss);
             mBusyNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - startTime).count());
             static bool const stats = std::getenv("EDGELLM_MOE_CPU_STATS") != nullptr;
@@ -286,10 +289,10 @@ private:
                 std::fprintf(stderr, "cpu miss phases (us per doorbell, mean over threads): x %.1f, gate_up %.1f, wait1 %.1f, swiglu %.1f, wait2 %.1f, down %.1f, wait3 %.1f\n",
                     phase[0] / per, phase[1] / per, phase[2] / per, phase[3] / per, phase[4] / per, phase[5] / per, phase[6] / per);
                 double const doorbells = static_cast<double>(mb.doorbells);
-                std::fprintf(stderr, "cpu miss: %llu layer calls, %llu doorbells (%.1f%%), %.2f misses per doorbell, host busy %.1f us per doorbell, GPU waited %.1f us per doorbell (at 2.46 GHz)\n",
+                std::fprintf(stderr, "cpu miss: %llu layer calls, %llu doorbells (%.1f%%), %.2f misses per doorbell, host busy %.1f us per doorbell, GPU waited %.1f us per doorbell (at 2.745 GHz), %llu wait timeouts, %llu doorbells for a layer without registered weights\n",
                     static_cast<unsigned long long>(mb.layerCalls), static_cast<unsigned long long>(mb.doorbells), 100.0 * doorbells / std::max<double>(1.0, static_cast<double>(mb.layerCalls)),
                     static_cast<double>(mMissSum) / static_cast<double>(mCalls), static_cast<double>(mBusyNs) / 1000.0 / static_cast<double>(mCalls),
-                    static_cast<double>(mb.waitCycles) / 2460.0 / std::max(1.0, doorbells));
+                    static_cast<double>(mb.waitCycles) / 2745.0 / std::max(1.0, doorbells), static_cast<unsigned long long>(mb.timeouts), static_cast<unsigned long long>(mUnregistered));
             }
         }
     }
@@ -306,6 +309,7 @@ private:
     uint64_t mCalls{0};
     uint64_t mMissSum{0};
     uint64_t mBusyNs{0};
+    uint64_t mUnregistered{0};
     std::atomic<bool> mStop{false};
     struct alignas(64) PhaseNs
     {

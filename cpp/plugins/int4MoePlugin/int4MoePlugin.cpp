@@ -222,7 +222,7 @@ int32_t cpuMissAdmitFromEnv()
 
 int32_t cpuMissThreadsFromEnv()
 {
-    static int32_t const n = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_THREADS"); return v != nullptr ? std::max(1, std::atoi(v)) : 8; }();
+    static int32_t const n = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_THREADS"); return v != nullptr ? std::clamp(std::atoi(v), 1, 64) : 8; }();
     return n;
 }
 
@@ -1263,13 +1263,14 @@ bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
     size_t const inter = static_cast<size_t>(mMoeInterSize);
     size_t const n1 = 2 * inter;
     size_t const expected[4] = {(hidden / 16) * 2 * n1 * 4, (hidden / 128) * n1 * 2, (inter / 16) * 2 * hidden * 4, (inter / 128) * hidden * 2};
-    bool ok = mQuantizationGroupSize == 128 && mActivationType != kACTIVATION_GEGLU && hidden % 64 == 0 && inter % 64 == 0 && inter <= 1024
+    bool ok = mQuantizationGroupSize == 128 && mActivationType != kACTIVATION_GEGLU && hidden % 128 == 0 && inter % 128 == 0 && inter <= 1024
         && hidden <= static_cast<size_t>(kernel::kCpuMissMaxHidden);
     for (int32_t i = 0; i < 4; ++i)
     {
         ok = ok && mCacheBytesPerExpert[i] == expected[i];
     }
-    ok = ok && cpumiss::Pool::get().init(cpuMissThreadsFromEnv());
+    int32_t const layerId = layerIdFromName(mLayerName);
+    ok = ok && layerId >= 0 && layerId < cpumiss::Pool::kMaxLayers && cpumiss::Pool::get().init(cpuMissThreadsFromEnv());
     // The packed weights sit in pinned host memory, which the CPU reads at its own address; the scales may sit in device memory, so they are mirrored once.
     uint8_t const* host[4]{};
     bool mirrored[4]{};
@@ -1313,7 +1314,7 @@ bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
     weights.dnSBytes = mCacheBytesPerExpert[3];
     weights.hidden = mHiddenSize;
     weights.inter = mMoeInterSize;
-    cpumiss::Pool::get().registerLayer(layerIdFromName(mLayerName), weights);
+    cpumiss::Pool::get().registerLayer(layerId, weights);
     return true;
 }
 

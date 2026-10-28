@@ -46,6 +46,7 @@ struct CpuMissMailbox
     alignas(64) uint64_t layerCalls;                               // counters written by the GPU, for the statistics line
     uint64_t doorbells;
     uint64_t waitCycles;
+    uint64_t timeouts;
 };
 
 //! Device-side bookkeeping shared by the doorbell and wait kernels of consecutive layers.

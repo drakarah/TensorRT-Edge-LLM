@@ -676,6 +676,7 @@ __global__ void cpuMissWaitAddKernel(half* out, int32_t numTokens, int32_t hidde
         }
         st->waitCycles += clock64() - t0;
         mb->waitCycles = st->waitCycles;
+        mb->timeouts = static_cast<uint64_t>(st->timeouts);
     }
     __syncthreads();
     if (!ok)
