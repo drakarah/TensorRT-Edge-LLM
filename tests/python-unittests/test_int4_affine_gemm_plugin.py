@@ -26,7 +26,6 @@ Shapes mirror the Flint projections; real checkpoint tensors are used when ``FLI
 
 from __future__ import annotations
 
-import json
 import os
 
 import pytest
@@ -68,19 +67,29 @@ def require_plugin_test_dependencies(request):
     pytest.skip(reason)
 
 
+_SHARD_MAP = {}
+
+
 def _load_checkpoint_tensors(module: str):
-    """(weight, scales, biases) of ``module`` from the Flint checkpoint, or None."""
-    index = os.path.join(_CKPT, "model.safetensors.index.json")
-    if not os.path.exists(index):
+    """(weight, scales, biases) of ``module`` from the Flint checkpoint, or None.
+
+    The MLX checkpoint ships ``model-0000N.safetensors`` shards without an index file, so
+    the key -> shard map is built by scanning the shard headers once.
+    """
+    if not os.path.isdir(_CKPT):
         return None
     from safetensors import safe_open
-    weight_map = json.load(open(index))["weight_map"]
+    if not _SHARD_MAP:
+        for name in sorted(os.listdir(_CKPT)):
+            if name.endswith(".safetensors"):
+                with safe_open(os.path.join(_CKPT, name), "pt") as f:
+                    _SHARD_MAP.update({k: name for k in f.keys()})
     out = []
     for suffix in ("weight", "scales", "biases"):
         key = f"{module}.{suffix}"
-        if key not in weight_map:
+        if key not in _SHARD_MAP:
             return None
-        with safe_open(os.path.join(_CKPT, weight_map[key]), "pt") as f:
+        with safe_open(os.path.join(_CKPT, _SHARD_MAP[key]), "pt") as f:
             out.append(f.get_tensor(key))
     return tuple(out)
 
