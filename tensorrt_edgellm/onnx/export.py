@@ -132,6 +132,12 @@ def export_onnx(
                             reduced_vocab_dir=reduced_vocab_dir,
                             config_filename=config_filename,
                             write_shared_artifacts=write_shared_artifacts)
+    # Models that stream weights straight from the checkpoint into a sidecar (Flint's routed
+    # experts) rewire their placeholders and write it here.
+    streamed = getattr(model, "externalize_streamed_weights", None)
+    if callable(streamed):
+        external_weight_files = list(external_weight_files or []) + list(
+            streamed(output_path, model_dir))
     if external_weight_files:
         patch_external_weight_manifest(out_dir, external_weight_files)
 
