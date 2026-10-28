@@ -85,6 +85,7 @@ and action models on NVIDIA edge platforms.
    :caption: Models
 
    developer_guide/models/cosmos3.md
+   developer_guide/models/flint.md
    developer_guide/models/nemotron3_5_asr.md
    developer_guide/models/pi05.md
 
