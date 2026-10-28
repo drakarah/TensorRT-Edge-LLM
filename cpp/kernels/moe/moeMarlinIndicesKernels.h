@@ -19,6 +19,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "cpuMissMailbox.h"
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace trt_edgellm
@@ -121,6 +123,17 @@ void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy cons
 //! tailSkip > 0: a non-resident expert at rank tailSkip+1 or lower gets weight 0 and the top-ranked expert's id (no fetch, no renormalisation).
 void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, ExpertCacheState const& cache,
     int32_t* topkIndices, float* topkWeights, cudaStream_t stream);
+
+//! CPU miss path. Run after the router, before the cache lookup. A routed expert that is not in the cache is computed on the host unless its miss counter
+//! (admit[expert], decayed every 256 calls; admit[numExperts] is the call counter) has reached admitThreshold, in which case the normal fill brings it in.
+//! A host-computed slot is pointed at a resident expert with weight 0. The misses and the layer input are written to the mailbox, then its seq; nothing is
+//! written when every expert is resident.
+void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t numTokens, int32_t topK, int32_t numExperts, half const* hidden,
+    int32_t hiddenSize, ExpertCacheState const& cache, int32_t* admit, int32_t admitThreshold, CpuMissMailbox* mailbox, CpuMissDeviceState* state,
+    int32_t layer, cudaStream_t stream);
+
+//! Wait for the host's answer to the last doorbell (no wait when it wrote none) and add it to output [numTokens, hiddenSize].
+void launchCpuMissWaitAdd(half* output, int32_t numTokens, int32_t hiddenSize, CpuMissMailbox* mailbox, CpuMissDeviceState* state, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

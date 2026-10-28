@@ -216,6 +216,11 @@ private:
     int32_t* mCacheState{nullptr}; // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S], tally[3]
     std::atomic<int32_t*> mCacheTally{nullptr};
     bool ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc) noexcept;
+    int32_t* mCpuAdmit{nullptr}; // device [numExperts + 1]: miss counters and call counter of the CPU miss path
+    bool mCpuMissChecked{false};
+    bool mCpuMissReady{false};
+    std::vector<uint8_t> mCpuMirror[4]; // host copies of expert tensors that live in device memory
+    bool prepareCpuMiss(void const* const* inputs) noexcept;
     std::thread mStatsThread;
     std::atomic<bool> mStatsStop{false};
     void startStats(std::string const& prefix);

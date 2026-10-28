@@ -572,5 +572,136 @@ void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExp
     cacheAwareTopkKernel<<<numTokens, 256, numExperts * sizeof(float), stream>>>(logits, numExperts, topK, bias, tailSkip, cache.slotOf, topkIndices, topkWeights);
 }
 
+namespace
+{
+constexpr long long kCpuMissTimeoutCycles = 400000000LL;
+
+__global__ void cpuMissDoorbellKernel(int32_t* topkIndices, float* topkWeights, int32_t numTokens, int32_t topK, int32_t numExperts, half const* hidden,
+    int32_t hiddenSize, int32_t const* slotOf, int32_t const* expertOf, int32_t* admit, int32_t admitThreshold, CpuMissMailbox* mb,
+    CpuMissDeviceState* st, int32_t layer)
+{
+    __shared__ int32_t count;
+    __shared__ int32_t halve;
+    int32_t const n = numTokens * topK;
+    if (threadIdx.x == 0)
+    {
+        count = 0;
+        halve = ((++admit[numExperts]) & 255) == 0;
+        mb->layerCalls = ++st->layerCalls;
+    }
+    __syncthreads();
+    if (halve)
+    {
+        for (int32_t e = threadIdx.x; e < numExperts; e += blockDim.x)
+        {
+            admit[e] >>= 1;
+        }
+    }
+    __syncthreads();
+    int32_t const dummy = expertOf[0];
+    if (dummy >= 0 && threadIdx.x < n)
+    {
+        int32_t const i = threadIdx.x;
+        int32_t const id = topkIndices[i];
+        if (slotOf[id] < 0)
+        {
+            int32_t const misses = atomicAdd(&admit[id], 1) + 1;
+            if (admitThreshold <= 0 || misses < admitThreshold)
+            {
+                int32_t const p = atomicAdd(&count, 1);
+                mb->expert[p] = id;
+                mb->token[p] = i / topK;
+                mb->weight[p] = topkWeights[i];
+                topkIndices[i] = dummy;
+                topkWeights[i] = 0.0F;
+            }
+        }
+    }
+    __syncthreads();
+    if (count == 0)
+    {
+        if (threadIdx.x == 0)
+        {
+            st->pending = 0;
+        }
+        return;
+    }
+    uint4 const* src = reinterpret_cast<uint4 const*>(hidden);
+    uint4* dst = reinterpret_cast<uint4*>(mb->x);
+    for (int32_t i = threadIdx.x; i < numTokens * hiddenSize / 8; i += blockDim.x)
+    {
+        dst[i] = src[i];
+    }
+    if (threadIdx.x == 0)
+    {
+        mb->layer = layer;
+        mb->numMiss = count;
+        mb->numTokens = numTokens;
+        mb->hidden = hiddenSize;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        uint64_t const s = ++st->seq;
+        st->expect = s;
+        st->pending = 1;
+        mb->doorbells = ++st->doorbells;
+        __threadfence();
+        mb->seq = s;
+        __threadfence_system();
+    }
+}
+
+__global__ void cpuMissWaitAddKernel(half* out, int32_t numTokens, int32_t hiddenSize, CpuMissMailbox* mb, CpuMissDeviceState* st)
+{
+    __shared__ int32_t ok;
+    if (st->pending == 0)
+    {
+        return;
+    }
+    if (threadIdx.x == 0)
+    {
+        uint64_t const want = st->expect;
+        long long const t0 = clock64();
+        ok = 1;
+        while (mb->done != want)
+        {
+            if (clock64() - t0 > kCpuMissTimeoutCycles)
+            {
+                ok = 0;
+                ++st->timeouts;
+                break;
+            }
+        }
+        st->waitCycles += clock64() - t0;
+        mb->waitCycles = st->waitCycles;
+    }
+    __syncthreads();
+    if (!ok)
+    {
+        return;
+    }
+    __threadfence_system();
+    for (int32_t i = threadIdx.x; i < numTokens * hiddenSize; i += blockDim.x)
+    {
+        out[i] = __float2half(__half2float(out[i]) + __ldcv(&mb->y[i]));
+    }
+}
+} // namespace
+
+void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t numTokens, int32_t topK, int32_t numExperts, half const* hidden,
+    int32_t hiddenSize, ExpertCacheState const& cache, int32_t* admit, int32_t admitThreshold, CpuMissMailbox* mailbox, CpuMissDeviceState* state,
+    int32_t layer, cudaStream_t stream)
+{
+    cpuMissDoorbellKernel<<<1, 256, 0, stream>>>(topkIndices, topkWeights, numTokens, topK, numExperts, hidden, hiddenSize, cache.slotOf, cache.expertOf,
+        admit, admitThreshold, mailbox, state, layer);
+}
+
+void launchCpuMissWaitAdd(half* output, int32_t numTokens, int32_t hiddenSize, CpuMissMailbox* mailbox, CpuMissDeviceState* state, cudaStream_t stream)
+{
+    cpuMissWaitAddKernel<<<1, 1024, 0, stream>>>(output, numTokens, hiddenSize, mailbox, state);
+}
+
 } // namespace kernel
 } // namespace trt_edgellm

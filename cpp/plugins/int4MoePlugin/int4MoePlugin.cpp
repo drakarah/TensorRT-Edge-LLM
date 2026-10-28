@@ -22,6 +22,7 @@
 #include "common/logger.h"
 #include "common/stringUtils.h"
 #include "common/tensor.h"
+#include "cpuMissPool.h"
 #include "kernels/moe/moeActivationKernels.h"
 #include "kernels/moe/moeAlignSumKernels.h"
 #include "kernels/moe/moeMarlinIndicesKernels.h"
@@ -201,6 +202,27 @@ int32_t tailSkipFromEnv()
         char const* const v = std::getenv("EDGELLM_MOE_TAIL_SKIP");
         return v != nullptr ? std::max(0, std::atoi(v)) : 0;
     }();
+    return n;
+}
+
+//! EDGELLM_MOE_CPU_MISS=1 (decode steps of <= 4 tokens served by the expert cache): a routed expert outside the cache is computed on the CPU from the pinned
+//! host copy instead of being copied in. EDGELLM_MOE_CPU_ADMIT=<n> (default 2): the n-th miss of an expert brings it into the cache; 0 never does.
+//! EDGELLM_MOE_CPU_THREADS=<n> (default 8): threads that spin for the work.
+bool cpuMissFromEnv()
+{
+    static bool const on = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_MISS"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
+int32_t cpuMissAdmitFromEnv()
+{
+    static int32_t const n = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_ADMIT"); return v != nullptr ? std::atoi(v) : 2; }();
+    return n;
+}
+
+int32_t cpuMissThreadsFromEnv()
+{
+    static int32_t const n = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_THREADS"); return v != nullptr ? std::max(1, std::atoi(v)) : 8; }();
     return n;
 }
 
@@ -1094,6 +1116,10 @@ Int4MoePlugin::~Int4MoePlugin() noexcept
     if (mCacheState != nullptr)
     {
         cudaFree(mCacheState);
+        if (mCpuAdmit != nullptr)
+        {
+            cudaFree(mCpuAdmit);
+        }
     }
 }
 
@@ -1213,8 +1239,81 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
     cudaMemset(mCacheState + mNumExperts + mCacheSlots, 0, (stateInts - mNumExperts - mCacheSlots) * 4);
     mCacheTally = mCacheState + stateInts - 3;
     mCacheReady = true;
+    if (cpuMissFromEnv() && cudaMalloc(reinterpret_cast<void**>(&mCpuAdmit), (static_cast<size_t>(mNumExperts) + 1) * sizeof(int32_t)) == cudaSuccess)
+    {
+        cudaMemset(mCpuAdmit, 0, (static_cast<size_t>(mNumExperts) + 1) * sizeof(int32_t));
+    }
     PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
     LOG_INFO("Int4MoePlugin %s: expert cache %d slots, %.1f MiB", mLayerName.c_str(), mCacheSlots, total / 1048576.0);
+    return true;
+}
+
+bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
+{
+    if (mCpuMissChecked)
+    {
+        return mCpuMissReady;
+    }
+    mCpuMissChecked = true;
+    if (mCpuAdmit == nullptr)
+    {
+        return false;
+    }
+    size_t const hidden = static_cast<size_t>(mHiddenSize);
+    size_t const inter = static_cast<size_t>(mMoeInterSize);
+    size_t const n1 = 2 * inter;
+    size_t const expected[4] = {(hidden / 16) * 2 * n1 * 4, (hidden / 128) * n1 * 2, (inter / 16) * 2 * hidden * 4, (inter / 128) * hidden * 2};
+    bool ok = mQuantizationGroupSize == 128 && mActivationType != kACTIVATION_GEGLU && hidden % 64 == 0 && inter % 64 == 0 && inter <= 1024
+        && hidden <= static_cast<size_t>(kernel::kCpuMissMaxHidden);
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        ok = ok && mCacheBytesPerExpert[i] == expected[i];
+    }
+    ok = ok && cpumiss::Pool::get().init(cpuMissThreadsFromEnv());
+    // The packed weights sit in pinned host memory, which the CPU reads at its own address; the scales may sit in device memory, so they are mirrored once.
+    uint8_t const* host[4]{};
+    bool mirrored[4]{};
+    for (int32_t i = 0; i < 4 && ok; ++i)
+    {
+        cudaPointerAttributes attributes{};
+        bool const known = cudaPointerGetAttributes(&attributes, inputs[2 + i]) == cudaSuccess;
+        cudaGetLastError();
+        if (known && attributes.type == cudaMemoryTypeHost && attributes.hostPointer != nullptr)
+        {
+            host[i] = static_cast<uint8_t const*>(attributes.hostPointer);
+            continue;
+        }
+        size_t const bytes = mCacheBytesPerExpert[i] * static_cast<size_t>(mNumExperts);
+        mCpuMirror[i].resize(bytes);
+        if (cudaMemcpy(mCpuMirror[i].data(), inputs[2 + i], bytes, cudaMemcpyDefault) != cudaSuccess)
+        {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+        host[i] = mCpuMirror[i].data();
+        mirrored[i] = true;
+    }
+    mCpuMissReady = ok;
+    LOG_INFO("Int4MoePlugin %s: CPU miss path %s (%d threads, admit after %d misses; tensors mirrored to host: %d%d%d%d)", mLayerName.c_str(),
+        ok ? "on" : "unavailable for this layer shape, CPU or memory", cpuMissThreadsFromEnv(), cpuMissAdmitFromEnv(), mirrored[0], mirrored[1], mirrored[2],
+        mirrored[3]);
+    if (!ok)
+    {
+        return false;
+    }
+    cpumiss::LayerWeights weights;
+    weights.guW = host[0];
+    weights.guS = host[1];
+    weights.dnW = host[2];
+    weights.dnS = host[3];
+    weights.guWBytes = mCacheBytesPerExpert[0];
+    weights.guSBytes = mCacheBytesPerExpert[1];
+    weights.dnWBytes = mCacheBytesPerExpert[2];
+    weights.dnSBytes = mCacheBytesPerExpert[3];
+    weights.hidden = mHiddenSize;
+    weights.inter = mMoeInterSize;
+    cpumiss::Pool::get().registerLayer(layerIdFromName(mLayerName), weights);
     return true;
 }
 
@@ -1769,6 +1868,8 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         }
         CUDA_CHECK(cudaGetLastError());
 
+        bool const cpuMiss = useCache && cpuMissFromEnv() && numTokens <= kernel::kCpuMissMaxTokens
+            && numTokens * mTopK <= kernel::kCpuMissMaxSlots && tileTokens == numTokens && prepareCpuMiss(inputs);
         if (useCache && hostRoundTripProbeFromEnv())
         {
             // rtx4060/moe-cpu-miss step 1: cost of the host round trip a CPU miss path needs (router ids to pinned host memory + a stream-blocking host node), no compute
@@ -1780,6 +1881,13 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         {
             kernel::ExpertCacheState state{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
                 mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
+            if (cpuMiss)
+            {
+                cpumiss::Pool& pool = cpumiss::Pool::get();
+                kernel::launchCpuMissDoorbell(topkIndicesPtr, topkWeightsPtr, numTokens, mTopK, mNumExperts,
+                    static_cast<half const*>(hiddenStatesTensor.rawPointer()), mHiddenSize, state, mCpuAdmit, cpuMissAdmitFromEnv(),
+                    pool.mailboxDevice(), pool.stateDevice(), layerIdFromName(mLayerName), stream);
+            }
             kernel::launchExpertCacheLookup(topkIndicesPtr, numTokens * mTopK, mNumExperts, state, stream);
             kernel::launchExpertCacheFill(state, stagingCopy, numTokens * mTopK, stream);
             CUDA_CHECK(cudaGetLastError());
@@ -1922,6 +2030,12 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         // ==================== Step 6: Aggregate Slots to Tokens ====================
         kernel::launchAggregateSlotOutputsKernel(
             downOutputPtr, static_cast<half*>(outputTensor.rawPointer()) + static_cast<int64_t>(t0) * mHiddenSize, tokens, mTopK, mHiddenSize, stream);
+        if (cpuMiss)
+        {
+            cpumiss::Pool& pool = cpumiss::Pool::get();
+            kernel::launchCpuMissWaitAdd(static_cast<half*>(outputTensor.rawPointer()) + static_cast<int64_t>(t0) * mHiddenSize, tokens, mHiddenSize,
+                pool.mailboxDevice(), pool.stateDevice(), stream);
+        }
         };
         for (int32_t t0 = 0; t0 < numTokens; t0 += tileTokens)
         {
