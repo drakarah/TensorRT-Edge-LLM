@@ -59,7 +59,7 @@ from ..default.modeling_default import (MLP, Attention, RMSNorm, qkv_concat)
 from ..linear import make_linear
 from ..muse_glimmer.modeling_muse_glimmer_text import (
     MuseGlimmerForCausalLM, _select_rope_for_layer)
-from ..ops import attention_plugin
+from ..ops import attention_plugin, int4_moe_affine_plugin
 from ..qwen3_moe.modeling_qwen3_moe import Qwen3MoERouter
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,10 @@ logger = logging.getLogger(__name__)
 # ``config.QUANT_INT4_MLX_AFFINE`` (branch feat/flint-int4-affine-gemm); spelled out here so
 # this module imports without that branch merged (the INT8 embedding then simply never matches).
 _MLX_AFFINE_QUANT = "int4_mlx_affine"
+
+# SwiGLU output of the routed experts is scaled by 2^-4 inside the plugin (and the routing
+# weights by 2^4): at layer 46 |silu(gate) * up| reaches 7.6e4 > the FP16 maximum.
+ACT_SCALE_LOG2 = 4
 
 __all__ = [
     "FlintRuntimeEmbedding",
@@ -233,39 +237,19 @@ class FlintAttention(Attention):
 # ---------------------------------------------------------------------------
 # Sparse MoE block
 # ---------------------------------------------------------------------------
-class _ExpertProj(nn.Module):
-    """Stacked routed-expert projection (MLX affine INT4, group 64).
-
-    ``weight`` is uint8 ``[E, N, K/2]`` (two nibbles per byte, low nibble
-    first along K), ``scales`` / ``biases`` are BF16 ``[E, N, K/group]`` with
-    ``w = scale * q + bias``.
-    """
-
-    def __init__(self, num_experts: int, out_features: int, in_features: int,
-                 group_size: int) -> None:
-        super().__init__()
-        self.register_buffer(
-            "weight",
-            torch.zeros(num_experts,
-                        out_features,
-                        in_features // 2,
-                        dtype=torch.uint8))
-        for name in ("scales", "biases"):
-            self.register_buffer(
-                name,
-                torch.zeros(num_experts,
-                            out_features,
-                            in_features // group_size,
-                            dtype=torch.bfloat16))
-
-
 class FlintSparseMoeBlock(nn.Module):
     """Sigmoid top-k routed experts + always-on ungated shared expert.
 
     ``y = routed(x) + shared_expert(x)`` where ``routed`` is one fused plugin
-    op (routing, expert GEMMs, SwiGLU, weighted combine). The routed op comes
-    from the affine-INT4 MoE plugin (``feat/flint-marlin-zp-moe``);
-    ``_routed_experts`` is the single hook that branch fills in.
+    op (``Int4MoeAffinePlugin``: sigmoid top-k routing, affine-INT4 expert
+    GEMMs, SwiGLU, weighted combine).
+
+    The routed expert weights (``switch_mlp.*`` in the checkpoint, ~0.46 GB per
+    layer) are never materialised in the model: the op is traced with tiny
+    placeholder inputs that the export rewires to external-weight graph inputs,
+    and ``checkpoint/flint_moe.py`` streams the repacked weights from the
+    checkpoint into a safetensors sidecar one layer at a time. Peak host memory
+    therefore does not depend on the number of layers.
     """
 
     def __init__(self, config: ModelConfig, module_prefix: str) -> None:
@@ -276,19 +260,16 @@ class FlintSparseMoeBlock(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size
         self.norm_topk_prob = config.norm_topk_prob
         self.group_size = config.quant.group_size
+        self.routed_scaling_factor = float(
+            getattr(config, "routed_scaling_factor", 1.0))
+        self.layer_idx = int(module_prefix.split(".")[1])
         self.gate = Qwen3MoERouter(config)
-        self.switch_mlp = nn.Module()
-        group = max(self.group_size, 1)
-        self.switch_mlp.gate_proj = _ExpertProj(self.num_experts,
-                                                self.moe_intermediate_size,
-                                                self.hidden_size, group)
-        self.switch_mlp.up_proj = _ExpertProj(self.num_experts,
-                                              self.moe_intermediate_size,
-                                              self.hidden_size, group)
-        self.switch_mlp.down_proj = _ExpertProj(self.num_experts,
-                                                self.hidden_size,
-                                                self.moe_intermediate_size,
-                                                group)
+        # Non-persistent placeholders, one per plugin weight input (see class doc).
+        from ...checkpoint.flint_moe import SLOTS, placeholder
+        for slot, name in enumerate(SLOTS):
+            self.register_buffer(f"expert_{name}",
+                                 placeholder(self.layer_idx, slot),
+                                 persistent=False)
         shared = config.moe_shared_expert_intermediate_size
         self.shared_expert = nn.Module()
         self.shared_expert.gate_proj = make_linear(
@@ -315,9 +296,24 @@ class FlintSparseMoeBlock(nn.Module):
 
     def _routed_experts(self, router_logits: torch.Tensor,
                         hidden_flat: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError(
-            "Flint routed experts need the affine-INT4 MoE plugin "
-            "(branch feat/flint-marlin-zp-moe).")
+        return int4_moe_affine_plugin(
+            router_logits,
+            hidden_flat,
+            self.expert_gate_up_qweights,
+            self.expert_gate_up_scales,
+            self.expert_gate_up_bias_prime,
+            self.expert_down_qweights,
+            self.expert_down_scales,
+            self.expert_down_bias_prime,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            hidden_size=self.hidden_size,
+            moe_inter_size=self.moe_intermediate_size,
+            activation_type=0,
+            quantization_group_size=max(self.group_size, 1),
+            act_scale_log2=ACT_SCALE_LOG2,
+            norm_topk_prob=int(bool(self.norm_topk_prob)),
+            routed_scaling_factor=self.routed_scaling_factor)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -441,6 +437,17 @@ class FlintForCausalLM(MuseGlimmerForCausalLM):
 
     # Muse keeps FP32 norm gains; Flint's RMSNorm gains follow the model dtype.
     match_fp32_elementwise_initializers = False
+
+    @staticmethod
+    def should_skip_checkpoint_key(key: str) -> bool:
+        """Routed experts are streamed into the sidecar at export, never loaded."""
+        return ".mlp.switch_mlp." in key
+
+    def externalize_streamed_weights(self, onnx_path: str,
+                                     model_dir: str) -> list:
+        """Post-ONNX hook: rewire expert placeholders and stream the sidecar."""
+        from ...checkpoint.flint_moe import externalize_flint_moe
+        return externalize_flint_moe(onnx_path, model_dir)
 
     def __init__(self, config: ModelConfig) -> None:
         # Skip MuseGlimmerForCausalLM.__init__: it would build a Muse stack.

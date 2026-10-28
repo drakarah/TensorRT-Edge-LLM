@@ -97,8 +97,11 @@ def test_flint_module_tree(tmp_path):
         assert attn.softmax_offset.shape == (8, )
         assert isinstance(layer.mlp, FlintSparseMoeBlock) == (i >= 2)
     moe = layers[2].mlp
-    assert moe.switch_mlp.gate_proj.weight.shape == (8, 64, 256 // 2)
-    assert moe.switch_mlp.down_proj.weight.shape == (8, 256, 64 // 2)
+    # routed experts are placeholders (streamed into the sidecar at export), not weights
+    assert moe.expert_gate_up_qweights.numel() == 4
+    assert not any("switch_mlp" in k for k in model.state_dict())
+    assert model.should_skip_checkpoint_key("model.layers.2.mlp.switch_mlp.up_proj.weight")
+    assert not model.should_skip_checkpoint_key("model.layers.2.mlp.shared_expert.up_proj.weight")
     assert not hasattr(moe, "shared_expert_gate")  # shared expert is ungated
 
 
