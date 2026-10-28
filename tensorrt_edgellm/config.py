@@ -154,6 +154,11 @@ def _is_muse_glimmer_model_type(model_type: str) -> bool:
     return str(model_type) in ("muse_glimmer", "muse_glimmer_text")
 
 
+def _is_flint_model_type(model_type: str) -> bool:
+    """Return whether a model type is Flint (hybrid sliding/NoPE MoE)."""
+    return str(model_type) == "flint"
+
+
 def _check_num_attention_heads(num_attn_heads: int) -> None:
     if num_attn_heads <= 0:
         raise ValueError("num_attention_heads must be a positive integer, "
@@ -264,7 +269,8 @@ def _parse_attention_layer_types(config: dict, num_hidden_layers: int,
     """Preserve per-layer sliding/full attention labels when required."""
     raw = config.get("layer_types")
     if not (_is_gemma4_model_type(model_type)
-            or _is_muse_glimmer_model_type(model_type)):
+            or _is_muse_glimmer_model_type(model_type)
+            or _is_flint_model_type(model_type)):
         return []
 
     if not isinstance(raw, list):
@@ -1141,7 +1147,8 @@ class ModelConfig:
                                      layer_types,
                                      model_dir=model_dir)
         gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
-        has_qk_norm = _detect_has_qk_norm(model_dir, model_type)
+        has_qk_norm = (True if _is_flint_model_type(model_type) else
+                       _detect_has_qk_norm(model_dir, model_type))
         has_value_norm = _get_has_value_norm(llm_dict, model_type)
         default_attention_scale_value = float(
             default_attention_scale(head_dim))
@@ -1156,6 +1163,35 @@ class ModelConfig:
                 attention_scaling = float(qk_scale_factor) / math.sqrt(
                     head_dim)
             # Full-attention layers use NoPE; sliding layers use regular RoPE.
+            if not dual_rope_configs:
+                _mp = int(llm_dict.get("max_position_embeddings", 4096))
+                _sliding = {
+                    "rope_theta": _get_rope_theta(llm_dict),
+                    "rope_scaling": None,
+                    "partial_rotary_factor": 1.0,
+                    "max_position_embeddings": _mp,
+                }
+                _full = dict(_sliding)
+                _full["rope_scaling"] = {"rope_type": "nope", "type": "nope"}
+                dual_rope_configs = {
+                    "sliding_rope_config": _sliding,
+                    "full_rope_config": _full,
+                }
+
+        if _is_flint_model_type(model_type):
+            # Full-attention layers are exactly the NoPE layers; sliding layers
+            # use plain RoPE (theta from config).
+            full_layers = {
+                i
+                for i, t in enumerate(attention_layer_types)
+                if t == "full_attention"
+            }
+            no_rope_layers = set(llm_dict.get("no_rope_layer_indices") or [])
+            if full_layers != no_rope_layers:
+                raise ValueError(
+                    "flint expects no_rope_layer_indices to equal the "
+                    f"full_attention layers: {sorted(no_rope_layers)} vs "
+                    f"{sorted(full_layers)}")
             if not dual_rope_configs:
                 _mp = int(llm_dict.get("max_position_embeddings", 4096))
                 _sliding = {
