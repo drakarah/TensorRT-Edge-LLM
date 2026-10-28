@@ -343,17 +343,35 @@ __global__ void expertCacheLookupKernel(int32_t* topkIndices, int32_t count, int
         }
     }
     __syncthreads();
+    int32_t* const list = reinterpret_cast<int32_t*>(needed + ((numExperts + 3) & ~3));
+    __shared__ int32_t numNeeded;
+    if (threadIdx.x < 32)
+    {
+        int32_t n = 0;
+        for (int32_t base = 0; base < numExperts; base += 32)
+        {
+            int32_t const e = base + threadIdx.x;
+            uint32_t const mask = __ballot_sync(0xffffffffu, e < numExperts && needed[e] != 0);
+            if (e < numExperts && needed[e] != 0)
+            {
+                list[n + __popc(mask & ((1u << threadIdx.x) - 1))] = e;
+            }
+            n += __popc(mask);
+        }
+        if (threadIdx.x == 0)
+        {
+            numNeeded = n;
+        }
+    }
+    __syncthreads();
     if (threadIdx.x == 0)
     {
         stamp = ++cache.counter[0];
         int32_t misses = 0;
         int32_t distinct = 0;
-        for (int32_t e = 0; e < numExperts; ++e)
+        for (int32_t i = 0; i < numNeeded; ++i)
         {
-            if (needed[e] == 0)
-            {
-                continue;
-            }
+            int32_t const e = list[i];
             ++distinct;
             int32_t slot = cache.slotOf[e];
             if (slot < 0)
@@ -410,40 +428,40 @@ __global__ void expertCacheLookupKernel(int32_t* topkIndices, int32_t count, int
 // grid = (numSlots, chunks, tensors): copies the experts listed as misses from host memory into their cache slots.
 __global__ void expertCacheFillKernel(ExpertCacheState cache, ExpertStagingCopy copy)
 {
-    if (static_cast<int32_t>(blockIdx.x) >= cache.missList[0])
-    {
-        return;
-    }
-    int32_t const expert = cache.missList[1 + 2 * blockIdx.x];
-    int32_t const slot = cache.missList[2 + 2 * blockIdx.x];
+    int32_t const misses = cache.missList[0];
     int32_t const t = blockIdx.z;
     size_t const bytes = copy.bytesPerExpert[t];
     size_t const chunk = (bytes / 16 + gridDim.y - 1) / gridDim.y;
     size_t const begin = chunk * blockIdx.y;
     size_t const end = min(begin + chunk, bytes / 16);
-    uint4 const* src = reinterpret_cast<uint4 const*>(copy.src[t] + bytes * expert);
-    uint4* dst = reinterpret_cast<uint4*>(copy.dst[t] + bytes * slot);
     constexpr int32_t kUnroll = 8;
     size_t const stride = static_cast<size_t>(blockDim.x) * kUnroll;
-    for (size_t base = begin; base < end; base += stride)
+    for (int32_t m = blockIdx.x; m < misses; m += gridDim.x)
     {
-        uint4 v[kUnroll];
-#pragma unroll
-        for (int32_t u = 0; u < kUnroll; ++u)
+        int32_t const expert = cache.missList[1 + 2 * m];
+        int32_t const slot = cache.missList[2 + 2 * m];
+        uint4 const* src = reinterpret_cast<uint4 const*>(copy.src[t] + bytes * expert);
+        uint4* dst = reinterpret_cast<uint4*>(copy.dst[t] + bytes * slot);
+        for (size_t base = begin; base < end; base += stride)
         {
-            size_t const i = base + threadIdx.x + static_cast<size_t>(u) * blockDim.x;
-            if (i < end)
+            uint4 v[kUnroll];
+#pragma unroll
+            for (int32_t u = 0; u < kUnroll; ++u)
             {
-                v[u] = src[i];
+                size_t const i = base + threadIdx.x + static_cast<size_t>(u) * blockDim.x;
+                if (i < end)
+                {
+                    v[u] = src[i];
+                }
             }
-        }
 #pragma unroll
-        for (int32_t u = 0; u < kUnroll; ++u)
-        {
-            size_t const i = base + threadIdx.x + static_cast<size_t>(u) * blockDim.x;
-            if (i < end)
+            for (int32_t u = 0; u < kUnroll; ++u)
             {
-                dst[i] = v[u];
+                size_t const i = base + threadIdx.x + static_cast<size_t>(u) * blockDim.x;
+                if (i < end)
+                {
+                    dst[i] = v[u];
+                }
             }
         }
     }
@@ -453,13 +471,13 @@ __global__ void expertCacheFillKernel(ExpertCacheState cache, ExpertStagingCopy 
 void launchExpertCacheLookup(
     int32_t* topkIndices, int32_t count, int32_t numExperts, ExpertCacheState const& cache, cudaStream_t stream)
 {
-    expertCacheLookupKernel<<<1, 128, numExperts, stream>>>(topkIndices, count, numExperts, cache);
+    expertCacheLookupKernel<<<1, 128, ((numExperts + 3) & ~3) + numExperts * sizeof(int32_t), stream>>>(topkIndices, count, numExperts, cache);
 }
 
 void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy const& copy, int32_t maxMisses, cudaStream_t stream)
 {
-    // at most one miss per selected expert: blocks beyond that exit at once but still cost a launch wave each (137 us per call with 60 slots, METRICS R25ax)
-    dim3 const grid(std::min(cache.numSlots, std::max(maxMisses, 1)), 16, copy.numTensors);
+    // blocks of an empty call still cost a launch wave (17 us with 512 blocks), so the grid is one block per 8 possible misses and the blocks loop over the misses
+    dim3 const grid(std::max(1, std::min(cache.numSlots, std::max(maxMisses, 1)) / 8), 16, copy.numTensors);
     expertCacheFillKernel<<<grid, 256, 0, stream>>>(cache, copy);
 }
 
