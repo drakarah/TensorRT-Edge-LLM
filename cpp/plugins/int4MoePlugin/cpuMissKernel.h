@@ -236,6 +236,149 @@ __attribute__((target("avx2,fma,f16c"))) inline void gemvTile(
     }
 }
 
+//! int8 activations of one input vector for gemvTileVnni: symmetric, one scale per 128 inputs, laid out per 16-row k-tile and block parity as 8 lanes x 4 bytes (rows
+//! 2p + {0, 8, 1, 9} of the tile, p = (2b + lane / 4) % 4 for blocks b of the tile), plus per group the int32 sum of every lane's four quantised values.
+template <int32_t kMaxK>
+struct QuantisedX
+{
+    alignas(32) int8_t v[kMaxK / 16 * 64];
+    alignas(32) int32_t sum[kMaxK / 128 * 16];
+    float scale[kMaxK / 128];
+    int32_t k;
+};
+
+template <int32_t kMaxK>
+__attribute__((target("avx2,fma,f16c,avxvnni"))) inline void quantiseX(float const* x, int32_t K, QuantisedX<kMaxK>& q)
+{
+    static __m128i const* const masks = []()
+    {
+        alignas(16) static uint8_t bytes[4][16];
+        for (int32_t p = 0; p < 4; ++p)
+        {
+            for (int32_t l = 0; l < 4; ++l)
+            {
+                bytes[p][4 * l + 0] = static_cast<uint8_t>(2 * p);
+                bytes[p][4 * l + 1] = static_cast<uint8_t>(2 * p + 8);
+                bytes[p][4 * l + 2] = static_cast<uint8_t>(2 * p + 1);
+                bytes[p][4 * l + 3] = static_cast<uint8_t>(2 * p + 9);
+            }
+        }
+        return reinterpret_cast<__m128i const*>(bytes);
+    }();
+    q.k = K;
+    __m256i const ones = _mm256_set1_epi8(1);
+    __m256 const signMask = _mm256_set1_ps(-0.0F);
+    for (int32_t g = 0; g < K / 128; ++g)
+    {
+        float const* xg = x + g * 128;
+        __m256 amaxv = _mm256_setzero_ps();
+        for (int32_t i = 0; i < 128; i += 8)
+        {
+            amaxv = _mm256_max_ps(amaxv, _mm256_andnot_ps(signMask, _mm256_loadu_ps(xg + i)));
+        }
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(amaxv), _mm256_extractf128_ps(amaxv, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_shuffle_ps(m4, m4, 1));
+        float const amax = _mm_cvtss_f32(m4);
+        float const scale = amax > 0.0F ? amax / 127.0F : 1.0F;
+        __m256 const inv = _mm256_set1_ps(1.0F / scale);
+        q.scale[g] = scale;
+        for (int32_t k = 0; k < 8; ++k)
+        {
+            __m256i const a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xg + k * 16), inv));
+            __m256i const b = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xg + k * 16 + 8), inv));
+            __m256i const words = _mm256_permute4x64_epi64(_mm256_packs_epi32(a, b), 0xD8);
+            __m256i const bytes = _mm256_packs_epi16(words, words);
+            __m128i const row = _mm_unpacklo_epi64(_mm256_castsi256_si128(bytes), _mm256_extracti128_si256(bytes, 1));
+            int8_t* dst = q.v + static_cast<size_t>(g * 8 + k) * 64;
+            for (int32_t par = 0; par < 2; ++par)
+            {
+                _mm_store_si128(reinterpret_cast<__m128i*>(dst + par * 32), _mm_shuffle_epi8(row, _mm_load_si128(masks + 2 * par)));
+                _mm_store_si128(reinterpret_cast<__m128i*>(dst + par * 32 + 16), _mm_shuffle_epi8(row, _mm_load_si128(masks + 2 * par + 1)));
+            }
+        }
+        for (int32_t par = 0; par < 2; ++par)
+        {
+            __m256i s = _mm256_setzero_si256();
+            for (int32_t k = 0; k < 8; ++k)
+            {
+                s = _mm256_dpbusd_avx_epi32(s, ones, _mm256_load_si256(reinterpret_cast<__m256i const*>(q.v + static_cast<size_t>(g * 8 + k) * 64 + par * 32)));
+            }
+            _mm256_store_si256(reinterpret_cast<__m256i*>(q.sum + (g * 2 + par) * 8), s);
+        }
+    }
+}
+
+//! gemvTile with int8 activations: u8 weights x s8 activations with vpdpbusd; per group the integer sum minus 8 * sum(x) is scaled by the weight scale times the
+//! activation scale. Nibbles {0,1,4,5} of a word are one output column and {2,3,6,7} the column 8 away; both multiply the same four activation rows.
+template <int32_t kMaxK>
+__attribute__((target("avx2,fma,f16c,avxvnni"))) inline void gemvTileVnni(
+    Tables const& t, int32_t const* w, uint16_t const* s, QuantisedX<kMaxK> const& x, int32_t N, int32_t nt, float* out64)
+{
+    alignas(32) float accF[16][2][8] = {};
+    alignas(32) float sv[16][8];
+    alignas(32) float chunk[64];
+    __m256i const m0 = _mm256_set1_epi32(0x000F000F);
+    __m256i const m1 = _mm256_set1_epi32(0x0F000F00);
+    __m256i const eight = _mm256_set1_epi32(8);
+    for (int32_t g = 0; g < x.k / 128; ++g)
+    {
+        uint16_t const* sc = s + static_cast<size_t>(g) * N + nt * 64;
+        for (int32_t i = 0; i < 8; ++i)
+        {
+            _mm256_store_ps(chunk + 8 * i, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<__m128i const*>(sc + 8 * i))));
+        }
+        __m256 const xs = _mm256_set1_ps(x.scale[g]);
+        for (int32_t e = 0; e < 16; ++e)
+        {
+            _mm256_store_ps(sv[e], _mm256_mul_ps(_mm256_i32gather_ps(chunk, _mm256_load_si256(reinterpret_cast<__m256i const*>(t.sVec[e])), 4), xs));
+        }
+        __m256i const off[2] = {_mm256_mullo_epi32(_mm256_load_si256(reinterpret_cast<__m256i const*>(x.sum + (g * 2 + 0) * 8)), eight),
+            _mm256_mullo_epi32(_mm256_load_si256(reinterpret_cast<__m256i const*>(x.sum + (g * 2 + 1) * 8)), eight)};
+        int32_t const* tile0 = w + static_cast<size_t>(g) * 8 * 2 * N + nt * 128;
+        for (int32_t b = 0; b < 16; b += 4)
+        {
+            __m256i accA[4] = {_mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256()};
+            __m256i accB[4] = {_mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256()};
+            for (int32_t k = 0; k < 8; ++k)
+            {
+                int32_t const* tk = tile0 + static_cast<size_t>(k) * 2 * N + b * 8;
+                int8_t const* xk = x.v + static_cast<size_t>(g * 8 + k) * 64;
+                __m256i const xv[2] = {_mm256_load_si256(reinterpret_cast<__m256i const*>(xk)), _mm256_load_si256(reinterpret_cast<__m256i const*>(xk + 32))};
+#pragma GCC unroll 4
+                for (int32_t i = 0; i < 4; ++i)
+                {
+                    __m256i const v = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(tk + i * 8));
+                    __m256i const lo = _mm256_or_si256(_mm256_and_si256(v, m0), _mm256_and_si256(_mm256_slli_epi32(v, 4), m1));
+                    __m256i const hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi32(v, 8), m0), _mm256_and_si256(_mm256_srli_epi32(v, 4), m1));
+                    accA[i] = _mm256_dpbusd_avx_epi32(accA[i], lo, xv[i & 1]);
+                    accB[i] = _mm256_dpbusd_avx_epi32(accB[i], hi, xv[i & 1]);
+                }
+            }
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                int32_t const bb = b + i;
+                __m256 const ca = _mm256_cvtepi32_ps(_mm256_sub_epi32(accA[i], off[bb & 1]));
+                __m256 const cb = _mm256_cvtepi32_ps(_mm256_sub_epi32(accB[i], off[bb & 1]));
+                _mm256_store_ps(accF[bb][0], _mm256_fmadd_ps(ca, _mm256_load_ps(sv[t.sOf[bb][0]]), _mm256_load_ps(accF[bb][0])));
+                _mm256_store_ps(accF[bb][1], _mm256_fmadd_ps(cb, _mm256_load_ps(sv[t.sOf[bb][2]]), _mm256_load_ps(accF[bb][1])));
+            }
+        }
+    }
+    for (int32_t c = 0; c < 64; ++c)
+    {
+        out64[c] = 0.0F;
+    }
+    for (int32_t b = 0; b < 16; ++b)
+    {
+        for (int32_t l = 0; l < 8; ++l)
+        {
+            out64[t.column[b][0][l]] += accF[b][0][l];
+            out64[t.column[b][2][l]] += accF[b][1][l];
+        }
+    }
+}
+
 } // namespace cpumiss
 } // namespace plugins
 } // namespace trt_edgellm

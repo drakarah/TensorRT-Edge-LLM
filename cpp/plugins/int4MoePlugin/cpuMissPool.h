@@ -28,6 +28,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <memory>
 #include <mutex>
 #include <pthread.h>
 #include <sched.h>
@@ -74,6 +75,13 @@ public:
         if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") || !__builtin_cpu_supports("f16c"))
         {
             return false;
+        }
+        char const* int8 = std::getenv("EDGELLM_MOE_CPU_INT8");
+        mInt8 = int8 != nullptr && std::atoi(int8) != 0;
+        if (mInt8 && !__builtin_cpu_supports("avxvnni"))
+        {
+            std::fprintf(stderr, "EDGELLM_MOE_CPU_INT8 requested but the CPU has no AVX-VNNI; using fp32\n");
+            mInt8 = false;
         }
         void* host = nullptr;
         if (cudaHostAlloc(&host, sizeof(kernel::CpuMissMailbox), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
@@ -195,7 +203,7 @@ private:
         }
     }
 
-    __attribute__((target("avx2,fma,f16c"))) void process(int32_t tid, uint64_t seq)
+    __attribute__((target("avx2,fma,f16c,avxvnni"))) void process(int32_t tid, uint64_t seq)
     {
         kernel::CpuMissMailbox& mb = *mMailbox;
         auto const startTime = std::chrono::steady_clock::now();
@@ -217,6 +225,23 @@ private:
         {
             _mm256_storeu_ps(xf.data() + i, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<__m128i const*>(mb.x + i))));
         }
+        struct Int8Scratch
+        {
+            QuantisedX<kernel::kCpuMissMaxHidden> gu[kernel::kCpuMissMaxTokens];
+            QuantisedX<1024> dn[kernel::kCpuMissMaxSlots];
+        };
+        thread_local std::unique_ptr<Int8Scratch> scratch;
+        if (mInt8)
+        {
+            if (!scratch)
+            {
+                scratch = std::make_unique<Int8Scratch>();
+            }
+            for (int32_t tok = 0; tok < tokens; ++tok)
+            {
+                quantiseX(xf.data() + static_cast<size_t>(tok) * hidden, hidden, scratch->gu[tok]);
+            }
+        }
         lap(0);
         int32_t const guN = 2 * inter;
         for (int32_t tile = tid; tile < guN / 64; tile += mThreads)
@@ -224,8 +249,16 @@ private:
             for (int32_t m = 0; m < numMiss; ++m)
             {
                 size_t const e = static_cast<size_t>(mb.expert[m]);
-                gemvTile(tab, reinterpret_cast<int32_t const*>(layer.guW + e * layer.guWBytes), reinterpret_cast<uint16_t const*>(layer.guS + e * layer.guSBytes),
-                    xf.data() + static_cast<size_t>(mb.token[m]) * hidden, hidden, guN, tile, &mGateUp[m][tile * 64]);
+                auto const* wq = reinterpret_cast<int32_t const*>(layer.guW + e * layer.guWBytes);
+                auto const* sq = reinterpret_cast<uint16_t const*>(layer.guS + e * layer.guSBytes);
+                if (mInt8)
+                {
+                    gemvTileVnni(tab, wq, sq, scratch->gu[mb.token[m]], guN, tile, &mGateUp[m][tile * 64]);
+                }
+                else
+                {
+                    gemvTile(tab, wq, sq, xf.data() + static_cast<size_t>(mb.token[m]) * hidden, hidden, guN, tile, &mGateUp[m][tile * 64]);
+                }
             }
         }
         lap(1);
@@ -242,6 +275,13 @@ private:
         lap(3);
         barrier();
         lap(4);
+        if (mInt8)
+        {
+            for (int32_t m = 0; m < numMiss; ++m)
+            {
+                quantiseX(mAct[m], inter, scratch->dn[m]);
+            }
+        }
         for (int32_t tile = tid; tile < hidden / 64; tile += mThreads)
         {
             for (int32_t tok = 0; tok < tokens; ++tok)
@@ -252,8 +292,16 @@ private:
             {
                 size_t const e = static_cast<size_t>(mb.expert[m]);
                 float out[64];
-                gemvTile(tab, reinterpret_cast<int32_t const*>(layer.dnW + e * layer.dnWBytes), reinterpret_cast<uint16_t const*>(layer.dnS + e * layer.dnSBytes),
-                    mAct[m], inter, hidden, tile, out);
+                auto const* wq = reinterpret_cast<int32_t const*>(layer.dnW + e * layer.dnWBytes);
+                auto const* sq = reinterpret_cast<uint16_t const*>(layer.dnS + e * layer.dnSBytes);
+                if (mInt8)
+                {
+                    gemvTileVnni(tab, wq, sq, scratch->dn[m], hidden, tile, out);
+                }
+                else
+                {
+                    gemvTile(tab, wq, sq, mAct[m], inter, hidden, tile, out);
+                }
                 float* y = mb.y + static_cast<size_t>(mb.token[m]) * hidden + tile * 64;
                 float const w = mb.weight[m];
                 for (int32_t c = 0; c < 64; ++c)
@@ -299,6 +347,7 @@ private:
 
     std::mutex mInitMutex;
     bool mReady{false};
+    bool mInt8{false};
     int32_t mThreads{1};
     int32_t mBarrierThreads{1};
     kernel::CpuMissMailbox* mMailbox{nullptr};
