@@ -357,6 +357,19 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
             for key, shard in weight_map.items()
         }
 
+    # ---- sharded safetensors without an index (e.g. MLX ``model-0000N``) ---
+    shard_files = sorted(
+        f for f in os.listdir(model_dir)
+        if f.endswith(".safetensors") and f != "model.safetensors")
+    if shard_files:
+        shard_keys: Dict[str, str] = {}
+        for shard_file in shard_files:
+            shard_path = os.path.join(model_dir, shard_file)
+            with safe_open(shard_path, framework="pt") as f:
+                for key in f.keys():
+                    shard_keys[key] = shard_path
+        return shard_keys
+
     # ---- PyTorch pickle (.bin) fallback ---------------------------------
     bin_index_path = os.path.join(model_dir, "pytorch_model.bin.index.json")
     bin_single_path = os.path.join(model_dir, "pytorch_model.bin")
