@@ -1733,6 +1733,129 @@ _int4_moe_plugin_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::Int4MoeAffinePlugin (Flint routed experts)
+# ---------------------------------------------------------------------------
+
+_int4_moe_affine_plugin_schema = OpSchema(
+    name="Int4MoeAffinePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("Flint routed experts: sigmoid top-k routing (plain, renormalised), "
+         "affine INT4 (MLX, group 64, w = (q-8)*scale + b') Marlin expert "
+         "GEMMs, SwiGLU scaled by 2^-act_scale_log2 with the inverse folded "
+         "into the routing weights, weighted combine. Mirrors "
+         "trt_edgellm::Int4MoeAffinePlugin."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="router_logits",
+            description="Router logits [T, E] FP32",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="hidden_states",
+            description="Input hidden states [T, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_gate_up_qweights",
+            description="Marlin packed gate|up weights int8",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_gate_up_scales",
+            description="gate|up scales [E, D/64, 2I]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_gate_up_bias_prime",
+            description="gate|up b' [E, D/64, 2I]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_down_qweights",
+            description="Marlin packed down weights int8",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_down_scales",
+            description="down scales [E, I/64, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_down_bias_prime",
+            description="down b' [E, I/64, D]",
+            type_str="T",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="Output tensor [T, D]",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        ("T", ["tensor(float16)"], "FP16 data type."),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="num_experts",
+            type=OpSchema.AttrType.INT,
+            description="Number of experts",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="top_k",
+            type=OpSchema.AttrType.INT,
+            description="Top K experts per token",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="hidden_size",
+            type=OpSchema.AttrType.INT,
+            description="Hidden size D",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="moe_inter_size",
+            type=OpSchema.AttrType.INT,
+            description="MoE intermediate size I",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="activation_type",
+            type=OpSchema.AttrType.INT,
+            description="Activation (0=SiLU)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="quantization_group_size",
+            type=OpSchema.AttrType.INT,
+            description="Quantization group size (64)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="act_scale_log2",
+            type=OpSchema.AttrType.INT,
+            description="SwiGLU output scale exponent",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="norm_topk_prob",
+            type=OpSchema.AttrType.INT,
+            description="Renormalise top-k scores",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="routed_scaling_factor",
+            type=OpSchema.AttrType.FLOAT,
+            description="Routing weight factor",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::Nvfp4MoePlugin (SM100/101/110 split FC1/FC2, 64-row up/gate interleave)
 # ---------------------------------------------------------------------------
 
@@ -2551,6 +2674,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _trt_ragged_attention_schema,
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
+    _int4_moe_affine_plugin_schema,
     _nvfp4_moe_plugin_schema,
     _nvfp4_a16_moe_plugin_schema,
     _nvfp4_a16_blackwell_moe_plugin_schema,
