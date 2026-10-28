@@ -1607,6 +1607,52 @@ def _(router_logits, hidden_states, fc_gate_up_qweights, fc_gate_up_scales,
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::int4_moe_affine_plugin  (Flint routed experts, affine INT4)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::int4_moe_affine_plugin",
+                         mutates_args=())
+def int4_moe_affine_plugin(
+    router_logits: torch.Tensor,  # [T, E] float32 - gate output before sigmoid
+    hidden_states: torch.Tensor,  # [T, H] float16
+    fc_gate_up_qweights: torch.Tensor,  # [E, H//16, 16*I] int8 (Marlin, [gate|up] columns)
+    fc_gate_up_scales: torch.Tensor,  # [E, H//64, 2*I] float16 (Marlin-permuted)
+    fc_gate_up_bias_prime: torch.Tensor,  # [E, H//64, 2*I] float16, bias + 8*scale
+    fc_down_qweights: torch.Tensor,  # [E, I//16, 8*H] int8 (Marlin)
+    fc_down_scales: torch.Tensor,  # [E, I//64, H] float16
+    fc_down_bias_prime: torch.Tensor,  # [E, I//64, H] float16
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    quantization_group_size: int,
+    act_scale_log2: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+) -> torch.Tensor:
+    """Stub: sigmoid top-k routing + affine INT4 expert GEMMs + weighted combine.
+
+    Mirrors ``trt_edgellm::Int4MoeAffinePlugin``. The weight inputs are not
+    validated here: Flint exports them as placeholders that are replaced by
+    external-weight graph inputs after tracing (see ``checkpoint/flint_moe.py``).
+    """
+    _validate_moe_token_layout(router_logits, hidden_states)
+    return torch.zeros_like(hidden_states)
+
+
+@int4_moe_affine_plugin.register_fake
+def _(router_logits, hidden_states, fc_gate_up_qweights, fc_gate_up_scales,
+      fc_gate_up_bias_prime, fc_down_qweights, fc_down_scales,
+      fc_down_bias_prime, num_experts, top_k, hidden_size, moe_inter_size,
+      activation_type, quantization_group_size, act_scale_log2, norm_topk_prob,
+      routed_scaling_factor):
+    _validate_moe_token_layout(router_logits, hidden_states)
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt::gather_nd  (token selection: GatherND with batch_dims=1)
 # ---------------------------------------------------------------------------
 
