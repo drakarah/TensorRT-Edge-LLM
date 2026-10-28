@@ -161,6 +161,10 @@ def load_weights(
             return None
         return key
 
+    # Models whose checkpoint tensors are streamed elsewhere at export (Flint's routed
+    # experts) name them here so they are never read into memory.
+    skip_key = getattr(model, "should_skip_checkpoint_key", None)
+
     loaded = skipped = 0
     for shard_path, keys in path_to_keys.items():
         if shard_path.endswith(".bin"):
@@ -196,7 +200,6 @@ def load_weights(
         else:
             with safe_open(shard_path, framework="pt", device=device) as f:
                 for key in keys:
-                    tensor = f.get_tensor(key)
                     mapped_key = _apply_prefix(key)
                     if mapped_key is None:
                         skipped += 1
@@ -206,6 +209,10 @@ def load_weights(
                         if mapped_key is None:
                             skipped += 1
                             continue
+                    if skip_key is not None and skip_key(mapped_key):
+                        skipped += 1
+                        continue
+                    tensor = f.get_tensor(key)
                     if _set_tensor(model, mapped_key, tensor, mapping=mapping):
                         loaded += 1
                     elif _try_split_fused_tensor(model,
