@@ -478,6 +478,27 @@ def _int4_groupwise_gemm_v2_translation(
     )
 
 
+@script()
+def _int4_affine_gemm_translation(
+    hidden_states: onnxscript.FLOAT16,
+    qweight: onnxscript.INT8,
+    scales: onnxscript.FLOAT16,
+    bias_prime: onnxscript.FLOAT16,
+    gemm_n: int,
+    gemm_k: int,
+    group_size: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Int4AffineGroupwiseGemmPlugin(
+        hidden_states,
+        qweight,
+        scales,
+        bias_prime,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        group_size=group_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # QKV packing op
 # ---------------------------------------------------------------------------
@@ -1805,6 +1826,8 @@ def build_custom_translation_table() -> dict:
         _int4_groupwise_gemm_translation,
         torch.ops.trt.int4_groupwise_gemm_v2.default:
         _int4_groupwise_gemm_v2_translation,
+        torch.ops.trt.int4_affine_gemm_plugin.default:
+        _int4_affine_gemm_translation,
         torch.ops.trt.qkv_concat.default:
         _qkv_concat_translation,
         torch.ops.trt.gelu_tanh_mul.default:

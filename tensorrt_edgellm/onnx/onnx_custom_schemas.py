@@ -853,6 +853,74 @@ _int4_groupwise_gemm_v2_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::Int4AffineGroupwiseGemmPlugin (MLX affine INT4, fragment-layout weights)
+# ---------------------------------------------------------------------------
+
+_int4_affine_gemm_schema = OpSchema(
+    name="Int4AffineGroupwiseGemmPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TensorRT affine Int4 groupwise GEMM plugin (MLX affine, group 64, "
+    "cuteDSL fragment-layout weights).",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="input",
+            description="Input tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="qweight",
+            description="Quantized weights, cuteDSL fragment layout (int8)",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="scales",
+            description="Scales (float16) [K/64, N]",
+            type_str="tensor(float16)",
+        ),
+        OpSchema.FormalParameter(
+            name="bias_prime",
+            description="Shifted bias fp16(bias + 8 * scale) (float16) [K/64, N]",
+            type_str="tensor(float16)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="Output tensor",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
+            "Input and output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="gemm_n",
+            type=OpSchema.AttrType.INT,
+            description="Output feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="gemm_k",
+            type=OpSchema.AttrType.INT,
+            description="Input feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="group_size",
+            type=OpSchema.AttrType.INT,
+            description="Group size (64)",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::Nvfp4A16GemmPlugin (dense FP16-A / NVFP4-W4 Marlin GEMM)
 # ---------------------------------------------------------------------------
 
@@ -2472,6 +2540,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _qkv_concat_schema,
     _gelu_tanh_mul_schema,
     _int4_groupwise_gemm_v2_schema,
+    _int4_affine_gemm_schema,
     _nvfp4_a16_gemm_schema,
     _nvfp4_a16_blackwell_gemm_schema,
     _causal_conv1d_schema,
