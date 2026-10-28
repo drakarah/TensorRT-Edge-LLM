@@ -179,7 +179,7 @@ def test_builder_tactics_match_reference(label, module, n, k, m, monkeypatch):
             f"{label} N={n} K={k} opt M={m} run M={m_run}: rel L2 {err:.2e}")
 
 
-@pytest.mark.parametrize("label,module,n,k", _SHAPES[:3])
+@pytest.mark.parametrize("label,module,n,k", _SHAPES)
 def test_every_tactic_matches_reference(label, module, n, k, monkeypatch):
     """Force each tactic id (1..16 GEMM variants, 17 GEMV) at M in {1, 8, 64, 512}."""
     tensors = _load_checkpoint_tensors(module) or _random_tensors(n, k, 0)
