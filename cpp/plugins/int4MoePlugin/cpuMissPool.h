@@ -17,8 +17,11 @@
 
 #pragma once
 
-#include "cpuMissKernel.h"
 #include "kernels/moe/cpuMissMailbox.h"
+
+#if defined(__x86_64__)
+
+#include "cpuMissKernel.h"
 
 #include <algorithm>
 #include <atomic>
@@ -32,6 +35,7 @@
 #include <mutex>
 #include <pthread.h>
 #include <sched.h>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -53,6 +57,63 @@ struct LayerWeights
     int32_t hidden{0};
     int32_t inter{0};
 };
+
+//! "0-11,14" -> {0..11, 14}
+inline std::vector<int32_t> parseCpuList(std::string const& text)
+{
+    std::vector<int32_t> cpus;
+    for (char const* c = text.c_str(); *c != '\0';)
+    {
+        char* end = nullptr;
+        long const first = std::strtol(c, &end, 10);
+        if (end == c)
+        {
+            break;
+        }
+        long last = first;
+        if (*end == '-')
+        {
+            c = end + 1;
+            last = std::strtol(c, &end, 10);
+        }
+        for (long cpu = first; cpu <= last; ++cpu)
+        {
+            cpus.push_back(static_cast<int32_t>(cpu));
+        }
+        c = (*end == ',') ? end + 1 : end;
+    }
+    return cpus;
+}
+
+inline std::string readFirstLine(std::string const& path)
+{
+    std::string line;
+    if (FILE* f = std::fopen(path.c_str(), "r"))
+    {
+        char buffer[256];
+        if (std::fgets(buffer, sizeof(buffer), f) != nullptr)
+        {
+            line = buffer;
+        }
+        std::fclose(f);
+    }
+    return line;
+}
+
+//! EDGELLM_MOE_CPU_CORES=auto: on an Intel hybrid CPU the first hardware thread of each performance core; empty elsewhere (workers stay unpinned).
+inline std::vector<int32_t> performanceCores()
+{
+    std::vector<int32_t> cores;
+    for (int32_t cpu : parseCpuList(readFirstLine("/sys/devices/cpu_core/cpus")))
+    {
+        auto const siblings = parseCpuList(readFirstLine("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list"));
+        if (siblings.empty() || siblings.front() == cpu)
+        {
+            cores.push_back(cpu);
+        }
+    }
+    return cores;
+}
 
 //! Threads that spin on the mailbox's seq. One doorbell is answered by all of them: gate_up tiles, SwiGLU, down tiles, with a barrier in between, then
 //! the first thread publishes done. Idle for 20 ms: the threads poll every 50 us until the next doorbell.
@@ -99,7 +160,11 @@ public:
         }
         mMailboxDev = static_cast<kernel::CpuMissMailbox*>(dev);
         cudaMemset(mStateDev, 0, sizeof(kernel::CpuMissDeviceState));
-        if (char const* cores = std::getenv("EDGELLM_MOE_CPU_CORES"))
+        if (char const* cores = std::getenv("EDGELLM_MOE_CPU_CORES"); cores != nullptr && std::strcmp(cores, "auto") == 0)
+        {
+            mCores = performanceCores();
+        }
+        else if (cores != nullptr)
         {
             // comma-separated CPU ids, one per worker in order; workers beyond the list stay unpinned
             for (char const* c = cores; *c != '\0';)
@@ -375,3 +440,62 @@ private:
 } // namespace cpumiss
 } // namespace plugins
 } // namespace trt_edgellm
+
+#else
+
+#include <cstddef>
+#include <cstdint>
+
+namespace trt_edgellm
+{
+namespace plugins
+{
+namespace cpumiss
+{
+
+//! Not available off x86: the pool never initialises, so the plugin keeps its normal miss path.
+struct LayerWeights
+{
+    uint8_t const* guW{nullptr};
+    uint8_t const* guS{nullptr};
+    uint8_t const* dnW{nullptr};
+    uint8_t const* dnS{nullptr};
+    size_t guWBytes{0}, guSBytes{0}, dnWBytes{0}, dnSBytes{0};
+    int32_t hidden{0};
+    int32_t inter{0};
+};
+
+class Pool
+{
+public:
+    static Pool& get()
+    {
+        static Pool pool;
+        return pool;
+    }
+
+    bool init(int32_t)
+    {
+        return false;
+    }
+
+    kernel::CpuMissMailbox* mailboxDevice() const
+    {
+        return nullptr;
+    }
+
+    kernel::CpuMissDeviceState* stateDevice() const
+    {
+        return nullptr;
+    }
+
+    void registerLayer(int32_t, LayerWeights const&) {}
+
+    static constexpr int32_t kMaxLayers = 1024;
+};
+
+} // namespace cpumiss
+} // namespace plugins
+} // namespace trt_edgellm
+
+#endif // defined(__x86_64__)

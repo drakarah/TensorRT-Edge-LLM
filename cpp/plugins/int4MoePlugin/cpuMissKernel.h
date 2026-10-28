@@ -17,6 +17,8 @@
 
 #pragma once
 
+#if defined(__x86_64__)
+
 #include <immintrin.h>
 
 #include <algorithm>
@@ -382,3 +384,5 @@ __attribute__((target("avx2,fma,f16c,avxvnni"))) inline void gemvTileVnni(
 } // namespace cpumiss
 } // namespace plugins
 } // namespace trt_edgellm
+
+#endif // defined(__x86_64__)
