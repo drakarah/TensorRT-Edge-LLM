@@ -27,9 +27,10 @@
 #include <cstdio>
 #include <cerrno>
 #include <cstring>
-#include <unistd.h>
 #include <cuda_runtime.h>
 #include <mutex>
+#include <pthread.h>
+#include <sched.h>
 #include <thread>
 #include <vector>
 
@@ -39,39 +40,6 @@ namespace plugins
 {
 namespace cpumiss
 {
-
-//! True when the first `bytes` bytes at `p` can be read by this process: a pipe write of the range fails with EFAULT instead of faulting.
-inline bool readableByCpu(void const* p, size_t bytes)
-{
-    int fds[2];
-    if (pipe(fds) != 0)
-    {
-        return false;
-    }
-    bool ok = true;
-    size_t done = 0;
-    char sink[4096];
-    while (done < bytes && ok)
-    {
-        size_t const chunk = std::min<size_t>(4096, bytes - done);
-        ssize_t const n = write(fds[1], static_cast<char const*>(p) + done, chunk);
-        if (n <= 0)
-        {
-            ok = false;
-        }
-        else
-        {
-            done += static_cast<size_t>(n);
-            if (read(fds[0], sink, static_cast<size_t>(n)) != n)
-            {
-                ok = false;
-            }
-        }
-    }
-    close(fds[0]);
-    close(fds[1]);
-    return ok;
-}
 
 //! Host pointers of one layer's experts (the plugin's pinned Marlin arrays) and their per-expert byte strides.
 struct LayerWeights
@@ -123,6 +91,21 @@ public:
         }
         mMailboxDev = static_cast<kernel::CpuMissMailbox*>(dev);
         cudaMemset(mStateDev, 0, sizeof(kernel::CpuMissDeviceState));
+        if (char const* cores = std::getenv("EDGELLM_MOE_CPU_CORES"))
+        {
+            // comma-separated CPU ids, one per worker in order; workers beyond the list stay unpinned
+            for (char const* c = cores; *c != '\0';)
+            {
+                char* end = nullptr;
+                long const id = std::strtol(c, &end, 10);
+                if (end == c)
+                {
+                    break;
+                }
+                mCores.push_back(static_cast<int32_t>(id));
+                c = (*end == ',') ? end + 1 : end;
+            }
+        }
         mThreads = std::max(1, threads);
         mBarrierThreads = mThreads;
         for (int32_t i = 0; i < mThreads; ++i)
@@ -182,6 +165,13 @@ private:
 
     void run(int32_t tid)
     {
+        if (tid < static_cast<int32_t>(mCores.size()))
+        {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(mCores[tid], &set);
+            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+        }
         uint64_t last = 0;
         auto lastWork = std::chrono::steady_clock::now();
         uint32_t spins = 0;
@@ -208,6 +198,12 @@ private:
     {
         kernel::CpuMissMailbox& mb = *mMailbox;
         auto const startTime = std::chrono::steady_clock::now();
+        auto mark = startTime;
+        auto lap = [&](int32_t phase) {
+            auto const now = std::chrono::steady_clock::now();
+            mPhaseNs[tid].ns[phase] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
+            mark = now;
+        };
         int32_t const numMiss = mb.numMiss;
         int32_t const tokens = mb.numTokens;
         int32_t const hidden = mb.hidden;
@@ -219,6 +215,7 @@ private:
         {
             _mm256_storeu_ps(xf.data() + i, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<__m128i const*>(mb.x + i))));
         }
+        lap(0);
         int32_t const guN = 2 * inter;
         for (int32_t tile = tid; tile < guN / 64; tile += mThreads)
         {
@@ -229,7 +226,9 @@ private:
                     xf.data() + static_cast<size_t>(mb.token[m]) * hidden, hidden, guN, tile, &mGateUp[m][tile * 64]);
             }
         }
+        lap(1);
         barrier();
+        lap(2);
         int32_t const total = numMiss * inter;
         for (int32_t idx = tid; idx < total; idx += mThreads)
         {
@@ -238,7 +237,9 @@ private:
             float const g = mGateUp[m][i];
             mAct[m][i] = g / (1.0F + std::exp(-g)) * mGateUp[m][inter + i];
         }
+        lap(3);
         barrier();
+        lap(4);
         for (int32_t tile = tid; tile < hidden / 64; tile += mThreads)
         {
             for (int32_t tok = 0; tok < tokens; ++tok)
@@ -259,7 +260,9 @@ private:
                 }
             }
         }
+        lap(5);
         barrier();
+        lap(6);
         if (tid == 0)
         {
             std::atomic_thread_fence(std::memory_order_release);
@@ -270,6 +273,18 @@ private:
             static bool const stats = std::getenv("EDGELLM_MOE_CPU_STATS") != nullptr;
             if (stats && mCalls % 4000 == 0)
             {
+                // mean over threads, per doorbell: x->fp32, gate_up tiles, wait, SwiGLU, wait, down tiles, wait (threads other than 0 may lag a call)
+                double phase[7] = {};
+                for (int32_t t = 0; t < mThreads; ++t)
+                {
+                    for (int32_t k = 0; k < 7; ++k)
+                    {
+                        phase[k] += static_cast<double>(mPhaseNs[t].ns[k]);
+                    }
+                }
+                double const per = 1000.0 * static_cast<double>(mThreads) * static_cast<double>(mCalls);
+                std::fprintf(stderr, "cpu miss phases (us per doorbell, mean over threads): x %.1f, gate_up %.1f, wait1 %.1f, swiglu %.1f, wait2 %.1f, down %.1f, wait3 %.1f\n",
+                    phase[0] / per, phase[1] / per, phase[2] / per, phase[3] / per, phase[4] / per, phase[5] / per, phase[6] / per);
                 double const doorbells = static_cast<double>(mb.doorbells);
                 std::fprintf(stderr, "cpu miss: %llu layer calls, %llu doorbells (%.1f%%), %.2f misses per doorbell, host busy %.1f us per doorbell, GPU waited %.1f us per doorbell (at 2.46 GHz)\n",
                     static_cast<unsigned long long>(mb.layerCalls), static_cast<unsigned long long>(mb.doorbells), 100.0 * doorbells / std::max<double>(1.0, static_cast<double>(mb.layerCalls)),
@@ -287,10 +302,16 @@ private:
     kernel::CpuMissMailbox* mMailboxDev{nullptr};
     kernel::CpuMissDeviceState* mStateDev{nullptr};
     std::vector<std::thread> mWorkers;
+    std::vector<int32_t> mCores;
     uint64_t mCalls{0};
     uint64_t mMissSum{0};
     uint64_t mBusyNs{0};
     std::atomic<bool> mStop{false};
+    struct alignas(64) PhaseNs
+    {
+        uint64_t ns[7];
+    };
+    PhaseNs mPhaseNs[64] = {};
     alignas(64) std::atomic<int32_t> mArrived{0};
     alignas(64) std::atomic<int32_t> mGeneration{0};
     LayerWeights mLayers[kMaxLayers];
