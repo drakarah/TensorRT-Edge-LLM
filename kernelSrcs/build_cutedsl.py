@@ -1000,6 +1000,33 @@ KERNEL_VARIANTS = [
             "--skip_rescale", "--export_only",
         ],
     ),
+    # Learned attention-sink prefill (Flint, head_dim 128): same kernels as fmha_v2_d128_paged /
+    # fmha_v2_d128_sw_paged plus a per-query-head FP32 sink logit in the softmax denominator. Separate
+    # variants (and a separate ABI with one extra tensor) so the sink-free kernels stay untouched.
+    KernelVariant(
+        name="fmha_v2_d128_sink_paged",
+        group="fmha",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "128",
+            "--m_block_size", "64", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--paged_kv", "--attention_sink",
+            "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_d128_sw_sink_paged",
+        group="fmha",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "128",
+            "--m_block_size", "64", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--paged_kv", "--attention_sink",
+            "--window_size_left", "4096", "--skip_rescale", "--export_only",
+        ],
+    ),
     KernelVariant(
         name="fmha_v2_d256_padding",
         group="fmha",

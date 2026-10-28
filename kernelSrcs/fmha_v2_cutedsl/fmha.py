@@ -110,6 +110,7 @@ class FMHAV2Ampere:
         packed_varlen: bool = False,
         skip_rescale: bool = False,
         hybrid_exp2: bool = False,
+        has_sink: bool = False,
     ):
         """Initialize the FMHA-v2 Ampere-floor kernel.
 
@@ -130,7 +131,13 @@ class FMHAV2Ampere:
             line with the upstream xlite-dev/ffpa-attn tuning.
         :param hybrid_exp2: scaffold for FA4-style 75 % MUFU + 25 % polynomial
             exp2 in softmax.  Not validated in this variant; defer.
+        :param has_sink: compile in learned attention sinks (paged context
+            entry ``__call_context_paged_sink__`` only).  Each query head ``h``
+            owns one FP32 logit ``sink[h]`` that joins the softmax denominator
+            as an extra column with no value contribution.  ``False`` (the
+            default) generates exactly the sink-free kernel.
         """
+        self._has_sink = has_sink
         self._head_dim = head_dim
         self._m_block_size = m_block_size
         self._n_block_size = n_block_size
@@ -595,6 +602,7 @@ class FMHAV2Ampere:
         attention_scale: cutlass.Float32,
         sm_count: cutlass.Int32,
         stream: cuda.CUstream,
+        sink_tensor: Optional[cute.Tensor] = None,
     ):
         """Launch FMHA-v2 directly against Edge-LLM's paged NHD KV cache.
 
@@ -607,7 +615,16 @@ class FMHAV2Ampere:
         ``cum_seqlen_q`` and ``cum_seqlen_k`` carry the actual per-batch
         logical lengths. The page size is fixed at 128 tokens. ``Bc`` must
         divide 128 so each K/V tile remains within one physical page.
+
+        ``sink_tensor`` is the optional ``(H_q,)`` FP32 learned-sink logit
+        vector; it must be given exactly when the kernel was built with
+        ``has_sink=True``.
         """
+        if cutlass.const_expr((sink_tensor is not None) != self._has_sink):
+            raise TypeError(
+                "FMHA-v2 paged attention: sink_tensor must be provided if and "
+                "only if the kernel is built with has_sink=True"
+            )
         if cutlass.const_expr(
             q_tensor.element_type != cutlass.Float16
             or kv_cache_pool.element_type != cutlass.Float16
@@ -755,6 +772,7 @@ class FMHAV2Ampere:
             gmem_tiled_copy_O,
             tiled_mma,
             SharedStorage,
+            sink_tensor,
         ).launch(
             grid=grid_dim,
             block=[self._num_threads, 1, 1],
@@ -787,6 +805,42 @@ class FMHAV2Ampere:
             attention_scale,
             sm_count,
             stream,
+        )
+
+    @cute.jit
+    def __call_context_paged_sink__(
+        self,
+        q_tensor: cute.Tensor,
+        kv_cache_pool: cute.Tensor,
+        kv_cache_page_list: cute.Tensor,
+        o_tensor: cute.Tensor,
+        cum_seqlen_q: cute.Tensor,
+        cum_seqlen_k: cute.Tensor,
+        sink_tensor: cute.Tensor,
+        window_size_left: cutlass.Int32,
+        attention_scale: cutlass.Float32,
+        sm_count: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """Paged context entry with learned attention sinks (``has_sink=True``).
+
+        Same as ``__call_context_paged__`` plus ``sink_tensor``, a contiguous
+        ``(H_q,)`` FP32 vector of per-query-head sink logits in scaled-logit
+        space (used raw; not multiplied by ``attention_scale``).
+        """
+        self._launch_context_paged(
+            q_tensor,
+            kv_cache_pool,
+            kv_cache_page_list,
+            o_tensor,
+            cum_seqlen_q,
+            cum_seqlen_k,
+            None,
+            window_size_left,
+            attention_scale,
+            sm_count,
+            stream,
+            sink_tensor,
         )
 
     @cute.jit
@@ -1007,6 +1061,7 @@ class FMHAV2Ampere:
         gmem_tiled_copy_O: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
+        mSink: Optional[cute.Tensor] = None,
     ):
         """FA2 kernel body: prologue cp.async Q/K, KV outer loop in reverse,
         ``compute_one_n_block`` for BMM1 → softmax_rescale → BMM2.  Epilogue
@@ -1723,7 +1778,16 @@ class FMHAV2Ampere:
         # ///////////////////////////////////////////////////////////////////////////////
         # Epilogue: normalize acc_O, rmem → smem (aliased over sQ) → gmem.
         # ///////////////////////////////////////////////////////////////////////////////
-        self.normalize_softmax(acc_O, row_sum)
+        if cutlass.const_expr(self._has_sink):
+            self.normalize_softmax_with_sink(
+                acc_O,
+                row_sum,
+                row_max,
+                mSink[num_head],
+                softmax_scale_log2,
+            )
+        else:
+            self.normalize_softmax(acc_O, row_sum)
         rO = cute.make_fragment_like(acc_O, self._dtype)
         rO.store(acc_O.load().to(self._dtype))
         sO = cute.make_tensor(sQ.iterator, sO_layout)
@@ -2376,6 +2440,50 @@ class FMHAV2Ampere:
 
             acc_O_mn[r, None] = acc_O_mn[r, None].load() * scale
 
+    @cute.jit
+    def normalize_softmax_with_sink(
+        self,
+        acc_O: cute.Tensor,
+        row_sum: cute.Tensor,
+        row_max: cute.Tensor,
+        sink: cutlass.Float32,
+        softmax_scale_log2: cutlass.Float32,
+    ):
+        """Final normalisation with a learned sink column in the denominator.
+
+        ``row_max`` is in raw (unscaled) score units and is already
+        quad-consistent (the running max is threadquad-reduced on every KV
+        step); ``row_sum`` is the per-thread partial sum relative to that max
+        and is reduced across the quad here.  The sink logit ``sink`` lives in
+        scaled-logit space and is used raw, so with ``m_s = row_max * scale``
+        the merged max is ``max(m_s, sink)`` and
+
+            out = acc_O * e^(m_s - new_max)
+                  / (row_sum * e^(m_s - new_max) + e^(sink - new_max)),
+
+        all in base 2.  Including the sink in the max keeps this finite for any
+        sink value (a huge sink drives the output to zero, a very negative one
+        reproduces the sink-free result).  A fully masked row has
+        ``row_max == -inf``: its correction factor is 0, the denominator is
+        ``e^0 = 1`` and the zero ``acc_O`` stays zero.
+        """
+        acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
+        log2_e = 1.4426950408889634074
+        # Clamp so a -inf sink behaves as "no sink" instead of producing
+        # exp2(-inf - -inf) = NaN on fully masked rows.
+        sink_log2 = cute.arch.fmax(sink * log2_e, cutlass.Float32(-1.0e30))
+        for r in cutlass.range_constexpr(cute.size(row_sum)):
+            row_sum_r = self._threadquad_reduce_sum(row_sum[r])
+            row_max_log2 = row_max[r] * softmax_scale_log2
+            new_max_log2 = cute.arch.fmax(row_max_log2, sink_log2)
+            # row_max_log2 may be -inf (fully masked row): exp2(-inf) = 0.
+            correction = cute.math.exp2(row_max_log2 - new_max_log2, fastmath=True)
+            denom = row_sum_r * correction + cute.math.exp2(
+                sink_log2 - new_max_log2, fastmath=True
+            )
+            scale = correction * cute.arch.rcp_approx(denom)
+            acc_O_mn[r, None] = acc_O_mn[r, None].load() * scale
+
     def _make_acc_tensor_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
         """Reinterpret a ``(MMA, MMA_M, MMA_N)`` accumulator as ``(M, N)``."""
         acc_layout_col_major = cute.make_layout(acc.layout.shape)
@@ -2705,8 +2813,13 @@ def _fmha_v2_reference(
     *,
     is_causal: bool,
     window_size_left: int,
+    sinks: Optional[cp.ndarray] = None,
 ) -> cp.ndarray:
-    """Small CuPy FP32 oracle for standalone FMHA-v2 kernel validation."""
+    """Small CuPy FP32 oracle for standalone FMHA-v2 kernel validation.
+
+    ``sinks`` (optional, ``(H_q,)`` FP32, scaled-logit space) adds a learned
+    attention-sink column to each query head's softmax denominator.
+    """
     batch_size, seqlen_q, num_q_heads, head_dim = q.shape
     seqlen_k = k.shape[1]
     num_kv_heads = k.shape[2]
@@ -2730,9 +2843,15 @@ def _fmha_v2_reference(
             scores = q_head_f32 @ k_head_f32.T
             scores *= softmax_scale
             scores = cp.where(mask, scores, -cp.inf)
-            scores -= cp.max(scores, axis=1, keepdims=True)
+            row_max = cp.max(scores, axis=1, keepdims=True)
+            if sinks is not None:
+                row_max = cp.maximum(row_max, sinks[q_head])
+            scores -= row_max
             probabilities = cp.exp(scores)
-            probabilities /= cp.sum(probabilities, axis=1, keepdims=True)
+            denominator = cp.sum(probabilities, axis=1, keepdims=True)
+            if sinks is not None:
+                denominator += cp.exp(sinks[q_head] - row_max)
+            probabilities /= denominator
             reference[batch, :, q_head, :] = probabilities @ v_head_f32
     return reference
 
@@ -2810,6 +2929,7 @@ def run(
     hybrid_exp2: bool = False,
     d512_ws: bool = False,
     d512_ws_i8: bool = False,
+    attention_sink: bool = False,
     warmup_iterations: int = 3,
     iterations: int = 10,
     skip_ref_check: bool = False,
@@ -2865,6 +2985,8 @@ def run(
         raise ValueError(f"{_tag} vision-block overlay is a Context FMHA mode, not packed ViT")
     if paged_kv and vision_block:
         raise ValueError(f"{_tag} --paged_kv does not support the vision-block overlay")
+    if attention_sink and (not paged_kv or paged_kv_ragged):
+        raise ValueError(f"{_tag} --attention_sink requires --paged_kv (not --paged_kv_ragged)")
     if paged_kv and not is_causal:
         raise ValueError(f"{_tag} --paged_kv requires --is_causal")
     if paged_kv and (
@@ -3082,7 +3204,22 @@ def run(
         packed_varlen=fmha_v2_vit or paged_kv_ragged,
         skip_rescale=skip_rescale,
         hybrid_exp2=hybrid_exp2,
+        has_sink=attention_sink,
     )
+    sink_dyn = None
+    sink_arr = None
+    if attention_sink:
+        if export_only:
+            sink_dyn = aot_placeholders.make_compact_tensor(
+                cutlass.Float32, (h_q,), stride_order=(0,), assumed_align=16
+            )
+        else:
+            # Spread of sink logits: well below, near and above typical scaled logits.
+            sink_arr = cp.linspace(-4.0, 8.0, h_q).astype(cp.float32)
+            sink_dyn = from_dlpack(sink_arr, assumed_align=16)
+        sink_dyn = sink_dyn.mark_layout_dynamic(leading_dim=0).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0,)
+        )
     if d512_ws:
         # Warp-specialized head-512 causal context kernel (same ABI as
         # __call_context__); see fmha_d512_ws.py.
@@ -3149,6 +3286,22 @@ def run(
             cu_q_dyn,
             cu_k_dyn,
             cutlass.Int32(max_q_seq_len),
+            cutlass.Int32(max(window_size_left, 0)),
+            cutlass.Float32(softmax_scale),
+            _sm_count,
+            current_stream,
+            **compile_options,
+        )
+    elif paged_kv and attention_sink:
+        compiled_fa2 = cute.compile(
+            fa2_fwd.__call_context_paged_sink__,
+            q_dyn,
+            kv_pool_dyn,
+            page_list_dyn,
+            o_dyn,
+            cu_q_dyn,
+            cu_k_dyn,
+            sink_dyn,
             cutlass.Int32(max(window_size_left, 0)),
             cutlass.Float32(softmax_scale),
             _sm_count,
@@ -3303,6 +3456,20 @@ def run(
             cutlass.Int32(utils.HardwareInfo().get_device_multiprocessor_count()),
             current_stream,
         )
+    elif paged_kv and attention_sink:
+        compiled_fa2(
+            q_dyn,
+            kv_pool_dyn,
+            page_list_dyn,
+            o_dyn,
+            cu_q_dyn,
+            cu_k_dyn,
+            sink_dyn,
+            cutlass.Int32(max(window_size_left, 0)),
+            cutlass.Float32(softmax_scale),
+            _sm_count,
+            current_stream,
+        )
     elif paged_kv:
         compiled_fa2(
             q_dyn,
@@ -3365,6 +3532,7 @@ def run(
             else _fmha_v2_reference(
                 q_arr, k_arr, v_arr, softmax_scale,
                 is_causal=is_causal, window_size_left=window_size_left,
+                sinks=sink_arr,
             )
         )
         _report_reference_error(
@@ -3396,6 +3564,12 @@ def run(
         )
     elif paged_kv:
         print(f"{_tag} PAGED_KV_REFERENCE_SKIPPED")
+
+    if attention_sink:
+        # The benchmark harness below has no sink-aware tensor sets; the
+        # reference check above is the validation for this variant.
+        print(f"{_tag} ATTENTION_SINK_DONE: benchmark skipped for the sink variant")
+        return None
 
     def generate_tensors():
         if paged_kv:
@@ -3701,6 +3875,8 @@ def _parse_args(argv=None):
                    help="Use the warp-specialized causal context kernel (fmha_d512_ws.py; head 256 or 512).")
     p.add_argument("--d512_ws_i8", action="store_true",
                    help="Causal context with INT8 Q·Kᵀ (fmha_d512_ws_i8.py; head 256 or 512); export only.")
+    p.add_argument("--attention_sink", action="store_true",
+                   help="Compile the learned attention-sink paged context variant (requires --paged_kv).")
     p.add_argument("--warmup_iterations", type=int, default=3)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--skip_ref_check", action="store_true")
@@ -3757,6 +3933,7 @@ def main():
         hybrid_exp2=args.hybrid_exp2,
         d512_ws=args.d512_ws,
         d512_ws_i8=args.d512_ws_i8,
+        attention_sink=args.attention_sink,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
         skip_ref_check=args.skip_ref_check or args.benchmark_paged_kv_ragged,

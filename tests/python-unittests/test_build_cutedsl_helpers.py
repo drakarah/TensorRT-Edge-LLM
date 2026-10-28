@@ -69,6 +69,10 @@ _FMHA_V2_RAGGED_PAGED_VARIANTS = {
     "fmha_v2_d256_sw_paged_ragged",
     "fmha_v2_d512_sw_paged_ragged",
 }
+_FMHA_V2_SINK_PAGED_VARIANTS = {
+    "fmha_v2_d128_sink_paged",
+    "fmha_v2_d128_sw_sink_paged",
+}
 _FMHA_V2_SPECIAL_VARIANTS = {
     "fmha_v2_d256_padding",
     "fmha_v2_vit_d64",
@@ -81,6 +85,7 @@ _FMHA_V2_SPECIAL_VARIANTS = {
 }
 _FMHA_V2_VARIANTS = (_FMHA_V2_DENSE_VARIANTS | _FMHA_V2_PAGED_VARIANTS
                      | _FMHA_V2_RAGGED_PAGED_VARIANTS
+                     | _FMHA_V2_SINK_PAGED_VARIANTS
                      | _FMHA_V2_SPECIAL_VARIANTS)
 _BLACKWELL_PACKED_PAGED_VARIANTS = {
     f"fmha_d{head_dim}_packed{sliding}_paged{fp8}"
@@ -437,6 +442,21 @@ def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
         variant.script_args[variant.script_args.index("--window_size_left") +
                             1] == "4096"
         for variant in sliding_ragged_paged_variants)
+
+    sink_paged_variants = [
+        variant for variant in fmha_v2_variants
+        if variant.name in _FMHA_V2_SINK_PAGED_VARIANTS
+    ]
+    assert {variant.name
+            for variant in sink_paged_variants} == _FMHA_V2_SINK_PAGED_VARIANTS
+    assert all("--paged_kv" in variant.script_args
+               and "--attention_sink" in variant.script_args
+               for variant in sink_paged_variants)
+    assert {
+        variant.name
+        for variant in sink_paged_variants
+        if "--window_size_left" in variant.script_args
+    } == {"fmha_v2_d128_sw_sink_paged"}
 
     padding_variant = next(variant for variant in fmha_v2_variants
                            if variant.name == "fmha_v2_d256_padding")

@@ -71,6 +71,12 @@ public:
     static bool canImplementPaged(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
         nvinfer1::DataType dataType, CuteDslFMHAV2MaskType maskType);
 
+    //! Returns whether the target AOT family covers native FP16 paged KV with learned attention sinks. Only
+    //! head_dim 128 (causal and sliding-causal) has sink variants; callers that need sinks must check this instead
+    //! of canImplementPaged().
+    static bool canImplementPagedSink(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
+        nvinfer1::DataType dataType, CuteDslFMHAV2MaskType maskType);
+
     //! Returns whether the target AOT family covers packed-Q/O native paged attention.
     static bool canImplementPagedRagged(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
         nvinfer1::DataType dataType, CuteDslFMHAV2MaskType maskType);
@@ -82,7 +88,8 @@ public:
     bool preflightLlm(cudaStream_t stream, int32_t slidingWindowSize = INT_MAX);
 
     //! Ensures the exact native-paged causal or sliding-causal LLM variant selected by runPaged() is loaded.
-    bool preflightPaged(cudaStream_t stream, int32_t slidingWindowSize = INT_MAX);
+    //! useAttentionSinks selects the *_sink_paged variant (head_dim 128 only), matching runPaged(attentionSinks).
+    bool preflightPaged(cudaStream_t stream, int32_t slidingWindowSize = INT_MAX, bool useAttentionSinks = false);
 
     //! Ensures the packed-Q/O native-paged causal or sliding-causal variant selected by runPagedRagged() is loaded.
     bool preflightPagedRagged(cudaStream_t stream, int32_t slidingWindowSize = INT_MAX);
@@ -101,9 +108,13 @@ public:
         cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX);
 
     //! Runs FP16 causal or sliding-causal attention directly against an FP16 NHD paged KV pool.
+    //! attentionSinks (optional) is a device array of numQHeads FP32 learned sink logits in scaled-logit space; when
+    //! non-null the sink variant is launched (head_dim 128 only, see canImplementPagedSink()). Null keeps the
+    //! sink-free kernels.
     bool runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
         int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens, int32_t numFlatPages, int32_t maxPagesPerSeq,
-        int32_t tokensPerPage, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX);
+        int32_t tokensPerPage, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX,
+        float const* attentionSinks = nullptr);
 
     /**
      * @brief Runs causal or sliding-causal attention over packed Q/O and an FP16 NHD paged KV pool.
@@ -179,6 +190,8 @@ private:
     static detail::LazyKernelModule<fmha_v2_d128_sw_paged_Kernel_Module_t> sLLM_d128SwPaged;
     static detail::LazyKernelModule<fmha_v2_d256_sw_paged_Kernel_Module_t> sLLM_d256SwPaged;
     static detail::LazyKernelModule<fmha_v2_d512_sw_paged_Kernel_Module_t> sLLM_d512SwPaged;
+    static detail::LazyKernelModule<fmha_v2_d128_sink_paged_Kernel_Module_t> sLLM_d128SinkPaged;
+    static detail::LazyKernelModule<fmha_v2_d128_sw_sink_paged_Kernel_Module_t> sLLM_d128SwSinkPaged;
 #if CUDA_VERSION >= 12000
     static detail::LazyKernelModule<fmha_v2_d64_paged_ragged_Kernel_Module_t> sLLM_d64PagedRagged;
     static detail::LazyKernelModule<fmha_v2_d128_paged_ragged_Kernel_Module_t> sLLM_d128PagedRagged;

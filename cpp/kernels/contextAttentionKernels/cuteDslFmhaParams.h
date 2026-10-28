@@ -86,6 +86,9 @@ struct LlmFmhaPagedParams
     //! Skip-softmax (BLASST) threshold as log2(lambda); 0.0 = disabled. Only the
     //! *_skipsoftmax_paged launchers forward it — the other wrappers have no such argument.
     float skipSoftmaxScaleFactor{};
+    //! Learned attention-sink logits, one FP32 per query head (device pointer, scaled-logit space, used raw). Null =
+    //! no sinks. Only the FMHA-v2 *_sink_paged launchers forward it; every other wrapper has no such argument.
+    float const* attentionSinks{};
     cudaStream_t stream{};
 };
 
