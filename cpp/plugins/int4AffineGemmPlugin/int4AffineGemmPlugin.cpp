@@ -428,10 +428,9 @@ int32_t Int4AffineGroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc
 
         // EDGELLM_INT4_AFFINE_FORCE_TACTIC=<id>: run this tactic id (1..16 GEMM variant, 17 GEMV) instead of the
         // engine's stored choice whenever it is valid for the shape (test / A-B tool, applies to every instance).
-        static int32_t const kForcedTactic = []() {
-            char const* value = std::getenv("EDGELLM_INT4_AFFINE_FORCE_TACTIC");
-            return value != nullptr ? std::atoi(value) : 0;
-        }();
+        // Read per call (a cheap getenv) so a test can sweep tactics within one process.
+        char const* const forcedValue = std::getenv("EDGELLM_INT4_AFFINE_FORCE_TACTIC");
+        int32_t const kForcedTactic = forcedValue != nullptr ? std::atoi(forcedValue) : 0;
         int32_t tactic = mTactic;
         if (kForcedTactic > 0)
         {
