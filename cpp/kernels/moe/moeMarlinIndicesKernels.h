@@ -135,5 +135,8 @@ void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t num
 //! Wait for the host's answer to the last doorbell (no wait when it wrote none) and add it to output [numTokens, hiddenSize].
 void launchCpuMissWaitAdd(half* output, int32_t numTokens, int32_t hiddenSize, CpuMissMailbox* mailbox, CpuMissDeviceState* state, cudaStream_t stream);
 
+//! Debug probe: per buffer {non-finite count, bit pattern of the largest finite |x|, count of |x| >= 30000} accumulated into counters[3].
+void launchFiniteWatch(half const* x, int64_t n, uint32_t* counters, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

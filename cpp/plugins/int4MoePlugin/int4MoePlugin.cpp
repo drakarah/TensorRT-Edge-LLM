@@ -38,6 +38,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <string>
 #include <thread>
@@ -232,6 +233,99 @@ int32_t layerIdFromName(std::string const& name) noexcept
     size_t const pos = name.find_last_of('_');
     return pos == std::string::npos ? -1 : std::atoi(name.c_str() + pos + 1);
 }
+
+//! EDGELLM_FINITE_WATCH=1: every MoE layer records, for its input and output, the count of non-finite values, the largest finite |x| and the count of
+//! |x| >= 30000 (fp16 limit 65504). A host thread reads the device counters on its own stream and logs changes; nothing else synchronises with it.
+class FiniteWatch
+{
+public:
+    static constexpr int32_t kSlots = 512;
+
+    static FiniteWatch* get() noexcept
+    {
+        static FiniteWatch* instance = []() -> FiniteWatch* {
+            char const* value = std::getenv("EDGELLM_FINITE_WATCH");
+            if (value == nullptr || std::atoi(value) == 0)
+            {
+                return nullptr;
+            }
+            auto* watch = new FiniteWatch();
+            return watch->mReady ? watch : nullptr;
+        }();
+        return instance;
+    }
+
+    uint32_t* counters(int32_t layerId, int32_t which) noexcept
+    {
+        int32_t const slot = layerId >= 0 && layerId < kSlots ? layerId : 0;
+        return mDevice + (static_cast<size_t>(slot) * 2 + which) * 3;
+    }
+
+private:
+    FiniteWatch()
+    {
+        size_t const bytes = static_cast<size_t>(kSlots) * 2 * 3 * sizeof(uint32_t);
+        if (cudaMalloc(reinterpret_cast<void**>(&mDevice), bytes) != cudaSuccess || cudaMemset(mDevice, 0, bytes) != cudaSuccess
+            || cudaStreamCreateWithFlags(&mStream, cudaStreamNonBlocking) != cudaSuccess)
+        {
+            cudaGetLastError();
+            return;
+        }
+        mHost.assign(static_cast<size_t>(kSlots) * 2 * 3, 0);
+        mLast.assign(mHost.size(), 0);
+        mReady = true;
+        std::thread([this]() { run(); }).detach();
+    }
+
+    void run() noexcept
+    {
+        int32_t tick = 0;
+        while (true)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (cudaMemcpyAsync(mHost.data(), mDevice, mHost.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, mStream) != cudaSuccess
+                || cudaStreamSynchronize(mStream) != cudaSuccess)
+            {
+                cudaGetLastError();
+                continue;
+            }
+            float worst = 0.0F;
+            int32_t worstSlot = -1;
+            for (int32_t slot = 0; slot < kSlots * 2; ++slot)
+            {
+                uint32_t const bad = mHost[slot * 3];
+                float maxAbs;
+                std::memcpy(&maxAbs, &mHost[slot * 3 + 1], sizeof(float));
+                if (bad != mLast[slot * 3])
+                {
+                    LOG_ERROR("FINITE: layer node %d %s: %u non-finite values so far (largest finite |x| %.1f)", slot / 2, slot % 2 == 0 ? "input" : "output", bad, maxAbs);
+                    mLast[slot * 3] = bad;
+                }
+                if (maxAbs > worst)
+                {
+                    worst = maxAbs;
+                    worstSlot = slot;
+                }
+            }
+            if (++tick % 12 == 0 && worstSlot >= 0)
+            {
+                uint32_t near = 0;
+                for (int32_t slot = 0; slot < kSlots * 2; ++slot)
+                {
+                    near += mHost[slot * 3 + 2];
+                }
+                LOG_INFO("FINITE: largest |x| %.1f (%.0f%% of the fp16 limit) at layer node %d %s; values >= 30000 so far: %u", worst, 100.0F * worst / 65504.0F,
+                    worstSlot / 2, worstSlot % 2 == 0 ? "input" : "output", near);
+            }
+        }
+    }
+
+    uint32_t* mDevice{nullptr};
+    cudaStream_t mStream{nullptr};
+    std::vector<uint32_t> mHost;
+    std::vector<uint32_t> mLast;
+    bool mReady{false};
+};
 
 //! Layer ids of the MoE plugins of this process (for the automatic cache sizing). The node name carries a " [profile N]" suffix per optimisation
 //! profile, so the layers are counted by their id, not by the name string.
@@ -980,6 +1074,7 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, int32_t const numExperts, 
     , mQuantizationGroupSize(quantizationGroupSize)
 {
     registerMoeLayerName(mLayerName);
+    FiniteWatch::get();
     if (std::find(kSUPPORTED_ACTIVATION_TYPES.begin(), kSUPPORTED_ACTIVATION_TYPES.end(), mActivationType)
         == kSUPPORTED_ACTIVATION_TYPES.end())
     {
@@ -992,6 +1087,7 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
     : mLayerName(name)
 {
     registerMoeLayerName(mLayerName);
+    FiniteWatch::get();
     for (int32_t i = 0; i < fc->nbFields; ++i)
     {
         std::string fieldName(fc->fields[i].name);
@@ -1623,6 +1719,10 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             return -1;
         }
         int32_t const numTokens = static_cast<int32_t>(numTokens64);
+        if (FiniteWatch* watch = FiniteWatch::get(); watch != nullptr && hiddenStatesDesc.type == DataType::kHALF)
+        {
+            kernel::launchFiniteWatch(static_cast<half const*>(inputs[1]), numTokens64 * mHiddenSize, watch->counters(layerIdFromName(mLayerName), 0), stream);
+        }
         int32_t const tileTokens = mTokenTile > 0 ? std::min(numTokens, mTokenTile) : numTokens;
         int32_t const moeBlockSize = getTunedMoeBlockSize(tileTokens);
 
@@ -2041,6 +2141,10 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         for (int32_t t0 = 0; t0 < numTokens; t0 += tileTokens)
         {
             runTile(t0, std::min(tileTokens, numTokens - t0));
+        }
+        if (FiniteWatch* watch = FiniteWatch::get(); watch != nullptr && outputDesc[0].type == DataType::kHALF)
+        {
+            kernel::launchFiniteWatch(static_cast<half const*>(outputs[0]), numTokens64 * mHiddenSize, watch->counters(layerIdFromName(mLayerName), 1), stream);
         }
         return 0;
     }

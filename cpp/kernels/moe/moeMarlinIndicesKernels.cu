@@ -99,6 +99,7 @@ namespace
 {
 
 constexpr int32_t kAggregateThreadsPerBlock{256};
+constexpr float kFiniteWatchNearLimit{30000.0F};
 
 template <typename T>
 struct AggregationTypeTraits;
@@ -707,6 +708,45 @@ __global__ void cpuMissWaitAddKernel(half* out, int32_t numTokens, int32_t hidde
         out[i] = __float2half(__half2float(out[i]) + __ldcv(&mb->y[i]));
     }
 }
+__global__ void finiteWatchKernel(half const* x, int64_t n, uint32_t* counters)
+{
+    float localMax = 0.0F;
+    uint32_t bad = 0;
+    uint32_t near = 0;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        float const v = __half2float(x[i]);
+        if (!isfinite(v))
+        {
+            ++bad;
+        }
+        else
+        {
+            float const a = fabsf(v);
+            localMax = fmaxf(localMax, a);
+            near += a >= kFiniteWatchNearLimit ? 1U : 0U;
+        }
+    }
+    for (int32_t off = 16; off > 0; off >>= 1)
+    {
+        localMax = fmaxf(localMax, __shfl_down_sync(0xffffffffu, localMax, off));
+        bad += __shfl_down_sync(0xffffffffu, bad, off);
+        near += __shfl_down_sync(0xffffffffu, near, off);
+    }
+    if ((threadIdx.x & 31) == 0)
+    {
+        if (bad != 0)
+        {
+            atomicAdd(&counters[0], bad);
+        }
+        if (near != 0)
+        {
+            atomicAdd(&counters[2], near);
+        }
+        atomicMax(&counters[1], __float_as_uint(localMax));
+    }
+}
 } // namespace
 
 void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t numTokens, int32_t topK, int32_t numExperts, half const* hidden,
@@ -720,6 +760,14 @@ void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t num
 void launchCpuMissWaitAdd(half* output, int32_t numTokens, int32_t hiddenSize, CpuMissMailbox* mailbox, CpuMissDeviceState* state, cudaStream_t stream)
 {
     cpuMissWaitAddKernel<<<1, 1024, 0, stream>>>(output, numTokens, hiddenSize, mailbox, state);
+}
+
+void launchFiniteWatch(half const* x, int64_t n, uint32_t* counters, cudaStream_t stream)
+{
+    if (n > 0)
+    {
+        finiteWatchKernel<<<32, 256, 0, stream>>>(x, n, counters);
+    }
 }
 
 } // namespace kernel
