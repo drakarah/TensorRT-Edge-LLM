@@ -771,7 +771,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("enabled", &ContextCacheConfig::enabled)
         .def_readwrite("max_records", &ContextCacheConfig::maxRecords)
         .def_readwrite("recurrent_snapshot_pool_bytes", &ContextCacheConfig::recurrentSnapshotPoolBytes)
-        .def_readwrite("partial_kv_snapshot_pool_bytes", &ContextCacheConfig::partialKvSnapshotPoolBytes);
+        .def_readwrite("partial_kv_snapshot_pool_bytes", &ContextCacheConfig::partialKvSnapshotPoolBytes)
+        .def_readwrite("snapshots_in_host_memory", &ContextCacheConfig::snapshotsInHostMemory);
 
     // ========================================================================
     // Image utilities

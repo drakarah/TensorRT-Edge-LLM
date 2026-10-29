@@ -110,10 +110,14 @@ class ContextCacheConfig:
     max_records: int = 1024
     recurrent_snapshot_pool_bytes: int = 0
     partial_kv_snapshot_pool_bytes: int = 0
+    snapshots_in_host_memory: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ServerConfigError("context_cache.enabled must be boolean")
+        if not isinstance(self.snapshots_in_host_memory, bool):
+            raise ServerConfigError(
+                "context_cache.snapshots_in_host_memory must be boolean")
         for name in (
                 "max_records",
                 "recurrent_snapshot_pool_bytes",
@@ -134,7 +138,8 @@ class ContextCacheConfig:
                     f"context_cache.{name} must fit a signed 64-bit integer")
         if (not self.enabled and
             (self.max_records != 1024 or self.recurrent_snapshot_pool_bytes
-             or self.partial_kv_snapshot_pool_bytes)):
+             or self.partial_kv_snapshot_pool_bytes
+             or self.snapshots_in_host_memory)):
             raise ServerConfigError(
                 "context-cache tuning requires context reuse to be enabled")
 
@@ -157,6 +162,7 @@ class ContextCacheConfig:
             "max_records",
             "recurrent_snapshot_pool_bytes",
             "partial_kv_snapshot_pool_bytes",
+            "snapshots_in_host_memory",
         }
         unsupported = sorted(set(raw) - supported)
         if unsupported:
@@ -370,6 +376,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
     model.add_argument("--context-cache-partial-kv-snapshot-pool-bytes",
                        type=_non_negative_int,
                        default=0)
+    model.add_argument(
+        "--context-cache-snapshots-in-host-memory",
+        action="store_true",
+        help="Keep the recurrent and partial-KV checkpoints of a hybrid "
+        "model in pinned host memory instead of on the GPU. The two snapshot "
+        "pool budgets then count host bytes.",
+    )
     return parser
 
 
@@ -394,6 +407,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
             args.context_cache_recurrent_snapshot_pool_bytes),
         partial_kv_snapshot_pool_bytes=(
             args.context_cache_partial_kv_snapshot_pool_bytes),
+        snapshots_in_host_memory=args.context_cache_snapshots_in_host_memory,
     )
     model = ModelConfig(
         model=args.model,

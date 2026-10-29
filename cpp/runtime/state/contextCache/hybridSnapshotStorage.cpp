@@ -45,13 +45,14 @@ size_t checkedAdd(size_t lhs, size_t rhs, char const* description)
     return lhs + rhs;
 }
 
-void validateGpuTensorLayout(Tensor const& tensor, Coords const& expectedShape, nvinfer1::DataType expectedType,
-    size_t expectedOuterBytes, std::string const& description)
+void validateTensorLayout(Tensor const& tensor, Coords const& expectedShape, nvinfer1::DataType expectedType,
+    size_t expectedOuterBytes, std::string const& description, DeviceType expectedDevice = DeviceType::kGPU)
 {
     ELLM_CHECK(tensor.getShape() == expectedShape,
         description + " shape " + tensor.getShape().formatString() + " does not match expected shape "
             + expectedShape.formatString());
-    ELLM_CHECK(tensor.getDeviceType() == DeviceType::kGPU, description + " must reside on the GPU");
+    ELLM_CHECK(tensor.getDeviceType() == expectedDevice,
+        description + (expectedDevice == DeviceType::kGPU ? " must reside on the GPU" : " must reside in pinned host memory"));
     ELLM_CHECK(tensor.getDataType() == expectedType, description + " dtype does not match its cache configuration");
     ELLM_CHECK(tensor.rawPointer() != nullptr, description + " has no backing allocation");
     ELLM_CHECK(tensor.getStride(0) >= 0, description + " has an invalid outer stride");
@@ -89,13 +90,15 @@ std::byte* byteOffset(void* pointer, size_t offset)
 
 HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, int32_t recurrentSlotCount,
     int32_t partialKvSlotCount, HybridCacheManager* draftCacheManager, int32_t boundaryHiddenDim,
-    nvinfer1::DataType boundaryHiddenType)
+    nvinfer1::DataType boundaryHiddenType, SnapshotMemory memory)
     : mCacheManager(cacheManager)
     , mDraftCacheManager(draftCacheManager)
     , mRecurrentSlotCount(recurrentSlotCount)
     , mPartialKvSlotCount(partialKvSlotCount)
     , mBoundaryHiddenDim(boundaryHiddenDim)
+    , mMemory(memory)
 {
+    DeviceType const slabDevice = memory == SnapshotMemory::kPinnedHost ? DeviceType::kCPU : DeviceType::kGPU;
     ELLM_CHECK(recurrentSlotCount >= 0 && partialKvSlotCount >= 0, "Hybrid snapshot slot counts must be non-negative");
     ELLM_CHECK(boundaryHiddenDim >= 0, "Hybrid snapshot boundary hidden dim must be non-negative");
     MambaCacheManager& mamba = cacheManager.getMambaCacheManager();
@@ -111,11 +114,11 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
     for (int32_t layer = 0; layer < mamba.numLayers(); ++layer)
     {
         std::string const layerSuffix = std::to_string(layer);
-        validateGpuTensorLayout(mamba.getRecurrentState(layer),
+        validateTensorLayout(mamba.getRecurrentState(layer),
             {mambaConfig.maxBatchSize, mambaConfig.recurrentStateNumHeads, mambaConfig.recurrentStateHeadDim,
                 mambaConfig.recurrentStateSize},
             mambaConfig.recurrentStateType, recurrentBytes, "Live recurrent state layer " + layerSuffix);
-        validateGpuTensorLayout(mamba.getConvState(layer),
+        validateTensorLayout(mamba.getConvState(layer),
             {mambaConfig.maxBatchSize, mambaConfig.convDim, mambaConfig.convKernel}, mambaConfig.convStateType,
             convBytes, "Live convolution state layer " + layerSuffix);
     }
@@ -133,7 +136,7 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
             = checkedMultiply(pageBytes, static_cast<size_t>(kv.numPages()), "live KV pool half");
         Tensor const& pool = kv.getCombinedKVCache(layer);
         std::string const description = "Live KV pool layer " + std::to_string(layer);
-        validateGpuTensorLayout(pool, {2, kv.numPages(), kTOKENS_PER_PAGE, layerConfig.numKVHeads, layerConfig.headDim},
+        validateTensorLayout(pool, {2, kv.numPages(), kTOKENS_PER_PAGE, layerConfig.numKVHeads, layerConfig.headDim},
             kvConfig.kvCacheType, poolHalfBytes, description);
         ELLM_CHECK(pool.getStride(1) >= 0
                 && checkedMultiply(static_cast<size_t>(pool.getStride(1)), utils::getTypeSize(pool.getDataType()),
@@ -154,17 +157,17 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
             mRecurrentSnapshots.emplace_back(
                 Tensor({recurrentSlotCount, mambaConfig.recurrentStateNumHeads, mambaConfig.recurrentStateHeadDim,
                            mambaConfig.recurrentStateSize},
-                    DeviceType::kGPU, mambaConfig.recurrentStateType,
+                    slabDevice, mambaConfig.recurrentStateType,
                     "HybridSnapshotStorage::recurrent_" + std::to_string(layer)));
             mConvSnapshots.emplace_back(Tensor({recurrentSlotCount, mambaConfig.convDim, mambaConfig.convKernel},
-                DeviceType::kGPU, mambaConfig.convStateType, "HybridSnapshotStorage::conv_" + std::to_string(layer)));
-            validateGpuTensorLayout(mRecurrentSnapshots.back(),
+                slabDevice, mambaConfig.convStateType, "HybridSnapshotStorage::conv_" + std::to_string(layer)));
+            validateTensorLayout(mRecurrentSnapshots.back(),
                 {recurrentSlotCount, mambaConfig.recurrentStateNumHeads, mambaConfig.recurrentStateHeadDim,
                     mambaConfig.recurrentStateSize},
-                mambaConfig.recurrentStateType, recurrentBytes, "Recurrent snapshot layer " + std::to_string(layer));
-            validateGpuTensorLayout(mConvSnapshots.back(),
+                mambaConfig.recurrentStateType, recurrentBytes, "Recurrent snapshot layer " + std::to_string(layer), slabDevice);
+            validateTensorLayout(mConvSnapshots.back(),
                 {recurrentSlotCount, mambaConfig.convDim, mambaConfig.convKernel}, mambaConfig.convStateType, convBytes,
-                "Convolution snapshot layer " + std::to_string(layer));
+                "Convolution snapshot layer " + std::to_string(layer), slabDevice);
         }
     }
 
@@ -181,11 +184,11 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
                 utils::getTypeSize(kvConfig.kvCacheType), "partial KV snapshot dtype");
             mPartialKvSnapshots.emplace_back(Tensor(
                 {partialKvSlotCount, 2, kTOKENS_PER_PAGE, layerConfig.numKVHeads, layerConfig.headDim},
-                DeviceType::kGPU, kvConfig.kvCacheType, "HybridSnapshotStorage::partialKv_" + std::to_string(layer)));
-            validateGpuTensorLayout(mPartialKvSnapshots.back(),
+                slabDevice, kvConfig.kvCacheType, "HybridSnapshotStorage::partialKv_" + std::to_string(layer)));
+            validateTensorLayout(mPartialKvSnapshots.back(),
                 {partialKvSlotCount, 2, kTOKENS_PER_PAGE, layerConfig.numKVHeads, layerConfig.headDim},
                 kvConfig.kvCacheType, checkedMultiply(2U, pageBytes, "partial KV snapshot slot"),
-                "Partial KV snapshot layer " + std::to_string(layer));
+                "Partial KV snapshot layer " + std::to_string(layer), slabDevice);
         }
 
         if (mDraftCacheManager != nullptr)
@@ -206,12 +209,12 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
                         utils::getTypeSize(draftKvConfig.kvCacheType), "draft partial KV snapshot dtype");
                 mDraftPartialKvSnapshots.emplace_back(
                     Tensor({partialKvSlotCount, 2, kTOKENS_PER_PAGE, layerConfig.numKVHeads, layerConfig.headDim},
-                        DeviceType::kGPU, draftKvConfig.kvCacheType,
+                        slabDevice, draftKvConfig.kvCacheType,
                         "HybridSnapshotStorage::draftPartialKv_" + std::to_string(layer)));
-                validateGpuTensorLayout(mDraftPartialKvSnapshots.back(),
+                validateTensorLayout(mDraftPartialKvSnapshots.back(),
                     {partialKvSlotCount, 2, kTOKENS_PER_PAGE, layerConfig.numKVHeads, layerConfig.headDim},
                     draftKvConfig.kvCacheType, checkedMultiply(2U, pageBytes, "draft partial KV snapshot slot"),
-                    "Draft partial KV snapshot layer " + std::to_string(layer));
+                    "Draft partial KV snapshot layer " + std::to_string(layer), slabDevice);
             }
         }
     }
@@ -220,10 +223,10 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
     {
         size_t const rowBytes = checkedMultiply(
             static_cast<size_t>(mBoundaryHiddenDim), utils::getTypeSize(boundaryHiddenType), "boundary hidden row");
-        mBoundaryHiddenSnapshot = Tensor({recurrentSlotCount, mBoundaryHiddenDim}, DeviceType::kGPU, boundaryHiddenType,
+        mBoundaryHiddenSnapshot = Tensor({recurrentSlotCount, mBoundaryHiddenDim}, slabDevice, boundaryHiddenType,
             "HybridSnapshotStorage::boundaryHidden");
-        validateGpuTensorLayout(mBoundaryHiddenSnapshot, {recurrentSlotCount, mBoundaryHiddenDim}, boundaryHiddenType,
-            rowBytes, "Boundary hidden snapshot");
+        validateTensorLayout(mBoundaryHiddenSnapshot, {recurrentSlotCount, mBoundaryHiddenDim}, boundaryHiddenType,
+            rowBytes, "Boundary hidden snapshot", slabDevice);
     }
 }
 
@@ -288,11 +291,11 @@ void HybridSnapshotStorage::captureRecurrent(int32_t snapshotSlot, int32_t batch
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(mRecurrentSnapshots[static_cast<size_t>(layer)].rawPointer(),
                                        static_cast<size_t>(snapshotSlot) * recurrentBytes),
             byteOffset(mamba.getRecurrentState(layer).rawPointer(), static_cast<size_t>(batchSlot) * recurrentBytes),
-            recurrentBytes, cudaMemcpyDeviceToDevice, stream));
+            recurrentBytes, captureKind(), stream));
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(mConvSnapshots[static_cast<size_t>(layer)].rawPointer(),
                                        static_cast<size_t>(snapshotSlot) * convBytes),
             byteOffset(mamba.getConvState(layer).rawPointer(), static_cast<size_t>(batchSlot) * convBytes), convBytes,
-            cudaMemcpyDeviceToDevice, stream));
+            captureKind(), stream));
     }
 }
 
@@ -309,12 +312,12 @@ void HybridSnapshotStorage::restoreRecurrent(int32_t snapshotSlot, int32_t batch
             byteOffset(mamba.getRecurrentState(layer).rawPointer(), static_cast<size_t>(batchSlot) * recurrentBytes),
             byteOffset(mRecurrentSnapshots[static_cast<size_t>(layer)].rawPointer(),
                 static_cast<size_t>(snapshotSlot) * recurrentBytes),
-            recurrentBytes, cudaMemcpyDeviceToDevice, stream));
+            recurrentBytes, restoreKind(), stream));
         CUDA_CHECK(cudaMemcpyAsync(
             byteOffset(mamba.getConvState(layer).rawPointer(), static_cast<size_t>(batchSlot) * convBytes),
             byteOffset(
                 mConvSnapshots[static_cast<size_t>(layer)].rawPointer(), static_cast<size_t>(snapshotSlot) * convBytes),
-            convBytes, cudaMemcpyDeviceToDevice, stream));
+            convBytes, restoreKind(), stream));
     }
 }
 
@@ -368,9 +371,9 @@ void HybridSnapshotStorage::capturePartialKv(HybridCacheManager& cacheManager, s
         size_t const pageOffset = static_cast<size_t>(sourcePage) * pageBytes;
         Tensor& snapshot = snapshots[static_cast<size_t>(layer)];
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(snapshot.rawPointer(), snapshotBase),
-            byteOffset(kvCache.kPoolPtr(layer), pageOffset), copyBytes, cudaMemcpyDeviceToDevice, stream));
+            byteOffset(kvCache.kPoolPtr(layer), pageOffset), copyBytes, captureKind(), stream));
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(snapshot.rawPointer(), snapshotBase + pageBytes),
-            byteOffset(kvCache.vPoolPtr(layer), pageOffset), copyBytes, cudaMemcpyDeviceToDevice, stream));
+            byteOffset(kvCache.vPoolPtr(layer), pageOffset), copyBytes, captureKind(), stream));
     }
 }
 
@@ -394,9 +397,9 @@ void HybridSnapshotStorage::restorePartialKv(HybridCacheManager& cacheManager, s
         size_t const pageOffset = static_cast<size_t>(destinationPage) * pageBytes;
         Tensor& snapshot = snapshots[static_cast<size_t>(layer)];
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(kvCache.kPoolPtr(layer), pageOffset),
-            byteOffset(snapshot.rawPointer(), snapshotBase), copyBytes, cudaMemcpyDeviceToDevice, stream));
+            byteOffset(snapshot.rawPointer(), snapshotBase), copyBytes, restoreKind(), stream));
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(kvCache.vPoolPtr(layer), pageOffset),
-            byteOffset(snapshot.rawPointer(), snapshotBase + pageBytes), copyBytes, cudaMemcpyDeviceToDevice, stream));
+            byteOffset(snapshot.rawPointer(), snapshotBase + pageBytes), copyBytes, restoreKind(), stream));
     }
 }
 
@@ -413,6 +416,21 @@ int32_t HybridSnapshotStorage::partialKvSlotCount() const noexcept
 int32_t HybridSnapshotStorage::boundaryHiddenDim() const noexcept
 {
     return mBoundaryHiddenDim;
+}
+
+SnapshotMemory HybridSnapshotStorage::memory() const noexcept
+{
+    return mMemory;
+}
+
+cudaMemcpyKind HybridSnapshotStorage::captureKind() const noexcept
+{
+    return mMemory == SnapshotMemory::kPinnedHost ? cudaMemcpyDeviceToHost : cudaMemcpyDeviceToDevice;
+}
+
+cudaMemcpyKind HybridSnapshotStorage::restoreKind() const noexcept
+{
+    return mMemory == SnapshotMemory::kPinnedHost ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
 }
 
 void HybridSnapshotStorage::captureBoundaryHidden(
@@ -433,7 +451,7 @@ void HybridSnapshotStorage::captureBoundaryHidden(
     CUDA_CHECK(cudaMemcpyAsync(
         byteOffset(mBoundaryHiddenSnapshot.rawPointer(), static_cast<size_t>(snapshotSlot) * rowBytes),
         static_cast<std::byte const*>(sourceHiddenStates.rawPointer()) + static_cast<size_t>(physicalRow) * rowBytes,
-        rowBytes, cudaMemcpyDeviceToDevice, stream));
+        rowBytes, captureKind(), stream));
 }
 
 void HybridSnapshotStorage::restoreBoundaryHidden(
@@ -454,7 +472,7 @@ void HybridSnapshotStorage::restoreBoundaryHidden(
     CUDA_CHECK(
         cudaMemcpyAsync(byteOffset(destinationHiddenStates.rawPointer(), static_cast<size_t>(physicalRow) * rowBytes),
             byteOffset(mBoundaryHiddenSnapshot.rawPointer(), static_cast<size_t>(snapshotSlot) * rowBytes), rowBytes,
-            cudaMemcpyDeviceToDevice, stream));
+            restoreKind(), stream));
 }
 
 void HybridSnapshotStorage::validateRecurrentSlots(int32_t snapshotSlot, int32_t batchSlot) const

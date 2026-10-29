@@ -845,6 +845,7 @@ def _native_context_cache_config(rt, config: ContextCacheConfig):
     native.max_records = config.max_records
     native.recurrent_snapshot_pool_bytes = config.recurrent_snapshot_pool_bytes
     native.partial_kv_snapshot_pool_bytes = config.partial_kv_snapshot_pool_bytes
+    native.snapshots_in_host_memory = config.snapshots_in_host_memory
     return native
 
 
