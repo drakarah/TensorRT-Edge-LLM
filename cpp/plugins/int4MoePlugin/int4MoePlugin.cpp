@@ -488,7 +488,10 @@ public:
             if (ok && !mBatchDst.empty())
             {
                 // one driver call for the whole layer instead of a few hundred cudaMemcpyAsync calls
-                if (cudaMemcpyBatchAsync(mBatchDst.data(), mBatchSrc.data(), mBatchSize.data(), mBatchDst.size(), nullptr, nullptr, 0, mSide)
+                cudaMemcpyAttributes attrs{};
+                attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+                size_t attrsIdx = 0;
+                if (cudaMemcpyBatchAsync(mBatchDst.data(), mBatchSrc.data(), mBatchSize.data(), mBatchDst.size(), &attrs, &attrsIdx, 1, mSide)
                     != cudaSuccess)
                 {
                     cudaGetLastError();
