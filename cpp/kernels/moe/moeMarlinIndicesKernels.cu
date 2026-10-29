@@ -488,20 +488,27 @@ namespace
 // Cache-aware top-k routing for decode steps (rtx4060/moe-cache-aware-routing): one block per token. The experts are selected by
 // logit + bias * [resident in this layer's cache], the combine weights are the softmax of the ORIGINAL logits over the selected experts (what an
 // unbiased router with the same selection would give), so only WHICH experts run changes. bias = 0 reproduces the exact router.
+//! A router logit that is NaN or beyond +-3e38 (garbage activations in a draft or warm-up pass, an overflowed GEMM) is clamped into a finite range, so
+//! it can neither win a comparison it should not (+inf, which would also turn the softmax weights into NaN) nor lose to the marker of an already
+//! chosen expert (-inf, which would pick that expert twice).
+__device__ __forceinline__ float sanitizeRouterLogit(float l)
+{
+    return l == l ? fminf(fmaxf(l, -3.0e38f), 3.0e38f) : -3.0e38f;
+}
+
 __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, int32_t const* slotOf,
     int32_t* topkIndices, float* topkWeights)
 {
     extern __shared__ float scoreSmem[]; // [numExperts] biased scores
     __shared__ float warpBest[32];
     __shared__ int32_t warpIdx[32];
-    __shared__ int32_t chosen[16];
-    __shared__ float chosenLogit[16];
+    __shared__ int32_t chosen[kRouterMaxTopK];
+    __shared__ float chosenLogit[kRouterMaxTopK];
     float const* row = logits + static_cast<size_t>(blockIdx.x) * numExperts;
     for (int32_t e = threadIdx.x; e < numExperts; e += blockDim.x)
     {
-        float const l = row[e];
-        // a NaN logit (e.g. garbage activations in a draft/warm-up pass) would never win a comparison and leave bestIdx out of range
-        scoreSmem[e] = (l == l ? l : -3.0e38f) + (slotOf[e] >= 0 ? bias : 0.0f);
+        float const l = sanitizeRouterLogit(row[e]);
+        scoreSmem[e] = l + (slotOf[e] >= 0 ? bias : 0.0f);
     }
     __syncthreads();
     int32_t const lane = threadIdx.x & 31;
@@ -549,7 +556,7 @@ __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, in
             }
             bi = bi < numExperts ? bi : 0;
             chosen[k] = bi;
-            chosenLogit[k] = row[bi] == row[bi] ? row[bi] : -3.0e38f;
+            chosenLogit[k] = sanitizeRouterLogit(row[bi]);
             scoreSmem[bi] = -3.4e38f;
         }
         __syncthreads();

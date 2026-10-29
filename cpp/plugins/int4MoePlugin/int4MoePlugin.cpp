@@ -1959,6 +1959,11 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         {
             kernel::ExpertCacheState const biasState{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
                 mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
+            if (mTopK > kernel::kRouterMaxTopK)
+            {
+                LOG_ERROR("Int4MoePlugin %s: cache-aware routing supports at most %d experts per token (top-k %d)", mLayerName.c_str(), kernel::kRouterMaxTopK, mTopK);
+                return -1;
+            }
             kernel::launchCacheAwareTopk(static_cast<float const*>(inputs[0]), numTokens, mNumExperts, mTopK, cacheBiasFromEnv(), tailSkipFromEnv(), biasState,
                 topkIndicesPtr, topkWeightsPtr, stream);
         }
