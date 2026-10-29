@@ -1367,8 +1367,8 @@ bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
     size_t const inter = static_cast<size_t>(mMoeInterSize);
     size_t const n1 = 2 * inter;
     size_t const expected[4] = {(hidden / 16) * 2 * n1 * 4, (hidden / 128) * n1 * 2, (inter / 16) * 2 * hidden * 4, (inter / 128) * hidden * 2};
-    bool ok = mQuantizationGroupSize == 128 && mActivationType != kACTIVATION_GEGLU && hidden % 128 == 0 && inter % 128 == 0 && inter <= 1024
-        && hidden <= static_cast<size_t>(kernel::kCpuMissMaxHidden);
+    bool ok = mActivationType != kACTIVATION_GEGLU
+        && cpumiss::shapeSupported(mHiddenSize, mMoeInterSize, mQuantizationGroupSize, kernel::kCpuMissMaxHidden);
     for (int32_t i = 0; i < 4; ++i)
     {
         ok = ok && mCacheBytesPerExpert[i] == expected[i];
