@@ -714,13 +714,13 @@ int32_t prefillChunkFromEnv()
     return chunk > 0 ? chunk : 0;
 }
 
-//! EDGELLM_MOE_PREFILL_ROUTED_CHUNK=<experts> (serve time, needs an engine built with EDGELLM_MOE_STAGE_EXPERTS=2): prefill passes run the expert GEMMs in chunks of that many
-//! routed experts; after the router has run, only the routed experts are copied by DMA into a small ring (EDGELLM_MOE_PREFILL_ROUTED_RING slots, default 4)
-//! while the previous chunk's GEMM runs. Costs one host round trip of the routed list per layer.
+//! EDGELLM_MOE_PREFILL_ROUTED_CHUNK=<experts> (serve time, default 16, 0 = off; needs an engine built with EDGELLM_MOE_STAGE_EXPERTS=2): prefill passes that fit one
+//! token tile run the expert GEMMs in chunks of that many routed experts; after the router has run, only the routed experts are copied by DMA into a small ring
+//! (EDGELLM_MOE_PREFILL_ROUTED_RING slots, default 4) while the previous chunk's GEMM runs. Costs one host round trip of the routed list per layer.
 int32_t routedChunkFromEnv()
 {
     char const* const value = std::getenv("EDGELLM_MOE_PREFILL_ROUTED_CHUNK");
-    int32_t const chunk = value != nullptr ? std::atoi(value) : 0;
+    int32_t const chunk = value != nullptr ? std::atoi(value) : 16;
     return chunk > 0 ? chunk : 0;
 }
 
