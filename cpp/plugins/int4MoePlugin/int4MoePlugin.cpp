@@ -28,6 +28,7 @@
 #include "kernels/moe/moeMarlinIndicesKernels.h"
 #include "kernels/moe/moeTopkSoftmaxKernels.h"
 #include "kernels/moe/moe_marlin/moeMarlin.h"
+#include "routedExpertRing.h"
 #include "plugins/utils/pluginUtils.h"
 
 #include <algorithm>
@@ -713,6 +714,23 @@ int32_t prefillChunkFromEnv()
     return chunk > 0 ? chunk : 0;
 }
 
+//! EDGELLM_MOE_PREFILL_ROUTED_CHUNK=<experts> (serve time, needs an engine built with EDGELLM_MOE_STAGE_EXPERTS=2): prefill passes run the expert GEMMs in chunks of that many
+//! routed experts; after the router has run, only the routed experts are copied by DMA into a small ring (EDGELLM_MOE_PREFILL_ROUTED_RING slots, default 4)
+//! while the previous chunk's GEMM runs. Costs one host round trip of the routed list per layer.
+int32_t routedChunkFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_PREFILL_ROUTED_CHUNK");
+    int32_t const chunk = value != nullptr ? std::atoi(value) : 0;
+    return chunk > 0 ? chunk : 0;
+}
+
+int32_t routedRingFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_PREFILL_ROUTED_RING");
+    int32_t const slots = value != nullptr ? std::atoi(value) : 4;
+    return slots < 2 ? 2 : (slots > 16 ? 16 : slots);
+}
+
 class ExpertChunkRing
 {
 public:
@@ -1264,7 +1282,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                     }
                     ExpertChunkRing::get().reserve(bpe, mNumExperts, prefillChunkFromEnv());
                 }
-                else if (mStageExperts == 2 || prefillOverlapFromEnv())
+                else if ((mStageExperts == 2 && routedChunkFromEnv() == 0) || prefillOverlapFromEnv())
                 {
                     PrefillExpertPrefetcher::get().reserve(layerBytes, prefillOverlapFromEnv());
                 }
@@ -1779,7 +1797,26 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         uint8_t* privatePtrs[4]{};
         static int32_t const chunkExperts = prefillChunkFromEnv();
         bool chunkMode = false;
-        if (chunkExperts > 0 && mStageExperts == 2 && stageNow && !cacheStep && tileTokens == numTokens)
+        static int32_t const routedChunk = routedChunkFromEnv();
+        bool routedMode = false;
+        if (routedChunk > 0 && mStageExperts == 2 && stageNow && !cacheStep && tileTokens == numTokens && mNumExperts <= 1024)
+        {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess)
+            {
+                cudaGetLastError();
+            }
+            if (capture == cudaStreamCaptureStatusNone)
+            {
+                size_t bpe[4];
+                for (int32_t i = 0; i < 4; ++i)
+                {
+                    bpe[i] = tensorBytes[i] / mNumExperts;
+                }
+                routedMode = routedring::RoutedExpertRing::get().reserve(bpe, mNumExperts, routedChunk, routedRingFromEnv());
+            }
+        }
+        if (!routedMode && chunkExperts > 0 && mStageExperts == 2 && stageNow && !cacheStep && tileTokens == numTokens)
         {
             cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
             if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess)
@@ -1801,7 +1838,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                 }
             }
         }
-        if (stageNow && !cacheStep && !chunkMode && (prefillOverlap || mStageExperts == 2))
+        if (stageNow && !cacheStep && !chunkMode && !routedMode && (prefillOverlap || mStageExperts == 2))
         {
             void const* srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
             pfResult = PrefillExpertPrefetcher::get().begin(layerIdFromName(mLayerName), srcPtrs, tensorBytes, stream,
@@ -1816,7 +1853,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         {
             PrefillExpertPrefetcher::get().invalidate();
         }
-        if (chunkMode)
+        if (chunkMode || routedMode)
         {
             // the GEMMs run chunk by chunk on the ring buffers: no layer-wide staging
             alignedWorkspacePtr += stagedWorkspaceBytes(mStageExperts, stageDims, stageTypes);
@@ -2036,6 +2073,17 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         kernel::launchCountSlotsPerExpertKernel(
             tileTopkIdx, slotsPerExpertWorkspace, tokens, mTopK, mNumExperts, stream);
         CUDA_CHECK(cudaGetLastError());
+        if (routedMode)
+        {
+            routedring::RoutedExpertRing& ring = routedring::RoutedExpertRing::get();
+            kernel::launchBuildRoutedList(
+                slotsPerExpertWorkspace, mNumExperts, ring.routedListDevice(), ring.rankOfDevice(), ring.numRoutedDevice(), stream);
+            void const* const srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
+            if (ring.readRouted(stream) < 1 || !ring.beginLayer(srcPtrs, stream))
+            {
+                throw std::runtime_error("routed expert ring: layer not available");
+            }
+        }
 
         kernel::launchComputePaddedOffsetsKernel(slotsPerExpertWorkspace, paddedCountsPtr, paddedOffsetsPtr,
             numTokensPostPaddedPtr, mNumExperts, moeBlockSize, stream);
@@ -2070,6 +2118,35 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                                   nvinfer1::PluginTensorDesc const& scalesDesc, rt::Tensor const& gemmTopkWeights, int64_t gemmTopK,
                                   bool mulTopkWeights)
         {
+            if (routedMode)
+            {
+                routedring::RoutedExpertRing& routed = routedring::RoutedExpertRing::get();
+                for (int32_t c = 0; c < routed.chunksPerPhase(); ++c)
+                {
+                    int32_t const count = routed.chunkCount(c);
+                    kernel::launchBuildRoutedChunkIndices(paddedOffsetsPtr, paddedCountsPtr, sortedTokenIdsPtr, expertIdsPtr,
+                        routed.routedListDevice(), routed.rankOfDevice(), c * routed.chunkExperts(), count, moeBlockSize, tilePadded,
+                        chunkSortedIdsPtr, chunkExpertIdsPtr, chunkNumPostPtr, stream);
+                    uint8_t* base = nullptr;
+                    int32_t weightsOffset = 0;
+                    int32_t scalesOffset = 0;
+                    if (!routed.acquire(phase, c, stream, &base, &weightsOffset, &scalesOffset))
+                    {
+                        throw std::runtime_error("routed expert ring: task not available");
+                    }
+                    rt::Tensor chunkWeights(base + weightsOffset, rt::Coords{count, kTile, nOut}, rt::DeviceType::kGPU, DataType::kINT32);
+                    rt::Tensor chunkScales(base + scalesOffset, rt::Coords{count, scalesDesc.dims.d[1], scalesDesc.dims.d[2]},
+                        rt::DeviceType::kGPU, scalesDesc.type);
+                    rt::Tensor chunkSortedIds(chunkSortedIdsPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                    rt::Tensor chunkExpertIds(chunkExpertIdsPtr, {tileBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                    rt::Tensor chunkNumPost(chunkNumPostPtr, {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                    moeAwqW4A16MarlinGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, chunkSortedIds, chunkExpertIds, chunkNumPost,
+                        gemmTopkWeights, marlinWorkspaceTensor, moeBlockSize, gemmTopK, mulTopkWeights, stream);
+                    CUDA_CHECK(cudaGetLastError());
+                    routed.release(stream);
+                }
+                return;
+            }
             ExpertChunkRing& ring = ExpertChunkRing::get();
             int32_t const chunk = ring.chunkExperts();
             for (int32_t e0 = 0, c = 0; e0 < mNumExperts; e0 += chunk, ++c)
@@ -2098,7 +2175,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             }
         };
 
-        if (chunkMode)
+        if (chunkMode || routedMode)
         {
             runChunkedGemm(0, hiddenStates2D, gateUpOutputTensor, mHiddenSize / 16, 2 * mMoeInterSize, inputDesc[3], topkWeightsFlatTensor, mTopK, false);
         }
@@ -2132,7 +2209,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor topkWeightsPaddedTensor(
             topkWeightsPaddedPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
 
-        if (chunkMode)
+        if (chunkMode || routedMode)
         {
             runChunkedGemm(1, activationOutputTensor, downOutputTensor, mMoeInterSize / 16, 2 * mHiddenSize, inputDesc[5], topkWeightsPaddedTensor, 1, true);
         }
