@@ -1973,3 +1973,44 @@ def test_image_data_url_reaches_bytes_loader():
     }])
     assert len(buffers) == 1
     assert Runtime.loaded == b"encoded-image"
+
+
+def test_chat_forwards_presence_penalty_to_the_runtime(client_and_llm):
+    client, llm = client_and_llm
+    body = {"messages": [{"role": "user", "content": "Hello"}]}
+
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+    assert llm.last_sampling_params.presence_penalty == 0.0
+
+    response = client.post("/v1/chat/completions", json={**body, "presence_penalty": 1.5})
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.presence_penalty == 1.5
+
+    response = client.post("/v1/chat/completions", json={**body, "presence_penalty": -0.5})
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.presence_penalty == -0.5
+
+
+def test_chat_refuses_presence_penalty_with_speculative_decoding(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    llm = _FakeLLM(tmp_path)
+    llm.has_draft_model = True
+    client = TestClient(_create_app(llm, ApiConfig()))
+    body = {"messages": [{"role": "user", "content": "Hello"}], "presence_penalty": 1.0}
+
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code >= 400
+    assert response.json()["error"]["param"] == "presence_penalty"
+    body["presence_penalty"] = 0.0
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+
+
+def test_chat_rejects_presence_penalty_out_of_range(client_and_llm):
+    client, _ = client_and_llm
+    for value in (2.5, -3.0):
+        response = client.post("/v1/chat/completions",
+                               json={"messages": [{"role": "user", "content": "Hello"}], "presence_penalty": value})
+        assert response.status_code == 400

@@ -80,7 +80,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     messages: List[Dict[str, Any]]
     model: Optional[str] = None
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
-    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    presence_penalty: float = Field(
+        default_factory=lambda: _env_default("EDGELLM_DEFAULT_PRESENCE_PENALTY", float, 0.0, lambda v: -2.0 <= v <= 2.0),
+        ge=-2.0,
+        le=2.0)
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = Field(default=None, ge=0, le=50)

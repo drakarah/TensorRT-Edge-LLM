@@ -19,7 +19,8 @@ import pytest
 from experimental.server.api.protocol import ChatCompletionRequest
 
 _ENV = ("EDGELLM_DEFAULT_TEMPERATURE", "EDGELLM_DEFAULT_TOP_P",
-        "EDGELLM_DEFAULT_TOP_K", "EDGELLM_DEFAULT_ENABLE_THINKING")
+        "EDGELLM_DEFAULT_TOP_K", "EDGELLM_DEFAULT_ENABLE_THINKING",
+        "EDGELLM_DEFAULT_PRESENCE_PENALTY")
 
 
 def _request(**fields):
@@ -89,3 +90,16 @@ def test_out_of_range_environment_defaults_fall_back(monkeypatch, name, value, f
 def test_zero_temperature_default_is_greedy(monkeypatch):
     monkeypatch.setenv("EDGELLM_DEFAULT_TEMPERATURE", "0")
     assert _request().temperature == 0.0
+
+
+def test_presence_penalty_default_comes_from_the_environment(monkeypatch):
+    assert _request().presence_penalty == 0.0
+    monkeypatch.setenv("EDGELLM_DEFAULT_PRESENCE_PENALTY", "1.5")
+    assert _request().presence_penalty == 1.5
+    assert _request(presence_penalty=0.5).presence_penalty == 0.5
+
+
+@pytest.mark.parametrize("value", ["3", "-2.5", "x", ""])
+def test_invalid_presence_penalty_default_falls_back(monkeypatch, value):
+    monkeypatch.setenv("EDGELLM_DEFAULT_PRESENCE_PENALTY", value)
+    assert _request().presence_penalty == 0.0
