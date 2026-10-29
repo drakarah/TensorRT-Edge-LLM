@@ -590,12 +590,109 @@ __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, in
         }
     }
 }
+//! One warp per token: the biased scores live in registers (kPerLane experts per lane, expert e = lane + 32 * j), each of the topK rounds takes the lane-local
+//! best and a shuffle reduction (larger score first, then lower expert index), and every lane ends with the same chosen list. Same selection, tie-break
+//! and arithmetic as cacheAwareTopkKernel, without shared memory or block barriers.
+template <int32_t kPerLane>
+__global__ void cacheAwareTopkWarpKernel(float const* logits, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, int32_t const* slotOf,
+    int32_t* topkIndices, float* topkWeights)
+{
+    float const* row = logits + static_cast<size_t>(blockIdx.x) * numExperts;
+    int32_t const lane = threadIdx.x;
+    float score[kPerLane];
+#pragma unroll
+    for (int32_t j = 0; j < kPerLane; ++j)
+    {
+        int32_t const e = lane + 32 * j;
+        score[j] = e < numExperts ? sanitizeRouterLogit(row[e]) + (slotOf[e] >= 0 ? bias : 0.0f) : -3.4e38f;
+    }
+    int32_t chosen[kRouterMaxTopK];
+    float chosenLogit[kRouterMaxTopK];
+    for (int32_t k = 0; k < topK; ++k)
+    {
+        float best = score[0];
+        int32_t bestJ = 0;
+#pragma unroll
+        for (int32_t j = 1; j < kPerLane; ++j)
+        {
+            if (score[j] > best)
+            {
+                best = score[j];
+                bestJ = j;
+            }
+        }
+        int32_t bestIdx = lane + 32 * bestJ;
+#pragma unroll
+        for (int32_t off = 16; off > 0; off >>= 1)
+        {
+            float const ov = __shfl_xor_sync(0xffffffffu, best, off);
+            int32_t const oi = __shfl_xor_sync(0xffffffffu, bestIdx, off);
+            if (ov > best || (ov == best && oi < bestIdx))
+            {
+                best = ov;
+                bestIdx = oi;
+            }
+        }
+        bestIdx = bestIdx < numExperts ? bestIdx : 0;
+        chosen[k] = bestIdx;
+        chosenLogit[k] = sanitizeRouterLogit(row[bestIdx]);
+        if ((bestIdx & 31) == lane)
+        {
+            int32_t const j = bestIdx >> 5;
+#pragma unroll
+            for (int32_t jj = 0; jj < kPerLane; ++jj)
+            {
+                if (jj == j)
+                {
+                    score[jj] = -3.4e38f;
+                }
+            }
+        }
+    }
+    if (lane == 0)
+    {
+        float mx = chosenLogit[0];
+        for (int32_t k = 1; k < topK; ++k)
+        {
+            mx = fmaxf(mx, chosenLogit[k]);
+        }
+        float sum = 0.0f;
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            chosenLogit[k] = __expf(chosenLogit[k] - mx);
+            sum += chosenLogit[k];
+        }
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            int32_t id = chosen[k];
+            float w = chosenLogit[k] / sum;
+            if (tailSkip > 0 && k >= tailSkip && slotOf[id] < 0)
+            {
+                id = chosen[0];
+                w = 0.0f;
+            }
+            topkIndices[static_cast<size_t>(blockIdx.x) * topK + k] = id;
+            topkWeights[static_cast<size_t>(blockIdx.x) * topK + k] = w;
+        }
+    }
+}
 } // namespace
 
 void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, ExpertCacheState const& cache,
     int32_t* topkIndices, float* topkWeights, cudaStream_t stream)
 {
-    cacheAwareTopkKernel<<<numTokens, 256, numExperts * sizeof(float), stream>>>(logits, numExperts, topK, bias, tailSkip, cache.slotOf, topkIndices, topkWeights);
+    if (topK <= kRouterMaxTopK && numExperts <= 256)
+    {
+        cacheAwareTopkWarpKernel<8><<<numTokens, 32, 0, stream>>>(logits, numExperts, topK, bias, tailSkip, cache.slotOf, topkIndices, topkWeights);
+    }
+    else if (topK <= kRouterMaxTopK && numExperts <= 512)
+    {
+        cacheAwareTopkWarpKernel<16><<<numTokens, 32, 0, stream>>>(logits, numExperts, topK, bias, tailSkip, cache.slotOf, topkIndices, topkWeights);
+    }
+    else
+    {
+        cacheAwareTopkKernel<<<numTokens, 256, numExperts * sizeof(float), stream>>>(logits, numExperts, topK, bias, tailSkip, cache.slotOf, topkIndices, topkWeights);
+    }
 }
 
 namespace
