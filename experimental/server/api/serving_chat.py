@@ -123,6 +123,12 @@ class OpenAIServingChat:
         self._default_max_tokens = (max_model_len if isinstance(
             max_model_len, int) and max_model_len > 0 else
                                     _FALLBACK_MAX_TOKENS)
+        # EDGELLM_DEFAULT_MAX_TOKENS bounds only requests that send no
+        # max_tokens, so a generation that never reaches its end token stops
+        # after that many tokens instead of at the end of the context.
+        cap = os.environ.get("EDGELLM_DEFAULT_MAX_TOKENS", "")
+        if cap.isdigit() and int(cap) > 0:
+            self._default_max_tokens = min(self._default_max_tokens, int(cap))
         # Fail during startup instead of after the first request.
         REASONING_PARSERS.resolve(config.reasoning_parser, self._model_dir)
         if config.tool_call_parser not in list_tool_parsers():
