@@ -422,6 +422,141 @@ TEST_F(SamplingTest, ApplyLogitBiasCanBanGreedyTopToken)
     EXPECT_EQ(gpuResults[0], 1);
 }
 
+namespace
+{
+struct PresenceFixture
+{
+    PresenceFixture(int32_t rows, int32_t vocab)
+        : logits({rows, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT)
+        , lastTokens({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32)
+        , flags({rows, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8)
+    {
+        CUDA_CHECK(cudaMemset(flags.rawPointer(), 0, static_cast<size_t>(rows) * vocab));
+    }
+
+    rt::Tensor logits;
+    rt::Tensor lastTokens;
+    rt::Tensor flags;
+};
+} // namespace
+
+TEST_F(SamplingTest, PresencePenaltyMarksTheFedTokenAndPenalisesIt)
+{
+    PresenceFixture f(1, 6);
+    copyHostToDevice<float>(f.logits, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
+    copyHostToDevice<int32_t>(f.lastTokens, {2});
+    applyPresencePenalty(f.logits, f.lastTokens, f.flags, 1.5f, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(copyDeviceToHost<float>(f.logits), (std::vector<float>{1.0f, 2.0f, 1.5f, 4.0f, 5.0f, 6.0f}));
+    EXPECT_EQ(copyDeviceToHost<int8_t>(f.flags), (std::vector<int8_t>{0, 0, 1, 0, 0, 0}));
+}
+
+TEST_F(SamplingTest, PresencePenaltyAccumulatesAcrossStepsAndCountsEachTokenOnce)
+{
+    PresenceFixture f(1, 5);
+    std::vector<float> const fresh{10.0f, 10.0f, 10.0f, 10.0f, 10.0f};
+    for (auto const token : {1, 3, 1})
+    {
+        copyHostToDevice<float>(f.logits, fresh);
+        copyHostToDevice<int32_t>(f.lastTokens, {token});
+        applyPresencePenalty(f.logits, f.lastTokens, f.flags, 2.0f, 0);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // Token 1 was fed twice but is penalised once; token 3 once; the others not at all.
+    EXPECT_EQ(copyDeviceToHost<float>(f.logits), (std::vector<float>{10.0f, 8.0f, 10.0f, 8.0f, 10.0f}));
+}
+
+TEST_F(SamplingTest, PresencePenaltyKeepsRowsIndependent)
+{
+    PresenceFixture f(2, 4);
+    copyHostToDevice<float>(f.logits, {5.0f, 5.0f, 5.0f, 5.0f, 5.0f, 5.0f, 5.0f, 5.0f});
+    copyHostToDevice<int32_t>(f.lastTokens, {0, 3});
+    applyPresencePenalty(f.logits, f.lastTokens, f.flags, 1.0f, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(copyDeviceToHost<float>(f.logits), (std::vector<float>{4.0f, 5.0f, 5.0f, 5.0f, 5.0f, 5.0f, 5.0f, 4.0f}));
+}
+
+TEST_F(SamplingTest, PresencePenaltyIgnoresFedTokensOutsideTheVocabulary)
+{
+    PresenceFixture f(2, 4);
+    copyHostToDevice<float>(f.logits, {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f});
+    copyHostToDevice<int32_t>(f.lastTokens, {-1, 4});
+    applyPresencePenalty(f.logits, f.lastTokens, f.flags, 3.0f, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(copyDeviceToHost<float>(f.logits), (std::vector<float>(8, 1.0f)));
+    EXPECT_EQ(copyDeviceToHost<int8_t>(f.flags), (std::vector<int8_t>(8, 0)));
+}
+
+TEST_F(SamplingTest, NegativePresencePenaltyFavoursRepeats)
+{
+    PresenceFixture f(1, 3);
+    copyHostToDevice<float>(f.logits, {1.0f, 1.0f, 1.0f});
+    copyHostToDevice<int32_t>(f.lastTokens, {1});
+    applyPresencePenalty(f.logits, f.lastTokens, f.flags, -2.0f, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(copyDeviceToHost<float>(f.logits), (std::vector<float>{1.0f, 3.0f, 1.0f}));
+}
+
+TEST_F(SamplingTest, ClearedFlagsStopThePenalty)
+{
+    PresenceFixture f(1, 3);
+    copyHostToDevice<float>(f.logits, {2.0f, 2.0f, 2.0f});
+    copyHostToDevice<int32_t>(f.lastTokens, {0});
+    applyPresencePenalty(f.logits, f.lastTokens, f.flags, 1.0f, 0);
+    CUDA_CHECK(cudaMemset(f.flags.rawPointer(), 0, 3));
+    copyHostToDevice<float>(f.logits, {2.0f, 2.0f, 2.0f});
+    copyHostToDevice<int32_t>(f.lastTokens, {-1});
+    applyPresencePenalty(f.logits, f.lastTokens, f.flags, 1.0f, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(copyDeviceToHost<float>(f.logits), (std::vector<float>(3, 2.0f)));
+}
+
+TEST_F(SamplingTest, PresencePenaltyReachesTheLastBlockOfALargeVocabulary)
+{
+    constexpr int32_t kVOCAB_SIZE = 248320;
+    PresenceFixture f(1, kVOCAB_SIZE);
+    std::vector<float> const ones(kVOCAB_SIZE, 1.0f);
+    for (auto const token : {255, 256, kVOCAB_SIZE - 1})
+    {
+        copyHostToDevice<float>(f.logits, ones);
+        copyHostToDevice<int32_t>(f.lastTokens, {token});
+        applyPresencePenalty(f.logits, f.lastTokens, f.flags, 0.5f, 0);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto const result = copyDeviceToHost<float>(f.logits);
+    for (int32_t i = 0; i < kVOCAB_SIZE; ++i)
+    {
+        float const expected = (i == 255 || i == 256 || i == kVOCAB_SIZE - 1) ? 0.5f : 1.0f;
+        ASSERT_EQ(result[i], expected) << "token " << i;
+    }
+}
+
+TEST_F(SamplingTest, PresencePenaltyCanChangeTheGreedyChoice)
+{
+    PresenceFixture f(1, 4);
+    copyHostToDevice<float>(f.logits, {9.0f, 8.5f, 1.0f, 1.0f});
+    copyHostToDevice<int32_t>(f.lastTokens, {0});
+    applyPresencePenalty(f.logits, f.lastTokens, f.flags, 1.0f, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    rt::Tensor selected({1, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    size_t const workspaceSize = getSelectAllTopKWorkspaceSize(1, 4, 1);
+    rt::Tensor workspace({static_cast<int64_t>(workspaceSize)}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    selectAllTopK(f.logits, std::nullopt, selected, 1, workspace, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(copyDeviceToHost<int32_t>(selected)[0], 1);
+}
+
+TEST_F(SamplingTest, PresencePenaltyRejectsMismatchedTensors)
+{
+    PresenceFixture f(1, 4);
+    rt::Tensor wrongFlagVocab({1, 5}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    EXPECT_THROW(applyPresencePenalty(f.logits, f.lastTokens, wrongFlagVocab, 1.0f, 0), std::runtime_error);
+    rt::Tensor wrongFlagType({1, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    EXPECT_THROW(applyPresencePenalty(f.logits, f.lastTokens, wrongFlagType, 1.0f, 0), std::runtime_error);
+    rt::Tensor noTokens({0}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    EXPECT_THROW(applyPresencePenalty(f.logits, noTokens, f.flags, 1.0f, 0), std::runtime_error);
+}
+
 TEST_F(SamplingTest, ApplyLogitBiasRepeatedRowsUsesOwningBatchSlot)
 {
     constexpr int32_t kBATCH_SIZE = 2;
