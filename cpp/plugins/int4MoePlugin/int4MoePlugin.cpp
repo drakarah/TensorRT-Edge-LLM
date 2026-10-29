@@ -158,13 +158,22 @@ size_t stagedExpertBytes(nvinfer1::Dims const* const dims[4], nvinfer1::DataType
     return total + 256; // + the routed-expert bitmap
 }
 
-//! EDGELLM_MOE_PREFILL_OVERLAP=1 (runtime): during prefill passes (>= kPrefetchMinTokens tokens) the experts of layer L+1 are copied by DMA on a
+//! EDGELLM_MOE_PREFILL_OVERLAP=1 (runtime): during prefill passes (>= EDGELLM_MOE_PREFILL_OVERLAP_MIN_TOKENS tokens) the experts of layer L+1 are copied by DMA on a
 //! side stream into one of two private device buffers while layer L computes, so the PCIe copy that the routed-expert staging puts in front of every
 //! layer's GEMMs (about 40% of a 3k-token prefill, METRICS R25m) is hidden behind compute. With that many tokens nearly every expert is routed in
 //! every layer, so copying the whole layer is not wasteful. The first layer of a pass, chunks below the threshold and decode steps keep the staging
 //! kernel / the expert cache. With stage mode 2 (engine built with EDGELLM_MOE_STAGE_EXPERTS=2) the staging kernel writes into buffer 0 of the same
 //! private pair instead of the TRT workspace, so the pair replaces the workspace head (net cost: one layer of INT4 experts, ~386 MB for the 26B).
-constexpr int32_t kPrefetchMinTokens = 128;
+//! EDGELLM_MOE_PREFILL_OVERLAP_MIN_TOKENS (runtime, default 128): passes below this many tokens stage only their routed experts instead. The overlap copies the
+//! whole layer in a fixed time (1.9 s per pass on an RTX 4060 laptop), which a pass of up to about 1,100 tokens of ordinary text does not need.
+int32_t prefetchMinTokens()
+{
+    static int32_t const value = []() {
+        char const* const env = std::getenv("EDGELLM_MOE_PREFILL_OVERLAP_MIN_TOKENS");
+        return env != nullptr ? std::max(1, std::atoi(env)) : 128;
+    }();
+    return value;
+}
 
 bool prefillOverlapFromEnv()
 {
@@ -1857,7 +1866,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         {
             void const* srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
             pfResult = PrefillExpertPrefetcher::get().begin(layerIdFromName(mLayerName), srcPtrs, tensorBytes, stream,
-                prefillOverlap && numTokens >= kPrefetchMinTokens, mStageExperts == 2, privatePtrs);
+                prefillOverlap && numTokens >= prefetchMinTokens(), mStageExperts == 2, privatePtrs);
             if (mStageExperts == 2 && pfResult == PrefillExpertPrefetcher::Result::kNone)
             {
                 LOG_ERROR("Int4MoePlugin %s: private staging buffer unavailable", mLayerName.c_str());
