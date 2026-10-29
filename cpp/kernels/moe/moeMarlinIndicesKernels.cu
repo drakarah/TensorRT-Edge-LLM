@@ -527,11 +527,8 @@ __global__ void expertCacheLookupKernel(int32_t* topkIndices, int32_t count, int
     for (int32_t i = threadIdx.x; i < count; i += blockDim.x)
     {
         int32_t const e = topkIndices[i];
-        if (e >= 0 && e < numExperts)
-        {
-            int32_t const slot = cache.slotOf[e];
-            topkIndices[i] = slot >= 0 ? slot : 0;
-        }
+        int32_t const slot = e >= 0 && e < numExperts ? cache.slotOf[e] : -1;
+        topkIndices[i] = slot >= 0 ? slot : 0;
     }
 }
 

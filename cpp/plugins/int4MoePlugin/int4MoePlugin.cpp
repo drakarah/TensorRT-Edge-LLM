@@ -1314,6 +1314,14 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
         }
         bytes *= inputDesc[2 + i].type == DataType::kHALF ? 2 : 1;
         mCacheBytesPerExpert[i] = bytes / mNumExperts;
+        if (mCacheBytesPerExpert[i] % 16 != 0)
+        {
+            // the fill kernel moves 16-byte vectors
+            LOG_WARNING("Int4MoePlugin %s: expert cache disabled, tensor %d holds %zu bytes per expert (not a multiple of 16)", mLayerName.c_str(), i,
+                mCacheBytesPerExpert[i]);
+            mCacheSlots = 0;
+            return false;
+        }
         total += (mCacheBytesPerExpert[i] * mCacheSlots + 255) & ~static_cast<size_t>(255);
     }
     size_t const stateInts = mNumExperts + 2 * static_cast<size_t>(mCacheSlots) + 1 + 1 + 2 * mCacheSlots + 3;
