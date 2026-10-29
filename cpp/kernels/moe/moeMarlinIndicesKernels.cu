@@ -326,6 +326,148 @@ namespace
 {
 // One block: looks the experts selected by the (<= a few) tokens up in a per-layer slot cache, assigns the least recently used
 // slot (not used by this call) to every miss, records the misses and rewrites the top-k expert ids to slot ids.
+constexpr int32_t kLookupMaxRegisterSlots = 256;
+
+//! Single-thread slot assignment, for caches with more slots than the warp version keeps in registers.
+__device__ void lookupSerial(ExpertCacheState const& cache, int32_t const* list, int32_t numNeeded, int32_t stamp)
+{
+    int32_t misses = 0;
+    int32_t distinct = 0;
+    for (int32_t i = 0; i < numNeeded; ++i)
+    {
+        int32_t const e = list[i];
+        ++distinct;
+        int32_t slot = cache.slotOf[e];
+        if (slot < 0)
+        {
+            int32_t best = -1;
+            int32_t bestUse = 0x7fffffff;
+            for (int32_t s = 0; s < cache.numSlots; ++s)
+            {
+                int32_t const use = cache.lastUse[s];
+                if (use != stamp && use < bestUse)
+                {
+                    bestUse = use;
+                    best = s;
+                }
+            }
+            if (best < 0)
+            {
+                continue; // more distinct experts than slots: the caller keeps this path to <= numSlots / topK tokens
+            }
+            int32_t const old = cache.expertOf[best];
+            if (old >= 0)
+            {
+                cache.slotOf[old] = -1;
+            }
+            cache.slotOf[e] = best;
+            cache.expertOf[best] = e;
+            cache.missList[1 + 2 * misses] = e;
+            cache.missList[2 + 2 * misses] = best;
+            ++misses;
+            slot = best;
+        }
+        cache.lastUse[slot] = stamp;
+    }
+    cache.missList[0] = misses;
+    if (cache.tally != nullptr)
+    {
+        cache.tally[0] += 1;
+        cache.tally[1] += distinct;
+        cache.tally[2] += misses;
+    }
+}
+
+//! Slot assignment by one warp: the last-use stamps of the cache slots live in registers (slot s on lane s % 32), a miss takes the least recently used
+//! slot not used by this call (lowest slot index among equals, as the serial scan does) through a shuffle reduction, and lane 0 owns slotOf / expertOf / missList.
+__device__ void lookupWarp(ExpertCacheState const& cache, int32_t const* list, int32_t numNeeded, int32_t numExperts, int32_t stamp)
+{
+    constexpr int32_t kPerLane = kLookupMaxRegisterSlots / 32;
+    constexpr int32_t kNone = 0x7fffffff;
+    int32_t const lane = threadIdx.x;
+    int32_t use[kPerLane];
+#pragma unroll
+    for (int32_t j = 0; j < kPerLane; ++j)
+    {
+        int32_t const s = lane + 32 * j;
+        use[j] = s < cache.numSlots ? cache.lastUse[s] : kNone;
+    }
+    int32_t misses = 0;
+    int32_t distinct = 0;
+    for (int32_t i = 0; i < numNeeded; ++i)
+    {
+        int32_t const e = list[i];
+        ++distinct;
+        int32_t slot = lane == 0 ? cache.slotOf[e] : 0;
+        slot = __shfl_sync(0xffffffffu, slot, 0);
+        if (slot < 0)
+        {
+            int32_t bestUse = kNone;
+            int32_t best = -1;
+#pragma unroll
+            for (int32_t j = 0; j < kPerLane; ++j)
+            {
+                if (use[j] != stamp && use[j] < bestUse)
+                {
+                    bestUse = use[j];
+                    best = lane + 32 * j;
+                }
+            }
+#pragma unroll
+            for (int32_t off = 16; off > 0; off >>= 1)
+            {
+                int32_t const ou = __shfl_xor_sync(0xffffffffu, bestUse, off);
+                int32_t const ob = __shfl_xor_sync(0xffffffffu, best, off);
+                if (ou < bestUse || (ou == bestUse && ob >= 0 && (best < 0 || ob < best)))
+                {
+                    bestUse = ou;
+                    best = ob;
+                }
+            }
+            if (best < 0)
+            {
+                continue; // more distinct experts than slots: the caller keeps this path to <= numSlots / topK tokens
+            }
+            if (lane == 0)
+            {
+                int32_t const old = cache.expertOf[best];
+                if (old >= 0)
+                {
+                    cache.slotOf[old] = -1;
+                }
+                cache.slotOf[e] = best;
+                cache.expertOf[best] = e;
+                cache.missList[1 + 2 * misses] = e;
+                cache.missList[2 + 2 * misses] = best;
+            }
+            ++misses;
+            slot = best;
+        }
+        if ((slot & 31) == lane)
+        {
+#pragma unroll
+            for (int32_t j = 0; j < kPerLane; ++j)
+            {
+                if (j == (slot >> 5))
+                {
+                    use[j] = stamp;
+                }
+            }
+            cache.lastUse[slot] = stamp;
+        }
+    }
+    if (lane == 0)
+    {
+        cache.missList[0] = misses;
+        if (cache.tally != nullptr)
+        {
+            cache.tally[0] += 1;
+            cache.tally[1] += distinct;
+            cache.tally[2] += misses;
+        }
+    }
+}
+
 __global__ void expertCacheLookupKernel(int32_t* topkIndices, int32_t count, int32_t numExperts, ExpertCacheState cache)
 {
     __shared__ int32_t stamp;
@@ -368,51 +510,18 @@ __global__ void expertCacheLookupKernel(int32_t* topkIndices, int32_t count, int
     if (threadIdx.x == 0)
     {
         stamp = ++cache.counter[0];
-        int32_t misses = 0;
-        int32_t distinct = 0;
-        for (int32_t i = 0; i < numNeeded; ++i)
+    }
+    __syncthreads();
+    if (cache.numSlots <= kLookupMaxRegisterSlots)
+    {
+        if (threadIdx.x < 32)
         {
-            int32_t const e = list[i];
-            ++distinct;
-            int32_t slot = cache.slotOf[e];
-            if (slot < 0)
-            {
-                int32_t best = -1;
-                int32_t bestUse = 0x7fffffff;
-                for (int32_t s = 0; s < cache.numSlots; ++s)
-                {
-                    int32_t const use = cache.lastUse[s];
-                    if (use != stamp && use < bestUse)
-                    {
-                        bestUse = use;
-                        best = s;
-                    }
-                }
-                if (best < 0)
-                {
-                    continue; // more distinct experts than slots: the caller keeps this path to <= numSlots / topK tokens
-                }
-                int32_t const old = cache.expertOf[best];
-                if (old >= 0)
-                {
-                    cache.slotOf[old] = -1;
-                }
-                cache.slotOf[e] = best;
-                cache.expertOf[best] = e;
-                cache.missList[1 + 2 * misses] = e;
-                cache.missList[2 + 2 * misses] = best;
-                ++misses;
-                slot = best;
-            }
-            cache.lastUse[slot] = stamp;
+            lookupWarp(cache, list, numNeeded, numExperts, stamp);
         }
-        cache.missList[0] = misses;
-        if (cache.tally != nullptr)
-        {
-            cache.tally[0] += 1;
-            cache.tally[1] += distinct;
-            cache.tally[2] += misses;
-        }
+    }
+    else if (threadIdx.x == 0)
+    {
+        lookupSerial(cache, list, numNeeded, stamp);
     }
     __syncthreads();
     for (int32_t i = threadIdx.x; i < count; i += blockDim.x)
