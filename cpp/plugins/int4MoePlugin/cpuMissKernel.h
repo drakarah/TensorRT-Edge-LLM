@@ -17,6 +17,26 @@
 
 #pragma once
 
+#include <cstdint>
+
+namespace trt_edgellm
+{
+namespace plugins
+{
+namespace cpumiss
+{
+
+//! Shapes the CPU kernels handle: groups of 128, hidden and intermediate size multiples of 128 and more than one scale group (with a single group the exporter
+//! stores the scales in a different permutation, which these kernels do not read), intermediate size up to 1024, hidden size up to kCpuMissMaxHidden.
+inline bool shapeSupported(int64_t hidden, int64_t inter, int64_t groupSize, int64_t maxHidden)
+{
+    return groupSize == 128 && hidden % 128 == 0 && inter % 128 == 0 && hidden > groupSize && inter > groupSize && inter <= 1024 && hidden <= maxHidden;
+}
+
+} // namespace cpumiss
+} // namespace plugins
+} // namespace trt_edgellm
+
 #if defined(__x86_64__)
 
 #include <immintrin.h>

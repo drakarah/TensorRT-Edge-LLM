@@ -28,6 +28,7 @@
 #include "kernels/moe/moeMarlinIndicesKernels.h"
 #include "kernels/moe/moeTopkSoftmaxKernels.h"
 #include "kernels/moe/moe_marlin/moeMarlin.h"
+#include "routedExpertRing.h"
 #include "plugins/utils/pluginUtils.h"
 
 #include <algorithm>
@@ -38,6 +39,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <string>
 #include <thread>
@@ -233,6 +235,99 @@ int32_t layerIdFromName(std::string const& name) noexcept
     return pos == std::string::npos ? -1 : std::atoi(name.c_str() + pos + 1);
 }
 
+//! EDGELLM_FINITE_WATCH=1: every MoE layer records, for its input and output, the count of non-finite values, the largest finite |x| and the count of
+//! |x| >= 30000 (fp16 limit 65504). A host thread reads the device counters on its own stream and logs changes; nothing else synchronises with it.
+class FiniteWatch
+{
+public:
+    static constexpr int32_t kSlots = 512;
+
+    static FiniteWatch* get() noexcept
+    {
+        static FiniteWatch* instance = []() -> FiniteWatch* {
+            char const* value = std::getenv("EDGELLM_FINITE_WATCH");
+            if (value == nullptr || std::atoi(value) == 0)
+            {
+                return nullptr;
+            }
+            auto* watch = new FiniteWatch();
+            return watch->mReady ? watch : nullptr;
+        }();
+        return instance;
+    }
+
+    uint32_t* counters(int32_t layerId, int32_t which) noexcept
+    {
+        int32_t const slot = layerId >= 0 && layerId < kSlots ? layerId : 0;
+        return mDevice + (static_cast<size_t>(slot) * 2 + which) * 3;
+    }
+
+private:
+    FiniteWatch()
+    {
+        size_t const bytes = static_cast<size_t>(kSlots) * 2 * 3 * sizeof(uint32_t);
+        if (cudaMalloc(reinterpret_cast<void**>(&mDevice), bytes) != cudaSuccess || cudaMemset(mDevice, 0, bytes) != cudaSuccess
+            || cudaStreamCreateWithFlags(&mStream, cudaStreamNonBlocking) != cudaSuccess)
+        {
+            cudaGetLastError();
+            return;
+        }
+        mHost.assign(static_cast<size_t>(kSlots) * 2 * 3, 0);
+        mLast.assign(mHost.size(), 0);
+        mReady = true;
+        std::thread([this]() { run(); }).detach();
+    }
+
+    void run() noexcept
+    {
+        int32_t tick = 0;
+        while (true)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (cudaMemcpyAsync(mHost.data(), mDevice, mHost.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, mStream) != cudaSuccess
+                || cudaStreamSynchronize(mStream) != cudaSuccess)
+            {
+                cudaGetLastError();
+                continue;
+            }
+            float worst = 0.0F;
+            int32_t worstSlot = -1;
+            for (int32_t slot = 0; slot < kSlots * 2; ++slot)
+            {
+                uint32_t const bad = mHost[slot * 3];
+                float maxAbs;
+                std::memcpy(&maxAbs, &mHost[slot * 3 + 1], sizeof(float));
+                if (bad != mLast[slot * 3])
+                {
+                    LOG_ERROR("FINITE: layer node %d %s: %u non-finite values so far (largest finite |x| %.1f)", slot / 2, slot % 2 == 0 ? "input" : "output", bad, maxAbs);
+                    mLast[slot * 3] = bad;
+                }
+                if (maxAbs > worst)
+                {
+                    worst = maxAbs;
+                    worstSlot = slot;
+                }
+            }
+            if (++tick % 12 == 0 && worstSlot >= 0)
+            {
+                uint32_t near = 0;
+                for (int32_t slot = 0; slot < kSlots * 2; ++slot)
+                {
+                    near += mHost[slot * 3 + 2];
+                }
+                LOG_INFO("FINITE: largest |x| %.1f (%.0f%% of the fp16 limit) at layer node %d %s; values >= 30000 so far: %u", worst, 100.0F * worst / 65504.0F,
+                    worstSlot / 2, worstSlot % 2 == 0 ? "input" : "output", near);
+            }
+        }
+    }
+
+    uint32_t* mDevice{nullptr};
+    cudaStream_t mStream{nullptr};
+    std::vector<uint32_t> mHost;
+    std::vector<uint32_t> mLast;
+    bool mReady{false};
+};
+
 //! Layer ids of the MoE plugins of this process (for the automatic cache sizing). The node name carries a " [profile N]" suffix per optimisation
 //! profile, so the layers are counted by their id, not by the name string.
 std::set<int32_t>& moeLayerNames()
@@ -394,7 +489,10 @@ public:
             if (ok && !mBatchDst.empty())
             {
                 // one driver call for the whole layer instead of a few hundred cudaMemcpyAsync calls
-                if (cudaMemcpyBatchAsync(mBatchDst.data(), mBatchSrc.data(), mBatchSize.data(), mBatchDst.size(), nullptr, nullptr, 0, mSide)
+                cudaMemcpyAttributes attrs{};
+                attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+                size_t attrsIdx = 0;
+                if (cudaMemcpyBatchAsync(mBatchDst.data(), mBatchSrc.data(), mBatchSize.data(), mBatchDst.size(), &attrs, &attrsIdx, 1, mSide)
                     != cudaSuccess)
                 {
                     cudaGetLastError();
@@ -614,6 +712,23 @@ int32_t prefillChunkFromEnv()
     char const* const value = std::getenv("EDGELLM_MOE_PREFILL_CHUNK");
     int32_t const chunk = value != nullptr ? std::atoi(value) : 0;
     return chunk > 0 ? chunk : 0;
+}
+
+//! EDGELLM_MOE_PREFILL_ROUTED_CHUNK=<experts> (serve time, default 16, 0 = off; needs an engine built with EDGELLM_MOE_STAGE_EXPERTS=2): prefill passes that fit one
+//! token tile run the expert GEMMs in chunks of that many routed experts; after the router has run, only the routed experts are copied by DMA into a small ring
+//! (EDGELLM_MOE_PREFILL_ROUTED_RING slots, default 4) while the previous chunk's GEMM runs. Costs one host round trip of the routed list per layer.
+int32_t routedChunkFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_PREFILL_ROUTED_CHUNK");
+    int32_t const chunk = value != nullptr ? std::atoi(value) : 16;
+    return chunk > 0 ? chunk : 0;
+}
+
+int32_t routedRingFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_PREFILL_ROUTED_RING");
+    int32_t const slots = value != nullptr ? std::atoi(value) : 4;
+    return slots < 2 ? 2 : (slots > 16 ? 16 : slots);
 }
 
 class ExpertChunkRing
@@ -980,6 +1095,7 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, int32_t const numExperts, 
     , mQuantizationGroupSize(quantizationGroupSize)
 {
     registerMoeLayerName(mLayerName);
+    FiniteWatch::get();
     if (std::find(kSUPPORTED_ACTIVATION_TYPES.begin(), kSUPPORTED_ACTIVATION_TYPES.end(), mActivationType)
         == kSUPPORTED_ACTIVATION_TYPES.end())
     {
@@ -992,6 +1108,7 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
     : mLayerName(name)
 {
     registerMoeLayerName(mLayerName);
+    FiniteWatch::get();
     for (int32_t i = 0; i < fc->nbFields; ++i)
     {
         std::string fieldName(fc->fields[i].name);
@@ -1151,6 +1268,20 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                     perSlot += bytes / mNumExperts + 256;
                     layerBytes += (bytes + 255) & ~static_cast<size_t>(255);
                 }
+                if (mStageExperts == 2 && routedChunkFromEnv() > 0 && mNumExperts <= 1024)
+                {
+                    size_t bpe[4];
+                    for (int32_t i = 0; i < 4; ++i)
+                    {
+                        size_t bytes = 1;
+                        for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+                        {
+                            bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+                        }
+                        bpe[i] = bytes * (inputDesc[2 + i].type == DataType::kHALF ? 2 : 1) / mNumExperts;
+                    }
+                    routedring::RoutedExpertRing::get().reserve(bpe, mNumExperts, routedChunkFromEnv(), routedRingFromEnv());
+                }
                 if (mStageExperts == 2 && prefillChunkFromEnv() > 0)
                 {
                     size_t bpe[4];
@@ -1218,6 +1349,14 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
         }
         bytes *= inputDesc[2 + i].type == DataType::kHALF ? 2 : 1;
         mCacheBytesPerExpert[i] = bytes / mNumExperts;
+        if (mCacheBytesPerExpert[i] % 16 != 0)
+        {
+            // the fill kernel moves 16-byte vectors
+            LOG_WARNING("Int4MoePlugin %s: expert cache disabled, tensor %d holds %zu bytes per expert (not a multiple of 16)", mLayerName.c_str(), i,
+                mCacheBytesPerExpert[i]);
+            mCacheSlots = 0;
+            return false;
+        }
         total += (mCacheBytesPerExpert[i] * mCacheSlots + 255) & ~static_cast<size_t>(255);
     }
     size_t const stateInts = mNumExperts + 2 * static_cast<size_t>(mCacheSlots) + 1 + 1 + 2 * mCacheSlots + 3;
@@ -1263,8 +1402,8 @@ bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
     size_t const inter = static_cast<size_t>(mMoeInterSize);
     size_t const n1 = 2 * inter;
     size_t const expected[4] = {(hidden / 16) * 2 * n1 * 4, (hidden / 128) * n1 * 2, (inter / 16) * 2 * hidden * 4, (inter / 128) * hidden * 2};
-    bool ok = mQuantizationGroupSize == 128 && mActivationType != kACTIVATION_GEGLU && hidden % 128 == 0 && inter % 128 == 0 && inter <= 1024
-        && hidden <= static_cast<size_t>(kernel::kCpuMissMaxHidden);
+    bool ok = mActivationType != kACTIVATION_GEGLU
+        && cpumiss::shapeSupported(mHiddenSize, mMoeInterSize, mQuantizationGroupSize, kernel::kCpuMissMaxHidden);
     for (int32_t i = 0; i < 4; ++i)
     {
         ok = ok && mCacheBytesPerExpert[i] == expected[i];
@@ -1623,6 +1762,10 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             return -1;
         }
         int32_t const numTokens = static_cast<int32_t>(numTokens64);
+        if (FiniteWatch* watch = FiniteWatch::get(); watch != nullptr && hiddenStatesDesc.type == DataType::kHALF)
+        {
+            kernel::launchFiniteWatch(static_cast<half const*>(inputs[1]), numTokens64 * mHiddenSize, watch->counters(layerIdFromName(mLayerName), 0), stream);
+        }
         int32_t const tileTokens = mTokenTile > 0 ? std::min(numTokens, mTokenTile) : numTokens;
         int32_t const moeBlockSize = getTunedMoeBlockSize(tileTokens);
 
@@ -1668,7 +1811,26 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         uint8_t* privatePtrs[4]{};
         static int32_t const chunkExperts = prefillChunkFromEnv();
         bool chunkMode = false;
-        if (chunkExperts > 0 && mStageExperts == 2 && stageNow && !cacheStep && tileTokens == numTokens)
+        static int32_t const routedChunk = routedChunkFromEnv();
+        bool routedMode = false;
+        if (routedChunk > 0 && mStageExperts == 2 && stageNow && !cacheStep && tileTokens == numTokens && mNumExperts <= 1024)
+        {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess)
+            {
+                cudaGetLastError();
+            }
+            if (capture == cudaStreamCaptureStatusNone)
+            {
+                size_t bpe[4];
+                for (int32_t i = 0; i < 4; ++i)
+                {
+                    bpe[i] = tensorBytes[i] / mNumExperts;
+                }
+                routedMode = routedring::RoutedExpertRing::get().reserve(bpe, mNumExperts, routedChunk, routedRingFromEnv());
+            }
+        }
+        if (!routedMode && chunkExperts > 0 && mStageExperts == 2 && stageNow && !cacheStep && tileTokens == numTokens)
         {
             cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
             if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess)
@@ -1690,7 +1852,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                 }
             }
         }
-        if (stageNow && !cacheStep && !chunkMode && (prefillOverlap || mStageExperts == 2))
+        if (stageNow && !cacheStep && !chunkMode && !routedMode && (prefillOverlap || mStageExperts == 2))
         {
             void const* srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
             pfResult = PrefillExpertPrefetcher::get().begin(layerIdFromName(mLayerName), srcPtrs, tensorBytes, stream,
@@ -1705,7 +1867,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         {
             PrefillExpertPrefetcher::get().invalidate();
         }
-        if (chunkMode)
+        if (chunkMode || routedMode)
         {
             // the GEMMs run chunk by chunk on the ring buffers: no layer-wide staging
             alignedWorkspacePtr += stagedWorkspaceBytes(mStageExperts, stageDims, stageTypes);
@@ -1859,6 +2021,11 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         {
             kernel::ExpertCacheState const biasState{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
                 mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
+            if (mTopK > kernel::kRouterMaxTopK)
+            {
+                LOG_ERROR("Int4MoePlugin %s: cache-aware routing supports at most %d experts per token (top-k %d)", mLayerName.c_str(), kernel::kRouterMaxTopK, mTopK);
+                return -1;
+            }
             kernel::launchCacheAwareTopk(static_cast<float const*>(inputs[0]), numTokens, mNumExperts, mTopK, cacheBiasFromEnv(), tailSkipFromEnv(), biasState,
                 topkIndicesPtr, topkWeightsPtr, stream);
         }
@@ -1920,6 +2087,17 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         kernel::launchCountSlotsPerExpertKernel(
             tileTopkIdx, slotsPerExpertWorkspace, tokens, mTopK, mNumExperts, stream);
         CUDA_CHECK(cudaGetLastError());
+        if (routedMode)
+        {
+            routedring::RoutedExpertRing& ring = routedring::RoutedExpertRing::get();
+            kernel::launchBuildRoutedList(
+                slotsPerExpertWorkspace, mNumExperts, ring.routedListDevice(), ring.rankOfDevice(), ring.numRoutedDevice(), stream);
+            void const* const srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
+            if (ring.readRouted(stream) < 1 || !ring.beginLayer(srcPtrs, stream))
+            {
+                throw std::runtime_error("routed expert ring: layer not available");
+            }
+        }
 
         kernel::launchComputePaddedOffsetsKernel(slotsPerExpertWorkspace, paddedCountsPtr, paddedOffsetsPtr,
             numTokensPostPaddedPtr, mNumExperts, moeBlockSize, stream);
@@ -1954,6 +2132,35 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                                   nvinfer1::PluginTensorDesc const& scalesDesc, rt::Tensor const& gemmTopkWeights, int64_t gemmTopK,
                                   bool mulTopkWeights)
         {
+            if (routedMode)
+            {
+                routedring::RoutedExpertRing& routed = routedring::RoutedExpertRing::get();
+                for (int32_t c = 0; c < routed.chunksPerPhase(); ++c)
+                {
+                    int32_t const count = routed.chunkCount(c);
+                    kernel::launchBuildRoutedChunkIndices(paddedOffsetsPtr, paddedCountsPtr, sortedTokenIdsPtr, expertIdsPtr,
+                        routed.routedListDevice(), routed.rankOfDevice(), c * routed.chunkExperts(), count, moeBlockSize, tilePadded,
+                        chunkSortedIdsPtr, chunkExpertIdsPtr, chunkNumPostPtr, stream);
+                    uint8_t* base = nullptr;
+                    int32_t weightsOffset = 0;
+                    int32_t scalesOffset = 0;
+                    if (!routed.acquire(phase, c, stream, &base, &weightsOffset, &scalesOffset))
+                    {
+                        throw std::runtime_error("routed expert ring: task not available");
+                    }
+                    rt::Tensor chunkWeights(base + weightsOffset, rt::Coords{count, kTile, nOut}, rt::DeviceType::kGPU, DataType::kINT32);
+                    rt::Tensor chunkScales(base + scalesOffset, rt::Coords{count, scalesDesc.dims.d[1], scalesDesc.dims.d[2]},
+                        rt::DeviceType::kGPU, scalesDesc.type);
+                    rt::Tensor chunkSortedIds(chunkSortedIdsPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                    rt::Tensor chunkExpertIds(chunkExpertIdsPtr, {tileBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                    rt::Tensor chunkNumPost(chunkNumPostPtr, {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                    moeAwqW4A16MarlinGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, chunkSortedIds, chunkExpertIds, chunkNumPost,
+                        gemmTopkWeights, marlinWorkspaceTensor, moeBlockSize, gemmTopK, mulTopkWeights, stream);
+                    CUDA_CHECK(cudaGetLastError());
+                    routed.release(stream);
+                }
+                return;
+            }
             ExpertChunkRing& ring = ExpertChunkRing::get();
             int32_t const chunk = ring.chunkExperts();
             for (int32_t e0 = 0, c = 0; e0 < mNumExperts; e0 += chunk, ++c)
@@ -1982,7 +2189,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             }
         };
 
-        if (chunkMode)
+        if (chunkMode || routedMode)
         {
             runChunkedGemm(0, hiddenStates2D, gateUpOutputTensor, mHiddenSize / 16, 2 * mMoeInterSize, inputDesc[3], topkWeightsFlatTensor, mTopK, false);
         }
@@ -2016,7 +2223,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor topkWeightsPaddedTensor(
             topkWeightsPaddedPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
 
-        if (chunkMode)
+        if (chunkMode || routedMode)
         {
             runChunkedGemm(1, activationOutputTensor, downOutputTensor, mMoeInterSize / 16, 2 * mHiddenSize, inputDesc[5], topkWeightsPaddedTensor, 1, true);
         }
@@ -2041,6 +2248,10 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         for (int32_t t0 = 0; t0 < numTokens; t0 += tileTokens)
         {
             runTile(t0, std::min(tileTokens, numTokens - t0));
+        }
+        if (FiniteWatch* watch = FiniteWatch::get(); watch != nullptr && outputDesc[0].type == DataType::kHALF)
+        {
+            kernel::launchFiniteWatch(static_cast<half const*>(outputs[0]), numTokens64 * mHiddenSize, watch->counters(layerIdFromName(mLayerName), 1), stream);
         }
         return 0;
     }

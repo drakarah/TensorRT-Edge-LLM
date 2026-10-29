@@ -443,6 +443,8 @@ private:
 
 #else
 
+#include "cpuMissKernel.h"
+
 #include <cstddef>
 #include <cstdint>
 

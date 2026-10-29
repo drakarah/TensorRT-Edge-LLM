@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -580,6 +581,111 @@ TEST_F(GuidedDecoderTest, RejectsTokensTheGrammarForbids)
         ASSERT_TRUE(decoder.advance(0, token)) << "token " << token;
     }
     EXPECT_FALSE(decoder.advance(0, 4)) << "'a' is not a legal start for an integer value";
+}
+
+//! EDGELLM_JSON_MAX_WHITESPACE is read once per process, so every setting runs in a fresh child process (threadsafe death tests re-execute the binary). The child
+//! exits with the number of whitespace tokens the matcher accepted in a row after the opening brace.
+class JsonMaxWhitespaceTest : public GuidedDecoderTest
+{
+protected:
+    static constexpr int32_t kOPEN_BRACE = 0;
+    static constexpr int32_t kQUOTE = 2;
+    static constexpr int32_t kCOLON = 3;
+    static constexpr int32_t kLETTER_A = 4;
+    static constexpr int32_t kSPACE = 9;
+    static constexpr int32_t kTRIES = 40;
+
+    //! cap == nullptr leaves the variable unset.
+    [[noreturn]] void acceptedSpacesInChild(char const* cap)
+    {
+        if (cap != nullptr)
+        {
+            ::setenv("EDGELLM_JSON_MAX_WHITESPACE", cap, 1);
+        }
+        else
+        {
+            ::unsetenv("EDGELLM_JSON_MAX_WHITESPACE");
+        }
+        rt::GuidedDecoder decoder;
+        initDecoder(decoder, 1);
+        std::string failReason;
+        if (!decoder.prepareSlot(0, makeGuide(rt::GuideType::kJsonObject, ""), failReason) || !decoder.advance(0, kOPEN_BRACE))
+        {
+            std::exit(99);
+        }
+        int32_t accepted = 0;
+        while (accepted < kTRIES && decoder.advance(0, kSPACE))
+        {
+            ++accepted;
+        }
+        std::exit(accepted);
+    }
+};
+
+TEST_F(JsonMaxWhitespaceTest, CapsEachWhitespaceRunAndLeavesTheRunsOfOtherSettingsAlone)
+{
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    EXPECT_EXIT(acceptedSpacesInChild("5"), ::testing::ExitedWithCode(5), "") << "a run of at most 5 whitespace tokens";
+    EXPECT_EXIT(acceptedSpacesInChild("1"), ::testing::ExitedWithCode(1), "");
+    EXPECT_EXIT(acceptedSpacesInChild("20"), ::testing::ExitedWithCode(20), "") << "the recommended value";
+}
+
+TEST_F(JsonMaxWhitespaceTest, UnsetEmptyZeroNegativeAndNonNumericValuesLeaveTheRunUnlimited)
+{
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    EXPECT_EXIT(acceptedSpacesInChild(nullptr), ::testing::ExitedWithCode(kTRIES), "") << "unset";
+    EXPECT_EXIT(acceptedSpacesInChild(""), ::testing::ExitedWithCode(kTRIES), "") << "empty";
+    EXPECT_EXIT(acceptedSpacesInChild("0"), ::testing::ExitedWithCode(kTRIES), "") << "zero";
+    EXPECT_EXIT(acceptedSpacesInChild("-3"), ::testing::ExitedWithCode(kTRIES), "") << "negative";
+    EXPECT_EXIT(acceptedSpacesInChild("many"), ::testing::ExitedWithCode(kTRIES), "") << "not a number";
+}
+
+TEST_F(JsonMaxWhitespaceTest, TheCountRestartsAfterEveryNonWhitespaceToken)
+{
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    // { <3 spaces> "a" <3 spaces> : <3 spaces>   is legal at a cap of 3; a fourth space at any of the three places is not
+    auto const run = [this](int32_t extraAt)
+    {
+        ::setenv("EDGELLM_JSON_MAX_WHITESPACE", "3", 1);
+        rt::GuidedDecoder decoder;
+        initDecoder(decoder, 1);
+        std::string failReason;
+        if (!decoder.prepareSlot(0,
+                makeGuide(rt::GuideType::kJsonSchema, R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]})"), failReason)
+            || !decoder.advance(0, kOPEN_BRACE))
+        {
+            std::exit(99);
+        }
+        int32_t const gaps[3] = {3, 3, 3};
+        // after the brace: spaces, then the key "a" (quote, a, quote), spaces, colon, spaces
+        std::vector<int32_t> plan;
+        for (int32_t i = 0; i < gaps[0] + (extraAt == 0 ? 1 : 0); ++i)
+        {
+            plan.push_back(kSPACE);
+        }
+        plan.insert(plan.end(), {kQUOTE, kLETTER_A, kQUOTE});
+        for (int32_t i = 0; i < gaps[1] + (extraAt == 1 ? 1 : 0); ++i)
+        {
+            plan.push_back(kSPACE);
+        }
+        plan.push_back(kCOLON);
+        for (int32_t i = 0; i < gaps[2] + (extraAt == 2 ? 1 : 0); ++i)
+        {
+            plan.push_back(kSPACE);
+        }
+        for (size_t i = 0; i < plan.size(); ++i)
+        {
+            if (!decoder.advance(0, plan[i]))
+            {
+                std::exit(static_cast<int>(i) + 1); // position of the first rejected token, 1-based
+            }
+        }
+        std::exit(0);
+    };
+    EXPECT_EXIT(run(-1), ::testing::ExitedWithCode(0), "") << "three spaces at each of the three places";
+    EXPECT_EXIT(run(0), ::testing::ExitedWithCode(4), "") << "a fourth space after the brace is the fourth token";
+    EXPECT_EXIT(run(1), ::testing::ExitedWithCode(3 + 3 + 4), "") << "a fourth space after the key";
+    EXPECT_EXIT(run(2), ::testing::ExitedWithCode(3 + 3 + 3 + 1 + 4), "") << "a fourth space after the colon";
 }
 
 //! Missing this reindexing is the failure mode where a constraint silently migrates onto a

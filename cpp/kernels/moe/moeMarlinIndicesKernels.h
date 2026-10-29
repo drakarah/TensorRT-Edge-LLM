@@ -34,6 +34,17 @@ void launchBuildChunkMarlinIndicesKernel(int32_t const* paddedOffsets, int32_t c
     int32_t moeBlockSize, int32_t maxPaddedSlots, int32_t* outSortedTokenIds, int32_t* outExpertIds,
     int32_t* outNumTokensPostPadded, cudaStream_t stream);
 
+//! The experts with a non-zero slot count in ascending id order (routedList[numExperts]), their ranks (rankOf[numExperts], -1 when not routed) and their number
+//! (numRouted[1]); @p counts is the per-expert slot count. numExperts <= 1024.
+void launchBuildRoutedList(
+    int32_t const* counts, int32_t numExperts, int32_t* routedList, int32_t* rankOf, int32_t* numRouted, cudaStream_t stream);
+
+//! Compact copy of the Marlin routing arrays of the routed experts with ranks [base, base + count) (expert ids rebased to rank - base), for running the expert
+//! GEMMs on a chunk of the routed experts only.
+void launchBuildRoutedChunkIndices(int32_t const* paddedOffsets, int32_t const* paddedCounts, int32_t const* sortedTokenIds,
+    int32_t const* expertIds, int32_t const* routedList, int32_t const* rankOf, int32_t base, int32_t count, int32_t moeBlockSize,
+    int32_t maxPaddedSlots, int32_t* outSortedTokenIds, int32_t* outExpertIds, int32_t* outNumTokensPostPadded, cudaStream_t stream);
+
 /**
  * @brief Launch kernel to build Marlin indices from slot lists (per-expert).
  */
@@ -121,6 +132,9 @@ void launchExpertCacheFill(ExpertCacheState const& cache, ExpertStagingCopy cons
 //! Cache-aware router for decode steps (<= a few tokens): selects top-k experts by logit + bias * [resident in the cache], weights = softmax of the
 //! original logits over the selected experts. Replaces the top-k softmax kernel; writes expert ids (not slot ids) and fp32 weights.
 //! tailSkip > 0: a non-resident expert at rank tailSkip+1 or lower gets weight 0 and the top-ranked expert's id (no fetch, no renormalisation).
+//! Largest top-k the cache-aware router supports.
+constexpr int32_t kRouterMaxTopK = 16;
+
 void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, ExpertCacheState const& cache,
     int32_t* topkIndices, float* topkWeights, cudaStream_t stream);
 
@@ -134,6 +148,9 @@ void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t num
 
 //! Wait for the host's answer to the last doorbell (no wait when it wrote none) and add it to output [numTokens, hiddenSize].
 void launchCpuMissWaitAdd(half* output, int32_t numTokens, int32_t hiddenSize, CpuMissMailbox* mailbox, CpuMissDeviceState* state, cudaStream_t stream);
+
+//! Debug probe: per buffer {non-finite count, bit pattern of the largest finite |x|, count of |x| >= 30000} accumulated into counters[3].
+void launchFiniteWatch(half const* x, int64_t n, uint32_t* counters, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

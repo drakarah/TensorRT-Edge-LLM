@@ -19,6 +19,7 @@
 #include "moeMarlinIndicesKernels.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -99,6 +100,7 @@ namespace
 {
 
 constexpr int32_t kAggregateThreadsPerBlock{256};
+constexpr float kFiniteWatchNearLimit{30000.0F};
 
 template <typename T>
 struct AggregationTypeTraits;
@@ -221,6 +223,97 @@ void launchBuildChunkMarlinIndicesKernel(int32_t const* paddedOffsets, int32_t c
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace
+{
+constexpr int32_t kRoutedListThreads = 1024;
+
+//! One block: the experts with a non-zero slot count in ascending id order (routedList), their rank (rankOf, -1 for the others) and their number.
+__global__ void buildRoutedListKernel(
+    int32_t const* counts, int32_t numExperts, int32_t* routedList, int32_t* rankOf, int32_t* numRouted)
+{
+    __shared__ int32_t scan[kRoutedListThreads];
+    int32_t const e = threadIdx.x;
+    int32_t const routed = e < numExperts && counts[e] > 0 ? 1 : 0;
+    scan[e] = routed;
+    __syncthreads();
+    for (int32_t d = 1; d < kRoutedListThreads; d <<= 1)
+    {
+        int32_t const add = e >= d ? scan[e - d] : 0;
+        __syncthreads();
+        scan[e] += add;
+        __syncthreads();
+    }
+    if (e < numExperts)
+    {
+        int32_t const rank = scan[e] - routed;
+        rankOf[e] = routed != 0 ? rank : -1;
+        if (routed != 0)
+        {
+            routedList[rank] = e;
+        }
+    }
+    if (e == kRoutedListThreads - 1)
+    {
+        numRouted[0] = scan[e];
+    }
+}
+
+//! Routing arrays of the routed experts with ranks [base, base + count): their padded blocks are contiguous (an expert without slots owns none), so the
+//! slice is one range of sorted token ids / block expert ids; expert ids are rebased to rank - base.
+__global__ void buildRoutedChunkIndicesKernel(int32_t const* paddedOffsets, int32_t const* paddedCounts, int32_t const* sortedTokenIds,
+    int32_t const* expertIds, int32_t const* routedList, int32_t const* rankOf, int32_t base, int32_t count, int32_t moeBlockSize,
+    int32_t* outSortedTokenIds, int32_t* outExpertIds, int32_t* outNumTokensPostPadded)
+{
+    int32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t const stride = gridDim.x * blockDim.x;
+    int32_t start = 0;
+    int32_t n = 0;
+    if (count > 0)
+    {
+        int32_t const first = routedList[base];
+        int32_t const last = routedList[base + count - 1];
+        start = paddedOffsets[first];
+        n = paddedOffsets[last] + paddedCounts[last] - start;
+    }
+    for (int32_t i = tid; i < n; i += stride)
+    {
+        outSortedTokenIds[i] = sortedTokenIds[start + i];
+    }
+    int32_t const numBlocks = n / moeBlockSize;
+    int32_t const blockStart = start / moeBlockSize;
+    for (int32_t b = tid; b < numBlocks; b += stride)
+    {
+        outExpertIds[b] = rankOf[expertIds[blockStart + b]] - base;
+    }
+    if (tid == 0)
+    {
+        outNumTokensPostPadded[0] = n;
+    }
+}
+} // namespace
+
+void launchBuildRoutedList(
+    int32_t const* counts, int32_t numExperts, int32_t* routedList, int32_t* rankOf, int32_t* numRouted, cudaStream_t stream)
+{
+    if (numExperts <= 0 || numExperts > kRoutedListThreads)
+    {
+        throw std::invalid_argument("launchBuildRoutedList: the number of experts must be in [1, 1024]");
+    }
+    buildRoutedListKernel<<<1, kRoutedListThreads, 0, stream>>>(counts, numExperts, routedList, rankOf, numRouted);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launchBuildRoutedChunkIndices(int32_t const* paddedOffsets, int32_t const* paddedCounts, int32_t const* sortedTokenIds,
+    int32_t const* expertIds, int32_t const* routedList, int32_t const* rankOf, int32_t base, int32_t count, int32_t moeBlockSize,
+    int32_t maxPaddedSlots, int32_t* outSortedTokenIds, int32_t* outExpertIds, int32_t* outNumTokensPostPadded, cudaStream_t stream)
+{
+    constexpr int32_t kThreads = 256;
+    int32_t const blocks = std::max(1, std::min(static_cast<int32_t>(trt_edgellm::divUp(maxPaddedSlots, kThreads)), 64));
+    buildRoutedChunkIndicesKernel<<<blocks, kThreads, 0, stream>>>(paddedOffsets, paddedCounts, sortedTokenIds, expertIds, routedList,
+        rankOf, base, count, moeBlockSize, outSortedTokenIds, outExpertIds, outNumTokensPostPadded);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launchBuildDenseMarlinIndicesKernel(int32_t* sortedTokenIds, int32_t* expertIds, int32_t* numTokensPostPadded,
     float* topkWeights, int32_t numTokens, int32_t paddedRows, int32_t moeBlockSize, cudaStream_t stream)
 {
@@ -325,6 +418,148 @@ namespace
 {
 // One block: looks the experts selected by the (<= a few) tokens up in a per-layer slot cache, assigns the least recently used
 // slot (not used by this call) to every miss, records the misses and rewrites the top-k expert ids to slot ids.
+constexpr int32_t kLookupMaxRegisterSlots = 256;
+
+//! Single-thread slot assignment, for caches with more slots than the warp version keeps in registers.
+__device__ void lookupSerial(ExpertCacheState const& cache, int32_t const* list, int32_t numNeeded, int32_t stamp)
+{
+    int32_t misses = 0;
+    int32_t distinct = 0;
+    for (int32_t i = 0; i < numNeeded; ++i)
+    {
+        int32_t const e = list[i];
+        ++distinct;
+        int32_t slot = cache.slotOf[e];
+        if (slot < 0)
+        {
+            int32_t best = -1;
+            int32_t bestUse = 0x7fffffff;
+            for (int32_t s = 0; s < cache.numSlots; ++s)
+            {
+                int32_t const use = cache.lastUse[s];
+                if (use != stamp && use < bestUse)
+                {
+                    bestUse = use;
+                    best = s;
+                }
+            }
+            if (best < 0)
+            {
+                continue; // more distinct experts than slots: the caller keeps this path to <= numSlots / topK tokens
+            }
+            int32_t const old = cache.expertOf[best];
+            if (old >= 0)
+            {
+                cache.slotOf[old] = -1;
+            }
+            cache.slotOf[e] = best;
+            cache.expertOf[best] = e;
+            cache.missList[1 + 2 * misses] = e;
+            cache.missList[2 + 2 * misses] = best;
+            ++misses;
+            slot = best;
+        }
+        cache.lastUse[slot] = stamp;
+    }
+    cache.missList[0] = misses;
+    if (cache.tally != nullptr)
+    {
+        cache.tally[0] += 1;
+        cache.tally[1] += distinct;
+        cache.tally[2] += misses;
+    }
+}
+
+//! Slot assignment by one warp: the last-use stamps of the cache slots live in registers (slot s on lane s % 32), a miss takes the least recently used
+//! slot not used by this call (lowest slot index among equals, as the serial scan does) through a shuffle reduction, and lane 0 owns slotOf / expertOf / missList.
+__device__ void lookupWarp(ExpertCacheState const& cache, int32_t const* list, int32_t numNeeded, int32_t numExperts, int32_t stamp)
+{
+    constexpr int32_t kPerLane = kLookupMaxRegisterSlots / 32;
+    constexpr int32_t kNone = 0x7fffffff;
+    int32_t const lane = threadIdx.x;
+    int32_t use[kPerLane];
+#pragma unroll
+    for (int32_t j = 0; j < kPerLane; ++j)
+    {
+        int32_t const s = lane + 32 * j;
+        use[j] = s < cache.numSlots ? cache.lastUse[s] : kNone;
+    }
+    int32_t misses = 0;
+    int32_t distinct = 0;
+    for (int32_t i = 0; i < numNeeded; ++i)
+    {
+        int32_t const e = list[i];
+        ++distinct;
+        int32_t slot = lane == 0 ? cache.slotOf[e] : 0;
+        slot = __shfl_sync(0xffffffffu, slot, 0);
+        if (slot < 0)
+        {
+            int32_t bestUse = kNone;
+            int32_t best = -1;
+#pragma unroll
+            for (int32_t j = 0; j < kPerLane; ++j)
+            {
+                if (use[j] != stamp && use[j] < bestUse)
+                {
+                    bestUse = use[j];
+                    best = lane + 32 * j;
+                }
+            }
+#pragma unroll
+            for (int32_t off = 16; off > 0; off >>= 1)
+            {
+                int32_t const ou = __shfl_xor_sync(0xffffffffu, bestUse, off);
+                int32_t const ob = __shfl_xor_sync(0xffffffffu, best, off);
+                if (ou < bestUse || (ou == bestUse && ob >= 0 && (best < 0 || ob < best)))
+                {
+                    bestUse = ou;
+                    best = ob;
+                }
+            }
+            if (best < 0)
+            {
+                continue; // more distinct experts than slots: the caller keeps this path to <= numSlots / topK tokens
+            }
+            if (lane == 0)
+            {
+                int32_t const old = cache.expertOf[best];
+                if (old >= 0)
+                {
+                    cache.slotOf[old] = -1;
+                }
+                cache.slotOf[e] = best;
+                cache.expertOf[best] = e;
+                cache.missList[1 + 2 * misses] = e;
+                cache.missList[2 + 2 * misses] = best;
+            }
+            ++misses;
+            slot = best;
+        }
+        if ((slot & 31) == lane)
+        {
+#pragma unroll
+            for (int32_t j = 0; j < kPerLane; ++j)
+            {
+                if (j == (slot >> 5))
+                {
+                    use[j] = stamp;
+                }
+            }
+            cache.lastUse[slot] = stamp;
+        }
+    }
+    if (lane == 0)
+    {
+        cache.missList[0] = misses;
+        if (cache.tally != nullptr)
+        {
+            cache.tally[0] += 1;
+            cache.tally[1] += distinct;
+            cache.tally[2] += misses;
+        }
+    }
+}
+
 __global__ void expertCacheLookupKernel(int32_t* topkIndices, int32_t count, int32_t numExperts, ExpertCacheState cache)
 {
     __shared__ int32_t stamp;
@@ -367,61 +602,25 @@ __global__ void expertCacheLookupKernel(int32_t* topkIndices, int32_t count, int
     if (threadIdx.x == 0)
     {
         stamp = ++cache.counter[0];
-        int32_t misses = 0;
-        int32_t distinct = 0;
-        for (int32_t i = 0; i < numNeeded; ++i)
+    }
+    __syncthreads();
+    if (cache.numSlots <= kLookupMaxRegisterSlots)
+    {
+        if (threadIdx.x < 32)
         {
-            int32_t const e = list[i];
-            ++distinct;
-            int32_t slot = cache.slotOf[e];
-            if (slot < 0)
-            {
-                int32_t best = -1;
-                int32_t bestUse = 0x7fffffff;
-                for (int32_t s = 0; s < cache.numSlots; ++s)
-                {
-                    int32_t const use = cache.lastUse[s];
-                    if (use != stamp && use < bestUse)
-                    {
-                        bestUse = use;
-                        best = s;
-                    }
-                }
-                if (best < 0)
-                {
-                    continue; // more distinct experts than slots: the caller keeps this path to <= numSlots / topK tokens
-                }
-                int32_t const old = cache.expertOf[best];
-                if (old >= 0)
-                {
-                    cache.slotOf[old] = -1;
-                }
-                cache.slotOf[e] = best;
-                cache.expertOf[best] = e;
-                cache.missList[1 + 2 * misses] = e;
-                cache.missList[2 + 2 * misses] = best;
-                ++misses;
-                slot = best;
-            }
-            cache.lastUse[slot] = stamp;
+            lookupWarp(cache, list, numNeeded, numExperts, stamp);
         }
-        cache.missList[0] = misses;
-        if (cache.tally != nullptr)
-        {
-            cache.tally[0] += 1;
-            cache.tally[1] += distinct;
-            cache.tally[2] += misses;
-        }
+    }
+    else if (threadIdx.x == 0)
+    {
+        lookupSerial(cache, list, numNeeded, stamp);
     }
     __syncthreads();
     for (int32_t i = threadIdx.x; i < count; i += blockDim.x)
     {
         int32_t const e = topkIndices[i];
-        if (e >= 0 && e < numExperts)
-        {
-            int32_t const slot = cache.slotOf[e];
-            topkIndices[i] = slot >= 0 ? slot : 0;
-        }
+        int32_t const slot = e >= 0 && e < numExperts ? cache.slotOf[e] : -1;
+        topkIndices[i] = slot >= 0 ? slot : 0;
     }
 }
 
@@ -487,20 +686,27 @@ namespace
 // Cache-aware top-k routing for decode steps (rtx4060/moe-cache-aware-routing): one block per token. The experts are selected by
 // logit + bias * [resident in this layer's cache], the combine weights are the softmax of the ORIGINAL logits over the selected experts (what an
 // unbiased router with the same selection would give), so only WHICH experts run changes. bias = 0 reproduces the exact router.
+//! A router logit that is NaN or beyond +-3e38 (garbage activations in a draft or warm-up pass, an overflowed GEMM) is clamped into a finite range, so
+//! it can neither win a comparison it should not (+inf, which would also turn the softmax weights into NaN) nor lose to the marker of an already
+//! chosen expert (-inf, which would pick that expert twice).
+__device__ __forceinline__ float sanitizeRouterLogit(float l)
+{
+    return l == l ? fminf(fmaxf(l, -3.0e38f), 3.0e38f) : -3.0e38f;
+}
+
 __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, int32_t const* slotOf,
     int32_t* topkIndices, float* topkWeights)
 {
     extern __shared__ float scoreSmem[]; // [numExperts] biased scores
     __shared__ float warpBest[32];
     __shared__ int32_t warpIdx[32];
-    __shared__ int32_t chosen[16];
-    __shared__ float chosenLogit[16];
+    __shared__ int32_t chosen[kRouterMaxTopK];
+    __shared__ float chosenLogit[kRouterMaxTopK];
     float const* row = logits + static_cast<size_t>(blockIdx.x) * numExperts;
     for (int32_t e = threadIdx.x; e < numExperts; e += blockDim.x)
     {
-        float const l = row[e];
-        // a NaN logit (e.g. garbage activations in a draft/warm-up pass) would never win a comparison and leave bestIdx out of range
-        scoreSmem[e] = (l == l ? l : -3.0e38f) + (slotOf[e] >= 0 ? bias : 0.0f);
+        float const l = sanitizeRouterLogit(row[e]);
+        scoreSmem[e] = l + (slotOf[e] >= 0 ? bias : 0.0f);
     }
     __syncthreads();
     int32_t const lane = threadIdx.x & 31;
@@ -548,7 +754,7 @@ __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, in
             }
             bi = bi < numExperts ? bi : 0;
             chosen[k] = bi;
-            chosenLogit[k] = row[bi] == row[bi] ? row[bi] : -3.0e38f;
+            chosenLogit[k] = sanitizeRouterLogit(row[bi]);
             scoreSmem[bi] = -3.4e38f;
         }
         __syncthreads();
@@ -582,12 +788,109 @@ __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, in
         }
     }
 }
+//! One warp per token: the biased scores live in registers (kPerLane experts per lane, expert e = lane + 32 * j), each of the topK rounds takes the lane-local
+//! best and a shuffle reduction (larger score first, then lower expert index), and every lane ends with the same chosen list. Same selection, tie-break
+//! and arithmetic as cacheAwareTopkKernel, without shared memory or block barriers.
+template <int32_t kPerLane>
+__global__ void cacheAwareTopkWarpKernel(float const* logits, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, int32_t const* slotOf,
+    int32_t* topkIndices, float* topkWeights)
+{
+    float const* row = logits + static_cast<size_t>(blockIdx.x) * numExperts;
+    int32_t const lane = threadIdx.x;
+    float score[kPerLane];
+#pragma unroll
+    for (int32_t j = 0; j < kPerLane; ++j)
+    {
+        int32_t const e = lane + 32 * j;
+        score[j] = e < numExperts ? sanitizeRouterLogit(row[e]) + (slotOf[e] >= 0 ? bias : 0.0f) : -3.4e38f;
+    }
+    int32_t chosen[kRouterMaxTopK];
+    float chosenLogit[kRouterMaxTopK];
+    for (int32_t k = 0; k < topK; ++k)
+    {
+        float best = score[0];
+        int32_t bestJ = 0;
+#pragma unroll
+        for (int32_t j = 1; j < kPerLane; ++j)
+        {
+            if (score[j] > best)
+            {
+                best = score[j];
+                bestJ = j;
+            }
+        }
+        int32_t bestIdx = lane + 32 * bestJ;
+#pragma unroll
+        for (int32_t off = 16; off > 0; off >>= 1)
+        {
+            float const ov = __shfl_xor_sync(0xffffffffu, best, off);
+            int32_t const oi = __shfl_xor_sync(0xffffffffu, bestIdx, off);
+            if (ov > best || (ov == best && oi < bestIdx))
+            {
+                best = ov;
+                bestIdx = oi;
+            }
+        }
+        bestIdx = bestIdx < numExperts ? bestIdx : 0;
+        chosen[k] = bestIdx;
+        chosenLogit[k] = sanitizeRouterLogit(row[bestIdx]);
+        if ((bestIdx & 31) == lane)
+        {
+            int32_t const j = bestIdx >> 5;
+#pragma unroll
+            for (int32_t jj = 0; jj < kPerLane; ++jj)
+            {
+                if (jj == j)
+                {
+                    score[jj] = -3.4e38f;
+                }
+            }
+        }
+    }
+    if (lane == 0)
+    {
+        float mx = chosenLogit[0];
+        for (int32_t k = 1; k < topK; ++k)
+        {
+            mx = fmaxf(mx, chosenLogit[k]);
+        }
+        float sum = 0.0f;
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            chosenLogit[k] = __expf(chosenLogit[k] - mx);
+            sum += chosenLogit[k];
+        }
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            int32_t id = chosen[k];
+            float w = chosenLogit[k] / sum;
+            if (tailSkip > 0 && k >= tailSkip && slotOf[id] < 0)
+            {
+                id = chosen[0];
+                w = 0.0f;
+            }
+            topkIndices[static_cast<size_t>(blockIdx.x) * topK + k] = id;
+            topkWeights[static_cast<size_t>(blockIdx.x) * topK + k] = w;
+        }
+    }
+}
 } // namespace
 
 void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, ExpertCacheState const& cache,
     int32_t* topkIndices, float* topkWeights, cudaStream_t stream)
 {
-    cacheAwareTopkKernel<<<numTokens, 256, numExperts * sizeof(float), stream>>>(logits, numExperts, topK, bias, tailSkip, cache.slotOf, topkIndices, topkWeights);
+    if (topK <= kRouterMaxTopK && numExperts <= 256)
+    {
+        cacheAwareTopkWarpKernel<8><<<numTokens, 32, 0, stream>>>(logits, numExperts, topK, bias, tailSkip, cache.slotOf, topkIndices, topkWeights);
+    }
+    else if (topK <= kRouterMaxTopK && numExperts <= 512)
+    {
+        cacheAwareTopkWarpKernel<16><<<numTokens, 32, 0, stream>>>(logits, numExperts, topK, bias, tailSkip, cache.slotOf, topkIndices, topkWeights);
+    }
+    else
+    {
+        cacheAwareTopkKernel<<<numTokens, 256, numExperts * sizeof(float), stream>>>(logits, numExperts, topK, bias, tailSkip, cache.slotOf, topkIndices, topkWeights);
+    }
 }
 
 namespace
@@ -707,6 +1010,45 @@ __global__ void cpuMissWaitAddKernel(half* out, int32_t numTokens, int32_t hidde
         out[i] = __float2half(__half2float(out[i]) + __ldcv(&mb->y[i]));
     }
 }
+__global__ void finiteWatchKernel(half const* x, int64_t n, uint32_t* counters)
+{
+    float localMax = 0.0F;
+    uint32_t bad = 0;
+    uint32_t near = 0;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        float const v = __half2float(x[i]);
+        if (!isfinite(v))
+        {
+            ++bad;
+        }
+        else
+        {
+            float const a = fabsf(v);
+            localMax = fmaxf(localMax, a);
+            near += a >= kFiniteWatchNearLimit ? 1U : 0U;
+        }
+    }
+    for (int32_t off = 16; off > 0; off >>= 1)
+    {
+        localMax = fmaxf(localMax, __shfl_down_sync(0xffffffffu, localMax, off));
+        bad += __shfl_down_sync(0xffffffffu, bad, off);
+        near += __shfl_down_sync(0xffffffffu, near, off);
+    }
+    if ((threadIdx.x & 31) == 0)
+    {
+        if (bad != 0)
+        {
+            atomicAdd(&counters[0], bad);
+        }
+        if (near != 0)
+        {
+            atomicAdd(&counters[2], near);
+        }
+        atomicMax(&counters[1], __float_as_uint(localMax));
+    }
+}
 } // namespace
 
 void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t numTokens, int32_t topK, int32_t numExperts, half const* hidden,
@@ -720,6 +1062,14 @@ void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t num
 void launchCpuMissWaitAdd(half* output, int32_t numTokens, int32_t hiddenSize, CpuMissMailbox* mailbox, CpuMissDeviceState* state, cudaStream_t stream)
 {
     cpuMissWaitAddKernel<<<1, 1024, 0, stream>>>(output, numTokens, hiddenSize, mailbox, state);
+}
+
+void launchFiniteWatch(half const* x, int64_t n, uint32_t* counters, cudaStream_t stream)
+{
+    if (n > 0)
+    {
+        finiteWatchKernel<<<32, 256, 0, stream>>>(x, n, counters);
+    }
 }
 
 } // namespace kernel
