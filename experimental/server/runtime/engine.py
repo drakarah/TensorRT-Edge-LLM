@@ -92,6 +92,7 @@ class SamplingParams:
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 50
+    presence_penalty: float = 0.0
     seed: Optional[int] = None
     max_tokens: int = 2048
     enable_thinking: bool = False
@@ -1408,6 +1409,7 @@ class LLM:
         request.temperature = params.temperature
         request.top_p = params.top_p
         request.top_k = params.top_k
+        request.presence_penalty = params.presence_penalty
         request.max_generate_length = params.max_tokens
         request.apply_chat_template = apply_chat_template
         request.add_generation_prompt = add_generation_prompt

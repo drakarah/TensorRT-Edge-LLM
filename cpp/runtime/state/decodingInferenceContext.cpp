@@ -281,6 +281,8 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     guidedUnsatisfiableSlots.clear();
     guidedMaskSuppressedPerSlot.clear();
     enableThinking = false;
+    presencePenalty = 0.0f;
+    presenceFlagsPending = false;
     callbackEmittedTokenCounts.clear();
     callbackEmittedTokenCounts.resize(batchSize, 0);
     shouldStopAfterAcceptedToken = {};

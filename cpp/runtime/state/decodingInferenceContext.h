@@ -204,6 +204,8 @@ struct DecodingInferenceContext
     float temperature{1.0f};              //!< Temperature for sampling
     float topP{1.0f};                     //!< Top-P sampling parameter
     int64_t topK{0};                      //!< Top-K sampling parameter
+    float presencePenalty{0.0f};          //!< Presence penalty of the request (0 = off)
+    bool presenceFlagsPending{false};     //!< The seen-token flags are cleared before the next penalised decode step
     std::vector<uint64_t> samplingSeeds;  //!< Stable seed for each active logical request
     bool useRequestStableSampling{false}; //!< Use request-position-derived uniforms for target sampling
     SpecProposalSampling proposalSampling{SpecProposalSampling::kAuto};

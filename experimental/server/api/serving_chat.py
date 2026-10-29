@@ -216,9 +216,13 @@ class OpenAIServingChat:
                 "frequency_penalty is not supported by the Edge-LLM runtime",
                 param="frequency_penalty")
         if request.presence_penalty != 0:
-            raise UnsupportedFeatureError(
-                "presence_penalty is not supported by the Edge-LLM runtime",
-                param="presence_penalty")
+            capabilities = getattr(self._client, "capabilities", None)
+            if (getattr(capabilities, "speculative_decoding", False)
+                    or (getattr(capabilities, "max_num_seqs", 1) or 1) > 1):
+                raise UnsupportedFeatureError(
+                    "presence_penalty needs a deployment without speculative "
+                    "decoding and with a single request slot",
+                    param="presence_penalty")
         try:
             tool_config = validate_tool_request(request.messages,
                                                 request.tools,
@@ -295,6 +299,7 @@ class OpenAIServingChat:
             temperature=0.0 if greedy else request.temperature,
             top_p=1.0 if greedy else request.top_p,
             top_k=1 if greedy else request.top_k,
+            presence_penalty=request.presence_penalty,
             seed=request.seed,
             max_tokens=(request.effective_max_tokens
                         or self._default_max_tokens),

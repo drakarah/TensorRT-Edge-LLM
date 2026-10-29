@@ -39,6 +39,7 @@ constexpr ComparedField kComparedFields[] = {
     // Sampling is applied to the batch as a whole, so a mismatch would not fail loudly: one request
     // would simply generate with the other's settings.
     {"temperature", [](auto const& a, auto const& b) { return a.temperature == b.temperature; }},
+    {"presencePenalty", [](auto const& a, auto const& b) { return a.presencePenalty == b.presencePenalty; }},
     {"topP", [](auto const& a, auto const& b) { return a.topP == b.topP; }},
     {"topK", [](auto const& a, auto const& b) { return a.topK == b.topK; }},
 
