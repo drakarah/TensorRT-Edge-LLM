@@ -19,6 +19,7 @@
 #include "moeMarlinIndicesKernels.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -219,6 +220,97 @@ void launchBuildChunkMarlinIndicesKernel(int32_t const* paddedOffsets, int32_t c
     int32_t const blocks = std::max(1, std::min(static_cast<int32_t>(trt_edgellm::divUp(maxPaddedSlots, kThreads)), 64));
     buildChunkMarlinIndicesKernel<<<blocks, kThreads, 0, stream>>>(paddedOffsets, numTokensPostPadded, sortedTokenIds,
         expertIds, e0, e1, numExperts, moeBlockSize, outSortedTokenIds, outExpertIds, outNumTokensPostPadded);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+namespace
+{
+constexpr int32_t kRoutedListThreads = 1024;
+
+//! One block: the experts with a non-zero slot count in ascending id order (routedList), their rank (rankOf, -1 for the others) and their number.
+__global__ void buildRoutedListKernel(
+    int32_t const* counts, int32_t numExperts, int32_t* routedList, int32_t* rankOf, int32_t* numRouted)
+{
+    __shared__ int32_t scan[kRoutedListThreads];
+    int32_t const e = threadIdx.x;
+    int32_t const routed = e < numExperts && counts[e] > 0 ? 1 : 0;
+    scan[e] = routed;
+    __syncthreads();
+    for (int32_t d = 1; d < kRoutedListThreads; d <<= 1)
+    {
+        int32_t const add = e >= d ? scan[e - d] : 0;
+        __syncthreads();
+        scan[e] += add;
+        __syncthreads();
+    }
+    if (e < numExperts)
+    {
+        int32_t const rank = scan[e] - routed;
+        rankOf[e] = routed != 0 ? rank : -1;
+        if (routed != 0)
+        {
+            routedList[rank] = e;
+        }
+    }
+    if (e == kRoutedListThreads - 1)
+    {
+        numRouted[0] = scan[e];
+    }
+}
+
+//! Routing arrays of the routed experts with ranks [base, base + count): their padded blocks are contiguous (an expert without slots owns none), so the
+//! slice is one range of sorted token ids / block expert ids; expert ids are rebased to rank - base.
+__global__ void buildRoutedChunkIndicesKernel(int32_t const* paddedOffsets, int32_t const* paddedCounts, int32_t const* sortedTokenIds,
+    int32_t const* expertIds, int32_t const* routedList, int32_t const* rankOf, int32_t base, int32_t count, int32_t moeBlockSize,
+    int32_t* outSortedTokenIds, int32_t* outExpertIds, int32_t* outNumTokensPostPadded)
+{
+    int32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t const stride = gridDim.x * blockDim.x;
+    int32_t start = 0;
+    int32_t n = 0;
+    if (count > 0)
+    {
+        int32_t const first = routedList[base];
+        int32_t const last = routedList[base + count - 1];
+        start = paddedOffsets[first];
+        n = paddedOffsets[last] + paddedCounts[last] - start;
+    }
+    for (int32_t i = tid; i < n; i += stride)
+    {
+        outSortedTokenIds[i] = sortedTokenIds[start + i];
+    }
+    int32_t const numBlocks = n / moeBlockSize;
+    int32_t const blockStart = start / moeBlockSize;
+    for (int32_t b = tid; b < numBlocks; b += stride)
+    {
+        outExpertIds[b] = rankOf[expertIds[blockStart + b]] - base;
+    }
+    if (tid == 0)
+    {
+        outNumTokensPostPadded[0] = n;
+    }
+}
+} // namespace
+
+void launchBuildRoutedList(
+    int32_t const* counts, int32_t numExperts, int32_t* routedList, int32_t* rankOf, int32_t* numRouted, cudaStream_t stream)
+{
+    if (numExperts <= 0 || numExperts > kRoutedListThreads)
+    {
+        throw std::invalid_argument("launchBuildRoutedList: the number of experts must be in [1, 1024]");
+    }
+    buildRoutedListKernel<<<1, kRoutedListThreads, 0, stream>>>(counts, numExperts, routedList, rankOf, numRouted);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launchBuildRoutedChunkIndices(int32_t const* paddedOffsets, int32_t const* paddedCounts, int32_t const* sortedTokenIds,
+    int32_t const* expertIds, int32_t const* routedList, int32_t const* rankOf, int32_t base, int32_t count, int32_t moeBlockSize,
+    int32_t maxPaddedSlots, int32_t* outSortedTokenIds, int32_t* outExpertIds, int32_t* outNumTokensPostPadded, cudaStream_t stream)
+{
+    constexpr int32_t kThreads = 256;
+    int32_t const blocks = std::max(1, std::min(static_cast<int32_t>(trt_edgellm::divUp(maxPaddedSlots, kThreads)), 64));
+    buildRoutedChunkIndicesKernel<<<blocks, kThreads, 0, stream>>>(paddedOffsets, paddedCounts, sortedTokenIds, expertIds, routedList,
+        rankOf, base, count, moeBlockSize, outSortedTokenIds, outExpertIds, outNumTokensPostPadded);
     CUDA_CHECK(cudaGetLastError());
 }
 

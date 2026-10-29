@@ -34,6 +34,17 @@ void launchBuildChunkMarlinIndicesKernel(int32_t const* paddedOffsets, int32_t c
     int32_t moeBlockSize, int32_t maxPaddedSlots, int32_t* outSortedTokenIds, int32_t* outExpertIds,
     int32_t* outNumTokensPostPadded, cudaStream_t stream);
 
+//! The experts with a non-zero slot count in ascending id order (routedList[numExperts]), their ranks (rankOf[numExperts], -1 when not routed) and their number
+//! (numRouted[1]); @p counts is the per-expert slot count. numExperts <= 1024.
+void launchBuildRoutedList(
+    int32_t const* counts, int32_t numExperts, int32_t* routedList, int32_t* rankOf, int32_t* numRouted, cudaStream_t stream);
+
+//! Compact copy of the Marlin routing arrays of the routed experts with ranks [base, base + count) (expert ids rebased to rank - base), for running the expert
+//! GEMMs on a chunk of the routed experts only.
+void launchBuildRoutedChunkIndices(int32_t const* paddedOffsets, int32_t const* paddedCounts, int32_t const* sortedTokenIds,
+    int32_t const* expertIds, int32_t const* routedList, int32_t const* rankOf, int32_t base, int32_t count, int32_t moeBlockSize,
+    int32_t maxPaddedSlots, int32_t* outSortedTokenIds, int32_t* outExpertIds, int32_t* outNumTokensPostPadded, cudaStream_t stream);
+
 /**
  * @brief Launch kernel to build Marlin indices from slot lists (per-expert).
  */
