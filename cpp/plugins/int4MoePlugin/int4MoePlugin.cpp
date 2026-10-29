@@ -1268,6 +1268,20 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                     perSlot += bytes / mNumExperts + 256;
                     layerBytes += (bytes + 255) & ~static_cast<size_t>(255);
                 }
+                if (mStageExperts == 2 && routedChunkFromEnv() > 0 && mNumExperts <= 1024)
+                {
+                    size_t bpe[4];
+                    for (int32_t i = 0; i < 4; ++i)
+                    {
+                        size_t bytes = 1;
+                        for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+                        {
+                            bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+                        }
+                        bpe[i] = bytes * (inputDesc[2 + i].type == DataType::kHALF ? 2 : 1) / mNumExperts;
+                    }
+                    routedring::RoutedExpertRing::get().reserve(bpe, mNumExperts, routedChunkFromEnv(), routedRingFromEnv());
+                }
                 if (mStageExperts == 2 && prefillChunkFromEnv() > 0)
                 {
                     size_t bpe[4];
@@ -1282,7 +1296,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                     }
                     ExpertChunkRing::get().reserve(bpe, mNumExperts, prefillChunkFromEnv());
                 }
-                else if ((mStageExperts == 2 && routedChunkFromEnv() == 0) || prefillOverlapFromEnv())
+                else if (mStageExperts == 2 || prefillOverlapFromEnv())
                 {
                     PrefillExpertPrefetcher::get().reserve(layerBytes, prefillOverlapFromEnv());
                 }
