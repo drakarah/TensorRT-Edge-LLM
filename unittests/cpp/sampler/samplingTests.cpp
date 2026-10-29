@@ -553,8 +553,9 @@ TEST_F(SamplingTest, PresencePenaltyRejectsMismatchedTensors)
     EXPECT_THROW(applyPresencePenalty(f.logits, f.lastTokens, wrongFlagVocab, 1.0f, 0), std::runtime_error);
     rt::Tensor wrongFlagType({1, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
     EXPECT_THROW(applyPresencePenalty(f.logits, f.lastTokens, wrongFlagType, 1.0f, 0), std::runtime_error);
-    rt::Tensor noTokens({0}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    EXPECT_THROW(applyPresencePenalty(f.logits, noTokens, f.flags, 1.0f, 0), std::runtime_error);
+    PresenceFixture twoRows(2, 4);
+    rt::Tensor oneFedToken({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    EXPECT_THROW(applyPresencePenalty(twoRows.logits, oneFedToken, twoRows.flags, 1.0f, 0), std::runtime_error);
 }
 
 TEST_F(SamplingTest, ApplyLogitBiasRepeatedRowsUsesOwningBatchSlot)
