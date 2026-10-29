@@ -17,6 +17,8 @@
 import asyncio
 import contextlib
 import logging
+import os
+import time
 from typing import Any, Dict
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
@@ -43,6 +45,18 @@ logger = logging.getLogger("edgellm.server")
 
 _DISCONNECT_POLL_S = 0.25
 _CLIENT_CLOSED_REQUEST = 499
+
+
+def _dump_cancelled_request(body: ChatCompletionRequest, seconds: float) -> None:
+    """EDGELLM_LOG_CANCELLED_DIR=<dir>: keep the body of every request cancelled by a disconnect, to replay a runaway generation."""
+    directory = os.environ.get("EDGELLM_LOG_CANCELLED_DIR")
+    if not directory:
+        return
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"cancelled_{time.strftime('%H%M%S')}_{int(seconds)}s.json")
+    with open(path, "w") as handle:
+        handle.write(body.model_dump_json(exclude_none=True))
+    logger.info("cancelled request after %.0f s saved to %s", seconds, path)
 
 
 async def _cancel_on_disconnect(request: Request, awaitable):
@@ -152,10 +166,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 "Connection": "keep-alive",
             },
         )
+    started = time.monotonic()
     with _nvtx_range("PY_CHAT_COMPLETION"):
         response = await _cancel_on_disconnect(
             request, handler.create_chat_completion(body))
     if response is None:
+        _dump_cancelled_request(body, time.monotonic() - started)
         return Response(status_code=_CLIENT_CLOSED_REQUEST)
     payload = response.model_dump(exclude_none=True)
     # OpenAI always sends message.content, as null on a tool-call-only reply;
