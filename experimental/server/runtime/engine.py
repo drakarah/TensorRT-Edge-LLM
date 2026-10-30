@@ -846,6 +846,7 @@ def _native_context_cache_config(rt, config: ContextCacheConfig):
     native.max_records = config.max_records
     native.recurrent_snapshot_pool_bytes = config.recurrent_snapshot_pool_bytes
     native.partial_kv_snapshot_pool_bytes = config.partial_kv_snapshot_pool_bytes
+    native.snapshots_in_host_memory = config.snapshots_in_host_memory
     return native
 
 
@@ -1381,11 +1382,18 @@ class LLM:
         # A negative value asks the native renderer/tokenizer to derive it.
         cache_config = getattr(self, "_context_cache_config", None)
         prefill_state_only = self._hybrid_base and self.has_draft_model
+        # A hybrid base without a draft model needs the tail only for
+        # EDGELLM_HYBRID_PLAIN_TAIL_CHECKPOINT, which publishes the checkpoint
+        # at the end of the prompt without that tail.
+        plain_hybrid_tail = (self._hybrid_base and not self.has_draft_model and
+                             os.environ.get("EDGELLM_HYBRID_PLAIN_TAIL_CHECKPOINT",
+                                            "0") not in ("", "0"))
         derive_replay_tail = (cache_config is not None and cache_config.enabled
-                              and (prefill_state_only
-                                   or not params.cache_generated_tokens)
-                              and self.has_draft_model and apply_chat_template
-                              and add_generation_prompt)
+                              and ((self.has_draft_model and
+                                    (prefill_state_only
+                                     or not params.cache_generated_tokens))
+                                   or plain_hybrid_tail)
+                              and apply_chat_template and add_generation_prompt)
         replay_tail_length = -1 if derive_replay_tail else 0
         cpp_messages, image_buffers = self._prepare_messages_for_runtime(
             messages)

@@ -996,17 +996,20 @@ ContextCacheCoordinator::ContextCacheCoordinator(ContextCacheConfig const& confi
             ELLM_CHECK(
                 partialKvSlots > 0, "Hybrid attention context reuse requires at least one partial-KV snapshot slot");
         }
+        SnapshotMemory const snapshotMemory
+            = config.snapshotsInHostMemory ? SnapshotMemory::kPinnedHost : SnapshotMemory::kDevice;
         if (mProfile.isHybrid() && mProfile.isSpeculative())
         {
             // Hybrid+MTP additionally snapshots the paired draft KV pages and one base-model hidden row per checkpoint
             // (the successor-dependent boundary hidden state); makeResourceCapacities prices both into the slot counts.
             ELLM_CHECK(mDraftCache != nullptr, "Hybrid+MTP context reuse requires validated draft cache resources");
             mHybridSnapshots = std::make_unique<HybridSnapshotStorage>(mBaseCache, recurrentSlots, partialKvSlots,
-                mDraftCache, deployment.base.hiddenSize, kBOUNDARY_HIDDEN_TYPE);
+                mDraftCache, deployment.base.hiddenSize, kBOUNDARY_HIDDEN_TYPE, snapshotMemory);
         }
         else
         {
-            mHybridSnapshots = std::make_unique<HybridSnapshotStorage>(mBaseCache, recurrentSlots, partialKvSlots);
+            mHybridSnapshots = std::make_unique<HybridSnapshotStorage>(mBaseCache, recurrentSlots, partialKvSlots, nullptr,
+                0, nvinfer1::DataType::kHALF, snapshotMemory);
         }
     }
 
