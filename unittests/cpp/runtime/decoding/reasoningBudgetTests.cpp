@@ -235,6 +235,26 @@ TEST(ReasoningBudgetTest, SyncFeedsOnlyTheNewTokens)
     EXPECT_EQ(budget.state(), State::kForcing);
 }
 
+TEST(ReasoningBudgetTest, BudgetOfZeroForcesTheSecondGeneratedToken)
+{
+    auto budget = makeBudget(0, {kMessageA, kThinkEnd});
+    // the prompt opens the block and the prefill already sampled one token
+    budget.sync({kWord, kThinkStart, kWord}, /*generated=*/1);
+    ASSERT_EQ(budget.state(), State::kForcing);
+    EXPECT_EQ(budget.forcedToken(), kMessageA);
+    budget.accept(kMessageA);
+    EXPECT_EQ(budget.forcedToken(), kThinkEnd);
+}
+
+TEST(ReasoningBudgetTest, FirstSampledTokenCountsAgainstTheBudget)
+{
+    auto budget = makeBudget(2);
+    budget.sync({kWord, kThinkStart, kWord}, /*generated=*/1);
+    EXPECT_EQ(budget.state(), State::kCounting);
+    budget.sync({kWord, kThinkStart, kWord, kWord}, /*generated=*/2);
+    EXPECT_EQ(budget.state(), State::kForcing);
+}
+
 TEST(ReasoningBudgetTest, SyncOfAnEmptyOrShortListIsHarmless)
 {
     ReasoningBudget budget({20, 21}, {{30}}, {30}, 3);
