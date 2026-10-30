@@ -20,7 +20,8 @@ from experimental.server.api.protocol import ChatCompletionRequest
 
 _ENV = ("EDGELLM_DEFAULT_TEMPERATURE", "EDGELLM_DEFAULT_TOP_P",
         "EDGELLM_DEFAULT_TOP_K", "EDGELLM_DEFAULT_ENABLE_THINKING",
-        "EDGELLM_DEFAULT_PRESENCE_PENALTY")
+        "EDGELLM_DEFAULT_PRESENCE_PENALTY", "EDGELLM_DEFAULT_REASONING_BUDGET",
+        "EDGELLM_DEFAULT_REASONING_BUDGET_MESSAGE")
 
 
 def _request(**fields):
@@ -103,3 +104,19 @@ def test_presence_penalty_default_comes_from_the_environment(monkeypatch):
 def test_invalid_presence_penalty_default_falls_back(monkeypatch, value):
     monkeypatch.setenv("EDGELLM_DEFAULT_PRESENCE_PENALTY", value)
     assert _request().presence_penalty == 0.0
+
+
+def test_reasoning_budget_default_comes_from_the_environment(monkeypatch):
+    assert _request().reasoning_budget_tokens == -1
+    assert _request().reasoning_budget_message == ""
+    monkeypatch.setenv("EDGELLM_DEFAULT_REASONING_BUDGET", "8192")
+    monkeypatch.setenv("EDGELLM_DEFAULT_REASONING_BUDGET_MESSAGE", "Time is up.")
+    assert _request().reasoning_budget_tokens == 8192
+    assert _request().reasoning_budget_message == "Time is up."
+    assert _request(reasoning_budget_tokens=0).reasoning_budget_tokens == 0
+
+
+@pytest.mark.parametrize("value", ["-2", "x", ""])
+def test_invalid_reasoning_budget_default_falls_back(monkeypatch, value):
+    monkeypatch.setenv("EDGELLM_DEFAULT_REASONING_BUDGET", value)
+    assert _request().reasoning_budget_tokens == -1

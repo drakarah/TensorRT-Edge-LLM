@@ -2014,3 +2014,45 @@ def test_chat_rejects_presence_penalty_out_of_range(client_and_llm):
         response = client.post("/v1/chat/completions",
                                json={"messages": [{"role": "user", "content": "Hello"}], "presence_penalty": value})
         assert response.status_code == 400
+
+
+def test_chat_forwards_the_reasoning_budget_only_when_thinking_is_on(client_and_llm):
+    client, llm = client_and_llm
+    body = {"messages": [{"role": "user", "content": "Hello"}], "reasoning_budget_tokens": 4096,
+            "reasoning_budget_message": "Answer now."}
+
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+    assert llm.last_sampling_params.reasoning_budget_tokens == -1
+
+    response = client.post("/v1/chat/completions", json={**body, "enable_thinking": True})
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.reasoning_budget_tokens == 4096
+    assert llm.last_sampling_params.reasoning_budget_message == "Answer now."
+
+    response = client.post("/v1/chat/completions", json={**body, "enable_thinking": True, "reasoning_budget_tokens": 0})
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.reasoning_budget_tokens == 0
+
+
+def test_chat_refuses_a_reasoning_budget_with_speculative_decoding(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    llm = _FakeLLM(tmp_path)
+    llm.has_draft_model = True
+    client = TestClient(_create_app(llm, ApiConfig()))
+    body = {"messages": [{"role": "user", "content": "Hello"}], "enable_thinking": True, "reasoning_budget_tokens": 100}
+
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code >= 400
+    assert response.json()["error"]["param"] == "reasoning_budget_tokens"
+    body["reasoning_budget_tokens"] = -1
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+
+
+def test_chat_rejects_a_reasoning_budget_below_minus_one(client_and_llm):
+    client, _ = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={"messages": [{"role": "user", "content": "Hello"}], "reasoning_budget_tokens": -2})
+    assert response.status_code == 400
