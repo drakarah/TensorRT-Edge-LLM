@@ -99,9 +99,12 @@ public:
      * @brief Brings the machine up to date with the full token list of the request (prompt, then generated tokens).
      *
      * The first call replays the list from its last start sequence, which is how a block the chat template already
-     * opened in the prompt is found; later calls feed only the tokens appended since.
+     * opened in the prompt is found; later calls feed only the tokens appended since. Tokens generated before the
+     * first call (the one the prefill sampled) were out of the budget's reach, so they do not consume forced tokens.
+     *
+     * @param generated Number of trailing entries of `tokens` that were generated, not part of the prompt
      */
-    void sync(std::vector<int32_t> const& tokens)
+    void sync(std::vector<int32_t> const& tokens, size_t generated = 0)
     {
         if (!mEnabled)
         {
@@ -120,8 +123,14 @@ public:
                 }
             }
         }
+        size_t const promptEnd = tokens.size() - std::min(generated, tokens.size());
+        bool const priming = mSeen == 0;
         for (size_t i = from; i < tokens.size(); ++i)
         {
+            if (priming && i >= promptEnd && mState == State::kForcing)
+            {
+                continue;
+            }
             accept(tokens[i]);
         }
         mSeen = tokens.size();

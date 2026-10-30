@@ -175,7 +175,7 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
 
     if (context.reasoningBudget.enabled())
     {
-        context.reasoningBudget.sync(context.tokenIds[0]);
+        context.reasoningBudget.sync(context.tokenIds[0], static_cast<size_t>(context.currentGenerateLengths[0]));
         if (auto const forced = context.reasoningBudget.forcedToken())
         {
             forceToken(mRuntime.base.pipelineIO.outputLogits, *forced, context.stream);
