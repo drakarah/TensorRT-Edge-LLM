@@ -199,6 +199,18 @@ void applyPresencePenalty(
 constexpr float kMaskedLogitValue = -1e30F;
 
 /*!
+ * \brief Leaves one token as the only candidate: every other logit of every row is set to \ref kMaskedLogitValue.
+ *
+ * Used to make the decoder emit a given token regardless of the sampling parameters.
+ *
+ * \param[in,out] logits Logits [GPU, Float] with shape [num-rows, vocab-size]
+ * \param[in] tokenId Token that stays, 0 <= tokenId < vocab-size
+ * \param[in] stream CUDA stream to execute the kernel
+ * \throws std::runtime_error If tensor validation fails or the token is outside the vocabulary
+ */
+void forceToken(rt::Tensor& logits, int32_t tokenId, cudaStream_t stream);
+
+/*!
  * \brief Zero out grammar-forbidden tokens ahead of sampling.
  *
  * The bitmask is dense and bit-packed, one bit per output-vocabulary entry, with a

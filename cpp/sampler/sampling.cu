@@ -930,6 +930,35 @@ void applyPresencePenalty(
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void forceTokenKernel(float* logits, int32_t vocabSize, int32_t tokenId)
+{
+    int32_t const column = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x)
+        + static_cast<int32_t>(threadIdx.x);
+    if (column < vocabSize && column != tokenId)
+    {
+        logits[static_cast<int64_t>(blockIdx.y) * vocabSize + column] = kMaskedLogitValue;
+    }
+}
+
+void forceToken(rt::Tensor& logits, int32_t tokenId, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU && logits.getDataType() == nvinfer1::DataType::kFLOAT,
+        "forceToken needs GPU Float logits");
+    auto const shape = logits.getShape();
+    check::check(shape.getNumDims() == 2, "Invalid tensor dimensions");
+    int32_t const rows = static_cast<int32_t>(shape[0]);
+    int32_t const vocabSize = static_cast<int32_t>(shape[1]);
+    check::check(tokenId >= 0 && tokenId < vocabSize, "Forced token is outside the vocabulary");
+    if (rows == 0)
+    {
+        return;
+    }
+    constexpr int32_t kBLOCK_SIZE = 256;
+    dim3 const grid(static_cast<uint32_t>((vocabSize + kBLOCK_SIZE - 1) / kBLOCK_SIZE), static_cast<uint32_t>(rows));
+    forceTokenKernel<<<grid, kBLOCK_SIZE, 0, stream>>>(logits.dataPointer<float>(), vocabSize, tokenId);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 //! Words of the packed mask each warp visits per launch; sizes the grid's x dimension.
 constexpr int32_t kTOKEN_BITMASK_WORDS_PER_WARP = 8;
 
