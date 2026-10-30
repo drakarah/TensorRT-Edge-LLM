@@ -84,6 +84,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default_factory=lambda: _env_default("EDGELLM_DEFAULT_PRESENCE_PENALTY", float, 0.0, lambda v: -2.0 <= v <= 2.0),
         ge=-2.0,
         le=2.0)
+    reasoning_budget_tokens: int = Field(
+        default_factory=lambda: _env_default("EDGELLM_DEFAULT_REASONING_BUDGET", int, -1, lambda v: v >= -1), ge=-1)
+    reasoning_budget_message: str = Field(
+        default_factory=lambda: os.environ.get("EDGELLM_DEFAULT_REASONING_BUDGET_MESSAGE", ""))
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = Field(default=None, ge=0, le=50)

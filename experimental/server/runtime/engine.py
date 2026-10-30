@@ -93,6 +93,8 @@ class SamplingParams:
     top_p: float = 0.9
     top_k: int = 50
     presence_penalty: float = 0.0
+    reasoning_budget_tokens: int = -1
+    reasoning_budget_message: str = ""
     seed: Optional[int] = None
     max_tokens: int = 2048
     enable_thinking: bool = False
@@ -1418,6 +1420,8 @@ class LLM:
         request.top_p = params.top_p
         request.top_k = params.top_k
         request.presence_penalty = params.presence_penalty
+        request.reasoning_budget_tokens = params.reasoning_budget_tokens
+        request.reasoning_budget_message = params.reasoning_budget_message
         request.max_generate_length = params.max_tokens
         request.apply_chat_template = apply_chat_template
         request.add_generation_prompt = add_generation_prompt

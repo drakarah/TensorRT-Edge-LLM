@@ -223,6 +223,15 @@ class OpenAIServingChat:
                     "presence_penalty needs a deployment without speculative "
                     "decoding and with a single request slot",
                     param="presence_penalty")
+        reasoning_budget = request.reasoning_budget_tokens if request.enable_thinking else -1
+        if reasoning_budget >= 0:
+            capabilities = getattr(self._client, "capabilities", None)
+            if (getattr(capabilities, "speculative_decoding", False)
+                    or (getattr(capabilities, "max_num_seqs", 1) or 1) > 1):
+                raise UnsupportedFeatureError(
+                    "reasoning_budget_tokens needs a deployment without speculative "
+                    "decoding and with a single request slot",
+                    param="reasoning_budget_tokens")
         try:
             tool_config = validate_tool_request(request.messages,
                                                 request.tools,
@@ -300,6 +309,8 @@ class OpenAIServingChat:
             top_p=1.0 if greedy else request.top_p,
             top_k=1 if greedy else request.top_k,
             presence_penalty=request.presence_penalty,
+            reasoning_budget_tokens=reasoning_budget,
+            reasoning_budget_message=request.reasoning_budget_message,
             seed=request.seed,
             max_tokens=(request.effective_max_tokens
                         or self._default_max_tokens),
