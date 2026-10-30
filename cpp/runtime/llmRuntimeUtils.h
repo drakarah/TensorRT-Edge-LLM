@@ -233,6 +233,7 @@ struct LLMGenerationRequest
     float temperature;                                      //!< Temperature parameter for sampling
     float topP;                                             //!< Top-p (nucleus) sampling parameter
     int64_t topK;                                           //!< Top-k sampling parameter
+    float presencePenalty{0.0f};                            //!< Subtracted from the logit of every token already generated (vanilla decoding, batch 1)
     int64_t maxGenerateLength;                              //!< Max length of the generated tokens
     std::optional<uint64_t> samplingSeed;                   //!< Stable request-level sampling seed
     SpecProposalSampling proposalSampling{SpecProposalSampling::kAuto}; //!< Draft proposal sampling policy

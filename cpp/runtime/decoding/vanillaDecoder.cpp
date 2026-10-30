@@ -153,6 +153,18 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
     }
     // GCOVR_EXCL_STOP
 
+    if (context.presencePenalty != 0.0f)
+    {
+        if (context.presenceFlagsPending)
+        {
+            CUDA_CHECK(cudaMemsetAsync(mRuntime.sampling.presenceSeen.rawPointer(), 0,
+                mRuntime.sampling.presenceSeen.getMemoryCapacity(), context.stream));
+            context.presenceFlagsPending = false;
+        }
+        applyPresencePenalty(mRuntime.base.pipelineIO.outputLogits, mRuntime.preprocess.idsInput,
+            mRuntime.sampling.presenceSeen, context.presencePenalty, context.stream);
+    }
+
     if (context.hasGuidedDecoding)
     {
         // One logits row per active slot. Sits after the forward was enqueued, so the host-side

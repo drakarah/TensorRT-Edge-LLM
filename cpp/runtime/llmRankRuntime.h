@@ -615,6 +615,7 @@ private:
     rt::Tensor mSamplingIndices;
     rt::Tensor mSamplingScores;
     rt::Tensor mSamplingUniforms;
+    rt::Tensor mPresenceSeen; //!< [maxBatch, outputVocab] flags of the tokens a request has generated (presence penalty)
     rt::Tensor mBaseVocabMappingTable; // Vocab mapping table for base model reduced vocab (empty if not used)
 
     // [3] Batch eviction support tensors.

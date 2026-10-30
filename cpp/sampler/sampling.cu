@@ -810,6 +810,28 @@ __global__ void applyLogitBiasRepeatedRowsKernel(float* logits, int32_t const* t
     }
 }
 
+__global__ void applyPresencePenaltyKernel(
+    float* logits, int32_t const* lastTokenIds, int8_t* seenFlags, int32_t vocabSize, float penalty)
+{
+    int32_t const rowId = static_cast<int32_t>(blockIdx.y);
+    int32_t const tokenId = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x)
+        + static_cast<int32_t>(threadIdx.x);
+    if (tokenId >= vocabSize)
+    {
+        return;
+    }
+    int64_t const offset = static_cast<int64_t>(rowId) * vocabSize + tokenId;
+    // Only the thread that owns the fed token writes its flag, and it reads that flag afterwards, so no synchronisation is needed.
+    if (lastTokenIds[rowId] == tokenId)
+    {
+        seenFlags[offset] = 1;
+    }
+    if (seenFlags[offset] != 0)
+    {
+        logits[offset] -= penalty;
+    }
+}
+
 void validateLogitBiasInputs(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tensor const& biasValues,
     rt::Tensor const& offsets, int32_t rowsPerSlot)
 {
@@ -877,6 +899,35 @@ void applyLogitBiasRepeatedRows(rt::Tensor& logits, rt::Tensor const& tokenIds, 
     applyLogitBiasRepeatedRowsKernel<<<totalRows, kBLOCK_SIZE, 0, stream>>>(logits.dataPointer<float>(),
         tokenIds.dataPointer<int32_t>(), biasValues.dataPointer<float>(), offsets.dataPointer<int32_t>(), vocabSize,
         rowsPerSlot);
+}
+
+void applyPresencePenalty(
+    rt::Tensor& logits, rt::Tensor const& lastTokenIds, rt::Tensor& seenFlags, float penalty, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU && lastTokenIds.getDeviceType() == rt::DeviceType::kGPU
+            && seenFlags.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    check::check(logits.getDataType() == nvinfer1::DataType::kFLOAT && lastTokenIds.getDataType() == nvinfer1::DataType::kINT32
+            && seenFlags.getDataType() == nvinfer1::DataType::kINT8,
+        "Invalid tensor data types");
+    auto const logitsShape = logits.getShape();
+    auto const lastTokenShape = lastTokenIds.getShape();
+    auto const flagsShape = seenFlags.getShape();
+    check::check(logitsShape.getNumDims() == 2 && flagsShape.getNumDims() == 2, "Invalid tensor dimensions");
+    int32_t const rows = static_cast<int32_t>(logitsShape[0]);
+    int32_t const vocabSize = static_cast<int32_t>(logitsShape[1]);
+    check::check(lastTokenShape.volume() >= rows, "Presence penalty needs one fed token per logits row");
+    check::check(flagsShape[0] >= rows && flagsShape[1] == vocabSize, "Presence penalty flag shape mismatch");
+    if (rows == 0 || vocabSize == 0)
+    {
+        return;
+    }
+
+    constexpr int32_t kBLOCK_SIZE = 256;
+    dim3 const grid(static_cast<uint32_t>((vocabSize + kBLOCK_SIZE - 1) / kBLOCK_SIZE), static_cast<uint32_t>(rows));
+    applyPresencePenaltyKernel<<<grid, kBLOCK_SIZE, 0, stream>>>(logits.dataPointer<float>(),
+        lastTokenIds.dataPointer<int32_t>(), seenFlags.dataPointer<int8_t>(), vocabSize, penalty);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 //! Words of the packed mask each warp visits per launch; sizes the grid's x dimension.

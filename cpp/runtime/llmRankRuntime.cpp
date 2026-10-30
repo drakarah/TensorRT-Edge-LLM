@@ -522,6 +522,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kINT32, "LLMRankRuntime::mSamplingIndices");
         mSamplingScores
             = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kFLOAT, "LLMRankRuntime::mSamplingScores");
+        mPresenceSeen = rt::Tensor({mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize}, rt::DeviceType::kGPU,
+            DataType::kINT8, "LLMRankRuntime::mPresenceSeen");
         mSamplingUniforms = rt::Tensor(
             {mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kFLOAT, "LLMRankRuntime::mSamplingUniforms");
         allocateLogitBias(mLogitBias, mMaxRuntimeBatchSize);
@@ -810,7 +812,8 @@ void LLMRankRuntime::buildDecodingRuntimeContext()
     PreprocessResources preprocessResources{
         *mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mDeepstack.get(), mGemma4Ple.get()};
     SamplingBuffers sampling{mSamplingWorkspace, mSamplingIndices, mSamplingScores, mBaseVocabMappingTable,
-        mHostDecoderTokenIds, mHostSelectedTokenIds, mHostOutputSpaceIds, mSamplingUniforms, mHostSamplingUniforms};
+        mHostDecoderTokenIds, mHostSelectedTokenIds, mHostOutputSpaceIds, mSamplingUniforms, mHostSamplingUniforms,
+        mPresenceSeen};
     LogprobsBuffers logprobs{
         mDeviceLogprobsValues, mDeviceLogprobsIndices, mHostLogprobsValues, mHostLogprobsIndices, mGatheredLogits};
     mDecodingRuntimeContext.reset(
@@ -1818,6 +1821,13 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
             request.temperature, request.topK, request.topP);
     }
 
+    if (request.presencePenalty != 0.0f && (enableSpecDecode || activeBatchSize > 1))
+    {
+        LOG_ERROR("presence_penalty needs vanilla decoding of a single request (speculative decoding: %d, batch: %d).",
+            static_cast<int>(enableSpecDecode), activeBatchSize);
+        return nullptr;
+    }
+
     int32_t maxGenerateLength = request.maxGenerateLength;
 
     if (request.formattedRequests.size() != static_cast<size_t>(activeBatchSize)
@@ -1926,6 +1936,8 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     context.temperature = forceGreedySpecDecode ? 1.0f : request.temperature;
     context.topP = forceGreedySpecDecode ? 1.0f : request.topP;
     context.topK = forceGreedySpecDecode ? 0 : request.topK;
+    context.presencePenalty = request.presencePenalty;
+    context.presenceFlagsPending = request.presencePenalty != 0.0f;
     bool const hasExplicitSamplingSeed = request.samplingSeed.has_value()
         || std::any_of(request.requests.begin(), request.requests.end(),
             [](LLMGenerationRequest::Request const& slot) { return slot.samplingSeed.has_value(); });

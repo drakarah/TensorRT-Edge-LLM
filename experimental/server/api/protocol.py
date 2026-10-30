@@ -15,6 +15,7 @@
 """Typed OpenAI protocol models supported by the Edge-LLM server."""
 
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -23,6 +24,25 @@ from pydantic import (BaseModel, ConfigDict, Field, StrictBool, ValidationInfo,
                       field_validator, model_validator)
 
 logger = logging.getLogger("edgellm.server.protocol")
+
+def _env_default(name: str, cast, fallback, valid=lambda value: True):
+    """Server-wide default for a request field that the client leaves out."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return fallback
+    try:
+        value = cast(raw)
+    except ValueError:
+        value = None
+    if value is None or not valid(value):
+        logger.warning("ignoring %s=%r", name, raw)
+        return fallback
+    return value
+
+
+def _env_flag_default(name: str, fallback: bool) -> bool:
+    return _env_default(name, lambda v: bool(int(v)), fallback)
+
 
 _UNSUPPORTED_SAMPLING_DEFAULTS = {
     "min_p": 0.0,
@@ -60,7 +80,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     messages: List[Dict[str, Any]]
     model: Optional[str] = None
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
-    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    presence_penalty: float = Field(
+        default_factory=lambda: _env_default("EDGELLM_DEFAULT_PRESENCE_PENALTY", float, 0.0, lambda v: -2.0 <= v <= 2.0),
+        ge=-2.0,
+        le=2.0)
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = Field(default=None, ge=0, le=50)
@@ -71,9 +94,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: float = Field(default=0.9, gt=0.0, le=1.0)
-    top_k: int = Field(default=50, ge=-1)
+    temperature: float = Field(default_factory=lambda: _env_default("EDGELLM_DEFAULT_TEMPERATURE", float, 0.7, lambda v: 0.0 <= v <= 2.0), ge=0.0, le=2.0)
+    top_p: float = Field(default_factory=lambda: _env_default("EDGELLM_DEFAULT_TOP_P", float, 0.9, lambda v: 0.0 < v <= 1.0), gt=0.0, le=1.0)
+    top_k: int = Field(default_factory=lambda: _env_default("EDGELLM_DEFAULT_TOP_K", int, 50, lambda v: v >= -1), ge=-1)
     min_p: float = Field(default=0.0, ge=0.0, le=1.0)
     repetition_penalty: float = Field(default=1.0, gt=0.0)
     tools: Optional[List[Dict[str, Any]]] = None
@@ -85,7 +108,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     audio: Optional[ChatAudioConfig] = None
     apply_chat_template: StrictBool = True
     add_generation_prompt: StrictBool = True
-    enable_thinking: bool = False
+    enable_thinking: bool = Field(default_factory=lambda: _env_flag_default("EDGELLM_DEFAULT_ENABLE_THINKING", False))
     reasoning_effort: Optional[str] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     disable_spec_decode: bool = False
