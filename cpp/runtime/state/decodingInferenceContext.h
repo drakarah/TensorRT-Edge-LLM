@@ -18,6 +18,7 @@
 #pragma once
 
 #include "runtime/exec/raggedBatchBuilder.h"
+#include "runtime/decoding/reasoningBudget.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/state/residentSlotPool.h"
 #include "runtime/streaming.h"
@@ -206,6 +207,7 @@ struct DecodingInferenceContext
     int64_t topK{0};                      //!< Top-K sampling parameter
     float presencePenalty{0.0f};          //!< Presence penalty of the request (0 = off)
     bool presenceFlagsPending{false};     //!< The seen-token flags are cleared before the next penalised decode step
+    ReasoningBudget reasoningBudget;      //!< Reasoning budget of the request (disabled unless requested)
     std::vector<uint64_t> samplingSeeds;  //!< Stable seed for each active logical request
     bool useRequestStableSampling{false}; //!< Use request-position-derived uniforms for target sampling
     SpecProposalSampling proposalSampling{SpecProposalSampling::kAuto};

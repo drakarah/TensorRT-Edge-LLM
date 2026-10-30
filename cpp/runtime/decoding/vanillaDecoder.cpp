@@ -173,6 +173,15 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
             /*rowsPerSlot=*/1, context.stream);
     }
 
+    if (context.reasoningBudget.enabled())
+    {
+        context.reasoningBudget.sync(context.tokenIds[0]);
+        if (auto const forced = context.reasoningBudget.forcedToken())
+        {
+            forceToken(mRuntime.base.pipelineIO.outputLogits, *forced, context.stream);
+        }
+    }
+
     check::check(mRuntime.sampling.indices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     if (shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
     {

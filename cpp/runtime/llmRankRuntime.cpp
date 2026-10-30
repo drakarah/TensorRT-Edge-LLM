@@ -1736,6 +1736,39 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     return finishGeneration(*generation, request, response, stream);
 }
 
+ReasoningBudget LLMRankRuntime::makeReasoningBudget(LLMGenerationRequest const& request)
+{
+    int32_t const startId = reasoningStartMarkers(*mTokenizer)[1];
+    int32_t const endId = reasoningEndMarkers(*mTokenizer)[1];
+    if (startId < 0 || endId < 0)
+    {
+        LOG_ERROR("The tokenizer has no think start/end tokens, so a reasoning budget cannot be applied.");
+        return {};
+    }
+    if (mTokenEndsUtf8.empty())
+    {
+        // A token whose bytes stop inside a multi-byte character decodes to U+FFFD.
+        mTokenEndsUtf8.assign(static_cast<size_t>(mDeployment.base.vocabSize), 1);
+        for (int32_t id = 0; id < mDeployment.base.vocabSize; ++id)
+        {
+            if (mTokenizer->decode({static_cast<tokenizer::Rank>(id)}).find("\xEF\xBF\xBD") != std::string::npos)
+            {
+                mTokenEndsUtf8[static_cast<size_t>(id)] = 0;
+            }
+        }
+    }
+    std::vector<int32_t> forced;
+    if (!request.reasoningBudgetMessage.empty())
+    {
+        for (auto const id : mTokenizer->encode(request.reasoningBudgetMessage))
+        {
+            forced.push_back(static_cast<int32_t>(id));
+        }
+    }
+    forced.push_back(endId);
+    return ReasoningBudget({startId}, {{endId}}, std::move(forced), request.reasoningBudgetTokens, mTokenEndsUtf8);
+}
+
 std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGeneration(LLMGenerationRequest const& request,
     LLMGenerationResponse& response, cudaStream_t stream, bool outputThinkerEmbeddings, TokenBroadcastFn tokenBroadcast,
     int32_t parallelRank, RequestId founderRequestId)
@@ -1825,6 +1858,16 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     {
         LOG_ERROR("presence_penalty needs vanilla decoding of a single request (speculative decoding: %d, batch: %d).",
             static_cast<int>(enableSpecDecode), activeBatchSize);
+        return nullptr;
+    }
+
+    if (request.reasoningBudgetTokens >= 0
+        && (enableSpecDecode || activeBatchSize > 1 || mDeployment.base.reducedVocabSize > 0))
+    {
+        LOG_ERROR(
+            "A reasoning budget needs vanilla decoding of a single request with the full vocabulary (speculative "
+            "decoding: %d, batch: %d, reduced vocabulary: %d).",
+            static_cast<int>(enableSpecDecode), activeBatchSize, static_cast<int>(mDeployment.base.reducedVocabSize > 0));
         return nullptr;
     }
 
@@ -1938,6 +1981,15 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     context.topK = forceGreedySpecDecode ? 0 : request.topK;
     context.presencePenalty = request.presencePenalty;
     context.presenceFlagsPending = request.presencePenalty != 0.0f;
+    if (request.reasoningBudgetTokens >= 0)
+    {
+        auto budget = makeReasoningBudget(request);
+        if (!budget.enabled())
+        {
+            return nullptr;
+        }
+        context.reasoningBudget = std::move(budget);
+    }
     bool const hasExplicitSamplingSeed = request.samplingSeed.has_value()
         || std::any_of(request.requests.begin(), request.requests.end(),
             [](LLMGenerationRequest::Request const& slot) { return slot.samplingSeed.has_value(); });

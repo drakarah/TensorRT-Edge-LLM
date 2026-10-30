@@ -283,6 +283,7 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     enableThinking = false;
     presencePenalty = 0.0f;
     presenceFlagsPending = false;
+    reasoningBudget = ReasoningBudget{};
     callbackEmittedTokenCounts.clear();
     callbackEmittedTokenCounts.resize(batchSize, 0);
     shouldStopAfterAcceptedToken = {};

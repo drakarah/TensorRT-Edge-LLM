@@ -29,6 +29,7 @@
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
+#include "runtime/decoding/reasoningBudget.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/features/deepstackBinding.h"
@@ -366,6 +367,9 @@ public:
     //! the context-cache admit, prefill-execution setup, streaming setup, and the founding prefill
     //! itself. Returns null on any refusal (the same conditions that returned false), and throws
     //! where handleRequest threw. @p request must outlive the returned object.
+    //! Budget for the request, disabled (and logged) when the tokenizer has no think tokens.
+    ReasoningBudget makeReasoningBudget(LLMGenerationRequest const& request);
+
     std::unique_ptr<SteppedGeneration> beginGeneration(LLMGenerationRequest const& request,
         LLMGenerationResponse& response, cudaStream_t stream, bool outputThinkerEmbeddings,
         TokenBroadcastFn tokenBroadcast, int32_t parallelRank, RequestId founderRequestId = 0);
@@ -615,6 +619,7 @@ private:
     rt::Tensor mSamplingIndices;
     rt::Tensor mSamplingScores;
     rt::Tensor mSamplingUniforms;
+    std::vector<uint8_t> mTokenEndsUtf8; //!< Per token: its bytes leave no unfinished UTF-8 character (built on the first reasoning budget)
     rt::Tensor mPresenceSeen; //!< [maxBatch, outputVocab] flags of the tokens a request has generated (presence penalty)
     rt::Tensor mBaseVocabMappingTable; // Vocab mapping table for base model reduced vocab (empty if not used)
 

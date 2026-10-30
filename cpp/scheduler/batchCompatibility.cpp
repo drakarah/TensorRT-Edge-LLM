@@ -40,6 +40,8 @@ constexpr ComparedField kComparedFields[] = {
     // would simply generate with the other's settings.
     {"temperature", [](auto const& a, auto const& b) { return a.temperature == b.temperature; }},
     {"presencePenalty", [](auto const& a, auto const& b) { return a.presencePenalty == b.presencePenalty; }},
+    {"reasoningBudgetTokens", [](auto const& a, auto const& b) { return a.reasoningBudgetTokens == b.reasoningBudgetTokens; }},
+    {"reasoningBudgetMessage", [](auto const& a, auto const& b) { return a.reasoningBudgetMessage == b.reasoningBudgetMessage; }},
     {"topP", [](auto const& a, auto const& b) { return a.topP == b.topP; }},
     {"topK", [](auto const& a, auto const& b) { return a.topK == b.topK; }},
 

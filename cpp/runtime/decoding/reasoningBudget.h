@@ -95,6 +95,38 @@ public:
         return std::nullopt;
     }
 
+    /*!
+     * @brief Brings the machine up to date with the full token list of the request (prompt, then generated tokens).
+     *
+     * The first call replays the list from its last start sequence, which is how a block the chat template already
+     * opened in the prompt is found; later calls feed only the tokens appended since.
+     */
+    void sync(std::vector<int32_t> const& tokens)
+    {
+        if (!mEnabled)
+        {
+            return;
+        }
+        size_t from = mSeen;
+        if (mSeen == 0 && tokens.size() >= mStart.size())
+        {
+            from = tokens.size();
+            for (size_t i = tokens.size() - mStart.size() + 1; i-- > 0;)
+            {
+                if (std::equal(mStart.begin(), mStart.end(), tokens.begin() + static_cast<std::ptrdiff_t>(i)))
+                {
+                    from = i;
+                    break;
+                }
+            }
+        }
+        for (size_t i = from; i < tokens.size(); ++i)
+        {
+            accept(tokens[i]);
+        }
+        mSeen = tokens.size();
+    }
+
     //! Feeds one token of the prompt tail or of the generation, in order.
     void accept(int32_t token)
     {
@@ -230,6 +262,7 @@ private:
     int32_t mBudget{-1};
     int32_t mRemaining{-1};
     size_t mForcePos{0};
+    size_t mSeen{0};
     State mState{State::kIdle};
     bool mEnabled{false};
 };
