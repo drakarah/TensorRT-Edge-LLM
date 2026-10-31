@@ -47,7 +47,7 @@ public:
     //! @return false, with nothing newly mapped, if the device cannot supply the memory.
     bool growTo(size_t bytesPerHalf) noexcept;
 
-    //! Release the most recently mapped chunks while at least @p bytesPerHalf (rounded up to the granularity) stays mapped.
+    //! Unmap and release granules from the end until @p bytesPerHalf (rounded up to the granularity) remain mapped.
     void shrinkTo(size_t bytesPerHalf) noexcept;
 
     void* base() const noexcept
@@ -77,7 +77,6 @@ private:
     size_t mMapped{};
     int mDevice{};
     std::vector<CUmemGenericAllocationHandle> mHandles[2];
-    std::vector<size_t> mChunkSizes;
 };
 
 } // namespace rt

@@ -90,49 +90,54 @@ bool VmmRegion::growTo(size_t bytesPerHalf) noexcept
     {
         return true;
     }
-    size_t const chunk = target - mMapped;
+    size_t const first = mMapped / mGranularity;
+    size_t const last = target / mGranularity;
     CUmemAllocationProp const prop = allocationProp(mDevice);
     CUmemAccessDesc access{};
     access.location = prop.location;
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
-    CUmemGenericAllocationHandle handles[2]{};
     bool ok = true;
-    int created = 0;
-    for (; created < 2 && ok; ++created)
+    for (int h = 0; h < 2 && ok; ++h)
     {
-        ok = cuMemCreate(&handles[created], chunk, &prop, 0) == CUDA_SUCCESS;
-    }
-    int mapped = 0;
-    if (ok)
-    {
-        for (; mapped < 2 && ok; ++mapped)
+        for (size_t g = first; g < last && ok; ++g)
         {
-            CUdeviceptr const at = mBase + static_cast<size_t>(mapped) * mHalfBytes + mMapped;
-            ok = cuMemMap(at, chunk, 0, handles[mapped], 0) == CUDA_SUCCESS
-                && cuMemSetAccess(at, chunk, &access, 1) == CUDA_SUCCESS;
+            CUmemGenericAllocationHandle handle{};
+            CUdeviceptr const at = mBase + static_cast<size_t>(h) * mHalfBytes + g * mGranularity;
+            if (cuMemCreate(&handle, mGranularity, &prop, 0) != CUDA_SUCCESS)
+            {
+                ok = false;
+            }
+            else if (cuMemMap(at, mGranularity, 0, handle, 0) != CUDA_SUCCESS)
+            {
+                cuMemRelease(handle);
+                ok = false;
+            }
+            else
+            {
+                mHandles[h].push_back(handle);
+            }
+        }
+        if (ok)
+        {
+            ok = cuMemSetAccess(mBase + static_cast<size_t>(h) * mHalfBytes + first * mGranularity, (last - first) * mGranularity, &access, 1)
+                == CUDA_SUCCESS;
         }
     }
     if (!ok)
     {
-        for (int h = 0; h < mapped; ++h)
-        {
-            cuMemUnmap(mBase + static_cast<size_t>(h) * mHalfBytes + mMapped, chunk);
-        }
         for (int h = 0; h < 2; ++h)
         {
-            if (handles[h] != 0)
+            while (mHandles[h].size() > first)
             {
-                cuMemRelease(handles[h]);
+                size_t const g = mHandles[h].size() - 1;
+                cuMemUnmap(mBase + static_cast<size_t>(h) * mHalfBytes + g * mGranularity, mGranularity);
+                cuMemRelease(mHandles[h].back());
+                mHandles[h].pop_back();
             }
         }
         return false;
     }
-    for (int h = 0; h < 2; ++h)
-    {
-        mHandles[h].push_back(handles[h]);
-    }
-    mChunkSizes.push_back(chunk);
     mMapped = target;
     return true;
 }
@@ -140,18 +145,17 @@ bool VmmRegion::growTo(size_t bytesPerHalf) noexcept
 void VmmRegion::shrinkTo(size_t bytesPerHalf) noexcept
 {
     size_t const keep = (bytesPerHalf + mGranularity - 1) / mGranularity * mGranularity;
-    while (!mChunkSizes.empty() && mMapped - mChunkSizes.back() >= keep)
+    for (int h = 0; h < 2; ++h)
     {
-        size_t const chunk = mChunkSizes.back();
-        for (int h = 0; h < 2; ++h)
+        while (mHandles[h].size() * mGranularity > keep)
         {
-            cuMemUnmap(mBase + static_cast<size_t>(h) * mHalfBytes + mMapped - chunk, chunk);
+            size_t const g = mHandles[h].size() - 1;
+            cuMemUnmap(mBase + static_cast<size_t>(h) * mHalfBytes + g * mGranularity, mGranularity);
             cuMemRelease(mHandles[h].back());
             mHandles[h].pop_back();
         }
-        mMapped -= chunk;
-        mChunkSizes.pop_back();
     }
+    mMapped = std::min(mMapped, keep);
 }
 
 } // namespace rt

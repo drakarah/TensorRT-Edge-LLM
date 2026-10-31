@@ -97,7 +97,7 @@ TEST(VmmRegionTest, GrowthIsCappedAtTheHalfSize)
     EXPECT_EQ(region.mappedPerHalf(), 2 * g);
 }
 
-TEST(VmmRegionTest, ShrinkReleasesWholeChunksAtOrAboveTheRequestedSize)
+TEST(VmmRegionTest, ShrinkReleasesGranulesFromTheEnd)
 {
     size_t const g = granule();
     rt::VmmRegion region(8 * g, 0);
@@ -106,15 +106,37 @@ TEST(VmmRegionTest, ShrinkReleasesWholeChunksAtOrAboveTheRequestedSize)
     EXPECT_EQ(region.mappedPerHalf(), 5 * g);
 
     region.shrinkTo(4 * g);
-    EXPECT_EQ(region.mappedPerHalf(), 5 * g) << "the last chunk spans 2g..5g and cannot be split";
-    region.shrinkTo(2 * g);
-    EXPECT_EQ(region.mappedPerHalf(), 2 * g);
+    EXPECT_EQ(region.mappedPerHalf(), 4 * g);
+    region.shrinkTo(2 * g + 1);
+    EXPECT_EQ(region.mappedPerHalf(), 3 * g) << "rounded up to the granule";
+    region.shrinkTo(10 * g);
+    EXPECT_EQ(region.mappedPerHalf(), 3 * g) << "shrinking to a larger size changes nothing";
     region.shrinkTo(0);
     EXPECT_EQ(region.mappedPerHalf(), 0u);
 
     ASSERT_TRUE(region.growTo(g));
     fill(region.base(), 0x5A, g);
     EXPECT_EQ(read(region.base(), 1)[0], 0x5A);
+}
+
+TEST(VmmRegionTest, ShrinkKeepsTheRemainingContentsAndRegrowthIsUsable)
+{
+    size_t const g = granule();
+    rt::VmmRegion region(4 * g, 0);
+    ASSERT_TRUE(region.growTo(4 * g));
+    uint8_t* const k = static_cast<uint8_t*>(region.base());
+    uint8_t* const v = k + region.halfBytes();
+    fill(k, 0x21, g);
+    fill(v, 0x22, g);
+    fill(k + 3 * g, 0x23, g);
+
+    region.shrinkTo(g);
+    EXPECT_EQ(read(k, 1)[0], 0x21);
+    EXPECT_EQ(read(v, 1)[0], 0x22);
+    ASSERT_TRUE(region.growTo(4 * g));
+    fill(k + 3 * g, 0x24, g);
+    EXPECT_EQ(read(k + 3 * g + g - 1, 1)[0], 0x24);
+    EXPECT_EQ(read(k, 1)[0], 0x21);
 }
 
 TEST(VmmRegionTest, FailedGrowthLeavesTheMappingUnchanged)
