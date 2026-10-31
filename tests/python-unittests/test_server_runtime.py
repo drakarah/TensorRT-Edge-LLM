@@ -690,7 +690,7 @@ def test_native_chat_template_derives_hybrid_mtp_replay_tail(monkeypatch):
     llm = _bare_llm(SimpleNamespace(has_draft_model=lambda: True))
     llm._rt = runtime_module
     llm._context_cache_config = ContextCacheConfig(enabled=True)
-    llm._prepare_messages_for_runtime = lambda _messages: ([], [])
+    llm._prepare_messages_for_runtime = lambda _messages, _apply_chat_template=True: ([], [])
     monkeypatch.setattr(engine_module, "_load_audio_buffers",
                         lambda *_args: [])
 
