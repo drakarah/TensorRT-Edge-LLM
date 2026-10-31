@@ -20,7 +20,8 @@ import time
 import pytest
 from test_server_requests import _create_app, _FakeLLM
 
-from experimental.server.runtime.request_stats import (RequestStats,
+from experimental.server.runtime.request_stats import (MIN_PREFILL_TOKENS,
+                                                       RequestStats,
                                                        RequestTimer)
 
 _ENV = ("EDGELLM_REQUEST_STATS", "EDGELLM_REQUEST_STATS_CAPACITY")
@@ -40,6 +41,7 @@ def _entry(**fields):
         "reused_tokens": 0,
         "completion_tokens": 11,
         "ttft_ms": 100.0,
+        "prefill_tok_s": 1000.0,
         "decode_ms": 1000.0,
         "decode_tokens": 10,
         "decode_tok_s": 10.0,
@@ -114,7 +116,7 @@ def test_concurrent_records_keep_unique_ids():
 def test_streamed_timer_splits_prefill_from_decode():
     timer = RequestTimer(stream=True)
     timer.prompt_tokens = 1000
-    timer.reused_tokens = 900
+    timer.reused_tokens = 500
     time.sleep(0.05)
     timer.tokens(1)
     time.sleep(0.1)
@@ -124,7 +126,7 @@ def test_streamed_timer_splits_prefill_from_decode():
     assert entry["decode_tokens"] == 9
     assert entry["ttft_ms"] >= 50
     assert entry["decode_ms"] >= 100
-    assert entry["prefill_tok_s"] == pytest.approx(100 /
+    assert entry["prefill_tok_s"] == pytest.approx(500 /
                                                    (entry["ttft_ms"] / 1000),
                                                    rel=0.01)
     assert entry["decode_tok_s"] == pytest.approx(9 /
@@ -153,7 +155,7 @@ def test_timer_without_tokens_reports_no_rates():
 
 def test_a_single_token_has_no_decode_rate():
     timer = RequestTimer(stream=True)
-    timer.prompt_tokens = 5
+    timer.prompt_tokens = 500
     timer.tokens(1)
     entry = timer.entry("ok")
     assert entry["decode_tokens"] == 0
@@ -173,7 +175,7 @@ def test_unknown_prompt_leaves_the_prefill_rate_empty():
     timer.tokens(1)
     assert timer.entry("ok")["prefill_tok_s"] is None
     timer = RequestTimer(stream=True)
-    timer.prompt_tokens = 50
+    timer.prompt_tokens = 500
     timer.tokens(1)
     assert timer.entry("ok")["prefill_tok_s"] is not None
 
@@ -188,10 +190,10 @@ def test_reuse_larger_than_the_prompt_gives_no_prefill_rate():
 
 def test_summary_weights_by_tokens_and_ignores_failed_requests():
     stats = RequestStats(10)
-    stats.record(_entry(prompt_tokens=100, reused_tokens=0, ttft_ms=100.0))
+    stats.record(_entry(prompt_tokens=1000, reused_tokens=0, ttft_ms=100.0))
     stats.record(
-        _entry(prompt_tokens=1000,
-               reused_tokens=800,
+        _entry(prompt_tokens=2000,
+               reused_tokens=1000,
                ttft_ms=100.0,
                decode_tokens=30,
                decode_ms=1000.0,
@@ -201,10 +203,35 @@ def test_summary_weights_by_tokens_and_ignores_failed_requests():
     summary = stats.snapshot()["summary"]
     assert summary["requests"] == 4
     assert summary["ok"] == 2
-    assert summary["prompt_tokens"] == 1100
-    assert summary["prefill_tok_s"] == pytest.approx(300 / 0.2, rel=0.001)
+    assert summary["prompt_tokens"] == 3000
+    assert summary["prefill_tok_s"] == pytest.approx(2000 / 0.2, rel=0.001)
     assert summary["decode_tok_s"] == pytest.approx(40 / 2.0, rel=0.001)
-    assert summary["reuse_share"] == pytest.approx(800 / 1100)
+    assert summary["reuse_share"] == pytest.approx(1000 / 3000)
+
+
+def test_prefill_rate_needs_enough_uncached_prompt_tokens():
+    timer = RequestTimer(stream=True)
+    timer.prompt_tokens = 1000
+    timer.reused_tokens = 1000 - MIN_PREFILL_TOKENS + 1
+    timer.tokens(1)
+    assert timer.entry("ok")["prefill_tok_s"] is None
+    timer = RequestTimer(stream=True)
+    timer.prompt_tokens = 1000
+    timer.reused_tokens = 1000 - MIN_PREFILL_TOKENS
+    timer.tokens(1)
+    assert timer.entry("ok")["prefill_tok_s"] is not None
+
+
+def test_summary_prefill_rate_leaves_out_requests_below_the_threshold():
+    stats = RequestStats(5)
+    stats.record(_entry(prompt_tokens=1000, reused_tokens=0, ttft_ms=100.0))
+    stats.record(
+        _entry(prompt_tokens=100,
+               reused_tokens=0,
+               ttft_ms=500.0,
+               prefill_tok_s=None))
+    assert stats.snapshot()["summary"]["prefill_tok_s"] == pytest.approx(
+        10000.0)
 
 
 def test_summary_of_an_empty_ring_is_all_empty():
