@@ -240,7 +240,7 @@ function renderMemory(mem) {
       stack($("#experts"), [
         { label: "On the GPU", value: r.expert_slots_per_layer, text: f0(r.expert_slots_per_layer) + " per layer", color: c("--s2") },
         { label: "In host memory only", value: r.expert_max_slots_per_layer - r.expert_slots_per_layer, text: f0(r.expert_max_slots_per_layer - r.expert_slots_per_layer) + " per layer", color: c("--grid") }], r.expert_max_slots_per_layer,
-        { text: `${f0(r.expert_layers)} layers with a cache, ${mib(r.expert_slot_mib)} per slot across them, ${mib(r.expert_cache_mib)} in all.` + (r.expert_cache_alloc_failures > 0 ? ` ${f0(r.expert_cache_alloc_failures)} cache allocations failed since start (those layers stream through staging buffers).` : ""), bad: r.expert_cache_alloc_failures > 0 });
+        { text: `${f0(r.expert_layers)} layers with a cache, ${mib(r.expert_slot_mib)} per slot across them, ${mib(r.expert_cache_mib)} in all.` });
     } else $("#experts").textContent = "No expert cache (the model does not stream experts).";
     const snaps = [["Recurrent state", r.recurrent_snapshots_free, r.recurrent_snapshots_capacity, "--s1"], ["Partial KV", r.partial_kv_snapshots_free, r.partial_kv_snapshots_capacity, "--s2"]].filter((x) => x[2] > 0);
     if (snaps.length) {
