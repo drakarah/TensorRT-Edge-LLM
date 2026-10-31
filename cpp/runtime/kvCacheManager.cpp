@@ -401,6 +401,36 @@ size_t KVCacheManager::bytesToMap(int32_t tokens) const noexcept
     return bytes;
 }
 
+size_t KVCacheManager::mappedBytes() const noexcept
+{
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
+    size_t bytes = 0;
+    for (int32_t i = 0; i < mConfig.numAttentionLayers; ++i)
+    {
+        if (isKVSharingRecipient(i))
+        {
+            continue;
+        }
+        bytes += mRegions[i] != nullptr ? 2 * mRegions[i]->mappedPerHalf()
+                                        : computeLayerBytes(mLayerNumPages[i], mConfig.layerConfigs[i], elemSize);
+    }
+    return bytes;
+}
+
+size_t KVCacheManager::capacityBytes() const noexcept
+{
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
+    size_t bytes = 0;
+    for (int32_t i = 0; i < mConfig.numAttentionLayers; ++i)
+    {
+        if (!isKVSharingRecipient(i))
+        {
+            bytes += computeLayerBytes(mLayerNumPages[i], mConfig.layerConfigs[i], elemSize);
+        }
+    }
+    return bytes;
+}
+
 int32_t KVCacheManager::storageLayer(int32_t attnLayerIdx) const noexcept
 {
     return isKVSharingRecipient(attnLayerIdx) ? mConfig.kvSharingDonors[attnLayerIdx] : attnLayerIdx;

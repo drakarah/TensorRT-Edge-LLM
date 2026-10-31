@@ -205,6 +205,12 @@ public:
     //! @brief Device bytes ensureTokens(@p tokens) would newly map across all layers (rounded to the mapping granule).
     size_t bytesToMap(int32_t tokens) const noexcept;
 
+    //! @brief Device bytes of KV storage that currently have physical backing, all layers.
+    size_t mappedBytes() const noexcept;
+
+    //! @brief Device bytes the KV storage occupies when fully backed, all layers.
+    size_t capacityBytes() const noexcept;
+
     //! Get the layer configuration for the given attention layer.
     //! @param attnLayerIdx The index of the attention layer.
     //! @return The KVLayerConfig for this layer.

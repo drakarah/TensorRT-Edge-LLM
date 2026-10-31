@@ -407,6 +407,11 @@ public:
         return mRuntime->getContextCacheMetrics();
     }
 
+    RuntimeMemoryMetrics getMemoryMetrics() const
+    {
+        return mRuntime->getMemoryMetrics();
+    }
+
 private:
     CudaStreamWrapper mStream;
     std::unique_ptr<void, DlDeleter> mPluginHandle;
@@ -765,6 +770,28 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("reclaimed_draft_kv_pages", &ContextCacheMetrics::reclaimedDraftKvPages)
         .def_readonly("reclaimed_recurrent_snapshots", &ContextCacheMetrics::reclaimedRecurrentSnapshots)
         .def_readonly("reclaimed_partial_kv_snapshots", &ContextCacheMetrics::reclaimedPartialKvSnapshots);
+
+    py::class_<RuntimeMemoryMetrics>(m, "RuntimeMemoryMetrics")
+        .def_readonly("valid", &RuntimeMemoryMetrics::valid)
+        .def_readonly("kv_growable", &RuntimeMemoryMetrics::kvGrowable)
+        .def_readonly("kv_mapped_tokens", &RuntimeMemoryMetrics::kvMappedTokens)
+        .def_readonly("kv_capacity_tokens", &RuntimeMemoryMetrics::kvCapacityTokens)
+        .def_readonly("kv_mapped_bytes", &RuntimeMemoryMetrics::kvMappedBytes)
+        .def_readonly("kv_capacity_bytes", &RuntimeMemoryMetrics::kvCapacityBytes)
+        .def_readonly("kv_pages_usable", &RuntimeMemoryMetrics::kvPagesUsable)
+        .def_readonly("kv_pages_free", &RuntimeMemoryMetrics::kvPagesFree)
+        .def_readonly("kv_pages_high_water", &RuntimeMemoryMetrics::kvPagesHighWater)
+        .def_readonly("context_records", &RuntimeMemoryMetrics::contextRecords)
+        .def_readonly("recurrent_snapshots_free", &RuntimeMemoryMetrics::recurrentSnapshotsFree)
+        .def_readonly("recurrent_snapshots_capacity", &RuntimeMemoryMetrics::recurrentSnapshotsCapacity)
+        .def_readonly("partial_kv_snapshots_free", &RuntimeMemoryMetrics::partialKvSnapshotsFree)
+        .def_readonly("partial_kv_snapshots_capacity", &RuntimeMemoryMetrics::partialKvSnapshotsCapacity)
+        .def_readonly("expert_layers", &RuntimeMemoryMetrics::expertLayers)
+        .def_readonly("expert_slots_per_layer", &RuntimeMemoryMetrics::expertSlotsPerLayer)
+        .def_readonly("expert_max_slots_per_layer", &RuntimeMemoryMetrics::expertMaxSlotsPerLayer)
+        .def_readonly("expert_bytes_per_slot_all_layers", &RuntimeMemoryMetrics::expertBytesPerSlotAllLayers)
+        .def_readonly("expert_cache_bytes", &RuntimeMemoryMetrics::expertCacheBytes)
+        .def_readonly("expert_cache_alloc_failures", &RuntimeMemoryMetrics::expertCacheAllocFailures);
 
     py::class_<ContextCacheConfig>(m, "ContextCacheConfig")
         .def(py::init<>())
@@ -1145,7 +1172,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def("get_eagle_generation_metrics", &PyLLMRuntime::getSpecDecodeGenerationMetrics,
             py::return_value_policy::reference_internal) // deprecated alias
         .def("get_multimodal_metrics", &PyLLMRuntime::getMultimodalMetrics)
-        .def("get_context_cache_metrics", &PyLLMRuntime::getContextCacheMetrics);
+        .def("get_context_cache_metrics", &PyLLMRuntime::getContextCacheMetrics)
+        .def("get_memory_metrics", &PyLLMRuntime::getMemoryMetrics);
 
     // ========================================================================
     // Request engine: in-flight batching over the same runtime

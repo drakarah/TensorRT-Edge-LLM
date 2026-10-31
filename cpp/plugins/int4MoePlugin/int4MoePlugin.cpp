@@ -1227,6 +1227,7 @@ void writeMoeStats(std::string const& prefix, std::string const& layer, int32_t 
 namespace
 {
 std::mutex gLiveCacheMutex;
+std::atomic<int64_t> gCacheAllocFailures{0};
 
 std::vector<Int4MoePlugin*>& liveCachePlugins()
 {
@@ -1393,6 +1394,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
         cudaGetLastError();
         LOG_WARNING("Int4MoePlugin %s: expert cache of %d slots not allocated (%zu bytes); using staging", mLayerName.c_str(),
             mCacheSlots, total);
+        ++gCacheAllocFailures;
         mCacheSlots = 0;
         return false;
     }
@@ -2649,6 +2651,43 @@ int64_t growLiveCacheBytes(int64_t bytes)
     }
     return taken;
 }
+
+//! Entry point for the runtime: fills @p out with {layers with a cache, slots per layer (smallest), most slots a layer can
+//! hold, device bytes of one slot over all layers, device bytes of all caches, cache allocations that failed so far};
+//! returns the number of values written.
+int32_t liveCacheInfo(int64_t* out, int32_t capacity)
+{
+    constexpr int32_t kValues = 6;
+    if (out == nullptr || capacity < kValues)
+    {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(gLiveCacheMutex);
+    int64_t layers = 0;
+    int64_t minSlots = std::numeric_limits<int32_t>::max();
+    int64_t maxSlots = 0;
+    int64_t perSlotAll = 0;
+    int64_t total = 0;
+    for (Int4MoePlugin* plugin : liveCachePlugins())
+    {
+        if (plugin->cacheSlots() == 0)
+        {
+            continue;
+        }
+        ++layers;
+        minSlots = std::min<int64_t>(minSlots, plugin->cacheSlots());
+        maxSlots = std::max<int64_t>(maxSlots, plugin->maxCacheSlots());
+        perSlotAll += static_cast<int64_t>(plugin->cacheBytesPerSlot());
+        total += static_cast<int64_t>(plugin->cacheSlots()) * static_cast<int64_t>(plugin->cacheBytesPerSlot());
+    }
+    out[0] = layers;
+    out[1] = layers > 0 ? minSlots : 0;
+    out[2] = maxSlots;
+    out[3] = perSlotAll;
+    out[4] = total;
+    out[5] = gCacheAllocFailures.load();
+    return kValues;
+}
 } // namespace plugins
 } // namespace trt_edgellm
 
@@ -2660,4 +2699,9 @@ extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeReleaseCache
 extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeGrowCacheBytes(int64_t bytes)
 {
     return trt_edgellm::plugins::growLiveCacheBytes(bytes);
+}
+
+extern "C" __attribute__((visibility("default"))) int32_t edgellmMoeCacheInfo(int64_t* out, int32_t capacity)
+{
+    return trt_edgellm::plugins::liveCacheInfo(out, capacity);
 }

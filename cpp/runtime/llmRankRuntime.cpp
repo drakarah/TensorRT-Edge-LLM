@@ -922,12 +922,72 @@ int64_t growExpertCacheBytes(int64_t bytes)
     return symbol != nullptr ? reinterpret_cast<Fn>(symbol)(bytes) : 0;
 }
 
+//! Reads the expert-cache sizes from the MoE plugin library; false when it is absent.
+bool expertCacheInfo(RuntimeMemoryMetrics& metrics)
+{
+    using Fn = int32_t (*)(int64_t*, int32_t);
+    void* symbol = moePluginSymbol("edgellmMoeCacheInfo");
+    int64_t values[6] = {};
+    if (symbol == nullptr || reinterpret_cast<Fn>(symbol)(values, 6) < 6)
+    {
+        return false;
+    }
+    metrics.expertLayers = static_cast<int32_t>(values[0]);
+    metrics.expertSlotsPerLayer = static_cast<int32_t>(values[1]);
+    metrics.expertMaxSlotsPerLayer = static_cast<int32_t>(values[2]);
+    metrics.expertBytesPerSlotAllLayers = values[3];
+    metrics.expertCacheBytes = values[4];
+    metrics.expertCacheAllocFailures = values[5];
+    return true;
+}
+
 //! Tokens by which the mapped KV may exceed the recent peak need before it is trimmed back (EDGELLM_KV_SHRINK_SLACK_TOKENS).
 int64_t kvShrinkSlackTokens()
 {
     return kvEnvInteger("EDGELLM_KV_SHRINK_SLACK_TOKENS", 16384, 0);
 }
 } // namespace
+
+RuntimeMemoryMetrics LLMRankRuntime::getMemoryMetrics() const
+{
+    std::lock_guard<std::mutex> lock(mMemoryMetricsMutex);
+    return mMemoryMetrics;
+}
+
+void LLMRankRuntime::refreshMemoryMetrics() noexcept
+{
+    try
+    {
+        RuntimeMemoryMetrics metrics;
+        KVCacheManager const& kv = mSharedResources->cacheManagers[0]->getKVCacheManager();
+        metrics.valid = true;
+        metrics.kvGrowable = kv.isGrowable();
+        metrics.kvMappedTokens = kv.mappedTokens();
+        metrics.kvCapacityTokens = mDeployment.base.maxKVCacheCapacity;
+        metrics.kvMappedBytes = static_cast<int64_t>(kv.mappedBytes());
+        metrics.kvCapacityBytes = static_cast<int64_t>(kv.capacityBytes());
+        if (mContextCache != nullptr)
+        {
+            ContextCacheMetrics const cache = mContextCache->metrics();
+            int32_t const usable = kv.isGrowable() ? kv.mappedTokens() / kTOKENS_PER_PAGE : cache.baseKvPages.capacity;
+            metrics.kvPagesUsable = usable;
+            metrics.kvPagesFree = cache.baseKvPages.free;
+            metrics.kvPagesHighWater = mContextCache->baseHighWaterPages();
+            metrics.contextRecords = static_cast<int64_t>(cache.currentRecords);
+            metrics.recurrentSnapshotsFree = cache.recurrentSnapshots.free;
+            metrics.recurrentSnapshotsCapacity = cache.recurrentSnapshots.capacity;
+            metrics.partialKvSnapshotsFree = cache.partialKvSnapshots.free;
+            metrics.partialKvSnapshotsCapacity = cache.partialKvSnapshots.capacity;
+        }
+        expertCacheInfo(metrics);
+        std::lock_guard<std::mutex> lock(mMemoryMetricsMutex);
+        mMemoryMetrics = metrics;
+    }
+    catch (std::exception const& e)
+    {
+        LOG_WARNING("Memory metrics unavailable: %s", e.what());
+    }
+}
 
 bool LLMRankRuntime::broadcastInt32(void* gpuBuffer, int32_t count, cudaStream_t stream)
 {
@@ -1780,12 +1840,21 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     cudaStream_t stream, bool outputThinkerEmbeddings, TokenBroadcastFn tokenBroadcast, int32_t parallelRank,
     GenerationBoundaryHook const& boundaryHook)
 {
+    struct MetricsAtExit
+    {
+        LLMRankRuntime& runtime;
+        ~MetricsAtExit()
+        {
+            runtime.refreshMemoryMetrics();
+        }
+    } metricsAtExit{*this};
     std::unique_ptr<SteppedGeneration> generation
         = beginGeneration(request, response, stream, outputThinkerEmbeddings, std::move(tokenBroadcast), parallelRank);
     if (generation == nullptr)
     {
         return false;
     }
+    refreshMemoryMetrics();
     if (!runGenerationLoop(generation->context, *generation->strategy, generation->managedRequest(), request,
             generation->kvHeadroom, stream, boundaryHook))
     {

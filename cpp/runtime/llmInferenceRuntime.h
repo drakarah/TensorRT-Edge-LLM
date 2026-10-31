@@ -22,6 +22,7 @@
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/generationBoundary.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/memoryMetrics.h"
 #include "runtime/modelArtifacts.h"
 #include "runtime/multiDevice/parallelConfig.h"
 #include "runtime/preprocess/visualTokenPruner.h"
@@ -113,6 +114,9 @@ public:
     char const* getSpeculativeDecodingStrategyName() const;
     metrics::LLMGenerationMetrics const& getGenerationMetrics() const;
     std::optional<ContextCacheMetrics> getContextCacheMetrics() const;
+
+    //! Memory the runtime manages as of the last request boundary (see RuntimeMemoryMetrics).
+    RuntimeMemoryMetrics getMemoryMetrics() const;
     metrics::MultimodalMetrics getMultimodalMetrics() const;
     rt::Tensor const& getEmbeddingTable() const;
     rt::Tensor const* getBaseModelHiddenStates(int32_t layerIdx) const;

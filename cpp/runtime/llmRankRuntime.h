@@ -26,6 +26,7 @@
 #include "profiling/timer.h"
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/kvNeedWindow.h"
+#include "runtime/memoryMetrics.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/guidedDecoder.h"
@@ -52,6 +53,7 @@
 #include "runtime/state/systemPromptKVCache.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
+#include <mutex>
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -426,6 +428,10 @@ public:
     //! Get context-cache metrics, or nullopt when the runtime cache is disabled.
     std::optional<ContextCacheMetrics> getContextCacheMetrics() const noexcept;
 
+    //! Memory the runtime manages (KV mapping, context-cache pools, expert cache) as of the last request boundary;
+    //! `valid` is false before the first request.
+    RuntimeMemoryMetrics getMemoryMetrics() const;
+
     //! Get multimodal metrics (returns empty metrics if no multimodal runner)
     metrics::MultimodalMetrics getMultimodalMetrics() const noexcept
     {
@@ -660,6 +666,9 @@ private:
     int32_t mLastPrefillLength{0};                                        //!< Valid prefill length in buffers
     std::vector<std::vector<int32_t>> mLastInputTokenIds;                 //!< Per-batch input token IDs
     KvNeedWindow mKvNeedWindow{makeKvNeedWindowFromEnv()};               //!< Recent KV needs; the trim target
+    void refreshMemoryMetrics() noexcept;
+    mutable std::mutex mMemoryMetricsMutex;
+    RuntimeMemoryMetrics mMemoryMetrics;                                //!< Taken at request boundaries
 
     ParallelMapping mMapping{};         //!< Fully-resolved parallel coordinates for this rank.
     TokenBroadcastFn mTokenBroadcast{}; //!< Optional sampled-token synchronization callback.
