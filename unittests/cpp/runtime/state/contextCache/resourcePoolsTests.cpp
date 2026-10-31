@@ -249,3 +249,192 @@ TEST(ContextCacheResourcePoolsTests, ReferenceUnderflowThrows)
     EXPECT_THROW(pools.releaseActiveRef(ResourceId{ResourceType::kBaseKvPage, 1}), std::runtime_error);
     EXPECT_EQ(pools.freeCount(ResourceType::kBaseKvPage), 1);
 }
+
+namespace
+{
+
+ResourceId basePage(int32_t index)
+{
+    return ResourceId{ResourceType::kBaseKvPage, index};
+}
+
+std::vector<int32_t> baseIds(std::vector<ResourceId> const& resources)
+{
+    std::vector<int32_t> ids;
+    for (ResourceId const& resource : resources)
+    {
+        ids.push_back(resource.index);
+    }
+    return ids;
+}
+
+} // namespace
+
+TEST(ContextCacheResourcePoolsTests, LowestFirstAllocatesTheLowestFreeIdsInsteadOfTheRing)
+{
+    ResourcePools pools(ResourceDemand{6, 0, 0, 0});
+    pools.setLowestFirst(ResourceType::kBaseKvPage, 6);
+
+    auto const first = pools.allocate(ResourceDemand{3, 0, 0, 0});
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(baseIds(*first), (std::vector<int32_t>{0, 1, 2}));
+
+    pools.releaseActiveRef(basePage(1));
+    auto const second = pools.allocate(ResourceDemand{2, 0, 0, 0});
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(baseIds(*second), (std::vector<int32_t>{1, 3})) << "a freed low id comes back before higher free ids";
+}
+
+TEST(ContextCacheResourcePoolsTests, TheRingStillRotatesWithoutLowestFirst)
+{
+    ResourcePools pools(ResourceDemand{4, 0, 0, 0});
+    ASSERT_TRUE(pools.allocate(ResourceDemand{2, 0, 0, 0}).has_value());
+    pools.releaseActiveRef(basePage(0));
+    auto const next = pools.allocate(ResourceDemand{1, 0, 0, 0});
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(baseIds(*next), std::vector<int32_t>{2}) << "default pools keep the circular order";
+}
+
+TEST(ContextCacheResourcePoolsTests, UsableLimitBoundsAllocationAndFreeCount)
+{
+    ResourcePools pools(ResourceDemand{8, 0, 0, 0});
+    pools.setLowestFirst(ResourceType::kBaseKvPage, 3);
+    EXPECT_EQ(pools.freeCount(ResourceType::kBaseKvPage), 3);
+    EXPECT_EQ(pools.capacity(ResourceType::kBaseKvPage), 8);
+
+    ASSERT_TRUE(pools.allocate(ResourceDemand{3, 0, 0, 0}).has_value());
+    EXPECT_EQ(pools.freeCount(ResourceType::kBaseKvPage), 0) << "free ids above the limit are not usable";
+    EXPECT_FALSE(pools.canAllocate(ResourceDemand{1, 0, 0, 0}));
+    EXPECT_FALSE(pools.allocate(ResourceDemand{1, 0, 0, 0}).has_value());
+
+    pools.setUsableLimit(ResourceType::kBaseKvPage, 5);
+    EXPECT_EQ(pools.freeCount(ResourceType::kBaseKvPage), 2);
+    auto const more = pools.allocate(ResourceDemand{2, 0, 0, 0});
+    ASSERT_TRUE(more.has_value());
+    EXPECT_EQ(baseIds(*more), (std::vector<int32_t>{3, 4}));
+}
+
+TEST(ContextCacheResourcePoolsTests, LimitCannotDropBelowAnAllocatedId)
+{
+    ResourcePools pools(ResourceDemand{8, 0, 0, 0});
+    pools.setLowestFirst(ResourceType::kBaseKvPage, 8);
+    ASSERT_TRUE(pools.allocate(ResourceDemand{4, 0, 0, 0}).has_value());
+    EXPECT_THROW(pools.setUsableLimit(ResourceType::kBaseKvPage, 3), std::runtime_error);
+    EXPECT_NO_THROW(pools.setUsableLimit(ResourceType::kBaseKvPage, 4));
+
+    pools.releaseActiveRef(basePage(3));
+    EXPECT_EQ(pools.highWater(ResourceType::kBaseKvPage), 3);
+    EXPECT_NO_THROW(pools.setUsableLimit(ResourceType::kBaseKvPage, 3));
+    EXPECT_THROW(pools.setUsableLimit(ResourceType::kBaseKvPage, 2), std::runtime_error);
+}
+
+TEST(ContextCacheResourcePoolsTests, HighWaterCountsActiveAndCacheReferences)
+{
+    ResourcePools pools(ResourceDemand{6, 0, 0, 0});
+    pools.setLowestFirst(ResourceType::kBaseKvPage, 6);
+    EXPECT_EQ(pools.highWater(ResourceType::kBaseKvPage), 0);
+
+    ASSERT_TRUE(pools.allocate(ResourceDemand{3, 0, 0, 0}).has_value());
+    EXPECT_EQ(pools.highWater(ResourceType::kBaseKvPage), 3);
+    pools.addCacheRef(basePage(2));
+    pools.releaseActiveRef(basePage(0));
+    pools.releaseActiveRef(basePage(1));
+    pools.releaseActiveRef(basePage(2));
+    EXPECT_EQ(pools.highWater(ResourceType::kBaseKvPage), 3) << "a retained page still counts";
+    pools.releaseCacheRef(basePage(2));
+    EXPECT_EQ(pools.highWater(ResourceType::kBaseKvPage), 0);
+}
+
+TEST(ContextCacheResourcePoolsTests, HighWaterIsNotBelowAHoleBelowIt)
+{
+    ResourcePools pools(ResourceDemand{6, 0, 0, 0});
+    pools.setLowestFirst(ResourceType::kBaseKvPage, 6);
+    ASSERT_TRUE(pools.allocate(ResourceDemand{4, 0, 0, 0}).has_value());
+    pools.releaseActiveRef(basePage(0));
+    pools.releaseActiveRef(basePage(1));
+    EXPECT_EQ(pools.highWater(ResourceType::kBaseKvPage), 4);
+}
+
+TEST(ContextCacheResourcePoolsTests, SwitchingAPoolWithAllocatedResourcesThrows)
+{
+    ResourcePools pools(ResourceDemand{4, 0, 0, 0});
+    ASSERT_TRUE(pools.allocate(ResourceDemand{1, 0, 0, 0}).has_value());
+    EXPECT_THROW(pools.setLowestFirst(ResourceType::kBaseKvPage, 4), std::runtime_error);
+    EXPECT_THROW(pools.setUsableLimit(ResourceType::kBaseKvPage, 4), std::runtime_error) << "not a lowest-first pool";
+}
+
+TEST(ContextCacheResourcePoolsTests, LimitIsClampedToTheCapacityAndToZero)
+{
+    ResourcePools pools(ResourceDemand{4, 0, 0, 0});
+    pools.setLowestFirst(ResourceType::kBaseKvPage, 100);
+    EXPECT_EQ(pools.freeCount(ResourceType::kBaseKvPage), 4);
+    pools.setUsableLimit(ResourceType::kBaseKvPage, -5);
+    EXPECT_EQ(pools.freeCount(ResourceType::kBaseKvPage), 0);
+    EXPECT_FALSE(pools.canAllocate(ResourceDemand{1, 0, 0, 0}));
+    auto const none = pools.allocate(ResourceDemand{0, 0, 0, 0});
+    ASSERT_TRUE(none.has_value());
+    EXPECT_TRUE(none->empty());
+}
+
+TEST(ContextCacheResourcePoolsTests, MultiPoolAllocationStaysAllOrNothingWithALimit)
+{
+    ResourcePools pools(ResourceDemand{4, 0, 2, 0});
+    pools.setLowestFirst(ResourceType::kBaseKvPage, 1);
+    ASSERT_TRUE(pools.allocate(ResourceDemand{1, 0, 0, 0}).has_value());
+
+    EXPECT_FALSE(pools.allocate(ResourceDemand{1, 0, 1, 0}).has_value());
+    EXPECT_EQ(pools.freeCount(ResourceType::kRecurrentSnapshot), 2) << "nothing was taken from the other pool";
+    EXPECT_EQ(pools.highWater(ResourceType::kBaseKvPage), 1);
+}
+
+TEST(ContextCacheResourcePoolsTests, OtherPoolsKeepTheirOrderWhenBaseIsLowestFirst)
+{
+    ResourcePools pools(ResourceDemand{4, 0, 3, 0});
+    pools.setLowestFirst(ResourceType::kBaseKvPage, 4);
+    auto const first = pools.allocate(ResourceDemand{0, 0, 2, 0});
+    ASSERT_TRUE(first.has_value());
+    pools.releaseActiveRef(ResourceId{ResourceType::kRecurrentSnapshot, 0});
+    auto const next = pools.allocate(ResourceDemand{0, 0, 1, 0});
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(next->front().index, 2) << "the recurrent pool still rotates through its ring";
+}
+
+TEST(ContextCacheResourcePoolsTests, IsUsableFollowsTheLimitAndRejectsUnknownIds)
+{
+    ResourcePools ring(ResourceDemand{4, 0, 0, 0});
+    EXPECT_TRUE(ring.isUsable(basePage(3)));
+    EXPECT_FALSE(ring.isUsable(basePage(4)));
+    EXPECT_FALSE(ring.isUsable(basePage(-1)));
+
+    ResourcePools limited(ResourceDemand{4, 0, 0, 0});
+    limited.setLowestFirst(ResourceType::kBaseKvPage, 2);
+    EXPECT_TRUE(limited.isUsable(basePage(1)));
+    EXPECT_FALSE(limited.isUsable(basePage(2)));
+}
+
+TEST(ContextCacheResourcePoolsTests, LowestFirstSurvivesManyAllocateReleaseCycles)
+{
+    ResourcePools pools(ResourceDemand{16, 0, 0, 0});
+    pools.setLowestFirst(ResourceType::kBaseKvPage, 10);
+    std::vector<ResourceId> held;
+    for (int round = 0; round < 200; ++round)
+    {
+        int32_t const want = 1 + (round * 7) % 4;
+        if (auto const got = pools.allocate(ResourceDemand{want, 0, 0, 0}))
+        {
+            for (ResourceId const& resource : *got)
+            {
+                EXPECT_LT(resource.index, 10);
+                held.push_back(resource);
+            }
+        }
+        else if (!held.empty())
+        {
+            size_t const drop = static_cast<size_t>(round) % held.size();
+            pools.releaseActiveRef(held[drop]);
+            held.erase(held.begin() + static_cast<std::ptrdiff_t>(drop));
+        }
+        EXPECT_LE(pools.highWater(ResourceType::kBaseKvPage), 10);
+        EXPECT_EQ(pools.freeCount(ResourceType::kBaseKvPage) + static_cast<int32_t>(held.size()), 10);
+    }
+}

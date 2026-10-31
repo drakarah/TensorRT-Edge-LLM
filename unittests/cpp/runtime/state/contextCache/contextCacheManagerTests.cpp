@@ -1164,3 +1164,128 @@ TEST(ContextCacheManagerTests, SpecEvictionRemovesBothIndices)
     expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0}, {0, 0, 1}, 2);
     expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0}, {0, 0, 1}, 2);
 }
+
+TEST(ContextCacheManagerTests, BaseHighWaterCountsRetainedRecordPages)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
+    EXPECT_EQ(manager.baseHighWater(), 0);
+    publishPrivateRecord(manager, {kHASH_A});
+    publishPrivateRecord(manager, {kHASH_B});
+    EXPECT_EQ(manager.baseHighWater(), 2) << "published records keep their pages allocated";
+}
+
+TEST(ContextCacheManagerTests, LimitingBasePagesAfterAnAllocationThrows)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
+    publishPrivateRecord(manager, {kHASH_A});
+    EXPECT_THROW(manager.limitBasePages(4), std::runtime_error);
+}
+
+TEST(ContextCacheManagerTests, LimitedPoolLeasesLowPagesAndRefusesBeyondTheLimit)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
+    manager.limitBasePages(2);
+
+    CacheRequestLease lease = acquirePrivatePages(manager, 2);
+    EXPECT_EQ(lease.basePages(), std::vector<PageId>({0, 1}));
+
+    AcquireResult refused = manager.acquireVanilla({}, kPAGE_SIZE);
+    EXPECT_EQ(refused.status, AcquireStatus::kInsufficientCapacity);
+    EXPECT_FALSE(refused.lease.has_value()) << "free pages above the limit are not handed out";
+    EXPECT_EQ(manager.baseHighWater(), 2);
+
+    lease.release();
+    CacheRequestLease again = acquirePrivatePages(manager, 2);
+    EXPECT_EQ(again.basePages(), std::vector<PageId>({0, 1}));
+}
+
+TEST(ContextCacheManagerTests, RaisingTheLimitMakesMorePagesAvailable)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
+    manager.limitBasePages(1);
+    CacheRequestLease lease = acquirePrivatePages(manager, 1);
+    EXPECT_EQ(manager.acquireVanilla({}, kPAGE_SIZE).status, AcquireStatus::kInsufficientCapacity);
+
+    manager.limitBasePages(3);
+    CacheRequestLease more = acquirePrivatePages(manager, 2);
+    EXPECT_EQ(more.basePages(), std::vector<PageId>({1, 2}));
+}
+
+TEST(ContextCacheManagerTests, PressureEvictsTheLeastRecentRecordAndReusesItsLowPage)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 0, 0}, 6);
+    manager.limitBasePages(3);
+    PublishedRecord const a = publishPrivateRecord(manager, {kHASH_A});
+    PublishedRecord const b = publishPrivateRecord(manager, {kHASH_B});
+    PublishedRecord const c = publishPrivateRecord(manager, {kHASH_C});
+    ASSERT_EQ(manager.records().lruToMru(), std::vector<RecordId>({a.id, b.id, c.id}));
+
+    CacheRequestLease lease = acquirePrivatePages(manager, 1);
+    EXPECT_EQ(lease.basePages(), std::vector<PageId>{0}) << "the evicted record's page is the lowest free one";
+    EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>({b.id, c.id}));
+}
+
+TEST(ContextCacheManagerTests, EvictingToAHighWaterKeepsRecordsBelowTheTarget)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 0, 0}, 6);
+    manager.limitBasePages(6);
+    PublishedRecord const a = publishPrivateRecord(manager, {kHASH_A});
+    PublishedRecord const b = publishPrivateRecord(manager, {kHASH_B});
+    PublishedRecord const c = publishPrivateRecord(manager, {kHASH_C});
+    ASSERT_EQ(manager.baseHighWater(), 3);
+
+    EXPECT_EQ(manager.evictToBaseHighWater(5), 0u) << "already within the target";
+    EXPECT_EQ(manager.evictToBaseHighWater(2), 1u);
+    EXPECT_EQ(manager.baseHighWater(), 2);
+    EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>({a.id, b.id})) << "only the record on the high page goes";
+    EXPECT_FALSE(manager.baseIndex().lookup(kHASH_C).has_value());
+    static_cast<void>(c);
+
+    EXPECT_EQ(manager.evictToBaseHighWater(0), 2u);
+    EXPECT_EQ(manager.baseHighWater(), 0);
+    EXPECT_TRUE(manager.records().lruToMru().empty());
+}
+
+TEST(ContextCacheManagerTests, EvictingToAHighWaterOnAnEmptyStoreDoesNothing)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
+    manager.limitBasePages(4);
+    EXPECT_EQ(manager.evictToBaseHighWater(0), 0u);
+    EXPECT_EQ(manager.baseHighWater(), 0);
+}
+
+TEST(ContextCacheManagerTests, TheLimitCanOnlyDropAfterTheRecordsAboveItAreEvicted)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
+    manager.limitBasePages(4);
+    publishPrivateRecord(manager, {kHASH_A});
+    publishPrivateRecord(manager, {kHASH_B});
+
+    EXPECT_THROW(manager.limitBasePages(1), std::runtime_error);
+    EXPECT_EQ(manager.evictToBaseHighWater(1), 1u);
+    EXPECT_NO_THROW(manager.limitBasePages(1));
+    CacheRequestLease lease = acquirePrivatePages(manager, 0);
+    EXPECT_TRUE(lease.valid());
+}
+
+TEST(ContextCacheManagerTests, LeasePagesStayBelowTheLimitAcrossManyRequests)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{16, 0, 0, 0}, 8);
+    manager.limitBasePages(5);
+    for (uint64_t round = 0; round < 60; ++round)
+    {
+        BlockHash const hash{round + 1, round + 101};
+        CacheRequestLease lease = acquirePrivatePages(manager, 1 + static_cast<int32_t>(round % 2));
+        for (PageId const page : lease.basePages())
+        {
+            ASSERT_LT(page, 5) << "round " << round;
+        }
+        if (round % 2 == 0)
+        {
+            PublishRequest const request{{hash}, kPAGE_SIZE};
+            static_cast<void>(manager.publish(lease, request));
+        }
+        lease.release();
+        ASSERT_LE(manager.baseHighWater(), 5) << "round " << round;
+    }
+}
