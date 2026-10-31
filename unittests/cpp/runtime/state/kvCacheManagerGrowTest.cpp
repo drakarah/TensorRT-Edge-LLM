@@ -232,3 +232,69 @@ TEST(KvCacheManagerGrowTest, KvSharingRecipientsOwnNoRegion)
     ASSERT_TRUE(kv.ensureTokens(8000));
     EXPECT_EQ(kv.kPoolPtr(1), kv.kPoolPtr(0));
 }
+
+TEST(KvCacheManagerGrowTest, ShrinkReleasesDownToTheRequestAndRegrowsWithStablePointers)
+{
+    rt::KVCacheManager kv(makeConfig(2, 1, 16384, 4096), nullptr);
+    size_t const granule = rt::VmmRegion::granularity(0);
+    void* const k = kv.kPoolPtr(0);
+    ASSERT_TRUE(kv.ensureTokens(16384));
+    fill(k, 0x31, static_cast<size_t>(rt::kTOKENS_PER_PAGE) * 2 * 256);
+
+    EXPECT_EQ(kv.shrinkTokens(6000), 2 * 2 * 2 * granule) << "two layers, both halves, 4,096 -> 8,192 keeps two granules of four released";
+    EXPECT_EQ(kv.mappedTokens(), 6016);
+    EXPECT_EQ(readByte(k), 0x31);
+    EXPECT_EQ(kv.kPoolPtr(0), k);
+
+    ASSERT_TRUE(kv.ensureTokens(16384));
+    EXPECT_EQ(kv.kPoolPtr(0), k);
+    uint8_t* const tail = static_cast<uint8_t*>(k) + (kv.numPages(0) - 1) * static_cast<size_t>(rt::kTOKENS_PER_PAGE) * 2 * 256;
+    fill(tail, 0x32, static_cast<size_t>(rt::kTOKENS_PER_PAGE) * 2 * 256);
+    EXPECT_EQ(readByte(tail), 0x32);
+    EXPECT_EQ(readByte(k), 0x31);
+}
+
+TEST(KvCacheManagerGrowTest, ShrinkNeverGoesBelowTheInitialMapping)
+{
+    rt::KVCacheManager kv(makeConfig(1, 1, 16384, 4096), nullptr);
+    ASSERT_TRUE(kv.ensureTokens(12000));
+    EXPECT_GT(kv.shrinkTokens(0), 0u);
+    EXPECT_EQ(kv.mappedTokens(), 4096);
+    EXPECT_EQ(kv.shrinkTokens(0), 0u);
+    EXPECT_EQ(kv.shrinkTokens(-7), 0u);
+    EXPECT_EQ(kv.mappedTokens(), 4096);
+}
+
+TEST(KvCacheManagerGrowTest, ShrinkToAtLeastTheMappedSizeChangesNothing)
+{
+    rt::KVCacheManager kv(makeConfig(1, 1, 16384, 4096), nullptr);
+    ASSERT_TRUE(kv.ensureTokens(9000));
+    int32_t const mapped = kv.mappedTokens();
+    EXPECT_EQ(kv.shrinkTokens(mapped), 0u);
+    EXPECT_EQ(kv.shrinkTokens(mapped + 5000), 0u);
+    EXPECT_EQ(kv.mappedTokens(), mapped);
+}
+
+TEST(KvCacheManagerGrowTest, ShrinkOnAFullPoolIsANoOp)
+{
+    rt::KVCacheManager kv(makeConfig(1, 1, 8192, 0), nullptr);
+    EXPECT_EQ(kv.shrinkTokens(100), 0u);
+    EXPECT_EQ(kv.mappedTokens(), 8192);
+}
+
+TEST(KvCacheManagerGrowTest, RepeatedGrowShrinkCyclesLeakNothing)
+{
+    rt::KVCacheManager kv(makeConfig(2, 1, 16384, 4096), nullptr);
+    size_t freeBefore = 0;
+    size_t total = 0;
+    ASSERT_EQ(cudaMemGetInfo(&freeBefore, &total), cudaSuccess);
+    for (int i = 0; i < 50; ++i)
+    {
+        ASSERT_TRUE(kv.ensureTokens(16384));
+        ASSERT_GT(kv.shrinkTokens(0), 0u);
+    }
+    size_t freeAfter = 0;
+    ASSERT_EQ(cudaMemGetInfo(&freeAfter, &total), cudaSuccess);
+    EXPECT_GE(freeAfter + (4u << 20), freeBefore) << "device memory is returned after every cycle";
+    EXPECT_EQ(kv.mappedTokens(), 4096);
+}
