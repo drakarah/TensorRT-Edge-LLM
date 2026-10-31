@@ -19,7 +19,7 @@ import contextlib
 import logging
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import (JSONResponse, PlainTextResponse, Response,
@@ -127,6 +127,22 @@ async def health(request: Request):
             "in_flight_batching": caps.in_flight_batching,
         },
     }
+
+
+@router.get("/stats")
+async def request_stats(request: Request, limit: Optional[int] = None):
+    stats = request.app.state.engine_client.stats
+    if stats is None:
+        return {"enabled": False}
+    return stats.snapshot(limit)
+
+
+@router.post("/stats/reset")
+async def reset_request_stats(request: Request):
+    stats = request.app.state.engine_client.stats
+    if stats is not None:
+        stats.reset()
+    return {"enabled": stats is not None}
 
 
 @router.get("/health/ready")

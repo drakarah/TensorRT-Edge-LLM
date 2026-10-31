@@ -30,6 +30,7 @@ from ..config import ApiConfig
 from ..parsing.tool_calling import ToolConfig, validate_tool_request
 from .engine import (LLM, TTS, AudioParams, CompletionOutput, SamplingParams,
                      StreamDelta)
+from .request_stats import RequestStats, RequestTimer
 
 
 @dataclass(frozen=True)
@@ -405,9 +406,38 @@ class EngineClient:
                 self._api_config.queue_timeout,
             )
         self._capabilities = _capabilities_for(llm)
+        self._stats = RequestStats.from_env()
         self._close_lock = asyncio.Lock()
         self._close_task = None
         self._closed = False
+
+    @property
+    def stats(self) -> Optional[RequestStats]:
+        return getattr(self, "_stats", None)
+
+    def _begin_timing(self, stream: bool):
+        if self.stats is None:
+            return None
+        timer = RequestTimer(stream)
+        timer.reuse_before = self._reused_tokens(
+        ) if self.active_requests == 1 else None
+        return timer
+
+    def _end_timing(self, timer, status: str) -> None:
+        if timer is None:
+            return
+        before = timer.reuse_before
+        if before is not None and self.active_requests == 1:
+            after = self._reused_tokens()
+            if after is not None:
+                timer.reused_tokens = after - before
+        self.stats.record(timer.entry(status))
+
+    def _reused_tokens(self) -> Optional[int]:
+        runtime = getattr(self._llm, "_runtime", None)
+        getter = getattr(runtime, "get_context_cache_metrics", None)
+        metrics = getter() if getter is not None else None
+        return None if metrics is None else int(metrics.reused_tokens)
 
     @property
     def llm(self) -> Union[LLM, TTS]:
@@ -492,6 +522,8 @@ class EngineClient:
         prepared: Optional[PreparedRequest] = None,
     ) -> CompletionOutput:
         owned = prepared
+        timer = None
+        status = "error"
         try:
             tool_config = tool_config or validate_tool_request(
                 messages, tools, tool_choice)
@@ -503,6 +535,7 @@ class EngineClient:
                     tool_choice=tool_config.tool_choice,
                     tool_config=tool_config,
                 )
+            timer = self._begin_timing(stream=False)
             latch = _HandleLatch()
             operation = partial(
                 self._llm._complete_prepared_request,
@@ -513,9 +546,17 @@ class EngineClient:
                 reasoning_parser=reasoning_parser,
                 on_handle=latch.publish,
             )
-            return await _run_sync(operation,
-                                   on_cancel=latch.cancel,
-                                   executor=self._executor)
+            output = await _run_sync(operation,
+                                     on_cancel=latch.cancel,
+                                     executor=self._executor)
+            if timer is not None:
+                timer.prompt_tokens = output.prompt_tokens
+                timer.tokens(len(output.token_ids))
+            status = "ok"
+            return output
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
         except (ServerError, KeyError, TypeError, ValueError):
             raise
         except getattr(self, "_submit_errors", ()) as exc:
@@ -523,6 +564,7 @@ class EngineClient:
         except Exception as exc:
             raise await self._engine_failure(exc, owned) from exc
         finally:
+            self._end_timing(timer, status)
             if owned is not None:
                 owned.release()
 
@@ -606,6 +648,8 @@ class EngineClient:
             tools=tools,
             tool_choice=tool_choice,
         )
+        timer = self._begin_timing(stream=True)
+        status = "aborted"
         try:
             iterator = self._llm.generate_stream(
                 messages,
@@ -615,16 +659,26 @@ class EngineClient:
                 prebuilt_request=owned.request,
             )
             async for item in _iterate_sync(iterator, self._executor):
+                if timer is not None:
+                    if item.prompt_tokens is not None:
+                        timer.prompt_tokens = item.prompt_tokens
+                    timer.tokens(len(item.token_ids))
                 yield item
+            status = "ok"
         except (ServerError, KeyError, TypeError, ValueError):
+            status = "error"
             raise
         except asyncio.CancelledError:
+            status = "cancelled"
             raise
         except getattr(self, "_submit_errors", ()) as exc:
+            status = "error"
             raise ServerOverloadedError(str(exc)) from exc
         except Exception as exc:
+            status = "error"
             raise await self._engine_failure(exc, owned) from exc
         finally:
+            self._end_timing(timer, status)
             if iterator is not None:
                 await asyncio.to_thread(_close_stream, iterator)
             owned.release()
