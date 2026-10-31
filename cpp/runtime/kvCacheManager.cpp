@@ -411,8 +411,9 @@ size_t KVCacheManager::mappedBytes() const noexcept
         {
             continue;
         }
-        bytes += mRegions[i] != nullptr ? 2 * mRegions[i]->mappedPerHalf()
-                                        : computeLayerBytes(mLayerNumPages[i], mConfig.layerConfigs[i], elemSize);
+        bytes += isGrowable() && mRegions[i] != nullptr
+            ? 2 * mRegions[i]->mappedPerHalf()
+            : computeLayerBytes(mLayerNumPages[i], mConfig.layerConfigs[i], elemSize);
     }
     return bytes;
 }
