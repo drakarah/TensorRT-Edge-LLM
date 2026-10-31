@@ -2510,7 +2510,8 @@ IPluginV3* Int4MoePluginCreator::createPlugin(
 } // namespace trt_edgellm
 
 //! Entry point for the runtime (resolved with dlsym): shrink every layer's expert cache so that at least @p bytesNeeded
-//! device bytes are released, keeping at least 4 * top-k slots. Returns the bytes released.
+//! device bytes are released, keeping at least 2 * top-k slots (a single-token decode needs top-k; larger verify steps fall back to staging).
+//! Returns the bytes released.
 extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeReleaseCacheBytes(int64_t bytesNeeded)
 {
     using trt_edgellm::plugins::Int4MoePlugin;
@@ -2527,7 +2528,7 @@ extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeReleaseCache
     {
         perSlotAll += plugin->cacheBytesPerSlot();
         slots = std::min(slots, plugin->cacheSlots());
-        floorSlots = std::max(floorSlots, 4 * plugin->topK());
+        floorSlots = std::max(floorSlots, 2 * plugin->topK());
     }
     if (perSlotAll == 0 || slots <= floorSlots)
     {
