@@ -21,6 +21,7 @@
 
 #if defined(__x86_64__)
 
+#include "cpuMissIdle.h"
 #include "cpuMissKernel.h"
 
 #include <algorithm>
@@ -116,7 +117,8 @@ inline std::vector<int32_t> performanceCores()
 }
 
 //! Threads that spin on the mailbox's seq. One doorbell is answered by all of them: gate_up tiles, SwiGLU, down tiles, with a barrier in between, then
-//! the first thread publishes done. Idle for 20 ms: the threads poll every 50 us until the next doorbell.
+//! the first thread publishes done. Idle for 20 ms: the threads poll every 50 us until the next doorbell; idle for EDGELLM_MOE_CPU_IDLE_MS (default 1000, 0 = never):
+//! they sleep 1 ms at a time.
 class Pool
 {
 public:
@@ -179,6 +181,7 @@ public:
                 c = (*end == ',') ? end + 1 : end;
             }
         }
+        mSleepAfter = parseSleepAfter(std::getenv("EDGELLM_MOE_CPU_IDLE_MS"));
         mThreads = std::max(1, threads);
         mBarrierThreads = mThreads;
         for (int32_t i = 0; i < mThreads; ++i)
@@ -249,18 +252,30 @@ private:
         uint64_t last = 0;
         auto lastWork = std::chrono::steady_clock::now();
         uint32_t spins = 0;
+        bool sleeping = false;
         while (!mStop.load(std::memory_order_relaxed))
         {
             uint64_t const seq = mMailbox->seq;
             if (seq == last)
             {
-                _mm_pause();
-                if ((++spins & 4095) == 0 && std::chrono::steady_clock::now() - lastWork > std::chrono::milliseconds(20))
+                if (sleeping)
                 {
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    std::this_thread::sleep_for(kSleepPeriod);
+                    continue;
+                }
+                _mm_pause();
+                if ((++spins & 4095) == 0)
+                {
+                    IdleStage const stage = idleStage(std::chrono::steady_clock::now() - lastWork, mSleepAfter);
+                    if (stage != IdleStage::kSpin)
+                    {
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    }
+                    sleeping = stage == IdleStage::kSleep;
                 }
                 continue;
             }
+            sleeping = false;
             std::atomic_thread_fence(std::memory_order_acquire);
             last = seq;
             process(tid, seq);
@@ -415,6 +430,7 @@ private:
     bool mInt8{false};
     int32_t mThreads{1};
     int32_t mBarrierThreads{1};
+    std::chrono::milliseconds mSleepAfter{kDefaultSleepAfter};
     kernel::CpuMissMailbox* mMailbox{nullptr};
     kernel::CpuMissMailbox* mMailboxDev{nullptr};
     kernel::CpuMissDeviceState* mStateDev{nullptr};

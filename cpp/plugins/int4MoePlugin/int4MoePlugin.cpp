@@ -209,7 +209,7 @@ int32_t tailSkipFromEnv()
 
 //! EDGELLM_MOE_CPU_MISS=1 (decode steps of <= 4 tokens served by the expert cache): a routed expert outside the cache is computed on the CPU from the pinned
 //! host copy instead of being copied in. EDGELLM_MOE_CPU_ADMIT=<n> (default 2): the n-th miss of an expert brings it into the cache; 0 never does.
-//! EDGELLM_MOE_CPU_THREADS=<n> (default 8): threads that spin for the work.
+//! EDGELLM_MOE_CPU_THREADS=<n> (default 8): threads that spin for the work; EDGELLM_MOE_CPU_IDLE_MS=<ms> (default 1000, 0 = never): idle time after which they sleep 1 ms at a time.
 bool cpuMissFromEnv()
 {
     static bool const on = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_MISS"); return v != nullptr && v[0] == '1'; }();
