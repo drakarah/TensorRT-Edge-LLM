@@ -2121,7 +2121,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         {
             longestInput = std::max(longestInput, static_cast<int32_t>(tokenIds.size()));
         }
-        int64_t const wanted = static_cast<int64_t>(longestInput) + std::max(request.maxGenerateLength, 0)
+        int64_t const wanted = static_cast<int64_t>(longestInput) + std::max<int64_t>(request.maxGenerateLength, 0)
             + kvHeadroom.baseExtraTokens;
         int32_t const needed = static_cast<int32_t>(std::min<int64_t>(mDeployment.base.maxKVCacheCapacity, wanted));
         if (!kv.ensureTokens(needed))
