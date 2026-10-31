@@ -1492,8 +1492,9 @@ int64_t Int4MoePlugin::shrinkExpertCache(int32_t newSlots) noexcept
     {
         oldTotal += tensorBytes(i, oldSlots);
     }
-    cudaFree(mCacheMem);
-    cudaFree(mCacheState);
+    // The stats thread reads the tally pointer: publish the new one before the old state is freed.
+    int32_t* const oldState = mCacheState;
+    void* const oldMem = mCacheMem;
     mCacheMem = newMem;
     mCacheState = newDeviceState;
     mCacheSlots = newSlots;
@@ -1502,6 +1503,8 @@ int64_t Int4MoePlugin::shrinkExpertCache(int32_t newSlots) noexcept
         mCacheTensors[i] = newTensors[i];
     }
     mCacheTally = mCacheState + newState.size() - 3;
+    cudaFree(oldMem);
+    cudaFree(oldState);
     PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
     return static_cast<int64_t>(oldTotal - total) + static_cast<int64_t>((stateInts(oldSlots) - stateInts(newSlots)) * 4);
 }

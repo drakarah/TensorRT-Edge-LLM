@@ -143,24 +143,40 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
         LOG_WARNING("KVCacheManager: on-demand mapping needs a single-slot engine; allocating the full pool.");
         growable = false;
     }
+    // Pages beyond the active slot's range are handed out for cross-request reuse and would be unmapped.
+    if (growable && static_cast<int64_t>(mNumPages) != minimumActivePages)
+    {
+        LOG_WARNING("KVCacheManager: on-demand mapping cannot back retained pages (numPages %d, active %lld); "
+                    "allocating the full pool.",
+            mNumPages, static_cast<long long>(minimumActivePages));
+        growable = false;
+    }
     int device = 0;
     if (growable)
     {
-        check::check(cudaGetDevice(&device) == cudaSuccess, "KVCacheManager: cudaGetDevice failed.");
-        size_t const granule = VmmRegion::granularity(device);
-        for (int32_t i = 0; i < mConfig.numAttentionLayers && growable; ++i)
+        try
         {
-            KVLayerConfig const& lc = mConfig.layerConfigs[i];
-            bool const reduced
-                = mConfig.useBoundedSwaKVCache && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.maxSequenceLength);
-            if (!isKVSharingRecipient(i) && !reduced
-                && computeLayerBytes(mNumPages, lc, elemSize) / 2 % granule != 0)
+            check::check(cudaGetDevice(&device) == cudaSuccess, "KVCacheManager: cudaGetDevice failed.");
+            size_t const granule = VmmRegion::granularity(device);
+            for (int32_t i = 0; i < mConfig.numAttentionLayers && growable; ++i)
             {
-                LOG_WARNING("KVCacheManager: layer %d pool half is not a multiple of the %zu-byte mapping granule; "
-                            "allocating the full pool.",
-                    i, granule);
-                growable = false;
+                KVLayerConfig const& lc = mConfig.layerConfigs[i];
+                bool const reduced = mConfig.useBoundedSwaKVCache
+                    && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.maxSequenceLength);
+                if (!isKVSharingRecipient(i) && !reduced
+                    && computeLayerBytes(mNumPages, lc, elemSize) / 2 % granule != 0)
+                {
+                    LOG_WARNING("KVCacheManager: layer %d pool half is not a multiple of the %zu-byte mapping granule; "
+                                "allocating the full pool.",
+                        i, granule);
+                    growable = false;
+                }
             }
+        }
+        catch (std::exception const& e)
+        {
+            LOG_WARNING("KVCacheManager: on-demand mapping unavailable (%s); allocating the full pool.", e.what());
+            growable = false;
         }
     }
     int64_t const initialPages

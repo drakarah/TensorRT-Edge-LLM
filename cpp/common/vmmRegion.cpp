@@ -18,6 +18,7 @@
 #include "common/vmmRegion.h"
 
 #include <algorithm>
+#include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
 
@@ -40,6 +41,15 @@ CUmemAllocationProp allocationProp(int device)
 
 size_t VmmRegion::granularity(int device)
 {
+    cudaFree(nullptr);
+    int supported = 0;
+    CUdevice handle{};
+    if (cuDeviceGet(&handle, device) != CUDA_SUCCESS
+        || cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, handle) != CUDA_SUCCESS
+        || supported == 0)
+    {
+        throw std::runtime_error("VmmRegion: the device does not support virtual memory management.");
+    }
     CUmemAllocationProp const prop = allocationProp(device);
     size_t granule = 0;
     if (cuMemGetAllocationGranularity(&granule, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || granule == 0)
