@@ -1264,8 +1264,8 @@ TEST(ContextCacheManagerTests, TheLimitCanOnlyDropAfterTheRecordsAboveItAreEvict
     EXPECT_THROW(manager.limitBasePages(1), std::runtime_error);
     EXPECT_EQ(manager.evictToBaseHighWater(1), 1u);
     EXPECT_NO_THROW(manager.limitBasePages(1));
-    CacheRequestLease lease = acquirePrivatePages(manager, 0);
-    EXPECT_TRUE(lease.valid());
+    CacheRequestLease lease = acquirePrivatePages(manager, 1);
+    EXPECT_EQ(lease.basePages(), std::vector<PageId>{0});
 }
 
 TEST(ContextCacheManagerTests, LeasePagesStayBelowTheLimitAcrossManyRequests)
