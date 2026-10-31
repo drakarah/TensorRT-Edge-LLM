@@ -2419,5 +2419,20 @@ ContextCacheManager const& ContextCacheCoordinator::manager() const noexcept
     return mManager;
 }
 
+void ContextCacheCoordinator::limitBasePages(int32_t pages)
+{
+    mManager.limitBasePages(pages);
+}
+
+int32_t ContextCacheCoordinator::baseHighWaterPages() const noexcept
+{
+    return mManager.baseHighWater();
+}
+
+size_t ContextCacheCoordinator::trimBasePagesTo(int32_t pages)
+{
+    return mManager.evictToBaseHighWater(pages);
+}
+
 } // namespace rt
 } // namespace trt_edgellm

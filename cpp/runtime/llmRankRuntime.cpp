@@ -681,6 +681,13 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         ELLM_CHECK(contextCacheDeploymentProfile.has_value(), "Context-cache deployment was not validated");
         mContextCache = std::make_unique<ContextCacheCoordinator>(
             contextCacheConfig, mDeployment, *contextCacheDeploymentProfile, cacheResources, stream);
+        {
+            KVCacheManager const& kv = mSharedResources->cacheManagers[0]->getKVCacheManager();
+            if (kv.isGrowable())
+            {
+                mContextCache->limitBasePages(kv.mappedTokens() / kTOKENS_PER_PAGE);
+            }
+        }
 
         mHybridMtpContextReuseDeployment
             = contextCacheDeploymentProfile->isHybrid() && contextCacheDeploymentProfile->isSpeculative();
@@ -2155,8 +2162,26 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         }
         int64_t const wanted = static_cast<int64_t>(longestInput) + std::max<int64_t>(request.maxGenerateLength, 0)
             + kvHeadroom.baseExtraTokens;
-        int32_t const needed = static_cast<int32_t>(std::min<int64_t>(mDeployment.base.maxKVCacheCapacity, wanted));
+        int64_t const wantedCapped = std::min<int64_t>(mDeployment.base.maxKVCacheCapacity, wanted);
+        // With the context cache the pages of a request are leased lowest-ID-first below the mapped range. The slack
+        // covers pages the request shares with a retained record, which are counted once in the high-water mark.
+        constexpr int64_t kCacheSlackPages = 128;
+        int64_t const wantedPages
+            = (wantedCapped + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE + (mContextCache != nullptr ? kCacheSlackPages : 0);
+        int32_t needed = static_cast<int32_t>(std::min<int64_t>(mDeployment.base.maxKVCacheCapacity, wantedPages * kTOKENS_PER_PAGE));
         int32_t const recentPeak = mKvNeedWindow.record(KvNeedWindow::Clock::now(), needed);
+        if (mContextCache != nullptr && kv.isGrowable())
+        {
+            // Records older than the recent-need window go, so their pages do not keep the mapping (and the expert
+            // cache that pays for it) large; the mapping always covers every page still held.
+            int32_t const peakPages = (recentPeak + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE;
+            if (mContextCache->baseHighWaterPages() > peakPages)
+            {
+                size_t const evicted = mContextCache->trimBasePagesTo(peakPages);
+                LOG_INFO("Evicted %zu context-cache records to keep the retained KV within %d pages.", evicted, peakPages);
+            }
+            needed = std::max(needed, std::min(mDeployment.base.maxKVCacheCapacity, mContextCache->baseHighWaterPages() * kTOKENS_PER_PAGE));
+        }
         bool cacheResized = false;
         if (!kv.ensureTokens(needed))
         {
@@ -2183,13 +2208,18 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
                 LOG_WARNING("KV cache cannot grow to %d tokens (mapped %d); limiting this request.", needed, kvLimit);
             }
         }
-        else if (kv.isGrowable() && static_cast<int64_t>(kv.mappedTokens()) > static_cast<int64_t>(recentPeak) + kvShrinkSlackTokens())
+        else if (kv.isGrowable()
+            && static_cast<int64_t>(kv.mappedTokens()) > static_cast<int64_t>(std::max(recentPeak, needed)) + kvShrinkSlackTokens())
         {
-            size_t const freed = kv.shrinkTokens(recentPeak);
+            size_t const freed = kv.shrinkTokens(std::max(recentPeak, needed));
             int64_t const taken = growExpertCacheBytes(static_cast<int64_t>(freed));
             cacheResized = taken > 0;
             LOG_INFO("Trimmed the KV cache to %d tokens, the peak need of the last %zu requests (%.1f MiB freed); the expert cache took %.1f MiB.",
                 kv.mappedTokens(), mKvNeedWindow.size(), freed / 1048576.0, taken / 1048576.0);
+        }
+        if (mContextCache != nullptr && kv.isGrowable())
+        {
+            mContextCache->limitBasePages(kv.mappedTokens() / kTOKENS_PER_PAGE);
         }
         if (cacheResized)
         {

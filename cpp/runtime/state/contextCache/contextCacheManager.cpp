@@ -936,6 +936,43 @@ PublishResult ContextCacheManager::publishHybridMtp(CacheRequestLease& lease, Hy
     publication.publishedBaseFullBlockCount = static_cast<int32_t>(fullBlockCount);
     return commitPreparedPublication(std::move(publication));
 }
+void ContextCacheManager::limitBasePages(int32_t pages)
+{
+    if (!mBasePagesLowestFirst)
+    {
+        mPools.setLowestFirst(ResourceType::kBaseKvPage, pages);
+        mBasePagesLowestFirst = true;
+        return;
+    }
+    mPools.setUsableLimit(ResourceType::kBaseKvPage, pages);
+}
+
+int32_t ContextCacheManager::baseHighWater() const noexcept
+{
+    return mPools.highWater(ResourceType::kBaseKvPage);
+}
+
+size_t ContextCacheManager::evictToBaseHighWater(int32_t pages)
+{
+    size_t evicted = 0;
+    for (RecordId const id : mRecords.lruToMru())
+    {
+        if (baseHighWater() <= pages)
+        {
+            break;
+        }
+        CacheRecord const& record = mRecords.get(id);
+        bool const holdsHighPage = std::any_of(record.basePagePath.begin(), record.basePagePath.end(),
+            [pages](PageId page) { return page >= pages; });
+        if (holdsHighPage)
+        {
+            evictRecord(id);
+            ++evicted;
+        }
+    }
+    return evicted;
+}
+
 ResourcePools const& ContextCacheManager::pools() const noexcept
 {
     return mPools;

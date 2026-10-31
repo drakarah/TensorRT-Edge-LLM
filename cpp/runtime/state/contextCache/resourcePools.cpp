@@ -19,6 +19,7 @@
 
 #include "common/checkMacros.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -105,6 +106,19 @@ bool ResourcePools::allocateInto(ResourceDemand const& demand, std::vector<Resou
     {
         Pool const& resourcePool = pool(type);
         int32_t const resourceCount = demand.get(type);
+        if (resourcePool.lowestFirst)
+        {
+            int32_t picked = 0;
+            for (int32_t id = 0; id < resourcePool.usableLimit && picked < resourceCount; ++id)
+            {
+                if (resourcePool.slots[static_cast<size_t>(id)].onFreeList)
+                {
+                    resources[outputIndex++] = ResourceId{type, id};
+                    ++picked;
+                }
+            }
+            continue;
+        }
         for (int32_t index = 0; index < resourceCount; ++index)
         {
             size_t const freeListIndex
@@ -117,7 +131,10 @@ bool ResourcePools::allocateInto(ResourceDemand const& demand, std::vector<Resou
     for (ResourceId const& resource : resources)
     {
         Pool& resourcePool = pool(resource.type);
-        resourcePool.freeListHead = (resourcePool.freeListHead + 1) % resourcePool.freeList.size();
+        if (!resourcePool.lowestFirst)
+        {
+            resourcePool.freeListHead = (resourcePool.freeListHead + 1) % resourcePool.freeList.size();
+        }
         --resourcePool.freeListCount;
         Slot& resourceSlot = resourcePool.slots[static_cast<size_t>(resource.index)];
         resourceSlot.activeRefCount = 1;
@@ -191,7 +208,7 @@ int32_t ResourcePools::freeCount(ResourceType type) const noexcept
     {
         return 0;
     }
-    return static_cast<int32_t>(mPools[index].freeListCount);
+    return static_cast<int32_t>(usableFree(mPools[index]));
 }
 
 int32_t ResourcePools::capacity(ResourceType type) const noexcept
@@ -212,7 +229,7 @@ bool ResourcePools::canAllocate(ResourceDemand const& demand) const noexcept
     }
     for (ResourceType const type : kRESOURCE_TYPES)
     {
-        if (static_cast<size_t>(demand.get(type)) > pool(type).freeListCount)
+        if (static_cast<size_t>(demand.get(type)) > usableFree(pool(type)))
         {
             return false;
         }
@@ -253,12 +270,74 @@ void ResourcePools::releaseIfUnused(ResourceId const& resource, Slot& resourceSl
     if (resourceSlot.activeRefCount == 0 && resourceSlot.cacheRefCount == 0 && !resourceSlot.onFreeList)
     {
         Pool& resourcePool = pool(resource.type);
-        size_t const freeListTail
-            = (resourcePool.freeListHead + resourcePool.freeListCount) % resourcePool.freeList.size();
-        resourcePool.freeList[freeListTail] = resource.index;
+        if (!resourcePool.lowestFirst)
+        {
+            size_t const freeListTail
+                = (resourcePool.freeListHead + resourcePool.freeListCount) % resourcePool.freeList.size();
+            resourcePool.freeList[freeListTail] = resource.index;
+        }
         ++resourcePool.freeListCount;
         resourceSlot.onFreeList = true;
     }
+}
+
+size_t ResourcePools::usableFree(Pool const& resourcePool) noexcept
+{
+    if (!resourcePool.lowestFirst)
+    {
+        return resourcePool.freeListCount;
+    }
+    size_t count = 0;
+    for (int32_t id = 0; id < resourcePool.usableLimit; ++id)
+    {
+        count += resourcePool.slots[static_cast<size_t>(id)].onFreeList ? 1 : 0;
+    }
+    return count;
+}
+
+bool ResourcePools::isUsable(ResourceId const& resource) const noexcept
+{
+    size_t const index = poolIndex(resource.type);
+    if (index >= mPools.size() || resource.index < 0 || static_cast<size_t>(resource.index) >= mPools[index].slots.size())
+    {
+        return false;
+    }
+    return !mPools[index].lowestFirst || resource.index < mPools[index].usableLimit;
+}
+
+int32_t ResourcePools::highWater(ResourceType type) const noexcept
+{
+    size_t const index = poolIndex(type);
+    if (index >= mPools.size())
+    {
+        return 0;
+    }
+    Pool const& resourcePool = mPools[index];
+    for (size_t id = resourcePool.slots.size(); id > 0; --id)
+    {
+        if (!resourcePool.slots[id - 1].onFreeList)
+        {
+            return static_cast<int32_t>(id);
+        }
+    }
+    return 0;
+}
+
+void ResourcePools::setLowestFirst(ResourceType type, int32_t usableLimit)
+{
+    Pool& resourcePool = pool(type);
+    ELLM_CHECK(highWater(type) == 0, "Cannot switch a context cache pool with allocated resources to lowest-first");
+    resourcePool.lowestFirst = true;
+    resourcePool.usableLimit = std::min(std::max(usableLimit, 0), static_cast<int32_t>(resourcePool.slots.size()));
+}
+
+void ResourcePools::setUsableLimit(ResourceType type, int32_t usableLimit)
+{
+    Pool& resourcePool = pool(type);
+    ELLM_CHECK(resourcePool.lowestFirst, "Only a lowest-first context cache pool has a usable limit");
+    int32_t const limit = std::min(std::max(usableLimit, 0), static_cast<int32_t>(resourcePool.slots.size()));
+    ELLM_CHECK(limit >= highWater(type), "Usable limit lies below an allocated context cache resource");
+    resourcePool.usableLimit = limit;
 }
 
 } // namespace rt
