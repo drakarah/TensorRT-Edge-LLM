@@ -90,11 +90,11 @@ inline int64_t kvEnvInteger(char const* name, int64_t fallback, int64_t minimum)
     return (end != value && *end == '\0' && parsed >= minimum) ? parsed : fallback;
 }
 
-//! Window configured by EDGELLM_KV_SHRINK_WINDOW_REQUESTS (default 32, at least 1) and EDGELLM_KV_SHRINK_WINDOW_SECONDS (default 900).
+//! Window configured by EDGELLM_KV_SHRINK_WINDOW_REQUESTS (default 4, at least 1) and EDGELLM_KV_SHRINK_WINDOW_SECONDS (default 300).
 inline KvNeedWindow makeKvNeedWindowFromEnv()
 {
-    return KvNeedWindow(static_cast<size_t>(kvEnvInteger("EDGELLM_KV_SHRINK_WINDOW_REQUESTS", 32, 1)),
-        std::chrono::seconds(kvEnvInteger("EDGELLM_KV_SHRINK_WINDOW_SECONDS", 900, 0)));
+    return KvNeedWindow(static_cast<size_t>(kvEnvInteger("EDGELLM_KV_SHRINK_WINDOW_REQUESTS", 4, 1)),
+        std::chrono::seconds(kvEnvInteger("EDGELLM_KV_SHRINK_WINDOW_SECONDS", 300, 0)));
 }
 
 } // namespace rt

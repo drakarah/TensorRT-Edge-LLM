@@ -185,16 +185,21 @@ TEST(KvNeedWindowTest, EnvironmentConfiguresTheWindow)
     EXPECT_EQ(window.record(t0, 10), 10);
 }
 
-TEST(KvNeedWindowTest, DefaultsAreThirtyTwoRequestsAndFifteenMinutes)
+TEST(KvNeedWindowTest, DefaultsAreFourRequestsAndFiveMinutes)
 {
     EnvGuard requests("EDGELLM_KV_SHRINK_WINDOW_REQUESTS", nullptr);
     EnvGuard age("EDGELLM_KV_SHRINK_WINDOW_SECONDS", nullptr);
     KvNeedWindow window = makeKvNeedWindowFromEnv();
     auto const t0 = Clock::now();
     window.record(t0, 9000);
-    for (int i = 0; i < 31; ++i)
+    for (int i = 1; i <= 3; ++i)
     {
         EXPECT_EQ(window.record(t0 + seconds(i), 10), 9000);
     }
-    EXPECT_EQ(window.record(t0 + seconds(32), 10), 10) << "the 33rd most recent request is gone";
+    EXPECT_EQ(window.record(t0 + seconds(4), 10), 10) << "the fifth most recent request is gone";
+
+    KvNeedWindow aged = makeKvNeedWindowFromEnv();
+    aged.record(t0, 9000);
+    EXPECT_EQ(aged.record(t0 + seconds(300), 10), 9000);
+    EXPECT_EQ(aged.record(t0 + seconds(301), 10), 10);
 }
