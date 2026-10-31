@@ -20,6 +20,8 @@
 #include "common/checkMacros.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -49,6 +51,14 @@ bool needsBaseVerifyIntermediateStates(DeploymentConfig const& bundle)
 
 namespace
 {
+
+int32_t kvInitialMappedTokens()
+{
+    char const* value = std::getenv("EDGELLM_KV_INITIAL_TOKENS");
+    int64_t const tokens = value != nullptr ? std::atoll(value) : 0;
+    return tokens > 0 && tokens <= std::numeric_limits<int32_t>::max() ? static_cast<int32_t>(tokens) : 0;
+}
+
 bool isDFlashDDTreeShape(DeploymentConfig const& bundle)
 {
     return bundle.specConfig.has_value() && isCachedBlockDraftMode(bundle.base.specDecodeType)
@@ -158,6 +168,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.numSwaPages=*/cfg.numSwaPages,
         /*.useBoundedSwaKVCache=*/cfg.usesBoundedSwaKVCache(),
         /*.kvSharingDonors=*/cfg.kvSharingDonors,
+        /*.initialMappedTokens=*/kvInitialMappedTokens(),
     };
     rt::MambaCacheManager::Config mambaCfg{
         /*.numRecurrentLayers=*/cfg.numLinearAttnLayers,
@@ -262,6 +273,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.numSwaPages=*/bundle.base.numSwaPages,
             /*.useBoundedSwaKVCache=*/bundle.base.usesBoundedSwaKVCache(),
             /*.kvSharingDonors=*/bundle.base.kvSharingDonors,
+            /*.initialMappedTokens=*/kvInitialMappedTokens(),
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/bundle.base.numLinearAttnLayers,

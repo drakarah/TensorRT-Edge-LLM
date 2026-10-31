@@ -277,7 +277,8 @@ if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
   target_compile_definitions(edgellmCore
                              PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
 endif()
-target_link_libraries(edgellmCore PRIVATE ${CMAKE_DL_LIBS} edgellmChatTemplate)
+target_link_libraries(edgellmCore PRIVATE ${CMAKE_DL_LIBS} ${CUDA_DRIVER_LINK_LIB}
+                                          edgellmChatTemplate)
 # Guided decoding: XGrammar is referenced only from
 # runtime/decoding/guidedDecoder.cpp; PUBLIC so downstream executables that link
 # edgellmCore statically also pull in the archive.

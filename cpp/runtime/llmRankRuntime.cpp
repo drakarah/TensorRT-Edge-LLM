@@ -2248,6 +2248,17 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         context.maxGenerateLength = clampedMaxGenerateLength;
         LOG_WARNING("Reduce max generation length to %d", context.maxGenerateLength);
     }
+    {
+        rt::KVCacheManager& kv = mSharedResources->cacheManagers[0]->getKVCacheManager();
+        int32_t const longestInput = *std::max_element(residentInputLengths.begin(), residentInputLengths.end());
+        int32_t const needed = longestInput + context.maxGenerateLength + kvHeadroom.baseExtraTokens;
+        if (!kv.ensureTokens(needed))
+        {
+            int32_t const mapped = kv.mappedTokens();
+            LOG_WARNING("KV cache cannot grow to %d tokens (mapped %d); limiting this request.", needed, mapped);
+            context.maxGenerateLength = std::min(context.maxGenerateLength, mapped - longestInput - kvHeadroom.baseExtraTokens);
+        }
+    }
     if (context.maxGenerateLength <= 0)
     {
         LOG_ERROR("Insufficient KV cache capacity for generation for this request.");

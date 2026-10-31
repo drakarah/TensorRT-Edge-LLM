@@ -20,6 +20,7 @@
 #include "common/logger.h"
 #include "common/pagedKvTypes.h"
 
+#include <algorithm>
 #include <limits>
 
 using namespace nvinfer1;
@@ -136,6 +137,40 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
         }
     }
 
+    bool growable = mConfig.initialMappedTokens > 0;
+    if (growable && mConfig.maxBatchSize != 1)
+    {
+        LOG_WARNING("KVCacheManager: on-demand mapping needs a single-slot engine; allocating the full pool.");
+        growable = false;
+    }
+    int device = 0;
+    if (growable)
+    {
+        check::check(cudaGetDevice(&device) == cudaSuccess, "KVCacheManager: cudaGetDevice failed.");
+        size_t const granule = VmmRegion::granularity(device);
+        for (int32_t i = 0; i < mConfig.numAttentionLayers && growable; ++i)
+        {
+            KVLayerConfig const& lc = mConfig.layerConfigs[i];
+            bool const reduced
+                = mConfig.useBoundedSwaKVCache && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.maxSequenceLength);
+            if (!isKVSharingRecipient(i) && !reduced
+                && computeLayerBytes(mNumPages, lc, elemSize) / 2 % granule != 0)
+            {
+                LOG_WARNING("KVCacheManager: layer %d pool half is not a multiple of the %zu-byte mapping granule; "
+                            "allocating the full pool.",
+                    i, granule);
+                growable = false;
+            }
+        }
+    }
+    int64_t const initialPages
+        = std::min<int64_t>(mNumPages, (static_cast<int64_t>(mConfig.initialMappedTokens) + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE);
+    if (growable)
+    {
+        mRegions.resize(mConfig.numAttentionLayers);
+        mMappedPages = static_cast<int32_t>(initialPages);
+    }
+
     // Every layer owns a pool-shaped buffer [2, numPages_i, kTOKENS_PER_PAGE, H, D].
     size_t totalBytes = 0;
     mLayerCaches.reserve(mConfig.numAttentionLayers);
@@ -175,8 +210,19 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
         size_t const layerBytes = computeLayerBytes(layerNumPages, lc, elemSize);
         check::check(totalBytes <= std::numeric_limits<size_t>::max() - layerBytes,
             "KVCacheManager: total allocation size overflow.");
-        totalBytes += layerBytes;
+        totalBytes += (growable && !isReduced) ? layerBytes / layerNumPages * mMappedPages : layerBytes;
 
+        if (growable && !isReduced)
+        {
+            size_t const pageBytes = computeLayerBytes(1, lc, elemSize) / 2;
+            mRegions[i] = std::make_unique<VmmRegion>(pageBytes * static_cast<size_t>(layerNumPages), device);
+            check::check(mRegions[i]->growTo(pageBytes * static_cast<size_t>(mMappedPages)),
+                "KVCacheManager: not enough device memory for the initial KV mapping.");
+            mLayerCaches.emplace_back(rt::Tensor(mRegions[i]->base(),
+                {2, layerNumPages, kTOKENS_PER_PAGE, lc.numKVHeads, lc.headDim}, DeviceType::kGPU,
+                mConfig.kvCacheType, "KVCacheManager::layer_" + std::to_string(i)));
+            continue;
+        }
         mLayerCaches.emplace_back(rt::Tensor({2, layerNumPages, kTOKENS_PER_PAGE, lc.numKVHeads, lc.headDim},
             DeviceType::kGPU, mConfig.kvCacheType, "KVCacheManager::layer_" + std::to_string(i)));
     }
@@ -203,8 +249,11 @@ KVCacheManager::KVCacheManager(KVCacheManager&& other) noexcept
     mIsUniform = other.mIsUniform;
     mCapPadded = other.mCapPadded;
     mNumPages = other.mNumPages;
+    mRegions = std::move(other.mRegions);
+    mMappedPages = other.mMappedPages;
 
     other.mConfig = Config{};
+    other.mMappedPages = 0;
     other.mIsUniform = true;
     other.mCapPadded = 0;
     other.mNumPages = 0;
@@ -223,14 +272,61 @@ KVCacheManager& KVCacheManager::operator=(KVCacheManager&& other) noexcept
         mIsUniform = other.mIsUniform;
         mCapPadded = other.mCapPadded;
         mNumPages = other.mNumPages;
+        mRegions = std::move(other.mRegions);
+        mMappedPages = other.mMappedPages;
 
         other.mConfig = Config{};
+        other.mMappedPages = 0;
         other.mIsUniform = true;
         other.mCapPadded = 0;
         other.mNumPages = 0;
         other.mReducedKVCacheCapacity.reset();
     }
     return *this;
+}
+
+bool KVCacheManager::isGrowable() const noexcept
+{
+    return !mRegions.empty();
+}
+
+int32_t KVCacheManager::mappedTokens() const noexcept
+{
+    return isGrowable() ? std::min(mMappedPages * kTOKENS_PER_PAGE, mConfig.maxSequenceLength) : mConfig.maxSequenceLength;
+}
+
+bool KVCacheManager::ensureTokens(int32_t tokens) noexcept
+{
+    if (!isGrowable() || tokens <= mappedTokens())
+    {
+        return true;
+    }
+    int32_t const wantPages = std::min(mNumPages, (std::min(tokens, mConfig.maxSequenceLength) + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE);
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
+    size_t const before = mRegions.size();
+    std::vector<size_t> previous(before, 0);
+    for (size_t i = 0; i < before; ++i)
+    {
+        if (mRegions[i] == nullptr)
+        {
+            continue;
+        }
+        previous[i] = mRegions[i]->mappedPerHalf();
+        size_t const pageBytes = computeLayerBytes(1, mConfig.layerConfigs[i], elemSize) / 2;
+        if (!mRegions[i]->growTo(pageBytes * static_cast<size_t>(wantPages)))
+        {
+            for (size_t k = 0; k < i; ++k)
+            {
+                if (mRegions[k] != nullptr)
+                {
+                    mRegions[k]->shrinkTo(previous[k]);
+                }
+            }
+            return false;
+        }
+    }
+    mMappedPages = wantPages;
+    return true;
 }
 
 int32_t KVCacheManager::storageLayer(int32_t attnLayerIdx) const noexcept

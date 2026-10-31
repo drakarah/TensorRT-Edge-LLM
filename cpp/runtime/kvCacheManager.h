@@ -18,8 +18,10 @@
 #pragma once
 
 #include "common/pagedKvTypes.h"
+#include "common/vmmRegion.h"
 #include <common/tensor.h>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -96,6 +98,9 @@ public:
         //! e.g. Gemma 4), or -1. Empty means no sharing. A recipient owns no pool: its accessors
         //! resolve to the donor's, which is what the attention plugins bind anyway.
         std::vector<int32_t> kvSharingDonors{};
+        //! When non-zero, full-capacity pools reserve their whole virtual range but map physical memory only for
+        //! this many tokens; ensureTokens() maps more. Single-slot engines only. Pointers never change.
+        int32_t initialMappedTokens{0};
     };
     //! \endcond
 
@@ -183,6 +188,16 @@ public:
     //! @return Device pointer to the V pool.
     void* vPoolPtr(int32_t attnLayerIdx) const noexcept;
 
+    //! @brief Whether physical memory is mapped on demand (Config::initialMappedTokens).
+    bool isGrowable() const noexcept;
+
+    //! @brief Tokens of every slot that currently have physical backing; maxSequenceLength when not growable.
+    int32_t mappedTokens() const noexcept;
+
+    //! @brief Back at least @p tokens tokens with physical memory in every growable layer.
+    //! @return false, with the mapping unchanged, if the device cannot supply the memory.
+    bool ensureTokens(int32_t tokens) noexcept;
+
     //! Get the layer configuration for the given attention layer.
     //! @param attnLayerIdx The index of the attention layer.
     //! @return The KVLayerConfig for this layer.
@@ -212,6 +227,8 @@ private:
     std::vector<int32_t> mLayerCapPadded; //!< Per-layer physical per-slot token spans
     std::vector<int32_t> mLayerNumPages;  //!< Per-layer physical page counts
     std::optional<int32_t> mReducedKVCacheCapacity; //!< Common non-full SWA window W
+    std::vector<std::unique_ptr<VmmRegion>> mRegions; //!< Per-layer on-demand pools; empty when not growable
+    int32_t mMappedPages{};                           //!< Pages backed per half in every region
 };
 
 } // namespace rt
