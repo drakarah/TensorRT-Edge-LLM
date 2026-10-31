@@ -881,9 +881,20 @@ int64_t releaseExpertCacheBytes(int64_t bytes)
     void* symbol = dlsym(RTLD_DEFAULT, "edgellmMoeReleaseCacheBytes");
     if (symbol == nullptr)
     {
-        if (void* library = dlopen("libNvInfer_edgellm_plugin.so", RTLD_LAZY | RTLD_NOLOAD))
+        // The plugin library may have been loaded with local symbol scope: find the loaded object by its path or name.
+        char const* const envPath = std::getenv("EDGELLM_PLUGIN_PATH");
+        for (char const* name : {envPath, "libNvInfer_edgellm_plugin.so.1", "libNvInfer_edgellm_plugin.so"})
         {
-            symbol = dlsym(library, "edgellmMoeReleaseCacheBytes");
+            void* library = name != nullptr ? dlopen(name, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
+            if (library != nullptr)
+            {
+                symbol = dlsym(library, "edgellmMoeReleaseCacheBytes");
+                dlclose(library);
+                if (symbol != nullptr)
+                {
+                    break;
+                }
+            }
         }
     }
     return symbol != nullptr ? reinterpret_cast<ReleaseFn>(symbol)(bytes) : 0;
