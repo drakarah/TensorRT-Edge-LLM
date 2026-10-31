@@ -915,12 +915,10 @@ int64_t growExpertCacheBytes(int64_t bytes)
     return symbol != nullptr ? reinterpret_cast<Fn>(symbol)(bytes) : 0;
 }
 
-//! Tokens by which the mapped KV may exceed a request's need before it is trimmed back (EDGELLM_KV_SHRINK_SLACK_TOKENS).
+//! Tokens by which the mapped KV may exceed the recent peak need before it is trimmed back (EDGELLM_KV_SHRINK_SLACK_TOKENS).
 int64_t kvShrinkSlackTokens()
 {
-    char const* value = std::getenv("EDGELLM_KV_SHRINK_SLACK_TOKENS");
-    int64_t const tokens = value != nullptr ? std::atoll(value) : 16384;
-    return tokens >= 0 ? tokens : 16384;
+    return kvEnvInteger("EDGELLM_KV_SHRINK_SLACK_TOKENS", 16384, 0);
 }
 } // namespace
 
@@ -2158,6 +2156,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         int64_t const wanted = static_cast<int64_t>(longestInput) + std::max<int64_t>(request.maxGenerateLength, 0)
             + kvHeadroom.baseExtraTokens;
         int32_t const needed = static_cast<int32_t>(std::min<int64_t>(mDeployment.base.maxKVCacheCapacity, wanted));
+        int32_t const recentPeak = mKvNeedWindow.record(KvNeedWindow::Clock::now(), needed);
         bool cacheResized = false;
         if (!kv.ensureTokens(needed))
         {
@@ -2178,13 +2177,13 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
                 LOG_WARNING("KV cache cannot grow to %d tokens (mapped %d); limiting this request.", needed, kvLimit);
             }
         }
-        else if (kv.isGrowable() && static_cast<int64_t>(kv.mappedTokens()) > static_cast<int64_t>(needed) + kvShrinkSlackTokens())
+        else if (kv.isGrowable() && static_cast<int64_t>(kv.mappedTokens()) > static_cast<int64_t>(recentPeak) + kvShrinkSlackTokens())
         {
-            size_t const freed = kv.shrinkTokens(needed);
+            size_t const freed = kv.shrinkTokens(recentPeak);
             int64_t const taken = growExpertCacheBytes(static_cast<int64_t>(freed));
             cacheResized = taken > 0;
-            LOG_INFO("Trimmed the KV cache to %d tokens (%.1f MiB freed); the expert cache took %.1f MiB.", kv.mappedTokens(),
-                freed / 1048576.0, taken / 1048576.0);
+            LOG_INFO("Trimmed the KV cache to %d tokens, the peak need of the last %zu requests (%.1f MiB freed); the expert cache took %.1f MiB.",
+                kv.mappedTokens(), mKvNeedWindow.size(), freed / 1048576.0, taken / 1048576.0);
         }
         if (cacheResized)
         {

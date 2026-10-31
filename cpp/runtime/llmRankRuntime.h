@@ -25,6 +25,7 @@
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include "runtime/config/deploymentConfig.h"
+#include "runtime/kvNeedWindow.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/guidedDecoder.h"
@@ -658,6 +659,7 @@ private:
     std::unordered_map<int32_t, rt::Tensor const*> mHiddenStatesRegistry; //!< Per-request layer→buffer map
     int32_t mLastPrefillLength{0};                                        //!< Valid prefill length in buffers
     std::vector<std::vector<int32_t>> mLastInputTokenIds;                 //!< Per-batch input token IDs
+    KvNeedWindow mKvNeedWindow{makeKvNeedWindowFromEnv()};               //!< Recent KV needs; the trim target
 
     ParallelMapping mMapping{};         //!< Fully-resolved parallel coordinates for this rank.
     TokenBroadcastFn mTokenBroadcast{}; //!< Optional sampled-token synchronization callback.
