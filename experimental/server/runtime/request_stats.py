@@ -25,6 +25,8 @@ _ENABLE_ENV = "EDGELLM_REQUEST_STATS"
 _CAPACITY_ENV = "EDGELLM_REQUEST_STATS_CAPACITY"
 _DEFAULT_CAPACITY = 500
 _MAX_CAPACITY = 100000
+# Below this many uncached prompt tokens the time to first token is mostly fixed cost (cache restore, first decode step).
+MIN_PREFILL_TOKENS = 256
 
 
 def _capacity_from_env() -> int:
@@ -93,8 +95,8 @@ class RequestTimer:
             "total_ms":
             round(total * 1000, 1),
             "prefill_tok_s":
-            None if ttft is None or new_prompt is None else _rate(
-                new_prompt, ttft),
+            None if ttft is None or new_prompt is None
+            or new_prompt < MIN_PREFILL_TOKENS else _rate(new_prompt, ttft),
             "decode_tok_s":
             None if decode_seconds is None else _rate(decode_tokens,
                                                       decode_seconds),
@@ -148,7 +150,7 @@ class RequestStats:
         streamed = [e for e in done if e["ttft_ms"] is not None]
         prefill_tokens = prefill_seconds = decode_tokens = decode_seconds = 0.0
         for e in streamed:
-            if e["prompt_tokens"] is not None:
+            if e["prefill_tok_s"] is not None:
                 prefill_tokens += e["prompt_tokens"] - (e["reused_tokens"]
                                                         or 0)
                 prefill_seconds += e["ttft_ms"] / 1000
