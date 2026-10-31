@@ -274,8 +274,8 @@ def test_route_reports_disabled(tmp_path, monkeypatch):
                     "role": "user",
                     "content": "hi"
                 }]})
-    assert client.get("/stats").json() == {"enabled": False}
-    assert client.post("/stats/reset").json() == {"enabled": False}
+    assert client.get("/api/stats").json() == {"enabled": False}
+    assert client.post("/api/stats/reset").json() == {"enabled": False}
 
 
 def test_route_records_a_non_streamed_request(tmp_path, monkeypatch):
@@ -287,7 +287,7 @@ def test_route_records_a_non_streamed_request(tmp_path, monkeypatch):
             "content": "hi"
         }]})
     assert response.status_code == 200
-    stats = client.get("/stats").json()
+    stats = client.get("/api/stats").json()
     (entry, ) = stats["requests"]
     assert (entry["status"], entry["stream"]) == ("ok", False)
     assert (entry["prompt_tokens"], entry["completion_tokens"]) == (7, 3)
@@ -305,7 +305,9 @@ def test_route_records_a_streamed_request(tmp_path, monkeypatch):
                                "stream": True
                            })
     assert response.status_code == 200
-    (entry, ) = client.get("/stats", params={"limit": 5}).json()["requests"]
+    (entry, ) = client.get("/api/stats", params={
+        "limit": 5
+    }).json()["requests"]
     assert (entry["status"], entry["stream"]) == ("ok", True)
     assert entry["prompt_tokens"] == 7
     assert entry["completion_tokens"] == 2
@@ -319,5 +321,46 @@ def test_route_reset_empties_the_ring(tmp_path, monkeypatch):
                     "role": "user",
                     "content": "hi"
                 }]})
-    assert client.post("/stats/reset").json() == {"enabled": True}
-    assert client.get("/stats").json()["requests"] == []
+    assert client.post("/api/stats/reset").json() == {"enabled": True}
+    assert client.get("/api/stats").json()["requests"] == []
+
+
+def test_stats_page_is_html_whether_or_not_stats_are_on(tmp_path, monkeypatch):
+    for enabled in (False, True):
+        client = _client(tmp_path / str(enabled), monkeypatch, enabled=enabled)
+        response = client.get("/stats")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/html")
+        assert response.headers["cache-control"] == "no-store"
+        assert "/api/stats" in response.text
+
+
+def test_stats_page_loads_the_json_from_api_stats_only(tmp_path, monkeypatch):
+    page = _client(tmp_path, monkeypatch, enabled=True).get("/stats").text
+    assert 'fetch("/api/stats"' in page
+    assert 'fetch("/api/stats/reset"' in page
+    assert 'fetch("/stats' not in page
+
+
+def test_old_reset_path_is_gone(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch, enabled=True)
+    assert client.post("/stats/reset").status_code == 404
+    assert client.post("/stats").status_code == 405
+
+
+def test_api_stats_limit_applies_to_the_json_route(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch, enabled=True)
+    for _ in range(3):
+        client.post("/v1/chat/completions",
+                    json={"messages": [{
+                        "role": "user",
+                        "content": "hi"
+                    }]})
+    assert len(client.get("/api/stats").json()["requests"]) == 3
+    assert len(
+        client.get("/api/stats", params={
+            "limit": 2
+        }).json()["requests"]) == 2
+    assert client.get("/api/stats", params={
+        "limit": 0
+    }).json()["requests"] == []
