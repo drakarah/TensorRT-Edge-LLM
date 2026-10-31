@@ -535,6 +535,14 @@ public:
         mSnapshotValid = false;
     }
 
+    //! The plugin gave its cache up (a failed resize): drop the view so the freed memory is not read.
+    void unregisterCache(int32_t layerId) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mCache.erase(layerId);
+        mSnapshotValid = false;
+    }
+
     //! A decode step (or any non-prefill call) breaks the layer sequence: a prefetch issued for a layer that now will not run must not be consumed.
     void invalidate() noexcept
     {
@@ -1431,83 +1439,134 @@ int64_t Int4MoePlugin::resizeExpertCache(int32_t newSlots) noexcept
     size_t const experts = static_cast<size_t>(mNumExperts);
     auto stateInts = [experts](int32_t slots) { return experts + 4 * static_cast<size_t>(slots) + 5; };
     auto tensorBytes = [this](int32_t i, int32_t slots) { return (mCacheBytesPerExpert[i] * slots + 255) & ~static_cast<size_t>(255); };
+    auto totalBytes = [&](int32_t slots) {
+        size_t total = 0;
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            total += tensorBytes(i, slots);
+        }
+        return total;
+    };
 
-    std::vector<int32_t> oldState(stateInts(oldSlots));
-    if (cudaDeviceSynchronize() != cudaSuccess
-        || cudaMemcpy(oldState.data(), mCacheState, oldState.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
-    {
-        cudaGetLastError();
-        return 0;
-    }
-    // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S], tally[3]
-    std::vector<int32_t> newState(stateInts(newSlots), 0);
-    size_t const oldCounter = experts + 2 * static_cast<size_t>(oldSlots);
-    size_t const newCounter = experts + 2 * static_cast<size_t>(newSlots);
-    for (size_t e = 0; e < experts; ++e)
-    {
-        newState[e] = oldState[e] >= newSlots ? -1 : oldState[e];
-    }
+    // Everything that survives goes through host memory, so the old block can be freed before the new one is allocated: a shrink must
+    // work when the device has no free memory left.
     int32_t const kept = std::min(oldSlots, newSlots);
-    for (int32_t s = 0; s < newSlots; ++s)
+    std::vector<int32_t> oldState(stateInts(oldSlots));
+    std::vector<uint8_t> keptTensors[4];
+    cudaError_t status = cudaDeviceSynchronize();
+    if (status == cudaSuccess)
     {
-        newState[experts + s] = s < kept ? oldState[experts + s] : -1;
-        newState[experts + newSlots + s] = s < kept ? oldState[experts + oldSlots + s] : 0;
+        status = cudaMemcpy(oldState.data(), mCacheState, oldState.size() * 4, cudaMemcpyDeviceToHost);
     }
-    newState[newCounter] = oldState[oldCounter];
-    for (size_t k = 0; k < 3; ++k)
+    for (int32_t i = 0; i < 4 && status == cudaSuccess; ++i)
     {
-        newState[newState.size() - 3 + k] = oldState[oldState.size() - 3 + k];
+        try
+        {
+            keptTensors[i].resize(mCacheBytesPerExpert[i] * kept);
+        }
+        catch (std::exception const&)
+        {
+            status = cudaErrorMemoryAllocation;
+            break;
+        }
+        status = cudaMemcpy(keptTensors[i].data(), mCacheTensors[i], keptTensors[i].size(), cudaMemcpyDeviceToHost);
+    }
+    if (status != cudaSuccess)
+    {
+        LOG_WARNING("Int4MoePlugin %s: expert cache resize cannot read the cache: %s", mLayerName.c_str(), cudaGetErrorString(status));
+        cudaGetLastError();
+        return 0;
     }
 
-    size_t total = 0;
-    for (int32_t i = 0; i < 4; ++i)
-    {
-        total += tensorBytes(i, newSlots);
-    }
-    void* newMem = nullptr;
-    int32_t* newDeviceState = nullptr;
-    if (cudaMalloc(&newMem, total) != cudaSuccess || cudaMalloc(reinterpret_cast<void**>(&newDeviceState), newState.size() * 4) != cudaSuccess)
-    {
-        cudaGetLastError();
-        cudaFree(newMem);
-        return 0;
-    }
-    uint8_t* target = static_cast<uint8_t*>(newMem);
-    uint8_t* newTensors[4]{};
-    bool ok = cudaMemcpy(newDeviceState, newState.data(), newState.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess;
-    for (int32_t i = 0; i < 4 && ok; ++i)
-    {
-        newTensors[i] = target;
-        ok = cudaMemcpy(target, mCacheTensors[i], mCacheBytesPerExpert[i] * kept, cudaMemcpyDeviceToDevice) == cudaSuccess;
-        target += tensorBytes(i, newSlots);
-    }
-    if (!ok)
-    {
-        cudaGetLastError();
-        cudaFree(newMem);
-        cudaFree(newDeviceState);
-        return 0;
-    }
-    size_t oldTotal = 0;
-    for (int32_t i = 0; i < 4; ++i)
-    {
-        oldTotal += tensorBytes(i, oldSlots);
-    }
-    // The stats thread reads the tally pointer: publish the new one before the old state is freed.
-    int32_t* const retiredState = mCacheState;
+    auto buildState = [&](int32_t slots) {
+        // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S], tally[3]
+        std::vector<int32_t> state(stateInts(slots), 0);
+        int32_t const live = std::min(kept, slots);
+        for (size_t e = 0; e < experts; ++e)
+        {
+            state[e] = oldState[e] >= live ? -1 : oldState[e];
+        }
+        for (int32_t s = 0; s < slots; ++s)
+        {
+            state[experts + s] = s < live ? oldState[experts + s] : -1;
+            state[experts + slots + s] = s < live ? oldState[experts + oldSlots + s] : 0;
+        }
+        state[experts + 2 * static_cast<size_t>(slots)] = oldState[experts + 2 * static_cast<size_t>(oldSlots)];
+        for (size_t k = 0; k < 3; ++k)
+        {
+            state[state.size() - 3 + k] = oldState[oldState.size() - 3 + k];
+        }
+        return state;
+    };
+
+    size_t const oldTotal = totalBytes(oldSlots) + stateInts(oldSlots) * 4;
     void* const retiredMem = mCacheMem;
-    mCacheMem = newMem;
-    mCacheState = newDeviceState;
-    mCacheSlots = newSlots;
-    for (int32_t i = 0; i < 4; ++i)
-    {
-        mCacheTensors[i] = newTensors[i];
-    }
-    mCacheTally = mCacheState + newState.size() - 3;
+    int32_t* const retiredState = mCacheState;
+    mCacheTally = nullptr;
+    PrefillExpertPrefetcher::get().invalidate();
     cudaFree(retiredMem);
     cudaFree(retiredState);
-    PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
-    return static_cast<int64_t>(oldTotal - total) + static_cast<int64_t>((stateInts(oldSlots) - stateInts(newSlots)) * 4);
+    mCacheMem = nullptr;
+    mCacheState = nullptr;
+
+    // Allocate the requested size; if a growth does not fit, fall back to the old size, which is always free again.
+    for (int32_t slots : {newSlots, oldSlots})
+    {
+        if (slots == oldSlots && newSlots < oldSlots)
+        {
+            break;
+        }
+        std::vector<int32_t> state = buildState(slots);
+        size_t const total = totalBytes(slots);
+        void* mem = nullptr;
+        int32_t* deviceState = nullptr;
+        cudaError_t allocStatus = cudaMalloc(&mem, total);
+        if (allocStatus == cudaSuccess)
+        {
+            allocStatus = cudaMalloc(reinterpret_cast<void**>(&deviceState), state.size() * 4);
+        }
+        if (allocStatus == cudaSuccess)
+        {
+            allocStatus = cudaMemcpy(deviceState, state.data(), state.size() * 4, cudaMemcpyHostToDevice);
+        }
+        uint8_t* cursor = static_cast<uint8_t*>(mem);
+        uint8_t* tensors[4]{};
+        for (int32_t i = 0; i < 4 && allocStatus == cudaSuccess; ++i)
+        {
+            tensors[i] = cursor;
+            if (!keptTensors[i].empty())
+            {
+                allocStatus = cudaMemcpy(cursor, keptTensors[i].data(), mCacheBytesPerExpert[i] * std::min(kept, slots), cudaMemcpyHostToDevice);
+            }
+            cursor += tensorBytes(i, slots);
+        }
+        if (allocStatus != cudaSuccess)
+        {
+            LOG_WARNING("Int4MoePlugin %s: expert cache resize to %d slots failed (%zu bytes): %s", mLayerName.c_str(), slots, total,
+                cudaGetErrorString(allocStatus));
+            cudaGetLastError();
+            cudaFree(mem);
+            cudaFree(deviceState);
+            continue;
+        }
+        mCacheMem = mem;
+        mCacheState = deviceState;
+        mCacheSlots = slots;
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            mCacheTensors[i] = tensors[i];
+        }
+        mCacheTally = mCacheState + state.size() - 3;
+        PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
+        return static_cast<int64_t>(oldTotal) - static_cast<int64_t>(total + state.size() * 4);
+    }
+
+    // No cache could be rebuilt: continue without one (decode falls back to staging).
+    LOG_WARNING("Int4MoePlugin %s: expert cache disabled after a failed resize.", mLayerName.c_str());
+    mCacheReady = false;
+    mCacheSlots = 0;
+    PrefillExpertPrefetcher::get().unregisterCache(layerIdFromName(mLayerName));
+    return static_cast<int64_t>(oldTotal);
 }
 
 bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
@@ -2506,19 +2565,16 @@ IPluginV3* Int4MoePluginCreator::createPlugin(
     }
 }
 
-} // namespace plugins
-} // namespace trt_edgellm
-
 //! Entry point for the runtime (resolved with dlsym): shrink every layer's expert cache so that at least @p bytesNeeded
 //! device bytes are released, keeping at least 2 * top-k slots (a single-token decode needs top-k; larger verify steps fall back to staging).
 //! Returns the bytes released.
-extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeReleaseCacheBytes(int64_t bytesNeeded)
+int64_t releaseLiveCacheBytes(int64_t bytesNeeded)
 {
-    using trt_edgellm::plugins::Int4MoePlugin;
-    std::lock_guard<std::mutex> lock(trt_edgellm::plugins::gLiveCacheMutex);
-    auto& plugins = trt_edgellm::plugins::liveCachePlugins();
+    std::lock_guard<std::mutex> lock(gLiveCacheMutex);
+    auto& plugins = liveCachePlugins();
     if (plugins.empty() || bytesNeeded <= 0)
     {
+        LOG_WARNING("Expert cache release: %zu caches registered, %lld bytes requested.", plugins.size(), static_cast<long long>(bytesNeeded));
         return 0;
     }
     size_t perSlotAll = 0;
@@ -2526,12 +2582,18 @@ extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeReleaseCache
     int32_t floorSlots = 1;
     for (Int4MoePlugin* plugin : plugins)
     {
+        if (plugin->cacheSlots() == 0)
+        {
+            continue;
+        }
         perSlotAll += plugin->cacheBytesPerSlot();
         slots = std::min(slots, plugin->cacheSlots());
         floorSlots = std::max(floorSlots, 2 * plugin->topK());
     }
     if (perSlotAll == 0 || slots <= floorSlots)
     {
+        LOG_WARNING("Expert cache release: nothing to give (%zu caches, %d slots, floor %d, %zu bytes per slot).", plugins.size(), slots,
+            floorSlots, perSlotAll);
         return 0;
     }
     int64_t const drop = (bytesNeeded + static_cast<int64_t>(perSlotAll) - 1) / static_cast<int64_t>(perSlotAll);
@@ -2539,18 +2601,24 @@ extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeReleaseCache
     int64_t released = 0;
     for (Int4MoePlugin* plugin : plugins)
     {
-        released += plugin->resizeExpertCache(target);
+        if (plugin->cacheSlots() > 0)
+        {
+            released += plugin->resizeExpertCache(target);
+        }
+    }
+    if (released <= 0)
+    {
+        LOG_WARNING("Expert cache release: resizing %zu caches from %d to %d slots freed nothing.", plugins.size(), slots, target);
     }
     return released;
 }
 
 //! Entry point for the runtime: give up to @p bytes of device memory to every layer's expert cache (more slots, never more than one per
 //! expert). Returns the bytes taken; the new slots start empty.
-extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeGrowCacheBytes(int64_t bytes)
+int64_t growLiveCacheBytes(int64_t bytes)
 {
-    using trt_edgellm::plugins::Int4MoePlugin;
-    std::lock_guard<std::mutex> lock(trt_edgellm::plugins::gLiveCacheMutex);
-    auto& plugins = trt_edgellm::plugins::liveCachePlugins();
+    std::lock_guard<std::mutex> lock(gLiveCacheMutex);
+    auto& plugins = liveCachePlugins();
     if (plugins.empty() || bytes <= 0)
     {
         return 0;
@@ -2559,6 +2627,10 @@ extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeGrowCacheByt
     int32_t slots = std::numeric_limits<int32_t>::max();
     for (Int4MoePlugin* plugin : plugins)
     {
+        if (plugin->cacheSlots() == 0)
+        {
+            continue;
+        }
         perSlotAll += plugin->cacheBytesPerSlot();
         slots = std::min(slots, plugin->cacheSlots());
     }
@@ -2570,7 +2642,22 @@ extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeGrowCacheByt
     int64_t taken = 0;
     for (Int4MoePlugin* plugin : plugins)
     {
-        taken -= plugin->resizeExpertCache(std::min(target, plugin->maxCacheSlots()));
+        if (plugin->cacheSlots() > 0)
+        {
+            taken -= plugin->resizeExpertCache(std::min(target, plugin->maxCacheSlots()));
+        }
     }
     return taken;
+}
+} // namespace plugins
+} // namespace trt_edgellm
+
+extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeReleaseCacheBytes(int64_t bytesNeeded)
+{
+    return trt_edgellm::plugins::releaseLiveCacheBytes(bytesNeeded);
+}
+
+extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeGrowCacheBytes(int64_t bytes)
+{
+    return trt_edgellm::plugins::growLiveCacheBytes(bytes);
 }

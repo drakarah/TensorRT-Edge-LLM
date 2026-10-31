@@ -2160,11 +2160,17 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         bool cacheResized = false;
         if (!kv.ensureTokens(needed))
         {
-            int64_t const released = releaseExpertCacheBytes(static_cast<int64_t>(kv.bytesToMap(needed)));
+            size_t const bytesNeeded = kv.bytesToMap(needed);
+            int64_t const released = releaseExpertCacheBytes(static_cast<int64_t>(bytesNeeded));
             cacheResized = released > 0;
             if (cacheResized)
             {
                 LOG_INFO("Released %.1f MiB of expert cache to grow the KV cache to %d tokens.", released / 1048576.0, needed);
+            }
+            else
+            {
+                LOG_WARNING("KV cache needs %.1f MiB more for %d tokens and no expert cache memory could be released (plugin entry point %s).",
+                    bytesNeeded / 1048576.0, needed, moePluginSymbol("edgellmMoeReleaseCacheBytes") != nullptr ? "found" : "not found");
             }
             if (!kv.ensureTokens(needed))
             {
