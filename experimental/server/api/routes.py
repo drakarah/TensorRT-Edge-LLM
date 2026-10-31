@@ -22,14 +22,15 @@ import time
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
-from fastapi.responses import (JSONResponse, PlainTextResponse, Response,
-                               StreamingResponse)
+from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
+                               Response, StreamingResponse)
 
 from . import anthropic_compat
 from .errors import ServerError
 from .protocol import (ChatCompletionRequest, ModelCard, ModelList,
 
                        SpeechRequest, TranscriptionResponse)
+from .stats_page import PAGE as _STATS_PAGE
 
 try:  # optional profiler annotations (no-ops unless a profiler is attached)
     from nvtx import annotate as _nvtx_range
@@ -129,7 +130,12 @@ async def health(request: Request):
     }
 
 
-@router.get("/stats")
+@router.get("/stats", response_class=HTMLResponse)
+async def stats_page():
+    return HTMLResponse(_STATS_PAGE, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/api/stats")
 async def request_stats(request: Request, limit: Optional[int] = None):
     stats = request.app.state.engine_client.stats
     if stats is None:
@@ -137,7 +143,7 @@ async def request_stats(request: Request, limit: Optional[int] = None):
     return stats.snapshot(limit)
 
 
-@router.post("/stats/reset")
+@router.post("/api/stats/reset")
 async def reset_request_stats(request: Request):
     stats = request.app.state.engine_client.stats
     if stats is not None:
