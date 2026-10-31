@@ -874,21 +874,20 @@ void LLMRankRuntime::setVisualPrunerConfig(VisualPrunerConfig const& config)
 
 namespace
 {
-//! Asks the MoE plugin library, when loaded, to release expert-cache memory; 0 when it is absent or nothing can go.
-int64_t releaseExpertCacheBytes(int64_t bytes)
+//! Looks up an exported function of the MoE plugin library, when it is loaded.
+void* moePluginSymbol(char const* name)
 {
-    using ReleaseFn = int64_t (*)(int64_t);
-    void* symbol = dlsym(RTLD_DEFAULT, "edgellmMoeReleaseCacheBytes");
+    void* symbol = dlsym(RTLD_DEFAULT, name);
     if (symbol == nullptr)
     {
         // The plugin library may have been loaded with local symbol scope: find the loaded object by its path or name.
         char const* const envPath = std::getenv("EDGELLM_PLUGIN_PATH");
-        for (char const* name : {envPath, "libNvInfer_edgellm_plugin.so.1", "libNvInfer_edgellm_plugin.so"})
+        for (char const* candidate : {envPath, "libNvInfer_edgellm_plugin.so.1", "libNvInfer_edgellm_plugin.so"})
         {
-            void* library = name != nullptr ? dlopen(name, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
+            void* library = candidate != nullptr ? dlopen(candidate, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
             if (library != nullptr)
             {
-                symbol = dlsym(library, "edgellmMoeReleaseCacheBytes");
+                symbol = dlsym(library, name);
                 dlclose(library);
                 if (symbol != nullptr)
                 {
@@ -897,7 +896,31 @@ int64_t releaseExpertCacheBytes(int64_t bytes)
             }
         }
     }
-    return symbol != nullptr ? reinterpret_cast<ReleaseFn>(symbol)(bytes) : 0;
+    return symbol;
+}
+
+//! Releases expert-cache memory through the MoE plugin library; 0 when it is absent or nothing can go.
+int64_t releaseExpertCacheBytes(int64_t bytes)
+{
+    using Fn = int64_t (*)(int64_t);
+    void* symbol = moePluginSymbol("edgellmMoeReleaseCacheBytes");
+    return symbol != nullptr ? reinterpret_cast<Fn>(symbol)(bytes) : 0;
+}
+
+//! Gives device memory to the expert caches; returns the bytes they took.
+int64_t growExpertCacheBytes(int64_t bytes)
+{
+    using Fn = int64_t (*)(int64_t);
+    void* symbol = moePluginSymbol("edgellmMoeGrowCacheBytes");
+    return symbol != nullptr ? reinterpret_cast<Fn>(symbol)(bytes) : 0;
+}
+
+//! Tokens by which the mapped KV may exceed a request's need before it is trimmed back (EDGELLM_KV_SHRINK_SLACK_TOKENS).
+int64_t kvShrinkSlackTokens()
+{
+    char const* value = std::getenv("EDGELLM_KV_SHRINK_SLACK_TOKENS");
+    int64_t const tokens = value != nullptr ? std::atoll(value) : 16384;
+    return tokens >= 0 ? tokens : 16384;
 }
 } // namespace
 
@@ -2135,12 +2158,13 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         int64_t const wanted = static_cast<int64_t>(longestInput) + std::max<int64_t>(request.maxGenerateLength, 0)
             + kvHeadroom.baseExtraTokens;
         int32_t const needed = static_cast<int32_t>(std::min<int64_t>(mDeployment.base.maxKVCacheCapacity, wanted));
+        bool cacheResized = false;
         if (!kv.ensureTokens(needed))
         {
             int64_t const released = releaseExpertCacheBytes(static_cast<int64_t>(kv.bytesToMap(needed)));
-            if (released > 0)
+            cacheResized = released > 0;
+            if (cacheResized)
             {
-                mBaseExecutor->dropGraphs();
                 LOG_INFO("Released %.1f MiB of expert cache to grow the KV cache to %d tokens.", released / 1048576.0, needed);
             }
             if (!kv.ensureTokens(needed))
@@ -2153,9 +2177,21 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
                 }
                 LOG_WARNING("KV cache cannot grow to %d tokens (mapped %d); limiting this request.", needed, kvLimit);
             }
-            if (released > 0 && !captureDecodingCUDAGraph(context.stream))
+        }
+        else if (kv.isGrowable() && static_cast<int64_t>(kv.mappedTokens()) > static_cast<int64_t>(needed) + kvShrinkSlackTokens())
+        {
+            size_t const freed = kv.shrinkTokens(needed);
+            int64_t const taken = growExpertCacheBytes(static_cast<int64_t>(freed));
+            cacheResized = taken > 0;
+            LOG_INFO("Trimmed the KV cache to %d tokens (%.1f MiB freed); the expert cache took %.1f MiB.", kv.mappedTokens(),
+                freed / 1048576.0, taken / 1048576.0);
+        }
+        if (cacheResized)
+        {
+            mBaseExecutor->dropGraphs();
+            if (!captureDecodingCUDAGraph(context.stream))
             {
-                LOG_WARNING("Decode graphs were not recaptured after the expert cache shrank; decoding runs without them.");
+                LOG_WARNING("Decode graphs were not recaptured after the expert cache changed size; decoding runs without them.");
             }
         }
     }

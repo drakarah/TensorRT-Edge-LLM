@@ -228,9 +228,15 @@ public:
     {
         return mTopK;
     }
-    //! Reallocate the cache with its first @p newSlots slots. Experts in the dropped slots become uncached. The
-    //! caller guarantees no enqueue is in flight. Returns the device bytes released (0 if nothing changed).
-    int64_t shrinkExpertCache(int32_t newSlots) noexcept;
+    //! Reallocate the cache with @p newSlots slots, keeping the first min(old, new). Experts in dropped slots become
+    //! uncached, added slots start empty. The caller guarantees no enqueue is in flight. Returns the device bytes
+    //! released (negative when the cache grew, 0 if nothing changed).
+    int64_t resizeExpertCache(int32_t newSlots) noexcept;
+    //! Largest useful slot count: one per expert.
+    int32_t maxCacheSlots() const noexcept
+    {
+        return mNumExperts;
+    }
 
 private:
     int32_t* mCpuAdmit{nullptr}; // device [numExperts + 1]: miss counters and call counter of the CPU miss path

@@ -198,6 +198,10 @@ public:
     //! @return false, with the mapping unchanged, if the device cannot supply the memory.
     bool ensureTokens(int32_t tokens) noexcept;
 
+    //! @brief Release the mapping beyond @p tokens, never below Config::initialMappedTokens.
+    //! @return Device bytes released (granule-rounded, all layers and both halves).
+    size_t shrinkTokens(int32_t tokens) noexcept;
+
     //! @brief Device bytes ensureTokens(@p tokens) would newly map across all layers (rounded to the mapping granule).
     size_t bytesToMap(int32_t tokens) const noexcept;
 
@@ -232,6 +236,7 @@ private:
     std::optional<int32_t> mReducedKVCacheCapacity; //!< Common non-full SWA window W
     std::vector<std::unique_ptr<VmmRegion>> mRegions; //!< Per-layer on-demand pools; empty when not growable
     int32_t mMappedPages{};                           //!< Pages backed per half in every region
+    int32_t mInitialPages{};                          //!< Lower bound of the mapping
 };
 
 } // namespace rt

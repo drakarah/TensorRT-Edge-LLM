@@ -185,6 +185,7 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     {
         mRegions.resize(mConfig.numAttentionLayers);
         mMappedPages = static_cast<int32_t>(initialPages);
+        mInitialPages = mMappedPages;
     }
 
     // Every layer owns a pool-shaped buffer [2, numPages_i, kTOKENS_PER_PAGE, H, D].
@@ -267,9 +268,11 @@ KVCacheManager::KVCacheManager(KVCacheManager&& other) noexcept
     mNumPages = other.mNumPages;
     mRegions = std::move(other.mRegions);
     mMappedPages = other.mMappedPages;
+    mInitialPages = other.mInitialPages;
 
     other.mConfig = Config{};
     other.mMappedPages = 0;
+    other.mInitialPages = 0;
     other.mIsUniform = true;
     other.mCapPadded = 0;
     other.mNumPages = 0;
@@ -290,9 +293,11 @@ KVCacheManager& KVCacheManager::operator=(KVCacheManager&& other) noexcept
         mNumPages = other.mNumPages;
         mRegions = std::move(other.mRegions);
         mMappedPages = other.mMappedPages;
+        mInitialPages = other.mInitialPages;
 
         other.mConfig = Config{};
         other.mMappedPages = 0;
+        other.mInitialPages = 0;
         other.mIsUniform = true;
         other.mCapPadded = 0;
         other.mNumPages = 0;
@@ -343,6 +348,34 @@ bool KVCacheManager::ensureTokens(int32_t tokens) noexcept
     }
     mMappedPages = wantPages;
     return true;
+}
+
+size_t KVCacheManager::shrinkTokens(int32_t tokens) noexcept
+{
+    if (!isGrowable() || tokens >= mappedTokens())
+    {
+        return 0;
+    }
+    int32_t const keepPages = std::max(mInitialPages, (std::max(tokens, 0) + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE);
+    if (keepPages >= mMappedPages)
+    {
+        return 0;
+    }
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
+    size_t released = 0;
+    for (size_t i = 0; i < mRegions.size(); ++i)
+    {
+        if (mRegions[i] == nullptr)
+        {
+            continue;
+        }
+        size_t const pageBytes = computeLayerBytes(1, mConfig.layerConfigs[i], elemSize) / 2;
+        size_t const before = mRegions[i]->mappedPerHalf();
+        mRegions[i]->shrinkTo(pageBytes * static_cast<size_t>(keepPages));
+        released += 2 * (before - mRegions[i]->mappedPerHalf());
+    }
+    mMappedPages = keepPages;
+    return released;
 }
 
 size_t KVCacheManager::bytesToMap(int32_t tokens) const noexcept

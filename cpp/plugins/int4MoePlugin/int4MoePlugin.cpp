@@ -1421,9 +1421,9 @@ size_t Int4MoePlugin::cacheBytesPerSlot() const noexcept
     return mCacheReady ? bytes : 0;
 }
 
-int64_t Int4MoePlugin::shrinkExpertCache(int32_t newSlots) noexcept
+int64_t Int4MoePlugin::resizeExpertCache(int32_t newSlots) noexcept
 {
-    if (!mCacheReady || newSlots >= mCacheSlots || newSlots < 1)
+    if (!mCacheReady || newSlots == mCacheSlots || newSlots < 1 || newSlots > mNumExperts)
     {
         return 0;
     }
@@ -1447,10 +1447,11 @@ int64_t Int4MoePlugin::shrinkExpertCache(int32_t newSlots) noexcept
     {
         newState[e] = oldState[e] >= newSlots ? -1 : oldState[e];
     }
+    int32_t const kept = std::min(oldSlots, newSlots);
     for (int32_t s = 0; s < newSlots; ++s)
     {
-        newState[experts + s] = oldState[experts + s];
-        newState[experts + newSlots + s] = oldState[experts + oldSlots + s];
+        newState[experts + s] = s < kept ? oldState[experts + s] : -1;
+        newState[experts + newSlots + s] = s < kept ? oldState[experts + oldSlots + s] : 0;
     }
     newState[newCounter] = oldState[oldCounter];
     for (size_t k = 0; k < 3; ++k)
@@ -1477,7 +1478,7 @@ int64_t Int4MoePlugin::shrinkExpertCache(int32_t newSlots) noexcept
     for (int32_t i = 0; i < 4 && ok; ++i)
     {
         newTensors[i] = target;
-        ok = cudaMemcpy(target, mCacheTensors[i], mCacheBytesPerExpert[i] * newSlots, cudaMemcpyDeviceToDevice) == cudaSuccess;
+        ok = cudaMemcpy(target, mCacheTensors[i], mCacheBytesPerExpert[i] * kept, cudaMemcpyDeviceToDevice) == cudaSuccess;
         target += tensorBytes(i, newSlots);
     }
     if (!ok)
@@ -2537,7 +2538,38 @@ extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeReleaseCache
     int64_t released = 0;
     for (Int4MoePlugin* plugin : plugins)
     {
-        released += plugin->shrinkExpertCache(target);
+        released += plugin->resizeExpertCache(target);
     }
     return released;
+}
+
+//! Entry point for the runtime: give up to @p bytes of device memory to every layer's expert cache (more slots, never more than one per
+//! expert). Returns the bytes taken; the new slots start empty.
+extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeGrowCacheBytes(int64_t bytes)
+{
+    using trt_edgellm::plugins::Int4MoePlugin;
+    std::lock_guard<std::mutex> lock(trt_edgellm::plugins::gLiveCacheMutex);
+    auto& plugins = trt_edgellm::plugins::liveCachePlugins();
+    if (plugins.empty() || bytes <= 0)
+    {
+        return 0;
+    }
+    size_t perSlotAll = 0;
+    int32_t slots = std::numeric_limits<int32_t>::max();
+    for (Int4MoePlugin* plugin : plugins)
+    {
+        perSlotAll += plugin->cacheBytesPerSlot();
+        slots = std::min(slots, plugin->cacheSlots());
+    }
+    if (perSlotAll == 0)
+    {
+        return 0;
+    }
+    int32_t const target = static_cast<int32_t>(std::min<int64_t>(std::numeric_limits<int32_t>::max(), slots + bytes / static_cast<int64_t>(perSlotAll)));
+    int64_t taken = 0;
+    for (Int4MoePlugin* plugin : plugins)
+    {
+        taken -= plugin->resizeExpertCache(std::min(target, plugin->maxCacheSlots()));
+    }
+    return taken;
 }
