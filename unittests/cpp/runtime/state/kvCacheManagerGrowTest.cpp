@@ -298,3 +298,40 @@ TEST(KvCacheManagerGrowTest, RepeatedGrowShrinkCyclesLeakNothing)
     EXPECT_GE(freeAfter + (4u << 20), freeBefore) << "device memory is returned after every cycle";
     EXPECT_EQ(kv.mappedTokens(), 4096);
 }
+
+TEST(KvCacheManagerGrowTest, MappedBytesEqualCapacityBytesWhenNotGrowable)
+{
+    rt::KVCacheManager kv(makeConfig(3, 1, 16384, 0), nullptr);
+    EXPECT_GT(kv.capacityBytes(), 0u);
+    EXPECT_EQ(kv.mappedBytes(), kv.capacityBytes());
+}
+
+TEST(KvCacheManagerGrowTest, MappedBytesFollowTheMappingWhileCapacityStays)
+{
+    rt::KVCacheManager kv(makeConfig(3, 1, 16384, 4096), nullptr);
+    size_t const capacity = kv.capacityBytes();
+    size_t const before = kv.mappedBytes();
+    EXPECT_GT(before, 0u);
+    EXPECT_LT(before, capacity);
+    size_t const toMap = kv.bytesToMap(8192);
+    ASSERT_TRUE(kv.ensureTokens(8192));
+    EXPECT_EQ(kv.mappedBytes(), before + toMap);
+    EXPECT_EQ(kv.capacityBytes(), capacity);
+}
+
+TEST(KvCacheManagerGrowTest, FullyMappedPoolReportsItsCapacity)
+{
+    rt::KVCacheManager kv(makeConfig(2, 1, 16384, 4096), nullptr);
+    ASSERT_TRUE(kv.ensureTokens(16384));
+    EXPECT_EQ(kv.mappedBytes(), kv.capacityBytes());
+}
+
+TEST(KvCacheManagerGrowTest, MappedBytesFallWhenTheMappingIsTrimmed)
+{
+    rt::KVCacheManager kv(makeConfig(2, 1, 16384, 4096), nullptr);
+    ASSERT_TRUE(kv.ensureTokens(12288));
+    size_t const grown = kv.mappedBytes();
+    kv.shrinkTokens(4096);
+    EXPECT_LT(kv.mappedBytes(), grown);
+    EXPECT_EQ(kv.mappedBytes() + kv.bytesToMap(12288), grown);
+}

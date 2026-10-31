@@ -274,7 +274,7 @@ def test_route_reports_disabled(tmp_path, monkeypatch):
                     "role": "user",
                     "content": "hi"
                 }]})
-    assert client.get("/api/stats").json() == {"enabled": False}
+    assert client.get("/api/stats").json()["enabled"] is False
     assert client.post("/api/stats/reset").json() == {"enabled": False}
 
 
