@@ -216,6 +216,23 @@ private:
     int32_t* mCacheState{nullptr}; // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S], tally[3]
     std::atomic<int32_t*> mCacheTally{nullptr};
     bool ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc) noexcept;
+
+public:
+    //! Device bytes the cache holds per slot (the four tensors); 0 while no cache is allocated.
+    size_t cacheBytesPerSlot() const noexcept;
+    int32_t cacheSlots() const noexcept
+    {
+        return mCacheReady ? mCacheSlots : 0;
+    }
+    int32_t topK() const noexcept
+    {
+        return mTopK;
+    }
+    //! Reallocate the cache with its first @p newSlots slots. Experts in the dropped slots become uncached. The
+    //! caller guarantees no enqueue is in flight. Returns the device bytes released (0 if nothing changed).
+    int64_t shrinkExpertCache(int32_t newSlots) noexcept;
+
+private:
     int32_t* mCpuAdmit{nullptr}; // device [numExperts + 1]: miss counters and call counter of the CPU miss path
     bool mCpuMissChecked{false};
     bool mCpuMissReady{false};

@@ -46,6 +46,7 @@
 #include "runtime/state/contextCache/contextCacheCoordinator.h"
 #include "sampler/sampling.h"
 #include <algorithm>
+#include <dlfcn.h>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -870,6 +871,24 @@ void LLMRankRuntime::setVisualPrunerConfig(VisualPrunerConfig const& config)
     LOG_INFO("Visual-token pruning enabled: algorithm=%s, reductionRatio=%.3f, minVisualTokens=%d",
         mVisualPruner->name(), config.reductionRatio, config.minVisualTokens);
 }
+
+namespace
+{
+//! Asks the MoE plugin library, when loaded, to release expert-cache memory; 0 when it is absent or nothing can go.
+int64_t releaseExpertCacheBytes(int64_t bytes)
+{
+    using ReleaseFn = int64_t (*)(int64_t);
+    void* symbol = dlsym(RTLD_DEFAULT, "edgellmMoeReleaseCacheBytes");
+    if (symbol == nullptr)
+    {
+        if (void* library = dlopen("libNvInfer_edgellm_plugin.so", RTLD_LAZY | RTLD_NOLOAD))
+        {
+            symbol = dlsym(library, "edgellmMoeReleaseCacheBytes");
+        }
+    }
+    return symbol != nullptr ? reinterpret_cast<ReleaseFn>(symbol)(bytes) : 0;
+}
+} // namespace
 
 bool LLMRankRuntime::broadcastInt32(void* gpuBuffer, int32_t count, cudaStream_t stream)
 {
@@ -2094,6 +2113,41 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     ELLM_CHECK(!enableSpecDecode || kvHeadroom.draftExtraTokens == 0 || mDeployment.draft.has_value(),
         "Decoder requested draft KV headroom without a draft engine");
 
+    int32_t kvLimit = mDeployment.base.maxKVCacheCapacity;
+    {
+        rt::KVCacheManager& kv = mSharedResources->cacheManagers[0]->getKVCacheManager();
+        int32_t longestInput = 0;
+        for (auto const& tokenIds : context.rawBatchedInputIds)
+        {
+            longestInput = std::max(longestInput, static_cast<int32_t>(tokenIds.size()));
+        }
+        int32_t const needed = std::min(mDeployment.base.maxKVCacheCapacity,
+            longestInput + std::max(request.maxGenerateLength, 0) + kvHeadroom.baseExtraTokens);
+        if (!kv.ensureTokens(needed))
+        {
+            int64_t const released = releaseExpertCacheBytes(static_cast<int64_t>(kv.bytesToMap(needed)));
+            if (released > 0)
+            {
+                mBaseExecutor->dropGraphs();
+                LOG_INFO("Released %.1f MiB of expert cache to grow the KV cache to %d tokens.", released / 1048576.0, needed);
+            }
+            if (!kv.ensureTokens(needed))
+            {
+                kvLimit = kv.mappedTokens();
+                if (longestInput > kvLimit)
+                {
+                    throw std::runtime_error("EDGELLM_INPUT_TOO_LONG: input length " + std::to_string(longestInput)
+                        + " exceeds the KV cache that could be mapped (" + std::to_string(kvLimit) + " tokens)");
+                }
+                LOG_WARNING("KV cache cannot grow to %d tokens (mapped %d); limiting this request.", needed, kvLimit);
+            }
+            if (released > 0 && !captureDecodingCUDAGraph(context.stream))
+            {
+                LOG_WARNING("Decode graphs were not recaptured after the expert cache shrank; decoding runs without them.");
+            }
+        }
+    }
+
     // In production, the system-prompt KV cache is saved during warm-up.
     // We disable profiling here to make benchmarking closer to production inference result.
     bool profilingEnabled = getProfilingEnabled();
@@ -2236,7 +2290,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         residentInputLengths.push_back(static_cast<int32_t>(tokenIds.size()));
     }
     int32_t clampedMaxGenerateLength = clampMaxGenerateLengthForKVCapacity(residentInputLengths,
-        request.maxGenerateLength, mDeployment.base.maxKVCacheCapacity, kvHeadroom.baseExtraTokens);
+        request.maxGenerateLength, kvLimit, kvHeadroom.baseExtraTokens);
     if (kvHeadroom.draftExtraTokens > 0)
     {
         ELLM_CHECK(mDeployment.draft.has_value(), "Draft KV headroom requires a draft engine");
@@ -2247,17 +2301,6 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     {
         context.maxGenerateLength = clampedMaxGenerateLength;
         LOG_WARNING("Reduce max generation length to %d", context.maxGenerateLength);
-    }
-    {
-        rt::KVCacheManager& kv = mSharedResources->cacheManagers[0]->getKVCacheManager();
-        int32_t const longestInput = *std::max_element(residentInputLengths.begin(), residentInputLengths.end());
-        int32_t const needed = longestInput + context.maxGenerateLength + kvHeadroom.baseExtraTokens;
-        if (!kv.ensureTokens(needed))
-        {
-            int32_t const mapped = kv.mappedTokens();
-            LOG_WARNING("KV cache cannot grow to %d tokens (mapped %d); limiting this request.", needed, mapped);
-            context.maxGenerateLength = std::min(context.maxGenerateLength, mapped - longestInput - kvHeadroom.baseExtraTokens);
-        }
     }
     if (context.maxGenerateLength <= 0)
     {

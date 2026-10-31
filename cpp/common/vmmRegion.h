@@ -60,6 +60,11 @@ public:
         return mHalfBytes;
     }
 
+    size_t granuleBytes() const noexcept
+    {
+        return mGranularity;
+    }
+
     size_t mappedPerHalf() const noexcept
     {
         return mMapped;

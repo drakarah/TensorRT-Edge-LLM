@@ -198,6 +198,9 @@ public:
     //! @return false, with the mapping unchanged, if the device cannot supply the memory.
     bool ensureTokens(int32_t tokens) noexcept;
 
+    //! @brief Device bytes ensureTokens(@p tokens) would newly map across all layers (rounded to the mapping granule).
+    size_t bytesToMap(int32_t tokens) const noexcept;
+
     //! Get the layer configuration for the given attention layer.
     //! @param attnLayerIdx The index of the attention layer.
     //! @return The KVLayerConfig for this layer.

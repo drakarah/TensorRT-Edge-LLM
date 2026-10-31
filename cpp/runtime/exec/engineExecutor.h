@@ -115,6 +115,9 @@ public:
      */
     virtual bool captureGraph(cudaStream_t stream) = 0;
 
+    //! Destroy every captured graph; later executes enqueue normally until a graph is captured again.
+    virtual void dropGraphs() noexcept = 0;
+
     /*!
      * @brief Query required device memory for the execution context.
      * @return Required memory size in bytes

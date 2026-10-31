@@ -329,6 +329,29 @@ bool KVCacheManager::ensureTokens(int32_t tokens) noexcept
     return true;
 }
 
+size_t KVCacheManager::bytesToMap(int32_t tokens) const noexcept
+{
+    if (!isGrowable() || tokens <= mappedTokens())
+    {
+        return 0;
+    }
+    int32_t const wantPages = std::min(mNumPages, (std::min(tokens, mConfig.maxSequenceLength) + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE);
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
+    size_t bytes = 0;
+    for (size_t i = 0; i < mRegions.size(); ++i)
+    {
+        if (mRegions[i] == nullptr)
+        {
+            continue;
+        }
+        size_t const pageBytes = computeLayerBytes(1, mConfig.layerConfigs[i], elemSize) / 2;
+        size_t const granule = mRegions[i]->granuleBytes();
+        size_t const target = (pageBytes * static_cast<size_t>(wantPages) + granule - 1) / granule * granule;
+        bytes += 2 * (target - std::min(target, mRegions[i]->mappedPerHalf()));
+    }
+    return bytes;
+}
+
 int32_t KVCacheManager::storageLayer(int32_t attnLayerIdx) const noexcept
 {
     return isKVSharingRecipient(attnLayerIdx) ? mConfig.kvSharingDonors[attnLayerIdx] : attnLayerIdx;

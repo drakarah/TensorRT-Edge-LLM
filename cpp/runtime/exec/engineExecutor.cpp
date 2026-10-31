@@ -113,6 +113,7 @@ public:
     bool prepare(int32_t profileIndex, InferenceDims const& dims, TensorMap const& map, cudaStream_t stream) override;
     bool execute(cudaStream_t stream) override;
     bool captureGraph(cudaStream_t stream) override;
+    void dropGraphs() noexcept override;
     int64_t getRequiredContextMemorySize() const override;
     bool setContextMemory(Tensor& sharedMem) override;
     int32_t getNumIOTensors() const override;
@@ -252,6 +253,11 @@ std::unique_ptr<EngineExecutor> EngineExecutor::createForDraft(
 }
 
 TrtEngineExecutor::~TrtEngineExecutor() noexcept
+{
+    dropGraphs();
+}
+
+void TrtEngineExecutor::dropGraphs() noexcept
 {
     for (auto& [hash, cg] : mGraphs)
     {
