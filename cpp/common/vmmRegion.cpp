@@ -145,6 +145,11 @@ bool VmmRegion::growTo(size_t bytesPerHalf) noexcept
 void VmmRegion::shrinkTo(size_t bytesPerHalf) noexcept
 {
     size_t const keep = (bytesPerHalf + mGranularity - 1) / mGranularity * mGranularity;
+    if (mMapped > keep)
+    {
+        // Unmapping requires that no outstanding work touches the range.
+        cudaDeviceSynchronize();
+    }
     for (int h = 0; h < 2; ++h)
     {
         while (mHandles[h].size() * mGranularity > keep)
