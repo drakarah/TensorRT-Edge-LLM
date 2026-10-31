@@ -153,3 +153,81 @@ TEST(KvCacheManagerGrowTest, FailedGrowthRollsBackEveryLayer)
     EXPECT_TRUE(kv.ensureTokens(8192));
     EXPECT_EQ(kv.mappedTokens(), 8192);
 }
+
+TEST(KvCacheManagerGrowTest, RetainedExtraPagesKeepTheFullPool)
+{
+    rt::KVCacheManager::Config config = makeConfig(1, 1, 16384, 4096);
+    config.numPages = 128 + 32;
+    rt::KVCacheManager kv(config, nullptr);
+    EXPECT_FALSE(kv.isGrowable()) << "pages past the active range would be handed out unmapped";
+    EXPECT_EQ(kv.mappedTokens(), 16384);
+    EXPECT_EQ(kv.numPages(), 160);
+}
+
+TEST(KvCacheManagerGrowTest, NonPositiveAndSmallerRequestsChangeNothing)
+{
+    rt::KVCacheManager kv(makeConfig(1, 1, 16384, 4096), nullptr);
+    EXPECT_TRUE(kv.ensureTokens(0));
+    EXPECT_TRUE(kv.ensureTokens(-5));
+    EXPECT_EQ(kv.mappedTokens(), 4096);
+    EXPECT_EQ(kv.bytesToMap(-5), 0u);
+
+    ASSERT_TRUE(kv.ensureTokens(12000));
+    int32_t const grown = kv.mappedTokens();
+    EXPECT_TRUE(kv.ensureTokens(100));
+    EXPECT_EQ(kv.mappedTokens(), grown) << "the mapping only ratchets up";
+    EXPECT_TRUE(kv.ensureTokens(12000));
+    EXPECT_EQ(kv.mappedTokens(), grown);
+}
+
+TEST(KvCacheManagerGrowTest, ExactPageAndGranuleBoundaries)
+{
+    rt::KVCacheManager kv(makeConfig(1, 1, 16384, 4096), nullptr);
+    ASSERT_TRUE(kv.ensureTokens(4096));
+    EXPECT_EQ(kv.mappedTokens(), 4096);
+    ASSERT_TRUE(kv.ensureTokens(4097));
+    EXPECT_EQ(kv.mappedTokens(), 4224) << "one more page";
+    ASSERT_TRUE(kv.ensureTokens(8192));
+    EXPECT_EQ(kv.mappedTokens(), 8192);
+    ASSERT_TRUE(kv.ensureTokens(16384));
+    EXPECT_EQ(kv.mappedTokens(), 16384);
+}
+
+TEST(KvCacheManagerGrowTest, InitialSizeOfOneTokenBacksOnePage)
+{
+    rt::KVCacheManager kv(makeConfig(1, 1, 16384, 1), nullptr);
+    ASSERT_TRUE(kv.isGrowable());
+    EXPECT_EQ(kv.mappedTokens(), rt::kTOKENS_PER_PAGE);
+    uint8_t* const k = static_cast<uint8_t*>(kv.kPoolPtr(0));
+    fill(k, 0x6D, static_cast<size_t>(rt::kTOKENS_PER_PAGE) * 2 * 256);
+    EXPECT_EQ(readByte(k + static_cast<size_t>(rt::kTOKENS_PER_PAGE) * 2 * 256 - 1), 0x6D);
+}
+
+TEST(KvCacheManagerGrowTest, MovedManagerKeepsTheMappings)
+{
+    rt::KVCacheManager first(makeConfig(1, 1, 16384, 4096), nullptr);
+    void* const k = first.kPoolPtr(0);
+    rt::KVCacheManager second(std::move(first));
+    EXPECT_TRUE(second.isGrowable());
+    EXPECT_EQ(second.kPoolPtr(0), k);
+    ASSERT_TRUE(second.ensureTokens(9000));
+    EXPECT_EQ(second.kPoolPtr(0), k);
+
+    rt::KVCacheManager third(makeConfig(1, 1, 8192, 0), nullptr);
+    third = std::move(second);
+    EXPECT_TRUE(third.isGrowable());
+    EXPECT_EQ(third.mappedTokens(), 9088);
+    EXPECT_FALSE(first.isGrowable());
+}
+
+TEST(KvCacheManagerGrowTest, KvSharingRecipientsOwnNoRegion)
+{
+    rt::KVCacheManager::Config config = makeConfig(3, 1, 16384, 4096);
+    config.kvSharingDonors = {-1, 0, 0};
+    rt::KVCacheManager kv(config, nullptr);
+    ASSERT_TRUE(kv.isGrowable());
+    size_t const granule = rt::VmmRegion::granularity(0);
+    EXPECT_EQ(kv.bytesToMap(4097), 1 * 2 * granule) << "only the donor layer maps memory";
+    ASSERT_TRUE(kv.ensureTokens(8000));
+    EXPECT_EQ(kv.kPoolPtr(1), kv.kPoolPtr(0));
+}
