@@ -21,9 +21,9 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Request stats</title>
 <style>
-:root { --bg: #f4f5f6; --panel: #ffffff; --fg: #1a1e22; --muted: #5f6a73; --line: #d9dee3; --grid: #e7eaed; --accent: #2b6cd4; --warm: #c96f1d; --bad: #bb3a2d; color-scheme: light; }
+:root { --bg: #f4f5f6; --panel: #ffffff; --fg: #1a1e22; --muted: #5f6a73; --line: #d9dee3; --grid: #e7eaed; --accent: #2b6cd4; --warm: #c96f1d; --bad: #bb3a2d; --s1: #2b6cd4; --s2: #c96f1d; --s3: #7f8c99; --s4: #8fb3ec; color-scheme: light; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #0f1113; --panel: #171a1d; --fg: #e7e9eb; --muted: #8b949c; --line: #2a2f34; --grid: #22272b; --accent: #5b9cf2; --warm: #e0a152; --bad: #e8695b; color-scheme: dark; }
+  :root { --bg: #0f1113; --panel: #171a1d; --fg: #e7e9eb; --muted: #8b949c; --line: #2a2f34; --grid: #22272b; --accent: #5b9cf2; --warm: #e0a152; --bad: #e8695b; --s1: #5b9cf2; --s2: #e0a152; --s3: #6f7b86; --s4: #35527a; color-scheme: dark; }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -55,6 +55,18 @@ th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--li
 th { color: var(--muted); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
 th:first-child, td:first-child { text-align: left; }
 td.bad { color: var(--bad); }
+.bar { display: flex; height: 24px; border-radius: 6px; overflow: hidden; background: var(--grid); margin: 6px 0 10px; }
+.bar > div { min-width: 0; }
+.bar > div + div { border-left: 2px solid var(--panel); }
+.legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 4px 16px; font-size: 13px; }
+.legend div { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.legend i { width: 10px; height: 10px; border-radius: 3px; flex: none; align-self: center; }
+.legend b { font-weight: 500; font-variant-numeric: tabular-nums; }
+.legend span { color: var(--muted); font-variant-numeric: tabular-nums; }
+.mem { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 12px; }
+.mem .wide { grid-column: 1 / -1; }
+.warn { color: var(--bad); }
+.soft { background: var(--panel); }
 #msg { color: var(--muted); }
 .disabled { padding: 24px; }
 .disabled code { background: var(--grid); padding: 1px 5px; border-radius: 4px; }
@@ -75,6 +87,13 @@ td.bad { color: var(--bad); }
       <span id="msg" role="status"></span>
     </div>
   </header>
+  <section class="mem" id="memory" hidden>
+    <div class="card wide"><h2>GPU memory</h2><p class="n" id="gpu-n">Read from the driver on every refresh.</p><div id="gpu"></div></div>
+    <div class="card"><h2>KV cache</h2><p class="n">Tokens. The cache maps memory as requests need it; pages hold the active request and the retained prefixes.</p><div id="kv"></div></div>
+    <div class="card"><h2>Expert cache</h2><p class="n">Experts per layer held on the GPU, out of all experts of a layer.</p><div id="experts"></div></div>
+    <div class="card"><h2>Host memory</h2><p class="n">System RAM. Experts, the embedding table and the reuse snapshots live here.</p><div id="host"></div></div>
+    <div class="card"><h2>Reuse snapshots</h2><p class="n">Snapshots of the recurrent state and of partial KV that let a hybrid model resume from a cached prefix.</p><div id="snaps"></div></div>
+  </section>
   <div id="off" class="card disabled" hidden>
     Per-request stats are off. Start the server with <code>EDGELLM_REQUEST_STATS=1</code> (ring size <code>EDGELLM_REQUEST_STATS_CAPACITY</code>, default 500) and reload this page.
   </div>
@@ -164,9 +183,86 @@ function plot(el, rows, o) {
 const base = (r) => [["Request", "#" + r.id], ["Context", f0(r.prompt_tokens) + " tokens"], ["New", f0(r.prompt_tokens - (r.reused_tokens || 0)) + " tokens"]];
 const newTokens = (r) => (r.prompt_tokens == null ? null : r.prompt_tokens - (r.reused_tokens || 0));
 
+const mib = (v) => (v >= 1024 ? (v / 1024).toFixed(2) + " GiB" : Math.round(v) + " MiB");
+const tok = (v) => nf.format(Math.round(v)) + " tokens";
+function stack(el, segs, total, note) {
+  const wrap = document.createElement("div");
+  const bar = document.createElement("div"); bar.className = "bar"; bar.setAttribute("role", "img");
+  bar.setAttribute("aria-label", segs.map((g) => `${g.label} ${g.text}`).join(", "));
+  const legend = document.createElement("div"); legend.className = "legend";
+  for (const g of segs) {
+    if (g.value > 0 && total > 0) { const d = document.createElement("div"); d.style.width = Math.max(0.4, (g.value / total) * 100) + "%"; d.style.background = g.color; d.title = `${g.label}: ${g.text}`; bar.appendChild(d); }
+    const row = document.createElement("div"), sw = document.createElement("i"), name = document.createElement("span"), val = document.createElement("b");
+    sw.style.background = g.color; name.textContent = g.label; val.textContent = g.text + (total > 0 ? ` (${((g.value / total) * 100).toFixed(1)}%)` : "");
+    row.append(sw, val, name); legend.appendChild(row);
+  }
+  wrap.append(bar, legend);
+  if (note) { const p = document.createElement("p"); p.className = "n"; p.style.margin = "8px 0 0"; p.textContent = note.text; if (note.bad) p.className += " warn"; wrap.appendChild(p); }
+  el.replaceChildren(wrap);
+}
+function renderMemory(mem) {
+  const sec = $("#memory");
+  if (!mem || (!mem.device && !mem.runtime && !mem.host)) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const d = mem.device, r = mem.runtime, h = mem.host, c = (n) => css(n);
+  if (d) {
+    if (r) {
+      const other = Math.max(0, d.used_mib - r.kv_mapped_mib - r.expert_cache_mib);
+      stack($("#gpu"), [
+        { label: "KV cache", value: r.kv_mapped_mib, text: mib(r.kv_mapped_mib), color: c("--s1") },
+        { label: "Expert cache", value: r.expert_cache_mib, text: mib(r.expert_cache_mib), color: c("--s2") },
+        { label: "Everything else in use", value: other, text: mib(other), color: c("--s3") },
+        { label: "Free", value: d.free_mib, text: mib(d.free_mib), color: c("--grid") }], d.total_mib,
+        { text: `Total ${mib(d.total_mib)}. Everything else is the dense weights, engine workspace, CUDA context and anything other processes hold. KV and expert cache are the runtime's own figures.` });
+    } else {
+      stack($("#gpu"), [
+        { label: "In use", value: d.used_mib, text: mib(d.used_mib), color: c("--s3") },
+        { label: "Free", value: d.free_mib, text: mib(d.free_mib), color: c("--grid") }], d.total_mib,
+        { text: `Total ${mib(d.total_mib)}. The runtime's own figures appear after the first request.` });
+    }
+  } else $("#gpu").textContent = "The GPU memory could not be read (nvidia-smi is not available to the server).";
+  if (r) {
+    const tpp = r.kv_pages_usable > 0 ? r.kv_mapped_tokens / r.kv_pages_usable : 0;
+    if (tpp > 0 && r.kv_pages_free >= 0) {
+      const used = (r.kv_pages_usable - r.kv_pages_free) * tpp, free = r.kv_pages_free * tpp;
+      stack($("#kv"), [
+        { label: "Pages in use", value: used, text: tok(used), color: c("--s1") },
+        { label: "Mapped, free", value: free, text: tok(free), color: c("--s4") },
+        { label: "Not mapped", value: r.kv_capacity_tokens - r.kv_mapped_tokens, text: tok(r.kv_capacity_tokens - r.kv_mapped_tokens), color: c("--grid") }], r.kv_capacity_tokens,
+        { text: `${mib(r.kv_mapped_mib)} mapped of ${mib(r.kv_capacity_mib)}; ${f0(r.context_records)} retained prefixes; highest page held ${f0(r.kv_pages_high_water)} of ${f0(r.kv_pages_usable)}.` });
+    } else {
+      stack($("#kv"), [
+        { label: "Mapped", value: r.kv_mapped_tokens, text: tok(r.kv_mapped_tokens), color: c("--s1") },
+        { label: "Not mapped", value: r.kv_capacity_tokens - r.kv_mapped_tokens, text: tok(r.kv_capacity_tokens - r.kv_mapped_tokens), color: c("--grid") }], r.kv_capacity_tokens,
+        { text: `${mib(r.kv_mapped_mib)} mapped of ${mib(r.kv_capacity_mib)}. Page use is only known with context reuse on.` });
+    }
+    if (r.expert_layers > 0 && r.expert_max_slots_per_layer > 0) {
+      stack($("#experts"), [
+        { label: "On the GPU", value: r.expert_slots_per_layer, text: f0(r.expert_slots_per_layer) + " per layer", color: c("--s2") },
+        { label: "In host memory only", value: r.expert_max_slots_per_layer - r.expert_slots_per_layer, text: f0(r.expert_max_slots_per_layer - r.expert_slots_per_layer) + " per layer", color: c("--grid") }], r.expert_max_slots_per_layer,
+        { text: `${f0(r.expert_layers)} layers with a cache, ${mib(r.expert_slot_mib)} per slot across them, ${mib(r.expert_cache_mib)} in all.` + (r.expert_cache_alloc_failures > 0 ? ` ${f0(r.expert_cache_alloc_failures)} cache allocations failed since start (those layers stream through staging buffers).` : ""), bad: r.expert_cache_alloc_failures > 0 });
+    } else $("#experts").textContent = "No expert cache (the model does not stream experts).";
+    const snaps = [["Recurrent state", r.recurrent_snapshots_free, r.recurrent_snapshots_capacity, "--s1"], ["Partial KV", r.partial_kv_snapshots_free, r.partial_kv_snapshots_capacity, "--s2"]].filter((x) => x[2] > 0);
+    if (snaps.length) {
+      const box = document.createElement("div");
+      for (const [name, free, cap, col] of snaps) { const holder = document.createElement("div"); const t = document.createElement("div"); stack(t, [{ label: name + " in use", value: cap - free, text: f0(cap - free) + " of " + f0(cap), color: c(col) }, { label: "Free", value: free, text: f0(free), color: c("--grid") }], cap); holder.appendChild(t); box.appendChild(holder); }
+      $("#snaps").replaceChildren(box);
+    } else $("#snaps").textContent = "Context reuse is off, or the model has no snapshots.";
+  } else for (const id of ["#kv", "#experts", "#snaps"]) $(id).textContent = "Available after the first request.";
+  if (h) {
+    const other = Math.max(0, h.total_mib - h.available_mib - h.server_rss_mib);
+    stack($("#host"), [
+      { label: "This server", value: h.server_rss_mib, text: mib(h.server_rss_mib), color: c("--s1") },
+      { label: "Other processes and cache", value: other, text: mib(other), color: c("--s3") },
+      { label: "Available", value: h.available_mib, text: mib(h.available_mib), color: c("--grid") }], h.total_mib,
+      { text: `Total ${mib(h.total_mib)}. Page cache counts as in use until it is needed.` });
+  } else $("#host").textContent = "Host memory could not be read.";
+}
+
 function tile(k, v, n) { const d = document.createElement("div"); d.className = "tile"; for (const [cls, t] of [["k", k], ["v", v], ["n", n]]) { const p = document.createElement("p"); p.className = cls; p.textContent = t; d.appendChild(p); } return d; }
 
 function render() {
+  renderMemory(data && data.memory);
   const off = !data || !data.enabled;
   $("#off").hidden = !off; $("#content").hidden = off;
   if (off) { $("#sub").textContent = "Stats are off"; return; }

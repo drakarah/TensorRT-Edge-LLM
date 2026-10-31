@@ -137,10 +137,14 @@ async def stats_page():
 
 @router.get("/api/stats")
 async def request_stats(request: Request, limit: Optional[int] = None):
-    stats = request.app.state.engine_client.stats
+    client = request.app.state.engine_client
+    memory = await client.memory_snapshot()
+    stats = client.stats
     if stats is None:
-        return {"enabled": False}
-    return stats.snapshot(limit)
+        return {"enabled": False, "memory": memory}
+    snapshot = stats.snapshot(limit)
+    snapshot["memory"] = memory
+    return snapshot
 
 
 @router.post("/api/stats/reset")

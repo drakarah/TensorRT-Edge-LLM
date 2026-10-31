@@ -30,6 +30,7 @@ from ..config import ApiConfig
 from ..parsing.tool_calling import ToolConfig, validate_tool_request
 from .engine import (LLM, TTS, AudioParams, CompletionOutput, SamplingParams,
                      StreamDelta)
+from .memory_stats import memory_snapshot
 from .request_stats import RequestStats, RequestTimer
 
 
@@ -410,6 +411,9 @@ class EngineClient:
         self._close_lock = asyncio.Lock()
         self._close_task = None
         self._closed = False
+
+    async def memory_snapshot(self) -> Dict[str, Any]:
+        return await asyncio.to_thread(memory_snapshot, self._llm)
 
     @property
     def stats(self) -> Optional[RequestStats]:
