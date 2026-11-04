@@ -318,7 +318,7 @@ TEST(UtilKernelTest, pagedSwaChunkedPrefillAssemblesSparseScrambledWindow)
 
     cudaStream_t stream{nullptr};
     kernel::assemblePagedSWAChunkedPrefillFMHAKV(poolTensor, pageTableTensor, kInputTensor, vInputTensor,
-        inputSeqLenTensor, startIndicesTensor, kWorkspaceTensor, vWorkspaceTensor, slidingWindowSize, stream);
+        inputSeqLenTensor, startIndicesTensor, kWorkspaceTensor, vWorkspaceTensor, slidingWindowSize, 1.0F, 1.0F, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto const kOutput = copyDeviceToHost<half>(kWorkspaceTensor);
     auto const vOutput = copyDeviceToHost<half>(vWorkspaceTensor);

@@ -204,11 +204,12 @@ def test_gdn_aot_tensors_include_state_indices(module_name, factory_name,
     assert state_indices.dynamic_strides_mask == (0, )
 
 
-def test_gdn_mtp_aot_tensors_do_not_add_state_indices():
+def test_gdn_mtp_aot_tensors_include_state_indices():
+    # The linear MTP verify kernel reads each sequence's resident pool row through state_indices (b01100d).
     module = _load_kernel_module("gdn_decode_mtp.py")
     tensors = module._make_aot_mtp_cute_tensors(4, 8, 8, 128, 128, 4)
 
-    assert "state_indices" not in tensors
+    assert "state_indices" in tensors
 
 
 def test_qsa_decode_aot_tensors_are_storage_free():

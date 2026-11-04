@@ -1606,10 +1606,22 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
     rt::Tensor const contextLengthTensor(const_cast<void*>(inputs[contextLengthIdx]),
         rt::Coords{contextLengthInputDesc.dims}, rt::DeviceType::kGPU, contextLengthInputDesc.type);
 
-    check::check(!mEnableAttentionSink
-            || (executionMode != AttentionExecutionMode::kNORMAL_PREFILL
-                && executionMode != AttentionExecutionMode::kCHUNKED_PREFILL),
-        "Learned attention sinks are not yet implemented in the FMHA prefill path.");
+    // Learned attention sinks in prefill exist only in the native-paged FP16 FMHA-v2 kernels (head_dim 128, causal
+    // and sliding-causal). Every other prefill route (Blackwell CuTe DSL FMHA, padding mask, quantized KV cache,
+    // bounded SWA cache, vision-block attention, dense/gathered K/V) would silently drop the sink, so reject it.
+    if (mEnableAttentionSink
+        && (executionMode == AttentionExecutionMode::kNORMAL_PREFILL
+            || executionMode == AttentionExecutionMode::kCHUNKED_PREFILL))
+    {
+        bool const sinkPrefillSupported = mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_V2
+            && !isPaddingContextMask(runtimeContextMaskMode) && !quantizedKVCache() && !useBoundedSwaCache
+            && !mEnableVisionBlockAttention
+            && CuteDslFMHAV2Runner::canImplementPagedSink(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType,
+                mSlidingWindowSize > 0 ? CuteDslFMHAV2MaskType::kSLIDING_CAUSAL : CuteDslFMHAV2MaskType::kCAUSAL);
+        check::check(sinkPrefillSupported,
+            "Learned attention sinks in prefill are only implemented in the native-paged FP16 FMHA-v2 kernels "
+            "(head_dim 128, no padding mask, quantized KV cache, bounded SWA cache or vision-block attention).");
+    }
 
     auto* alignedWorkspacePtr = static_cast<std::byte*>(workspace);
     if (alignedWorkspacePtr == nullptr
@@ -1891,8 +1903,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, preflightKVSeqLen, useSmallD64);
             int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
             bool const preflightSucceeded = usePaddingContextMask ? runner.preflightPadding(stream)
-                : useNativePagedFMHA                              ? runner.preflightPaged(stream, slidingWindow)
-                                                                  : runner.preflightLlm(stream, slidingWindow);
+                : useNativePagedFMHA ? runner.preflightPaged(stream, slidingWindow, mEnableAttentionSink != 0)
+                                     : runner.preflightLlm(stream, slidingWindow);
             if (!preflightSucceeded)
             {
                 return -1;
@@ -2086,7 +2098,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     if (!runner.runPaged(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(), pageTable,
                             attentionOutputTensor.dataPointer<half>(), cuQSeqLensTensor.dataPointer<int32_t>(),
                             cuKVSeqLensTensor.dataPointer<int32_t>(), 2 * numPages, maxPagesPerSeq,
-                            rt::kTOKENS_PER_PAGE, stream, mAttentionScale, slidingWindow))
+                            rt::kTOKENS_PER_PAGE, stream, mAttentionScale, slidingWindow, attentionSinkDevicePtr))
                     {
                         return -1;
                     }
@@ -2272,7 +2284,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 if (!runner.runPaged(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(), pageTable,
                         attentionOutputTensor.dataPointer<half>(), cuQSeqLensTensor.dataPointer<int32_t>(),
                         cuKVSeqLensTensor.dataPointer<int32_t>(), 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE,
-                        stream, mAttentionScale, slidingWindow))
+                        stream, mAttentionScale, slidingWindow, attentionSinkDevicePtr))
                 {
                     return -1;
                 }

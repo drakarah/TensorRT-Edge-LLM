@@ -35,10 +35,18 @@ if _REPO_ROOT not in sys.path:
 try:
     import torch
 
-    from tensorrt_edgellm.checkpoint.repacking import repack_gptq_to_plugin
+    from tensorrt_edgellm.checkpoint.repacking import (
+        int4_gemm_plugin_version, repack_gptq_to_plugin)
 except ImportError as exc:  # pragma: no cover
     pytest.skip(f"tensorrt_edgellm/torch not importable: {exc}",
                 allow_module_level=True)
+
+
+def _packed_shape(out_features: int, in_features: int):
+    """Shape of the repacked int8 weight: V2 cuteDSL fragment layout is [N*K/512, 512]; V1 is [N/2, K]."""
+    if int4_gemm_plugin_version() == 2:
+        return (out_features * in_features // 512, 512)
+    return (out_features // 2, in_features)
 
 
 def _random_qweight(in_features: int,
@@ -71,8 +79,8 @@ def _packed_midpoint_qzeros(num_groups: int, out_features: int,
 def test_symmetric_empty_qzeros_matches_explicit_midpoint():
     """Symmetric (empty ``[num_groups, 0]`` qzeros) must produce the same result
     as an explicit asymmetric call whose stored zeros are the midpoint (8)."""
-    # _pack_intweights requires in_features % 64 == 0 and out_features % 4 == 0.
-    in_features, out_features, num_groups = 128, 16, 4
+    # repack_gptq_to_plugin requires in_features % 64 == 0 and out_features % 64 == 0 (cuteDSL fragment layout).
+    in_features, out_features, num_groups = 128, 64, 4
     qweight = _random_qweight(in_features, out_features, seed=1)
 
     sym_qzeros = torch.empty(num_groups, 0, dtype=torch.int32)
@@ -89,14 +97,13 @@ def test_symmetric_empty_qzeros_matches_explicit_midpoint():
 
 def test_symmetric_output_shape_and_dtype():
     """Empty qzeros must not crash and must yield correctly shaped int8 output."""
-    in_features, out_features, num_groups = 128, 16, 4
+    in_features, out_features, num_groups = 128, 64, 4
     qweight = _random_qweight(in_features, out_features, seed=2)
     sym_qzeros = torch.empty(num_groups, 0, dtype=torch.int32)
 
     qw_out, perm = repack_gptq_to_plugin(qweight, sym_qzeros)
 
-    # _pack_intweights packs 4 N-rows per int16 -> int8 view doubles the rows.
-    assert qw_out.shape == (out_features // 2, in_features)
+    assert qw_out.shape == _packed_shape(out_features, in_features)
     assert qw_out.dtype == torch.int8
     assert perm.shape == (in_features, )
     # Sequential g_idx -> identity activation permutation.
@@ -105,7 +112,7 @@ def test_symmetric_output_shape_and_dtype():
 
 def test_symmetric_num_groups_falls_back_to_gidx():
     """Fully empty qzeros (shape[0]==0) must infer num_groups from ``g_idx``."""
-    in_features, out_features, num_groups = 128, 16, 4
+    in_features, out_features, num_groups = 128, 64, 4
     group_size = in_features // num_groups
     qweight = _random_qweight(in_features, out_features, seed=3)
     g_idx = torch.arange(in_features, dtype=torch.int32) // group_size
@@ -119,5 +126,5 @@ def test_symmetric_num_groups_falls_back_to_gidx():
                                               zero_point_offset=1)
     qw_ref, _ = repack_gptq_to_plugin(qweight, explicit_qzeros)
 
-    assert qw_gidx.shape == (out_features // 2, in_features)
+    assert qw_gidx.shape == _packed_shape(out_features, in_features)
     assert torch.equal(qw_gidx, qw_ref)

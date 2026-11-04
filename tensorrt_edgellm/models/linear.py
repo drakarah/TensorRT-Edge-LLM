@@ -35,12 +35,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..config import (QUANT_FP8, QUANT_FP16, QUANT_INT4_AWQ,
-                      QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ, QUANT_INT8_SQ,
-                      QUANT_MXFP8, QUANT_NVFP4, QUANT_NVFP4_A16, Mapping,
-                      ModelConfig, module_quant_group_size, module_quant_type)
+                      QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ,
+                      QUANT_INT4_MLX_AFFINE, QUANT_INT8_SQ, QUANT_MXFP8,
+                      QUANT_NVFP4, QUANT_NVFP4_A16, Mapping, ModelConfig,
+                      module_quant_group_size, module_quant_type)
 from .ops import (all_reduce, fp8_dequantize, fp8_quantize,
-                  fused_nvfp4_gemm_allreduce, int4_gemm_plugin_version,
-                  int4_groupwise_gemm, int4_groupwise_gemm_v2, int8_sq_act_qdq,
+                  fused_nvfp4_gemm_allreduce, int4_affine_gemm_plugin,
+                  int4_gemm_plugin_version, int4_groupwise_gemm,
+                  int4_groupwise_gemm_v2, int8_sq_act_qdq,
                   int8_sq_weight_dq, mxfp8_act_qdq, mxfp8_weight_dq,
                   nvfp4_a16_blackwell_gemm, nvfp4_a16_gemm, nvfp4_act_qdq,
                   nvfp4_dequantize, use_blackwell_nvfp4_a16_gemm,
@@ -87,6 +89,7 @@ __all__ = [
     "ModelOptAWQPrepackedLinear",
     "NVFP4A16Linear",
     "GPTQLinear",
+    "MlxAffineInt4Linear",
     "INT8SQLinear",
     "TPMode",
     "make_linear",
@@ -639,6 +642,68 @@ class ModelOptAWQPrepackedLinear(LinearBase):
 
 
 # ---------------------------------------------------------------------------
+# MlxAffineInt4Linear  (MLX affine INT4, group 64: w = scale * q + bias)
+# ---------------------------------------------------------------------------
+
+
+class MlxAffineInt4Linear(LinearBase):
+    """MLX affine INT4 W4A16 linear served by ``Int4AffineGroupwiseGemmPlugin``.
+
+    Checkpoint buffers: ``weight`` uint8 ``[out, in/2]`` (low nibble = even k),
+    ``scales`` and ``biases`` BF16 ``[out, in/64]`` with ``w = scale * q + bias``,
+    q in 0..15 (the loader casts BF16 to fp16, which is exact for these ranges).
+    :func:`checkpoint.repacking.apply_all_repacking` rewrites them in place into the
+    plugin inputs: ``weight`` int8 ``[rows, 512]`` (cuteDSL fragment layout holding
+    raw nibbles), ``scales`` fp16 ``[in/64, out]`` and ``biases`` fp16 ``[in/64, out]``
+    holding ``bias' = fp16(bias + 8 * scale)``. Tensor parallelism is not supported.
+    """
+
+    def __init__(self,
+                 in_features: int,
+                 out_features: int,
+                 group_size: int = 64,
+                 bias: bool = False) -> None:
+        super().__init__()
+        if group_size != 64:
+            raise ValueError(
+                f"MlxAffineInt4Linear supports group_size 64, got {group_size}"
+            )
+        if in_features % group_size != 0 or out_features % 8 != 0:
+            raise ValueError(
+                "MlxAffineInt4Linear needs in_features % 64 == 0 and "
+                f"out_features % 8 == 0, got in={in_features}, out={out_features}"
+            )
+        if bias:
+            raise NotImplementedError(
+                "MlxAffineInt4Linear does not support a linear bias")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.bias = None
+        self.register_buffer(
+            "weight",
+            torch.zeros(out_features, in_features // 2, dtype=torch.uint8))
+        self.register_buffer(
+            "scales",
+            torch.ones(out_features,
+                       in_features // group_size,
+                       dtype=torch.bfloat16))
+        self.register_buffer(
+            "biases",
+            torch.zeros(out_features,
+                        in_features // group_size,
+                        dtype=torch.bfloat16))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        _require_fp16_input(hidden_states, "MlxAffineInt4Linear")
+        return int4_affine_gemm_plugin(hidden_states, self.weight,
+                                       self.scales.to(torch.float16),
+                                       self.biases.to(torch.float16),
+                                       self.out_features, self.in_features,
+                                       self.group_size)
+
+
+# ---------------------------------------------------------------------------
 # NVFP4A16Linear  (compressed-tensors NVFP4 W4A16, dense target-selected GEMM)
 # ---------------------------------------------------------------------------
 
@@ -866,8 +931,8 @@ class INT8SQLinear(LinearBase):
 
 def is_int4_linear(module: nn.Module) -> bool:
     """Return whether *module* emits an INT4 groupwise GEMM plugin."""
-    return isinstance(module,
-                      (AWQLinear, ModelOptAWQPrepackedLinear, GPTQLinear))
+    return isinstance(module, (AWQLinear, ModelOptAWQPrepackedLinear,
+                               GPTQLinear, MlxAffineInt4Linear))
 
 
 def is_nvfp4_a16_linear(module: nn.Module) -> bool:
@@ -944,6 +1009,12 @@ def make_linear(
     elif quant_type == QUANT_INT4_GPTQ:
         layer = GPTQLinear(in_features, out_features, group_size,
                            config.quant.gptq_zero_point_offset, bias)
+    elif quant_type == QUANT_INT4_MLX_AFFINE:
+        if config.tp_size > 1:
+            raise NotImplementedError(
+                "MLX affine INT4 linears do not support tensor parallelism")
+        layer = MlxAffineInt4Linear(in_features, out_features, group_size,
+                                    bias)
     elif quant_type == QUANT_INT8_SQ:
         layer = INT8SQLinear(in_features, out_features, bias)
     else:

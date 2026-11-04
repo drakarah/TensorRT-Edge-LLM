@@ -138,6 +138,13 @@ TEST(KvCacheManagerGrowTest, BytesToMapCountsEveryLayerAndBothHalves)
 
 TEST(KvCacheManagerGrowTest, FailedGrowthRollsBackEveryLayer)
 {
+    int integrated = 0;
+    ASSERT_EQ(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0), cudaSuccess);
+    if (integrated != 0)
+    {
+        GTEST_SKIP() << "integrated (unified-memory) GPU: an oversized mapping is backed from system RAM until the OOM "
+                        "killer fires instead of failing cleanly, so the failure path cannot be injected this way";
+    }
     size_t freeBytes = 0;
     size_t totalBytes = 0;
     ASSERT_EQ(cudaMemGetInfo(&freeBytes, &totalBytes), cudaSuccess);

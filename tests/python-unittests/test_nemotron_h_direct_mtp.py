@@ -146,8 +146,11 @@ def test_fp16_moe_emits_nemotron_routing_contract(monkeypatch):
     }
     bindings = {"fc1_weights": {}, "fc2_weights": {}}
 
-    result = moe.fp16_moe("router",
-                          "hidden",
+    # fp16_moe validates the [T, E] / [T, H] layout, so the stand-ins need an ``ndim``.
+    router = SimpleNamespace(ndim=2)
+    hidden = SimpleNamespace(ndim=2)
+    result = moe.fp16_moe(router,
+                          hidden,
                           expert_weights,
                           2,
                           1,
