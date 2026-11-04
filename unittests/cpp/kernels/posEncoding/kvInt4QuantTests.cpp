@@ -417,3 +417,59 @@ TEST(KvInt4Hadamard, ScaleConstantIsOneOverSqrtOf128)
 {
     EXPECT_EQ(kVInt4HadamardScale, static_cast<float>(1.0 / std::sqrt(128.0)));
 }
+
+TEST(KvInt4Packed, LayoutConstantsAreConsistent)
+{
+    EXPECT_EQ(kVInt4PackedChannels, 256);
+    EXPECT_EQ(kVInt4PackedNibbleBytes * 2, kVInt4PackedChannels);
+    EXPECT_EQ(kVInt4PackedGroups * kVInt4GroupSize, kVInt4PackedChannels);
+    EXPECT_EQ(kVInt4PackedScaleOffset, kVInt4PackedNibbleBytes);
+    EXPECT_EQ(kVInt4PackedZeroOffset, kVInt4PackedScaleOffset + 2 * kVInt4PackedGroups);
+    EXPECT_EQ(kVInt4PackedUsedBytes, kVInt4PackedZeroOffset + 2 * kVInt4PackedGroups);
+    EXPECT_LE(kVInt4PackedUsedBytes, kVInt4PackedChannels);
+}
+
+TEST(KvInt4Packed, NibbleOrderAndUntouchedTail)
+{
+    // Channel i is nibble i: channel 0 in the low nibble of byte 0, channel 1 in its high nibble.
+    std::vector<float> values(256);
+    for (int32_t i = 0; i < 256; ++i)
+    {
+        values[i] = static_cast<float>(i % 32); // 0..31 in every group: codes spread over 0..15
+    }
+    std::vector<uint8_t> row(256, 0xA5);
+    vInt4PackRowHost(values.data(), row.data());
+    for (int32_t i = kVInt4PackedUsedBytes; i < 256; ++i)
+    {
+        EXPECT_EQ(row[i], 0xA5) << "byte " << i << " must not be written";
+    }
+    EXPECT_EQ(row[0] & 0x0F, 0);  // channel 0 is the group minimum: code 0
+    EXPECT_EQ(row[15] >> 4, 15);  // channel 31 is the group maximum: code 15
+    std::vector<float> decoded(256);
+    vInt4UnpackRowHost(row.data(), decoded.data());
+    for (int32_t i = 0; i < 256; ++i)
+    {
+        EXPECT_NEAR(decoded[i], values[i], 31.0F / 15.0F * 0.5F + 1e-3F);
+    }
+}
+
+TEST(KvInt4Packed, DegenerateGroupsRoundTripToTheirConstant)
+{
+    // Constant groups, an all-zero group, and a group with +inf / NaN: no crash, finite zero reconstruction for the last two.
+    std::vector<float> values(256, 0.0F);
+    for (int32_t i = 32; i < 64; ++i) values[i] = 3.5F;
+    for (int32_t i = 64; i < 96; ++i) values[i] = -2.25F;
+    values[96] = INFINITY;
+    for (int32_t i = 128; i < 160; ++i) values[i] = std::numeric_limits<float>::quiet_NaN();
+    for (int32_t i = 160; i < 192; ++i) values[i] = 70000.0F;
+    std::vector<uint8_t> row(256, 0);
+    vInt4PackRowHost(values.data(), row.data());
+    std::vector<float> decoded(256);
+    vInt4UnpackRowHost(row.data(), decoded.data());
+    for (int32_t i = 0; i < 32; ++i) EXPECT_EQ(decoded[i], 0.0F);
+    for (int32_t i = 32; i < 64; ++i) EXPECT_EQ(decoded[i], 3.5F);
+    for (int32_t i = 64; i < 96; ++i) EXPECT_EQ(decoded[i], -2.25F);
+    for (int32_t i = 96; i < 128; ++i) EXPECT_EQ(decoded[i], 0.0F);
+    for (int32_t i = 128; i < 160; ++i) EXPECT_EQ(decoded[i], 0.0F);
+    for (int32_t i = 160; i < 192; ++i) EXPECT_EQ(decoded[i], 0.0F);
+}

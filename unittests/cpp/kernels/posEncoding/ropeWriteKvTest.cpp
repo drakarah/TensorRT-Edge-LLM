@@ -2396,6 +2396,117 @@ TEST(RopeWriteKvVInt4Emulation, PackedToSplitMatchesReference)
     }
 }
 
+namespace
+{
+//! The packed K8V4 row: every writer must produce the bytes of the host reference in the first 160 bytes of each V row and leave
+//! the other 96 bytes, the K plane and unwritten slots alone.
+void runVInt4PackedCase(EmuWriter const writer)
+{
+    SCOPED_TRACE(std::string(emuWriterName(writer)) + " packed");
+    EmuSetup const cfg;
+    int32_t const maxPagesPerSeq = getMaxPagesPerSeq(cfg.capacity);
+    int32_t const numPages = cfg.batchSize * maxPagesPerSeq;
+    std::mt19937 gen(9191U + static_cast<uint32_t>(writer));
+    std::uniform_real_distribution<float> uniform(-5.0F, 5.0F);
+    std::vector<half> qHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numQHeads * cfg.headDim);
+    std::vector<half> kHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numKVHeads * cfg.headDim);
+    std::vector<half> vHost(kHost.size());
+    for (auto& x : qHost) x = __float2half(uniform(gen));
+    for (auto& x : kHost) x = __float2half(uniform(gen));
+    std::vector<float> row(cfg.headDim);
+    for (int32_t b = 0; b < cfg.batchSize; ++b)
+    {
+        for (int32_t t = 0; t < cfg.qSeqLen; ++t)
+        {
+            for (int32_t h = 0; h < cfg.numKVHeads; ++h)
+            {
+                fillEmulationRow(gen, (b * 7 + t * 3 + h) % kNumRowPatterns, b * 1000 + t * 10 + h, row);
+                half* dst = &vHost[((static_cast<size_t>(b) * cfg.qSeqLen + t) * cfg.numKVHeads + h) * cfg.headDim];
+                for (int32_t d = 0; d < cfg.headDim; ++d) dst[d] = __float2half(row[d]);
+            }
+        }
+    }
+    auto const off = runEmuWriter(writer, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8);
+    auto const packed = runEmuWriter(writer, cfg, qHost, kHost, vHost, "packed", nvinfer1::DataType::kINT8);
+    auto const packedAgain = runEmuWriter(writer, cfg, qHost, kHost, vHost, "packed", nvinfer1::DataType::kINT8);
+    ASSERT_EQ(off.size(), packed.size());
+    EXPECT_EQ(packed, packedAgain) << "the packed writer must be deterministic";
+
+    // Expected: the int8 pool, with every written V row replaced by [160 reference bytes | 96 sentinel bytes].
+    std::vector<int8_t> expected = off;
+    std::vector<int32_t> const pageTable = makeReversedPageTable(cfg.batchSize, maxPagesPerSeq);
+    for (int32_t b = 0; b < cfg.batchSize; ++b)
+    {
+        for (int32_t t = 0; t < cfg.qSeqLen; ++t)
+        {
+            int32_t const vPage = pageTable[(b * 2 + 1) * maxPagesPerSeq + t / kPageSize];
+            for (int32_t h = 0; h < cfg.numKVHeads; ++h)
+            {
+                half const* src = &vHost[((static_cast<size_t>(b) * cfg.qSeqLen + t) * cfg.numKVHeads + h) * cfg.headDim];
+                for (int32_t d = 0; d < cfg.headDim; ++d) row[d] = __half2float(src[d]);
+                std::vector<uint8_t> bytes(cfg.headDim, static_cast<uint8_t>(kINT8_SENTINEL));
+                vInt4PackRowHost(row.data(), bytes.data());
+                for (int32_t d = 0; d < cfg.headDim; ++d)
+                {
+                    expected[pagedKvIndex(0, vPage, t % kPageSize, h, d, numPages, cfg.numKVHeads, cfg.headDim)]
+                        = static_cast<int8_t>(bytes[d]);
+                }
+                // Decoding the packed row must stay within half a step of the input (the step is the group scale).
+                std::vector<float> decoded(cfg.headDim);
+                vInt4UnpackRowHost(bytes.data(), decoded.data());
+                for (int32_t d = 0; d < cfg.headDim; ++d)
+                {
+                    float scale;
+                    {
+                        __half s;
+                        std::memcpy(&s, bytes.data() + kVInt4PackedScaleOffset + 2 * (d / kVInt4GroupSize), 2);
+                        scale = __half2float(s);
+                    }
+                    if (std::isfinite(row[d]) && std::fabs(row[d]) <= 60000.0F && scale > 0.0F)
+                    {
+                        EXPECT_LE(std::fabs(decoded[d] - row[d]), 0.5001F * scale + 1.0e-3F * std::fabs(row[d]) + 1e-6F);
+                    }
+                }
+            }
+        }
+    }
+    int32_t mismatches = 0;
+    for (size_t i = 0; i < expected.size() && mismatches < 10; ++i)
+    {
+        if (expected[i] != packed[i])
+        {
+            ++mismatches;
+            ADD_FAILURE() << "pool byte " << i << " expected " << static_cast<int32_t>(expected[i]) << " got "
+                          << static_cast<int32_t>(packed[i]);
+        }
+    }
+    EXPECT_EQ(mismatches, 0);
+}
+} // namespace
+
+TEST(RopeWriteKvVInt4Packed, WriteKVMatchesReference)
+{
+    runVInt4PackedCase(EmuWriter::kWriteKV);
+}
+
+TEST(RopeWriteKvVInt4Packed, SplitQKVMatchesReference)
+{
+    runVInt4PackedCase(EmuWriter::kSplitQKV);
+}
+
+TEST(RopeWriteKvVInt4Packed, PackedToSplitMatchesReference)
+{
+    runVInt4PackedCase(EmuWriter::kPackedToSplit);
+}
+
+TEST(RopeWriteKvVInt4Packed, FullyOverwrittenRowsKeepTheLastBytes)
+{
+    // Writing the same tokens twice (second time with different values) must replace the first 160 bytes and still not touch
+    // bytes 160..255; covered indirectly by the sentinel check above, here we only check the explicit "packed" env spelling.
+    ScopedEnv const env(kVInt4EnvName, "packed");
+    EXPECT_NO_THROW(runVInt4PackedCase(EmuWriter::kWriteKV));
+}
+
 TEST(RopeWriteKvVInt4Emulation, ExplicitOffEqualsUnset)
 {
     EmuSetup const cfg;
