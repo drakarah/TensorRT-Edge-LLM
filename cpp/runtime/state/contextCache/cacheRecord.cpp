@@ -289,6 +289,17 @@ void CacheRecordStore::markDemoted(RecordId id, std::vector<int32_t> hostSlots)
     record.hostSlots = std::move(hostSlots);
 }
 
+void CacheRecordStore::markPromoted(RecordId id, std::vector<PageId> basePages)
+{
+    auto const entry = mRecords.find(id);
+    ELLM_CHECK(entry != mRecords.end(), "Context cache record ID does not exist");
+    CacheRecord& record = entry->second.record;
+    ELLM_CHECK(record.demoted() && basePages.size() == record.hostSlots.size(),
+        "A promoted record needs one base page per host slot");
+    record.basePagePath = std::move(basePages);
+    record.hostSlots.clear();
+}
+
 CacheRecord CacheRecordStore::erase(RecordId id)
 {
     auto const record = mRecords.find(id);

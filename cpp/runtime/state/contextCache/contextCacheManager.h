@@ -155,6 +155,9 @@ struct ContextCacheManagerMetrics
     uint64_t demotedRecords{};
     //! Demoted records dropped to make room for a newer demotion.
     uint64_t hostEvictedRecords{};
+    //! Demoted records whose pages were copied back because a request matched them, and the pages that needed a copy.
+    uint64_t promotedRecords{};
+    uint64_t restoredPages{};
 };
 
 //! Host orchestrator for the complete context-cache lifecycle under an externally serialized single-writer contract.
@@ -228,9 +231,10 @@ public:
     //! its snapshot slots. Off until called. Must be called at most once.
     void enableHostTier(int32_t slotCount, int32_t minBlocks);
     bool hostTierEnabled() const noexcept;
-    //! Device-to-host copies that demotions since the last call require. The runtime must enqueue them, in order, on the
-    //! stream that writes the pool before any kernel that may overwrite the freed pages.
-    std::vector<HostKvTransfer> takeHostDemotions();
+    //! Copies the host tier needs since the last call, in the order they must run: demotions copy a page out before its
+    //! slot or page is reused, restores copy a page back before the request reads it. The runtime must enqueue them in
+    //! order on the stream that writes the KV pool, before any kernel that may touch those pages.
+    std::vector<HostKvTransfer> takeHostTransfers();
     HostKvIndex const* hostIndex() const noexcept;
 
     ResourcePools const& pools() const noexcept;
@@ -251,6 +255,11 @@ private:
     void evictRecord(RecordId id, bool allowDemote = true);
     void dropRecord(RecordId id);
     bool tryDemoteRecord(RecordId id);
+    //! Copy a demoted record's pages back when a candidate checkpoint of the request names it. Stops at the first
+    //! candidate (longest first) that is resident or promoted.
+    void promoteMatching(std::vector<HybridCheckpointCandidate> const& candidates,
+        std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount);
+    bool promoteRecord(RecordId id);
     void releaseBasePages(std::vector<PageId> const& pages);
     void releaseHostUser(CacheRecordKey const& hostKey, RecordId id);
     void applyEviction(EvictionPlan const& plan, ResourceDemand const& demand);
@@ -269,7 +278,7 @@ private:
     int32_t mHostMinBlocks{1};
     //! Demoted records per host entry; records with the same block chain and different tails share one entry.
     std::unordered_map<CacheRecordKey, std::vector<RecordId>> mHostUsers;
-    std::vector<HostKvTransfer> mPendingDemotions;
+    std::vector<HostKvTransfer> mPendingTransfers;
 };
 
 } // namespace rt

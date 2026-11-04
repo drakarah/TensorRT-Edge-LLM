@@ -171,6 +171,8 @@ public:
     void setSpecState(RecordId id, SpecPagedStateRecord state);
     //! Replace a resident record's base pages with host slots. Keeps its identity, snapshots and LRU position.
     void markDemoted(RecordId id, std::vector<int32_t> hostSlots);
+    //! Give a demoted record base pages again (one per host slot) and forget its host slots.
+    void markPromoted(RecordId id, std::vector<PageId> basePages);
     void touch(RecordId id);
     CacheRecord erase(RecordId id);
     std::vector<RecordId> lruToMru() const;

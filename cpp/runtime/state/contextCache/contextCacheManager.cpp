@@ -402,6 +402,10 @@ AcquireResult ContextCacheManager::acquireHybrid(std::vector<HybridCheckpointCan
     std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, bool hasAttention,
     ContextCacheLookupPolicy lookupPolicy)
 {
+    if (mHost.has_value() && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
+    {
+        promoteMatching(candidates, inputFullBlockHashes, inputTokenCount);
+    }
     return acquire(makeHybridReusePlan(
         candidates, inputFullBlockHashes, inputTokenCount, mPageSize, hasAttention, mRecords, lookupPolicy));
 }
@@ -1109,8 +1113,8 @@ bool ContextCacheManager::tryDemoteRecord(RecordId id)
         {
             auto const position
                 = std::find(record.logicalBlockHashes.begin(), record.logicalBlockHashes.end(), block.hash);
-            mPendingDemotions.push_back(
-                {record.basePagePath[static_cast<size_t>(position - record.logicalBlockHashes.begin())], block.slot});
+            mPendingTransfers.push_back({record.basePagePath[static_cast<size_t>(position - record.logicalBlockHashes.begin())],
+                block.slot, /*toHost=*/true});
         }
     }
     else
@@ -1128,6 +1132,118 @@ bool ContextCacheManager::tryDemoteRecord(RecordId id)
     mHostUsers[hostKey].push_back(id);
     ++mMetrics.demotedRecords;
     mMetrics.reclaimedBaseKvPages += static_cast<uint64_t>(mPools.freeCount(ResourceType::kBaseKvPage) - freeBefore);
+    return true;
+}
+
+void ContextCacheManager::promoteMatching(std::vector<HybridCheckpointCandidate> const& candidates,
+    std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount)
+{
+    std::vector<HybridCheckpointCandidate> ordered = candidates;
+    std::sort(ordered.begin(), ordered.end(),
+        [](auto const& lhs, auto const& rhs) { return lhs.exactLength > rhs.exactLength; });
+    for (HybridCheckpointCandidate const& candidate : ordered)
+    {
+        if (candidate.exactLength <= 0 || candidate.exactLength >= inputTokenCount)
+        {
+            continue;
+        }
+        std::optional<RecordId> const id
+            = mRecords.findHybrid(HybridCheckpointKey{candidate.exactPrefixDigest, candidate.exactLength});
+        if (!id.has_value())
+        {
+            continue;
+        }
+        CacheRecord const& record = mRecords.get(*id);
+        size_t const fullBlockCount = static_cast<size_t>(candidate.exactLength / mPageSize);
+        bool const prefixMatches = record.logicalBlockHashes.size() == fullBlockCount
+            && fullBlockCount <= inputFullBlockHashes.size()
+            && std::equal(record.logicalBlockHashes.begin(), record.logicalBlockHashes.end(),
+                inputFullBlockHashes.begin());
+        if (!prefixMatches)
+        {
+            continue;
+        }
+        if (!record.demoted() || promoteRecord(*id))
+        {
+            return;
+        }
+    }
+}
+
+bool ContextCacheManager::promoteRecord(RecordId id)
+{
+    CacheRecord const& record = mRecords.get(id);
+    CacheRecordKey const hostKey = hostKeyOf(record);
+    size_t const blocks = record.logicalBlockHashes.size();
+
+    // Blocks another resident record still maps keep their page; only the others need a copy.
+    auto const findMissing = [&]()
+    {
+        std::vector<size_t> missing;
+        for (size_t i = 0; i < blocks; ++i)
+        {
+            if (!mBaseIndex.lookup(record.logicalBlockHashes[i]).has_value())
+            {
+                missing.push_back(i);
+            }
+        }
+        return missing;
+    };
+
+    std::vector<size_t> missing = findMissing();
+    if (!missing.empty())
+    {
+        ResourceDemand const demand{static_cast<int32_t>(missing.size()), 0, 0, 0};
+        EvictionPlan const eviction = EvictionPlanner::plan(demand, mPools, mRecords);
+        if (!eviction.feasible)
+        {
+            return false;
+        }
+        // The eviction may demote other records and so evict host entries; this one must survive it.
+        mHost->pin(hostKey);
+        applyEviction(eviction, demand);
+        mHost->unpin(hostKey);
+        // Evicting a record can unmap a shared ancestor block, which then needs a page too.
+        missing = findMissing();
+        if (!mPools.canAllocate(ResourceDemand{static_cast<int32_t>(missing.size()), 0, 0, 0}))
+        {
+            return false;
+        }
+    }
+
+    std::vector<PageId> path(blocks, 0);
+    for (size_t i = 0; i < blocks; ++i)
+    {
+        std::optional<PageId> const page = mBaseIndex.lookup(record.logicalBlockHashes[i]);
+        if (page.has_value())
+        {
+            path[i] = *page;
+        }
+    }
+    std::vector<ResourceId> allocated(missing.size());
+    ELLM_CHECK(mPools.allocateInto(ResourceDemand{static_cast<int32_t>(missing.size()), 0, 0, 0}, allocated),
+        "Host KV promotion allocation failed after a feasible check");
+    for (size_t k = 0; k < missing.size(); ++k)
+    {
+        PageId const page = allocated[k].index;
+        path[missing[k]] = page;
+        BaseInsertResult const inserted = mBaseIndex.insert(record.logicalBlockHashes[missing[k]], page);
+        ELLM_CHECK(inserted.inserted, "Host KV promotion found its block already mapped");
+        mPendingTransfers.push_back({page, record.hostSlots[missing[k]], /*toHost=*/false});
+    }
+    for (PageId const page : path)
+    {
+        mPools.addCacheRef(ResourceId{ResourceType::kBaseKvPage, page});
+    }
+    for (ResourceId const& resource : allocated)
+    {
+        mPools.releaseActiveRef(resource);
+    }
+    mRecords.markPromoted(id, std::move(path));
+    mRecords.touch(id);
+    releaseHostUser(hostKey, id);
+    ++mMetrics.promotedRecords;
+    mMetrics.restoredPages += missing.size();
     return true;
 }
 
@@ -1203,9 +1319,9 @@ bool ContextCacheManager::hostTierEnabled() const noexcept
     return mHost.has_value();
 }
 
-std::vector<HostKvTransfer> ContextCacheManager::takeHostDemotions()
+std::vector<HostKvTransfer> ContextCacheManager::takeHostTransfers()
 {
-    return std::exchange(mPendingDemotions, {});
+    return std::exchange(mPendingTransfers, {});
 }
 
 HostKvIndex const* ContextCacheManager::hostIndex() const noexcept

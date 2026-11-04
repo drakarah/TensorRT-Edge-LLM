@@ -38,6 +38,8 @@ struct HostKvTransfer
 {
     PageId page{};
     int32_t slot{};
+    //! True: device page to host slot (demotion). False: host slot to device page (restore).
+    bool toHost{true};
 };
 
 //! One block of a demoted record and the host slot that holds its KV page.
