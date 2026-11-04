@@ -1852,3 +1852,77 @@ TEST(ContextCacheManagerHostTierTests, ADemotedThenRestoredRecordCanBeDemotedAga
     EXPECT_EQ(manager.takeHostTransfers().size(), 2u);
     EXPECT_EQ(manager.metrics().demotedRecords, 3u);
 }
+
+TEST(ContextCacheManagerSupersededTests, EveryRecordIsKeptByDefault)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 3, 0}, 8);
+    publishHybridRecord(manager, kDIGEST_1, {kHASH_A});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_A, kHASH_B});
+    publishHybridRecord(manager, kDIGEST_3, {kHASH_A, kHASH_B, kHASH_C});
+    EXPECT_EQ(manager.records().size(), 3u);
+    EXPECT_EQ(manager.metrics().supersededRecords, 0u);
+}
+
+TEST(ContextCacheManagerSupersededTests, KeepingNoneDropsEveryOlderRecordOfTheChain)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 3, 0}, 8);
+    manager.setSupersededRecordsKept(0);
+    PublishedHybridRecord const first = publishHybridRecord(manager, kDIGEST_1, {kHASH_A});
+    PublishedHybridRecord const second = publishHybridRecord(manager, kDIGEST_2, {kHASH_A, kHASH_B});
+    EXPECT_FALSE(manager.records().contains(first.id));
+    PublishedHybridRecord const third = publishHybridRecord(manager, kDIGEST_3, {kHASH_A, kHASH_B, kHASH_C});
+    EXPECT_FALSE(manager.records().contains(second.id));
+    EXPECT_TRUE(manager.records().contains(third.id));
+    EXPECT_EQ(manager.records().size(), 1u);
+    EXPECT_EQ(manager.metrics().supersededRecords, 2u);
+    EXPECT_EQ(manager.pools().freeCount(ResourceType::kRecurrentSnapshot), 2) << "the dropped records freed their slots";
+}
+
+TEST(ContextCacheManagerSupersededTests, KeepingOneKeepsTheLongestOlderRecord)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 4, 0}, 8);
+    manager.setSupersededRecordsKept(1);
+    PublishedHybridRecord const first = publishHybridRecord(manager, kDIGEST_1, {kHASH_A});
+    PublishedHybridRecord const second = publishHybridRecord(manager, kDIGEST_2, {kHASH_A, kHASH_B});
+    EXPECT_TRUE(manager.records().contains(first.id));
+    PublishedHybridRecord const third = publishHybridRecord(manager, kDIGEST_3, {kHASH_A, kHASH_B, kHASH_C});
+    EXPECT_FALSE(manager.records().contains(first.id));
+    EXPECT_TRUE(manager.records().contains(second.id));
+    EXPECT_TRUE(manager.records().contains(third.id));
+    EXPECT_EQ(manager.metrics().supersededRecords, 1u);
+}
+
+TEST(ContextCacheManagerSupersededTests, OtherChainsAndDivergedRecordsAreLeftAlone)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{8, 0, 4, 0}, 8);
+    manager.setSupersededRecordsKept(0);
+    PublishedHybridRecord const unrelated = publishHybridRecord(manager, kDIGEST_1, {kHASH_D});
+    PublishedHybridRecord const diverged = publishHybridRecord(manager, kDIGEST_2, {kHASH_A, kHASH_C});
+    PublishedHybridRecord const fresh = publishHybridRecord(manager, kDIGEST_3, {kHASH_A, kHASH_B});
+    EXPECT_TRUE(manager.records().contains(unrelated.id));
+    EXPECT_TRUE(manager.records().contains(diverged.id)) << "a shared first block is not a prefix of the whole chain";
+    EXPECT_TRUE(manager.records().contains(fresh.id));
+    EXPECT_EQ(manager.metrics().supersededRecords, 0u);
+}
+
+TEST(ContextCacheManagerSupersededTests, ADemotedOlderRecordIsDroppedWithItsHostEntry)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 3, 0}, 8);
+    manager.enableHostTier(8, 1);
+    manager.setSupersededRecordsKept(0);
+    PublishedHybridRecord const older = publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_C, kHASH_D, kHASH_E});
+    CacheRequestLease pressure = acquirePrivatePages(manager, 2);
+    ASSERT_TRUE(manager.records().get(older.id).demoted());
+    pressure.release();
+    ASSERT_EQ(manager.hostIndex()->entryCount(), 1u);
+
+    PublishedHybridRecord const fresh = publishHybridRecord(manager, kDIGEST_3, {kHASH_A, kHASH_B, kHASH_E});
+    EXPECT_FALSE(manager.records().contains(older.id));
+    EXPECT_TRUE(manager.records().contains(fresh.id));
+    EXPECT_EQ(manager.metrics().supersededRecords, 1u);
+    for (RecordId const id : manager.records().lruToMru())
+    {
+        EXPECT_FALSE(id == older.id);
+    }
+}
