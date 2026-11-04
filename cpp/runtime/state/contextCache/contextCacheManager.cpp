@@ -1141,6 +1141,7 @@ void ContextCacheManager::restoreForRequest(std::vector<HybridCheckpointCandidat
     std::vector<HybridCheckpointCandidate> ordered = candidates;
     std::sort(ordered.begin(), ordered.end(),
         [](auto const& lhs, auto const& rhs) { return lhs.exactLength > rhs.exactLength; });
+    size_t named = 0;
     for (HybridCheckpointCandidate const& candidate : ordered)
     {
         if (candidate.exactLength <= 0 || candidate.exactLength >= inputTokenCount)
@@ -1153,6 +1154,7 @@ void ContextCacheManager::restoreForRequest(std::vector<HybridCheckpointCandidat
         {
             continue;
         }
+        ++named;
         CacheRecord const& record = mRecords.get(*id);
         size_t const fullBlockCount = static_cast<size_t>(candidate.exactLength / mPageSize);
         bool const prefixMatches = record.logicalBlockHashes.size() == fullBlockCount
@@ -1161,12 +1163,24 @@ void ContextCacheManager::restoreForRequest(std::vector<HybridCheckpointCandidat
                 inputFullBlockHashes.begin());
         if (!prefixMatches)
         {
+            LOG_INFO("Host KV tier: the %d-token checkpoint record does not match the request's blocks.", candidate.exactLength);
             continue;
         }
-        if (!record.demoted() || promoteRecord(*id))
+        if (!record.demoted())
         {
             return;
         }
+        if (promoteRecord(*id))
+        {
+            return;
+        }
+        LOG_WARNING("Host KV tier: the %d-token record is on the host but its %zu pages could not be made room for.",
+            candidate.exactLength, record.hostSlots.size());
+    }
+    if (named == 0 && !ordered.empty())
+    {
+        LOG_INFO("Host KV tier: none of the %zu checkpoint candidates (longest %d tokens) names a retained record.",
+            ordered.size(), ordered.front().exactLength);
     }
 }
 
@@ -1253,6 +1267,11 @@ void ContextCacheManager::dropRecord(RecordId id)
         mPools.freeCount(ResourceType::kDraftKvPage), mPools.freeCount(ResourceType::kRecurrentSnapshot),
         mPools.freeCount(ResourceType::kPartialKvSnapshot)};
     CacheRecord const record = mRecords.erase(id);
+    if (mHost.has_value() && (record.demoted() || record.basePagePath.size() >= static_cast<size_t>(mHostMinBlocks)))
+    {
+        LOG_INFO("Context cache: dropped a %s record of %zu blocks.", record.demoted() ? "demoted" : "resident",
+            record.logicalBlockHashes.size());
+    }
     if (record.demoted())
     {
         releaseHostUser(hostKeyOf(record), id);
