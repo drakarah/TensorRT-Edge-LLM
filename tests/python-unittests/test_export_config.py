@@ -168,7 +168,7 @@ def test_draft_always_writes_fp16_kv_cache_dtype():
 def test_llm_export_source_contains_base_dtype_write():
     src = _load_source()
     pattern = re.compile(
-        r"out\[['\"]kv_cache_dtype['\"]\]\s*=\s*\(\s*['\"]fp8['\"]\s+if\s+config\.quant\.kv_cache_quant\s*==\s*['\"]fp8['\"]\s+else\s+['\"]fp16['\"]"
+        r"out\[['\"]kv_cache_dtype['\"]\]\s*=\s*\(\s*config\.quant\.kv_cache_quant\s+if\s+config\.quant\.kv_cache_quant\s+in\s*\(\s*['\"]fp8['\"]\s*,\s*['\"]int8['\"]\s*\)\s+else\s+['\"]fp16['\"]"
     )
     assert pattern.search(src), (
         "Expected kv_cache_dtype write missing from checkpoint_utils.py; "
@@ -243,9 +243,8 @@ def test_runtime_config_writer_emits_rank_configs_for_multi_rank_export():
         writer_src,
     )
     assert re.search(
-        r"if\s+world_size\s*>\s*1\s+or\s+tp_size\s*>\s*1\s*:\s*"
-        r"(?:\#.*\s*)*"
-        r"_apply_global_model_fields\(\s*out\s*,\s*global_llm_config\s*\)",
+        r"if\s+world_size\s*>\s*1\s+or\s+tp_size\s*>\s*1\s*:"
+        r"[\s\S]*?\n {8}_apply_global_model_fields\(\s*out\s*,\s*global_llm_config\s*\)",
         writer_src,
     ), ("Global checkpoint fields must only replace rank-local values for "
         "multi-rank exports.")
