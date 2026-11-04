@@ -695,6 +695,7 @@ def test_experimental_dspark_accepts_shared_kv_and_value_norm():
     target = _dense_config()
     cfg = _dense_config(dspark_target_layer_ids=[0],
                         dspark_markov_rank=1,
+                        dspark_mask_token_id=3,  # must lie inside the 64-token test vocabulary
                         attention_k_eq_v=True,
                         has_value_norm=True)
 
