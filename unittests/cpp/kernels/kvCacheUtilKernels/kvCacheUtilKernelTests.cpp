@@ -737,18 +737,19 @@ void fillPackedPool(std::vector<int8_t>& pool, std::mt19937& gen)
         {
             float scale = std::fabs(metaDist(gen)) * 0.1F;
             float zero = metaDist(gen);
-            switch ((r + g) % 11)
+            switch ((r + g) % 13)
             {
             case 0: scale = 0.F; break;
             case 1: scale = 5.9604645e-8F; break; // smallest fp16 subnormal
             case 2: scale = 60000.F / 15.F; zero = -30000.F; break;
             case 3: zero = -0.F; break;
+            case 4: scale = 65504.F; zero = 65504.F; break; // code * scale + zero overflows to +inf in every channel with code > 0
             default: break;
             }
             __half const hs = __float2half_rn(scale);
             __half const hz = __float2half_rn(zero);
-            std::memcpy(row + kernel::kVInt4PackedScaleOffset + 2 * g, &hs, 2);
-            std::memcpy(row + kernel::kVInt4PackedZeroOffset + 2 * g, &hz, 2);
+            std::memcpy(row + kernel::vInt4PackedScaleByte(g), &hs, 2);
+            std::memcpy(row + kernel::vInt4PackedZeroByte(g), &hz, 2);
         }
     }
 }

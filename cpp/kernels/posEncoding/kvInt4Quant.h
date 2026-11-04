@@ -45,16 +45,25 @@ enum class VInt4Mode : int32_t
 
 //! Packed V row of 256 channels inside a 256-byte int8 row (the pool keeps its geometry; only the first 160 bytes are used):
 //!   bytes   0..127  nibble i (low nibble of byte i/2 for even i) is the code 0..15 of channel i;
-//!   bytes 128..143  eight fp16 scales, one per group of 32 channels;
-//!   bytes 144..159  eight fp16 zero points;
+//!   bytes 128..159  eight {fp16 scale, fp16 zero point} pairs, one per group of 32 channels, group g at byte 128 + 4 g (scale
+//!                   first); a pair is one 32-bit word so a reader fetches both with one load;
 //!   bytes 160..255  never written or read.
-//! Channel value = code * scale + zero. Groups are those of VInt4Mode::kGroup32Asym; this is the same arithmetic, so the packed
-//! cache holds exactly the values the emulation stored (up to the int8 grid of the emulation).
+//! Channel value = fp16 fused multiply-add code * scale + zero, rounded once to fp16 (what the decode kernel computes with one
+//! half2 FMA). Groups are those of VInt4Mode::kGroup32Asym and the parameters are the same, so the packed cache holds the values
+//! the emulation stored, up to the int8 grid of the emulation.
 constexpr int32_t kVInt4PackedChannels = 256;
 constexpr int32_t kVInt4PackedNibbleBytes = 128;
-constexpr int32_t kVInt4PackedScaleOffset = 128;
-constexpr int32_t kVInt4PackedZeroOffset = 144;
+constexpr int32_t kVInt4PackedMetaOffset = 128;
 constexpr int32_t kVInt4PackedUsedBytes = 160;
+//! Byte offset of group g's fp16 scale and of its fp16 zero point inside the row.
+constexpr int32_t vInt4PackedScaleByte(int32_t group)
+{
+    return kVInt4PackedMetaOffset + 4 * group;
+}
+constexpr int32_t vInt4PackedZeroByte(int32_t group)
+{
+    return kVInt4PackedMetaOffset + 4 * group + 2;
+}
 constexpr int32_t kVInt4PackedGroups = 8;
 
 //! Largest code magnitude. Codes lie in [-7, 7]; the code -8 is never produced so that negation stays exact.
@@ -185,7 +194,22 @@ __host__ __device__ inline VInt4Asym vInt4AsymParams(float groupMin, float group
     float const range = vInt4Sub(groupMax, zero);
     float const raw = vInt4Divide(range, static_cast<float>(kVInt4AsymMaxCode));
     float const scale = __half2float(__float2half_ru(raw));
-    return {(scale > 0.0F && scale <= kVInt4MaxFp16) ? scale : 0.0F, zero};
+    if (!(scale <= kVInt4MaxFp16))
+    {
+        return {0.0F, 0.0F};
+    }
+    if (!(scale > 0.0F))
+    {
+        return {0.0F, zero}; // constant group: every code is 0 and the group decodes to its (fp16-rounded) value
+    }
+    // The decoder computes code * scale + zero in fp16; the largest code must not reach beyond the fp16 range, which rounding the
+    // scale up can cause for a group whose maximum is within one step of 65504.
+    float const reach = vInt4Add(vInt4Mul(static_cast<float>(kVInt4AsymMaxCode), scale), zero);
+    if (!(reach <= kVInt4MaxFp16))
+    {
+        return {0.0F, 0.0F};
+    }
+    return {scale, zero};
 }
 
 //! Asymmetric code of @p x: round((x - zero) / scale) clamped to [0, 15]; 0 for a zero scale.
@@ -267,13 +291,20 @@ inline void vInt4PackRowHost(float const* values, uint8_t* row)
         }
         __half const scale = __float2half_rn(params.scale);
         __half const zero = __float2half_rn(params.zero);
-        std::memcpy(row + kVInt4PackedScaleOffset + 2 * g, &scale, 2);
-        std::memcpy(row + kVInt4PackedZeroOffset + 2 * g, &zero, 2);
+        std::memcpy(row + vInt4PackedScaleByte(g), &scale, 2);
+        std::memcpy(row + vInt4PackedZeroByte(g), &zero, 2);
     }
 }
 
-//! Host reference of the unpack: channel values of a packed row, code * scale + zero, with the same float arithmetic as the
-//! emulation.
+//! The canonical decoded value: code * scale + zero evaluated exactly (the operands are fp16, so double holds the result
+//! exactly) and rounded once to fp16, which is what a half-precision fused multiply-add gives.
+inline float vInt4PackedDecode(int32_t code, __half scale, __half zero)
+{
+    double const exact = static_cast<double>(code) * static_cast<double>(__half2float(scale)) + static_cast<double>(__half2float(zero));
+    return __half2float(__double2half(exact));
+}
+
+//! Host reference of the unpack: channel values of a packed row (see vInt4PackedDecode).
 inline void vInt4UnpackRowHost(uint8_t const* row, float* values)
 {
     for (int32_t channel = 0; channel < kVInt4PackedChannels; ++channel)
@@ -283,9 +314,9 @@ inline void vInt4UnpackRowHost(uint8_t const* row, float* values)
         int32_t const code = (channel % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
         __half scale;
         __half zero;
-        std::memcpy(&scale, row + kVInt4PackedScaleOffset + 2 * g, 2);
-        std::memcpy(&zero, row + kVInt4PackedZeroOffset + 2 * g, 2);
-        values[channel] = vInt4AsymDequant(code, VInt4Asym{__half2float(scale), __half2float(zero)});
+        std::memcpy(&scale, row + vInt4PackedScaleByte(g), 2);
+        std::memcpy(&zero, row + vInt4PackedZeroByte(g), 2);
+        values[channel] = vInt4PackedDecode(code, scale, zero);
     }
 }
 

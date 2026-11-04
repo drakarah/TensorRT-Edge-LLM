@@ -509,8 +509,10 @@ __device__ __forceinline__ void storeVecVPacked(int8_t* dst, int64_t base, DVec<
     if ((lane & 3u) == 0)
     {
         uint32_t const group = lane >> 2;
-        *reinterpret_cast<__half*>(rowStart + kVInt4PackedScaleOffset + 2u * group) = __float2half_rn(params.scale);
-        *reinterpret_cast<__half*>(rowStart + kVInt4PackedZeroOffset + 2u * group) = __float2half_rn(params.zero);
+        // One 32-bit store of the {scale, zero} pair (little endian: scale in the low half).
+        uint32_t const pair = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(params.scale)))
+            | (static_cast<uint32_t>(__half_as_ushort(__float2half_rn(params.zero))) << 16);
+        *reinterpret_cast<uint32_t*>(rowStart + vInt4PackedScaleByte(static_cast<int32_t>(group))) = pair;
     }
 }
 

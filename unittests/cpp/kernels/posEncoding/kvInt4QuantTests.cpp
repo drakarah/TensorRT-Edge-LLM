@@ -423,9 +423,12 @@ TEST(KvInt4Packed, LayoutConstantsAreConsistent)
     EXPECT_EQ(kVInt4PackedChannels, 256);
     EXPECT_EQ(kVInt4PackedNibbleBytes * 2, kVInt4PackedChannels);
     EXPECT_EQ(kVInt4PackedGroups * kVInt4GroupSize, kVInt4PackedChannels);
-    EXPECT_EQ(kVInt4PackedScaleOffset, kVInt4PackedNibbleBytes);
-    EXPECT_EQ(kVInt4PackedZeroOffset, kVInt4PackedScaleOffset + 2 * kVInt4PackedGroups);
-    EXPECT_EQ(kVInt4PackedUsedBytes, kVInt4PackedZeroOffset + 2 * kVInt4PackedGroups);
+    EXPECT_EQ(kVInt4PackedMetaOffset, kVInt4PackedNibbleBytes);
+    EXPECT_EQ(vInt4PackedScaleByte(0), 128);
+    EXPECT_EQ(vInt4PackedZeroByte(0), 130);
+    EXPECT_EQ(vInt4PackedScaleByte(7), 156);
+    EXPECT_EQ(vInt4PackedZeroByte(7), 158);
+    EXPECT_EQ(kVInt4PackedUsedBytes, vInt4PackedZeroByte(kVInt4PackedGroups - 1) + 2);
     EXPECT_LE(kVInt4PackedUsedBytes, kVInt4PackedChannels);
 }
 
@@ -472,4 +475,27 @@ TEST(KvInt4Packed, DegenerateGroupsRoundTripToTheirConstant)
     for (int32_t i = 96; i < 128; ++i) EXPECT_EQ(decoded[i], 0.0F);
     for (int32_t i = 128; i < 160; ++i) EXPECT_EQ(decoded[i], 0.0F);
     for (int32_t i = 160; i < 192; ++i) EXPECT_EQ(decoded[i], 0.0F);
+}
+
+TEST(KvInt4Packed, OverflowGuardAndDecodeAreExactFp16Fma)
+{
+    // A group spanning the whole fp16 range: the rounded-up scale (8736) would push code 15 to 65536 > 65504, so the group is stored
+    // as degenerate (scale 0, zero 0) and decodes to zero instead of +inf.
+    VInt4Asym const wide = vInt4AsymParams(-65504.0F, 65504.0F);
+    EXPECT_EQ(wide.scale, 0.0F);
+    EXPECT_EQ(wide.zero, 0.0F);
+    // A group whose top code stays inside the range is kept.
+    VInt4Asym const ok = vInt4AsymParams(-30000.0F, 30000.0F);
+    EXPECT_GT(ok.scale, 0.0F);
+    EXPECT_LE(15.0F * ok.scale + ok.zero, 65504.0F);
+    // The decode is one rounding of the exact value, not two: pick values whose float product-plus-sum would round twice.
+    __half const scale = __float2half_rn(0.3333F);
+    __half const zero = __float2half_rn(1000.0F);
+    for (int32_t code = 0; code < 16; ++code)
+    {
+        double const exact = static_cast<double>(code) * __half2float(scale) + __half2float(zero);
+        EXPECT_EQ(vInt4PackedDecode(code, scale, zero), __half2float(__double2half(exact)));
+    }
+    // Overflow of the decode itself gives +inf (the writer never produces such metadata).
+    EXPECT_TRUE(std::isinf(vInt4PackedDecode(15, __float2half_rn(65504.0F), __float2half_rn(65504.0F))));
 }

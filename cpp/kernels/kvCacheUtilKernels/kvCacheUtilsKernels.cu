@@ -391,13 +391,15 @@ __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ poo
             uint8_t const* const rowBytes = reinterpret_cast<uint8_t const*>(vSrc) + row * 256;
             uint32_t const word = *reinterpret_cast<uint32_t const*>(rowBytes + 4 * lane);
             uint32_t const group = lane >> 2;
-            float const scale = __half2float(*reinterpret_cast<__half const*>(rowBytes + kVInt4PackedScaleOffset + 2 * group));
-            float const zero = __half2float(*reinterpret_cast<__half const*>(rowBytes + kVInt4PackedZeroOffset + 2 * group));
+            uint32_t const pair = *reinterpret_cast<uint32_t const*>(rowBytes + vInt4PackedScaleByte(static_cast<int32_t>(group)));
+            __half const scale = __ushort_as_half(static_cast<unsigned short>(pair & 0xFFFFu));
+            __half const zero = __ushort_as_half(static_cast<unsigned short>(pair >> 16));
             __align__(16) half vOut[kVEC];
 #pragma unroll
             for (uint32_t j = 0; j < kVEC; ++j)
             {
-                vOut[j] = __float2half(vInt4AsymDequant(static_cast<int32_t>((word >> (4 * j)) & 0xFu), VInt4Asym{scale, zero}));
+                // The canonical decode: one fp16 fused multiply-add, as the decode kernel does.
+                vOut[j] = __hfma(__int2half_rn(static_cast<int32_t>((word >> (4 * j)) & 0xFu)), scale, zero);
             }
             reinterpret_cast<uint4*>(vDst + dstOffset)[v] = *reinterpret_cast<uint4 const*>(vOut);
         }

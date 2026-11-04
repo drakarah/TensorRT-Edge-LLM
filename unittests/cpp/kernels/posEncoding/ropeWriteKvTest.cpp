@@ -2126,6 +2126,15 @@ std::vector<int8_t> referenceEmulatedVRow(std::vector<float> const& row, float c
                     zero = zeroHalf;
                     float const s = __half2float(__float2half_ru((hi - zero) / 15.0F));
                     scale = (s > 0.0F && s <= 65504.0F) ? s : 0.0F;
+                    if (s > 65504.0F)
+                    {
+                        zero = 0.0F;
+                    }
+                    if (scale > 0.0F && 15.0F * scale + zero > 65504.0F)
+                    {
+                        scale = 0.0F; // the largest code would leave the fp16 range: the group is stored as degenerate
+                        zero = 0.0F;
+                    }
                 }
             }
             for (size_t i = first; i < first + groupSize; ++i)
@@ -2459,7 +2468,7 @@ void runVInt4PackedCase(EmuWriter const writer)
                     float scale;
                     {
                         __half s;
-                        std::memcpy(&s, bytes.data() + kVInt4PackedScaleOffset + 2 * (d / kVInt4GroupSize), 2);
+                        std::memcpy(&s, bytes.data() + vInt4PackedScaleByte(d / kVInt4GroupSize), 2);
                         scale = __half2float(s);
                     }
                     if (std::isfinite(row[d]) && std::fabs(row[d]) <= 60000.0F && scale > 0.0F)
