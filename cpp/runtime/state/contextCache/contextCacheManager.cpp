@@ -489,7 +489,7 @@ AcquireResult ContextCacheManager::acquire(ReusePlan plan)
     std::vector<ResourceId> allocated(resourceDemandCount(plan.demand));
     // Every host allocation has completed. A feasible plan makes the remaining eviction/allocation sequence a
     // deterministic metadata commit; allocateInto() performs no dynamic allocation.
-    applyEviction(eviction);
+    applyEviction(eviction, plan.demand);
     ELLM_CHECK(
         mPools.allocateInto(plan.demand, allocated), "Context cache allocation failed after a feasible eviction plan");
     for (ResourceId const& resource : allocated)
@@ -619,7 +619,7 @@ bool ContextCacheManager::growPages(CacheRequestLease& lease, ResourceDemand con
     lease.mSpecPages.reserve(lease.mSpecPages.size() + static_cast<size_t>(demand.draftKvPages));
     std::vector<ResourceId> allocated(growth);
 
-    applyEviction(eviction);
+    applyEviction(eviction, demand);
     ELLM_CHECK(mPools.allocateInto(demand, allocated),
         "Context cache growth allocation failed after a feasible eviction plan");
     for (ResourceId const& resource : allocated)
@@ -667,12 +667,12 @@ PublishResult ContextCacheManager::commitPreparedPublication(PreparedPublication
 
     if (mRecords.maxRecords() == 0)
     {
-        evictRecord(inserted.id);
+        dropRecord(inserted.id);
     }
     else if (publication.recordLimitVictim.has_value())
     {
         LOG_INFO("Context cache: record limit of %d reached, evicting the least recently used record.", mRecords.maxRecords());
-        evictRecord(*publication.recordLimitVictim);
+        dropRecord(*publication.recordLimitVictim);
     }
     ELLM_CHECK(mRecords.size() <= static_cast<size_t>(mRecords.maxRecords()),
         "Context cache publication did not enforce its record limit");
@@ -1018,17 +1018,19 @@ void ContextCacheManager::releaseLease(CacheRequestLease& lease) noexcept
     lease.mPartialKvSnapshotBinding.reset();
 }
 
-void ContextCacheManager::evictRecord(RecordId id)
+namespace
 {
-    ResourceDemand const freeBefore{mPools.freeCount(ResourceType::kBaseKvPage),
-        mPools.freeCount(ResourceType::kDraftKvPage), mPools.freeCount(ResourceType::kRecurrentSnapshot),
-        mPools.freeCount(ResourceType::kPartialKvSnapshot)};
-    CacheRecord const record = mRecords.erase(id);
-    if (record.specState.has_value())
-    {
-        mSpecIndex.paged().erase(record);
-    }
-    for (PageId const page : record.basePagePath)
+
+CacheRecordKey hostKeyOf(CacheRecord const& record)
+{
+    return CacheRecordKey{record.logicalBlockHashes.back(), static_cast<int32_t>(record.logicalBlockHashes.size())};
+}
+
+} // namespace
+
+void ContextCacheManager::releaseBasePages(std::vector<PageId> const& pages)
+{
+    for (PageId const page : pages)
     {
         ResourceId const resource{ResourceType::kBaseKvPage, page};
         mPools.releaseCacheRef(resource);
@@ -1037,6 +1039,113 @@ void ContextCacheManager::evictRecord(RecordId id)
             mBaseIndex.erasePage(page);
         }
     }
+}
+
+void ContextCacheManager::releaseHostUser(CacheRecordKey const& hostKey, RecordId id)
+{
+    auto const users = mHostUsers.find(hostKey);
+    ELLM_CHECK(users != mHostUsers.end(), "Demoted record has no host entry");
+    users->second.erase(std::remove(users->second.begin(), users->second.end(), id), users->second.end());
+    if (users->second.empty())
+    {
+        mHostUsers.erase(users);
+        bool const erased = mHost->erase(hostKey);
+        ELLM_CHECK(erased, "Host KV entry of a demoted record is missing or pinned");
+    }
+}
+
+void ContextCacheManager::evictRecord(RecordId id, bool allowDemote)
+{
+    if (allowDemote && tryDemoteRecord(id))
+    {
+        return;
+    }
+    dropRecord(id);
+}
+
+bool ContextCacheManager::tryDemoteRecord(RecordId id)
+{
+    if (!mHost.has_value())
+    {
+        return false;
+    }
+    CacheRecord const& record = mRecords.get(id);
+    size_t const blocks = record.basePagePath.size();
+    if (record.demoted() || record.specState.has_value() || !record.recurrentSnapshotSlot.has_value()
+        || !record.exactCheckpointLength.has_value() || blocks == 0 || blocks < static_cast<size_t>(mHostMinBlocks)
+        || record.logicalBlockHashes.size() != blocks)
+    {
+        return false;
+    }
+
+    HostKvDemotionPlan plan = mHost->planDemotion(record.logicalBlockHashes);
+    if (plan.status == HostKvPlanStatus::kInfeasible || plan.status == HostKvPlanStatus::kEmpty)
+    {
+        return false;
+    }
+    if (!plan.victims.empty())
+    {
+        // Dropping the victims' records erases their host entries, so plan again afterwards.
+        for (CacheRecordKey const& victim : plan.victims)
+        {
+            std::vector<RecordId> const users = mHostUsers.at(victim);
+            for (RecordId const user : users)
+            {
+                dropRecord(user);
+                ++mMetrics.hostEvictedRecords;
+            }
+        }
+        plan = mHost->planDemotion(record.logicalBlockHashes);
+        ELLM_CHECK(plan.victims.empty() && plan.status != HostKvPlanStatus::kInfeasible,
+            "Host KV tier could not make room after dropping its victims");
+    }
+
+    CacheRecordKey const hostKey = hostKeyOf(record);
+    if (plan.status == HostKvPlanStatus::kReady)
+    {
+        bool const committed = mHost->commitDemotion(record.logicalBlockHashes, plan);
+        ELLM_CHECK(committed, "Host KV demotion plan went stale");
+        for (HostKvBlock const& block : plan.newBlocks)
+        {
+            auto const position
+                = std::find(record.logicalBlockHashes.begin(), record.logicalBlockHashes.end(), block.hash);
+            mPendingDemotions.push_back(
+                {record.basePagePath[static_cast<size_t>(position - record.logicalBlockHashes.begin())], block.slot});
+        }
+    }
+    else
+    {
+        mHost->touch(hostKey);
+    }
+
+    std::optional<HostKvHit> const hit = mHost->lookupPrefix(record.logicalBlockHashes);
+    ELLM_CHECK(hit.has_value() && hit->key == hostKey, "Host KV entry missing right after demotion");
+
+    int32_t const freeBefore = mPools.freeCount(ResourceType::kBaseKvPage);
+    std::vector<PageId> const pages = record.basePagePath;
+    mRecords.markDemoted(id, hit->slots);
+    releaseBasePages(pages);
+    mHostUsers[hostKey].push_back(id);
+    ++mMetrics.demotedRecords;
+    mMetrics.reclaimedBaseKvPages += static_cast<uint64_t>(mPools.freeCount(ResourceType::kBaseKvPage) - freeBefore);
+    return true;
+}
+
+void ContextCacheManager::dropRecord(RecordId id)
+{
+    ResourceDemand const freeBefore{mPools.freeCount(ResourceType::kBaseKvPage),
+        mPools.freeCount(ResourceType::kDraftKvPage), mPools.freeCount(ResourceType::kRecurrentSnapshot),
+        mPools.freeCount(ResourceType::kPartialKvSnapshot)};
+    CacheRecord const record = mRecords.erase(id);
+    if (record.demoted())
+    {
+        releaseHostUser(hostKeyOf(record), id);
+    }
+    if (record.specState.has_value())
+    {
+        mSpecIndex.paged().erase(record);
+    }
+    releaseBasePages(record.basePagePath);
     if (record.specState.has_value())
     {
         for (PageId const page : record.specState->pagePath)
@@ -1065,7 +1174,7 @@ void ContextCacheManager::evictRecord(RecordId id)
         += static_cast<uint64_t>(freeAfter.partialKvSnapshotSlots - freeBefore.partialKvSnapshotSlots);
 }
 
-void ContextCacheManager::applyEviction(EvictionPlan const& plan)
+void ContextCacheManager::applyEviction(EvictionPlan const& plan, ResourceDemand const& demand)
 {
     if (!plan.victims.empty())
     {
@@ -1073,10 +1182,35 @@ void ContextCacheManager::applyEviction(EvictionPlan const& plan)
             plan.victims.size(), plan.reclaimed.baseKvPages, plan.reclaimed.recurrentSnapshotSlots, plan.reclaimed.partialKvSnapshotSlots,
             mRecords.size() - plan.victims.size());
     }
+    // A demand for snapshot slots or draft pages needs the victims' own resources, which demotion keeps.
+    bool const allowDemote = demand.onlyBasePages();
     for (RecordId const id : plan.victims)
     {
-        evictRecord(id);
+        evictRecord(id, allowDemote);
     }
+}
+
+void ContextCacheManager::enableHostTier(int32_t slotCount, int32_t minBlocks)
+{
+    ELLM_CHECK(!mHost.has_value(), "The host KV tier is already enabled");
+    ELLM_CHECK(slotCount > 0 && minBlocks >= 1, "The host KV tier needs at least one slot and a positive minimum");
+    mHost.emplace(slotCount);
+    mHostMinBlocks = minBlocks;
+}
+
+bool ContextCacheManager::hostTierEnabled() const noexcept
+{
+    return mHost.has_value();
+}
+
+std::vector<HostKvTransfer> ContextCacheManager::takeHostDemotions()
+{
+    return std::exchange(mPendingDemotions, {});
+}
+
+HostKvIndex const* ContextCacheManager::hostIndex() const noexcept
+{
+    return mHost.has_value() ? &*mHost : nullptr;
 }
 
 void ContextCacheManager::releaseLeaseResource(CacheRequestLease& lease, ResourceId resource)

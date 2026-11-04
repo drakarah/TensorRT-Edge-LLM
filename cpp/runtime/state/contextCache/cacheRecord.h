@@ -125,6 +125,14 @@ struct CacheRecord
     std::optional<int32_t> recurrentSnapshotSlot;
     std::optional<int32_t> partialKvSnapshotSlot;
     std::optional<int32_t> exactCheckpointLength;
+    //! Host KV slots of a demoted record, one per logical block. A demoted record holds no base pages (basePagePath is
+    //! empty) and keeps only its snapshot slots; it cannot be reused until its pages are restored.
+    std::vector<int32_t> hostSlots;
+
+    bool demoted() const noexcept
+    {
+        return !hostSlots.empty();
+    }
 
     std::vector<ResourceId> resources() const;
     std::optional<HybridCheckpointKey> hybridKey() const;
@@ -161,6 +169,8 @@ public:
     bool contains(RecordId id) const noexcept;
     //! Attach coherent speculative state to a base-only record without changing base identity or record ownership.
     void setSpecState(RecordId id, SpecPagedStateRecord state);
+    //! Replace a resident record's base pages with host slots. Keeps its identity, snapshots and LRU position.
+    void markDemoted(RecordId id, std::vector<int32_t> hostSlots);
     void touch(RecordId id);
     CacheRecord erase(RecordId id);
     std::vector<RecordId> lruToMru() const;

@@ -73,6 +73,11 @@ EvictionPlan EvictionPlanner::plan(ResourceDemand const& demand, ResourcePools c
     }
     for (RecordId const recordId : evictionOrder)
     {
+        // A demoted record holds only snapshot slots; evicting it cannot help a demand for pages.
+        if (demand.onlyBasePages() && records.get(recordId).demoted())
+        {
+            continue;
+        }
         plan.victims.push_back(recordId);
         for (ResourceId const& resource : records.get(recordId).resources())
         {

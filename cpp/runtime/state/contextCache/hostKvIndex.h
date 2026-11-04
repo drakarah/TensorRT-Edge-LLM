@@ -33,6 +33,13 @@ namespace trt_edgellm
 namespace rt
 {
 
+//! One device KV page paired with one host slot, for a copy the runtime has to enqueue.
+struct HostKvTransfer
+{
+    PageId page{};
+    int32_t slot{};
+};
+
 //! One block of a demoted record and the host slot that holds its KV page.
 struct HostKvBlock
 {

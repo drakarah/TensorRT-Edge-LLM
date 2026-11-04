@@ -277,6 +277,18 @@ void CacheRecordStore::touch(RecordId id)
     mLru.splice(mLru.end(), mLru, record->second.lruPosition);
 }
 
+void CacheRecordStore::markDemoted(RecordId id, std::vector<int32_t> hostSlots)
+{
+    auto const entry = mRecords.find(id);
+    ELLM_CHECK(entry != mRecords.end(), "Context cache record ID does not exist");
+    CacheRecord& record = entry->second.record;
+    ELLM_CHECK(!record.demoted() && !record.specState.has_value(), "Only a resident base-only record can be demoted");
+    ELLM_CHECK(!hostSlots.empty() && hostSlots.size() == record.basePagePath.size(),
+        "A demoted record needs one host slot per base page");
+    record.basePagePath.clear();
+    record.hostSlots = std::move(hostSlots);
+}
+
 CacheRecord CacheRecordStore::erase(RecordId id)
 {
     auto const record = mRecords.find(id);

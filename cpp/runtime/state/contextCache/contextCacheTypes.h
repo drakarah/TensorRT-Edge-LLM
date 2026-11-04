@@ -107,6 +107,11 @@ struct ResourceDemand
     {
         return baseKvPages >= 0 && draftKvPages >= 0 && recurrentSnapshotSlots >= 0 && partialKvSnapshotSlots >= 0;
     }
+
+    bool onlyBasePages() const noexcept
+    {
+        return draftKvPages == 0 && recurrentSnapshotSlots == 0 && partialKvSnapshotSlots == 0;
+    }
 };
 
 } // namespace rt

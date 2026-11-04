@@ -20,6 +20,7 @@
 #include "runtime/state/contextCache/blockIndex.h"
 #include "runtime/state/contextCache/cacheRecord.h"
 #include "runtime/state/contextCache/evictionPlanner.h"
+#include "runtime/state/contextCache/hostKvIndex.h"
 #include "runtime/state/contextCache/resourcePools.h"
 #include "runtime/state/contextCache/reusePlan.h"
 #include "runtime/state/contextCache/specStatePlan.h"
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace trt_edgellm
@@ -149,6 +151,10 @@ struct ContextCacheManagerMetrics
     uint64_t reclaimedDraftKvPages{};
     uint64_t reclaimedRecurrentSnapshots{};
     uint64_t reclaimedPartialKvSnapshots{};
+    //! Records whose base pages moved to host slots instead of being dropped.
+    uint64_t demotedRecords{};
+    //! Demoted records dropped to make room for a newer demotion.
+    uint64_t hostEvictedRecords{};
 };
 
 //! Host orchestrator for the complete context-cache lifecycle under an externally serialized single-writer contract.
@@ -217,6 +223,16 @@ public:
     //! the target. Between requests only. Returns the number of evicted records.
     size_t evictToBaseHighWater(int32_t pages, size_t protectMostRecent = 0);
 
+    //! Keep the base pages of evicted hybrid records in @p slotCount host slots instead of dropping them. A record is
+    //! demoted only when it has at least @p minBlocks full blocks, a recurrent snapshot and no speculative state; it keeps
+    //! its snapshot slots. Off until called. Must be called at most once.
+    void enableHostTier(int32_t slotCount, int32_t minBlocks);
+    bool hostTierEnabled() const noexcept;
+    //! Device-to-host copies that demotions since the last call require. The runtime must enqueue them, in order, on the
+    //! stream that writes the pool before any kernel that may overwrite the freed pages.
+    std::vector<HostKvTransfer> takeHostDemotions();
+    HostKvIndex const* hostIndex() const noexcept;
+
     ResourcePools const& pools() const noexcept;
     BaseBlockIndex const& baseIndex() const noexcept;
     SpecStateIndex const& specIndex() const noexcept;
@@ -231,8 +247,13 @@ private:
     void releaseLease(CacheRequestLease& lease) noexcept;
     bool growPages(CacheRequestLease& lease, ResourceDemand const& demand);
     PublishResult commitPreparedPublication(PreparedPublication publication);
-    void evictRecord(RecordId id);
-    void applyEviction(EvictionPlan const& plan);
+    //! Demote the record when the host tier can take it, otherwise drop it.
+    void evictRecord(RecordId id, bool allowDemote = true);
+    void dropRecord(RecordId id);
+    bool tryDemoteRecord(RecordId id);
+    void releaseBasePages(std::vector<PageId> const& pages);
+    void releaseHostUser(CacheRecordKey const& hostKey, RecordId id);
+    void applyEviction(EvictionPlan const& plan, ResourceDemand const& demand);
     void releaseLeaseResource(CacheRequestLease& lease, ResourceId resource);
 
     int32_t mPageSize{};
@@ -243,6 +264,12 @@ private:
     std::optional<SpecReuseContract> mSpecReuseContract;
     CacheRecordStore mRecords;
     ContextCacheManagerMetrics mMetrics;
+
+    std::optional<HostKvIndex> mHost;
+    int32_t mHostMinBlocks{1};
+    //! Demoted records per host entry; records with the same block chain and different tails share one entry.
+    std::unordered_map<CacheRecordKey, std::vector<RecordId>> mHostUsers;
+    std::vector<HostKvTransfer> mPendingDemotions;
 };
 
 } // namespace rt
