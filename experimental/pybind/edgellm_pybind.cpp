@@ -796,7 +796,12 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("expert_max_slots_per_layer", &RuntimeMemoryMetrics::expertMaxSlotsPerLayer)
         .def_readonly("expert_bytes_per_slot_all_layers", &RuntimeMemoryMetrics::expertBytesPerSlotAllLayers)
         .def_readonly("expert_cache_bytes", &RuntimeMemoryMetrics::expertCacheBytes)
-        .def_readonly("expert_cache_alloc_failures", &RuntimeMemoryMetrics::expertCacheAllocFailures);
+        .def_readonly("expert_cache_alloc_failures", &RuntimeMemoryMetrics::expertCacheAllocFailures)
+        .def_readonly("host_expert_weights_bytes", &RuntimeMemoryMetrics::hostExpertWeightsBytes)
+        .def_readonly("host_embedding_bytes", &RuntimeMemoryMetrics::hostEmbeddingBytes)
+        .def_readonly("host_snapshot_bytes", &RuntimeMemoryMetrics::hostSnapshotBytes)
+        .def_readonly("host_kv_tier_bytes", &RuntimeMemoryMetrics::hostKvTierBytes)
+        .def_readonly("host_kv_tier_used_bytes", &RuntimeMemoryMetrics::hostKvTierUsedBytes);
 
     py::class_<ContextCacheConfig>(m, "ContextCacheConfig")
         .def(py::init<>())

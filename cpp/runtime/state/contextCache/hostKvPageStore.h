@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "common/hostMemoryAccounting.h"
 #include "common/pagedKvTypes.h"
 #include "common/tensor.h"
 #include "runtime/kvCacheManager.h"
@@ -70,6 +71,7 @@ private:
     std::vector<size_t> mPageBytes;
     std::vector<Tensor> mKeys;
     std::vector<Tensor> mValues;
+    HostMemoryReservation mHostReservation;
 };
 
 } // namespace rt

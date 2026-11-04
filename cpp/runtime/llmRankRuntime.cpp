@@ -20,6 +20,7 @@
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
+#include "common/hostMemoryAccounting.h"
 #include "common/inputLimits.h"
 #include "common/logger.h"
 #include "common/mathUtils.h"
@@ -988,7 +989,17 @@ void LLMRankRuntime::refreshMemoryMetrics() noexcept
             metrics.recurrentSnapshotsCapacity = cache.recurrentSnapshots.capacity;
             metrics.partialKvSnapshotsFree = cache.partialKvSnapshots.free;
             metrics.partialKvSnapshotsCapacity = cache.partialKvSnapshots.capacity;
+            if (cache.hostKvSlots.capacity > 0)
+            {
+                int64_t const tierBytes = HostMemoryAccounting::bytes(HostMemoryCategory::kKvTier);
+                metrics.hostKvTierUsedBytes
+                    = tierBytes / cache.hostKvSlots.capacity * (cache.hostKvSlots.capacity - cache.hostKvSlots.free);
+            }
         }
+        metrics.hostExpertWeightsBytes = HostMemoryAccounting::bytes(HostMemoryCategory::kExpertWeights);
+        metrics.hostEmbeddingBytes = HostMemoryAccounting::bytes(HostMemoryCategory::kEmbeddingTable);
+        metrics.hostSnapshotBytes = HostMemoryAccounting::bytes(HostMemoryCategory::kSnapshots);
+        metrics.hostKvTierBytes = HostMemoryAccounting::bytes(HostMemoryCategory::kKvTier);
         expertCacheInfo(metrics);
         std::lock_guard<std::mutex> lock(mMemoryMetricsMutex);
         mMemoryMetrics = metrics;

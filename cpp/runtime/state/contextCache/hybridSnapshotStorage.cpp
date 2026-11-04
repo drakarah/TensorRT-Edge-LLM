@@ -228,6 +228,19 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
         validateTensorLayout(mBoundaryHiddenSnapshot, {recurrentSlotCount, mBoundaryHiddenDim}, boundaryHiddenType,
             rowBytes, "Boundary hidden snapshot", slabDevice);
     }
+
+    if (memory == SnapshotMemory::kPinnedHost)
+    {
+        int64_t hostBytes = mBoundaryHiddenSnapshot.getMemoryCapacity();
+        for (auto const* slabs : {&mRecurrentSnapshots, &mConvSnapshots, &mPartialKvSnapshots, &mDraftPartialKvSnapshots})
+        {
+            for (Tensor const& slab : *slabs)
+            {
+                hostBytes += slab.getMemoryCapacity();
+            }
+        }
+        mHostReservation = HostMemoryReservation(HostMemoryCategory::kSnapshots, hostBytes);
+    }
 }
 
 size_t HybridSnapshotStorage::recurrentBytesPerSlot(MambaCacheManager::Config const& config)

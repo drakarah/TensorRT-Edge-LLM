@@ -71,6 +71,15 @@ HostKvPageStore::HostKvPageStore(KVCacheManager const& kvCache, int32_t slotCoun
             mValues.emplace_back(shape, DeviceType::kCPU, kvCache.getConfig().kvCacheType, "HostKvPageStore::v_" + suffix);
         }
     }
+    int64_t hostBytes = 0;
+    for (std::vector<Tensor> const* slabs : {&mKeys, &mValues})
+    {
+        for (Tensor const& slab : *slabs)
+        {
+            hostBytes += slab.getMemoryCapacity();
+        }
+    }
+    mHostReservation = HostMemoryReservation(HostMemoryCategory::kKvTier, hostBytes);
 }
 
 int32_t HostKvPageStore::slotCount() const noexcept

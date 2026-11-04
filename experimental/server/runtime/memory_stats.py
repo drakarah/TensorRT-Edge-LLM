@@ -26,7 +26,16 @@ _MIB_FIELDS = {
     "kv_capacity_bytes": "kv_capacity_mib",
     "expert_bytes_per_slot_all_layers": "expert_slot_mib",
     "expert_cache_bytes": "expert_cache_mib",
+    "host_expert_weights_bytes": "host_expert_weights_mib",
+    "host_embedding_bytes": "host_embedding_mib",
+    "host_snapshot_bytes": "host_snapshot_mib",
+    "host_kv_tier_bytes": "host_kv_tier_mib",
+    "host_kv_tier_used_bytes": "host_kv_tier_used_mib",
 }
+# Fields a binding older than the server may not have; the page then shows the coarse host bar.
+_OPTIONAL_RUNTIME_FIELDS = ("host_expert_weights_bytes", "host_embedding_bytes",
+                            "host_snapshot_bytes", "host_kv_tier_bytes",
+                            "host_kv_tier_used_bytes")
 _RUNTIME_FIELDS = ("kv_growable", "kv_mapped_tokens", "kv_capacity_tokens",
                    "kv_mapped_bytes", "kv_capacity_bytes", "kv_pages_usable",
                    "kv_pages_free", "kv_pages_high_water", "context_records",
@@ -121,8 +130,10 @@ def runtime_memory(llm: Any) -> Optional[Dict[str, Any]]:
     if not getattr(metrics, "valid", False):
         return None
     out = {}
-    for name in _RUNTIME_FIELDS:
-        value = getattr(metrics, name)
+    for name in _RUNTIME_FIELDS + _OPTIONAL_RUNTIME_FIELDS:
+        value = getattr(metrics, name, None)
+        if value is None and name in _OPTIONAL_RUNTIME_FIELDS:
+            continue
         if name in _MIB_FIELDS:
             out[_MIB_FIELDS[name]] = value / _MIB
         else:

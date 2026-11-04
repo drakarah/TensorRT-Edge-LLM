@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "common/hostMemoryAccounting.h"
 #include "common/tensor.h"
 #include "runtime/hybridCacheManager.h"
 #include "runtime/state/contextCache/contextCacheTypes.h"
@@ -112,6 +113,8 @@ private:
     std::vector<Tensor> mDraftPartialKvSnapshots;
     //! One [recurrentSlotCount, boundaryHiddenDim] slab holding each checkpoint's saved boundary hidden state.
     Tensor mBoundaryHiddenSnapshot;
+    //! Pinned host bytes of the slabs above (empty when they live on the device).
+    HostMemoryReservation mHostReservation;
 };
 
 } // namespace rt

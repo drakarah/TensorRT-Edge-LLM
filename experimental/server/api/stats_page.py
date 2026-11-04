@@ -21,9 +21,9 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Request stats</title>
 <style>
-:root { --bg: #f4f5f6; --panel: #ffffff; --fg: #1a1e22; --muted: #5f6a73; --line: #d9dee3; --grid: #e7eaed; --accent: #2b6cd4; --warm: #c96f1d; --bad: #bb3a2d; --s1: #2b6cd4; --s2: #c96f1d; --s3: #7f8c99; --s4: #8fb3ec; color-scheme: light; }
+:root { --bg: #f4f5f6; --panel: #ffffff; --fg: #1a1e22; --muted: #5f6a73; --line: #d9dee3; --grid: #e7eaed; --accent: #2b6cd4; --warm: #c96f1d; --bad: #bb3a2d; --s1: #2b6cd4; --s2: #c96f1d; --s3: #7f8c99; --s4: #8fb3ec; --s5: #2a9d8f; --s6: #8a5cc2; color-scheme: light; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #0f1113; --panel: #171a1d; --fg: #e7e9eb; --muted: #8b949c; --line: #2a2f34; --grid: #22272b; --accent: #5b9cf2; --warm: #e0a152; --bad: #e8695b; --s1: #5b9cf2; --s2: #e0a152; --s3: #6f7b86; --s4: #35527a; color-scheme: dark; }
+  :root { --bg: #0f1113; --panel: #171a1d; --fg: #e7e9eb; --muted: #8b949c; --line: #2a2f34; --grid: #22272b; --accent: #5b9cf2; --warm: #e0a152; --bad: #e8695b; --s1: #5b9cf2; --s2: #e0a152; --s3: #6f7b86; --s4: #35527a; --s5: #4fc3b0; --s6: #b08be0; color-scheme: dark; }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -91,7 +91,7 @@ td.bad { color: var(--bad); }
     <div class="card wide"><h2>GPU memory</h2><p class="n" id="gpu-n">Read from the driver on every refresh.</p><div id="gpu"></div></div>
     <div class="card"><h2>KV cache</h2><p class="n">Tokens. The cache maps memory as requests need it; pages hold the active request and the retained prefixes.</p><div id="kv"></div></div>
     <div class="card"><h2>Expert cache</h2><p class="n">Experts per layer held on the GPU, out of all experts of a layer.</p><div id="experts"></div></div>
-    <div class="card"><h2>Host memory</h2><p class="n">System RAM. Experts, the embedding table and the reuse snapshots live here.</p><div id="host"></div></div>
+    <div class="card"><h2>Host memory</h2><p class="n">System RAM, pinned for the GPU: the expert weights, the embedding table, the reuse snapshots and the host KV tier.</p><div id="host"></div></div>
     <div class="card"><h2>Reuse snapshots</h2><p class="n">Snapshots of the recurrent state and of partial KV that let a hybrid model resume from a cached prefix.</p><div id="snaps"></div></div>
   </section>
   <div id="off" class="card disabled" hidden>
@@ -249,7 +249,23 @@ function renderMemory(mem) {
       $("#snaps").replaceChildren(box);
     } else $("#snaps").textContent = "Context reuse is off, or the model has no snapshots.";
   } else for (const id of ["#kv", "#experts", "#snaps"]) $(id).textContent = "Available after the first request.";
-  if (h) {
+  if (h && r && r.host_expert_weights_mib !== undefined) {
+    const tier = r.host_kv_tier_mib || 0, tierUsed = Math.min(tier, r.host_kv_tier_used_mib || 0);
+    const known = r.host_expert_weights_mib + r.host_embedding_mib + r.host_snapshot_mib + tier;
+    const other = Math.max(0, h.total_mib - h.available_mib - known);
+    const segs = [
+      { label: "Expert weights", value: r.host_expert_weights_mib, text: mib(r.host_expert_weights_mib), color: c("--s1") },
+      { label: "Embedding table", value: r.host_embedding_mib, text: mib(r.host_embedding_mib), color: c("--s5") },
+      { label: "Reuse snapshots", value: r.host_snapshot_mib, text: mib(r.host_snapshot_mib), color: c("--s6") }];
+    if (tier > 0) segs.push(
+      { label: "Host KV tier, holding sessions", value: tierUsed, text: mib(tierUsed), color: c("--s2") },
+      { label: "Host KV tier, free", value: tier - tierUsed, text: mib(tier - tierUsed), color: c("--s4") });
+    segs.push(
+      { label: "Everything else in use", value: other, text: mib(other), color: c("--s3") },
+      { label: "Available", value: h.available_mib, text: mib(h.available_mib), color: c("--grid") });
+    stack($("#host"), segs, h.total_mib,
+      { text: `Total ${mib(h.total_mib)}. The first four are the runtime's own reservations. Everything else is the Python server, the CUDA host context, other processes and page cache; page cache counts as in use until it is needed.` });
+  } else if (h) {
     const other = Math.max(0, h.total_mib - h.available_mib - h.server_rss_mib);
     stack($("#host"), [
       { label: "This server", value: h.server_rss_mib, text: mib(h.server_rss_mib), color: c("--s1") },

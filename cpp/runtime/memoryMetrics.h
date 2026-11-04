@@ -52,6 +52,13 @@ struct RuntimeMemoryMetrics
     int64_t expertCacheBytes{};
     //! Expert cache allocations that failed since start (the layer then streams through staging buffers).
     int64_t expertCacheAllocFailures{};
+    //! Pinned host memory the runtime holds, by use: routed-expert weights, the token embedding table, the recurrent and
+    //! partial-KV snapshot pools, and the host KV tier (capacity and the part holding sessions).
+    int64_t hostExpertWeightsBytes{};
+    int64_t hostEmbeddingBytes{};
+    int64_t hostSnapshotBytes{};
+    int64_t hostKvTierBytes{};
+    int64_t hostKvTierUsedBytes{};
 };
 
 } // namespace rt

@@ -17,6 +17,7 @@
 
 #include "runtime/llmRuntimeUtils.h"
 
+#include "common/hostMemoryAccounting.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
@@ -894,6 +895,11 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
 
     ELLM_CHECK(embeddingPtr != nullptr,
         format::fmtstr("Embedding file missing 'embedding' tensor: %s", embeddingPath.string().c_str()));
+    if (tableDevice == rt::DeviceType::kCPU)
+    {
+        HostMemoryAccounting::add(HostMemoryCategory::kEmbeddingTable,
+            embeddingPtr->getMemoryCapacity() + (scalesPtr != nullptr ? scalesPtr->getMemoryCapacity() : 0));
+    }
 
     ELLM_CHECK(embeddingPtr->getShape().getNumDims() == 2,
         format::fmtstr("Embedding tensor must be 2D, got %d dimensions", embeddingPtr->getShape().getNumDims()));

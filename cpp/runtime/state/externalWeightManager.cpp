@@ -17,6 +17,7 @@
 
 #include "runtime/state/externalWeightManager.h"
 
+#include "common/hostMemoryAccounting.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
@@ -401,6 +402,7 @@ void loadSidecars(std::filesystem::path const& engineDir, std::filesystem::path 
             views.reserve(loaded.size());
             for (Tensor& tensor : loaded)
             {
+                HostMemoryAccounting::add(HostMemoryCategory::kExpertWeights, tensor.getMemoryCapacity());
                 views.emplace_back(tensor.rawPointer(), tensor.getShape(), DeviceType::kGPU, tensor.getDataType(),
                     tensor.getName());
                 hostWeights.push_back(std::move(tensor));
