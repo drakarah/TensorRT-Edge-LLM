@@ -938,7 +938,7 @@ TEST_F(LLMEngineConfigTest, RejectsMixedReducedKVCacheCapacities)
     EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
 }
 
-TEST_F(LLMEngineConfigTest, RejectsReducedKVCacheCapacityForFp8)
+TEST_F(LLMEngineConfigTest, AcceptsReducedKVCacheCapacityForQuantizedKv)
 {
     Json json = makeMinimalConfig();
     json["num_hidden_layers"] = 1;
@@ -947,10 +947,11 @@ TEST_F(LLMEngineConfigTest, RejectsReducedKVCacheCapacityForFp8)
     json["layer_types"] = {"attention"};
     json["kv_layer_configs"] = Json::array({Json{{"num_kv_heads", 4}, {"head_dim", 64}, {"kv_cache_capacity", 128}}});
     auto const path = writeJsonToTempFile(json);
-    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+    // Bounded SWA KV now supports quantized KV (5c2f632) and speculative decoding (3203e24).
+    EXPECT_NO_THROW(parseEngineConfig(path));
 }
 
-TEST_F(LLMEngineConfigTest, RejectsReducedKVCacheCapacityWhenSpecFlagIsSet)
+TEST_F(LLMEngineConfigTest, AcceptsReducedKVCacheCapacityWhenSpecFlagIsSet)
 {
     Json json = makeMinimalConfig();
     json["num_hidden_layers"] = 1;
@@ -959,7 +960,8 @@ TEST_F(LLMEngineConfigTest, RejectsReducedKVCacheCapacityWhenSpecFlagIsSet)
     json["layer_types"] = {"attention"};
     json["kv_layer_configs"] = Json::array({Json{{"num_kv_heads", 4}, {"head_dim", 64}, {"kv_cache_capacity", 128}}});
     auto const path = writeJsonToTempFile(json);
-    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+    // Bounded SWA KV now supports quantized KV (5c2f632) and speculative decoding (3203e24).
+    EXPECT_NO_THROW(parseEngineConfig(path));
 }
 
 TEST_F(LLMEngineConfigTest, ReducedKVCacheCapacityRequiresConfiguredSwaPages)
