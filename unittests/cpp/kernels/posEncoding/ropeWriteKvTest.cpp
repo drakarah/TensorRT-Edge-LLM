@@ -2215,6 +2215,7 @@ struct EmuSetup
     int32_t capacity{256};
     float kScale{0.07F};
     float vScale{0.045F};
+    bool unmapSecondVPage{false}; //!< page table entry -1 for logical V page 1 of every sequence
 };
 
 //! Runs one writer against an int8 pool and returns the pool, starting from the sentinel.
@@ -2242,7 +2243,14 @@ std::vector<int8_t> runEmuWriter(EmuWriter const writer, EmuSetup const& cfg, st
     rt::Tensor endLens(rt::Coords{cfg.batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
     copyHostToDevice(endLens, std::vector<int32_t>(cfg.batchSize, cfg.qSeqLen));
 
-    std::vector<int32_t> const pageTableHost = makeReversedPageTable(cfg.batchSize, maxPagesPerSeq);
+    std::vector<int32_t> pageTableHost = makeReversedPageTable(cfg.batchSize, maxPagesPerSeq);
+    if (cfg.unmapSecondVPage)
+    {
+        for (int32_t b = 0; b < cfg.batchSize; ++b)
+        {
+            pageTableHost[(b * 2 + 1) * maxPagesPerSeq + 1] = -1;
+        }
+    }
     rt::Tensor pageTableT(
         rt::Coords{cfg.batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
     copyHostToDevice(pageTableT, pageTableHost);
@@ -2538,18 +2546,72 @@ TEST(RopeWriteKvVInt4Packed, ScopedModeSelectsPackedWithoutTheEnvironment)
     // After the guard the writers follow the environment again.
     EXPECT_EQ(runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8), plain);
     {
+        // A cache that is not packed must never receive packed rows because the environment asks for them.
         ScopedVInt4WriteMode const off(false);
-        EXPECT_EQ(runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, "packed", nvinfer1::DataType::kINT8), viaEnv);
+        EXPECT_ANY_THROW(
+            runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, "packed", nvinfer1::DataType::kINT8));
+        EXPECT_EQ(runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8), plain);
+        EXPECT_NE(runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, "token", nvinfer1::DataType::kINT8), plain);
     }
 }
 
-TEST(RopeWriteKvVInt4Packed, FullyOverwrittenRowsKeepTheLastBytes)
+TEST(RopeWriteKvVInt4Packed, UnmappedVPageIsSkippedAndNothingElseChanges)
 {
-    // Writing the same tokens twice (second time with different values) must replace the first 160 bytes and still not touch
-    // bytes 160..255; covered indirectly by the sentinel check above, here we only check the explicit "packed" env spelling.
+    for (EmuWriter const writer : {EmuWriter::kWriteKV, EmuWriter::kSplitQKV, EmuWriter::kPackedToSplit})
+    {
+        SCOPED_TRACE(emuWriterName(writer));
+        EmuSetup cfg;
+        std::mt19937 gen(5150U);
+        std::uniform_real_distribution<float> uniform(-3.0F, 3.0F);
+        size_t const rows = static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numKVHeads * cfg.headDim;
+        std::vector<half> qHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numQHeads * cfg.headDim);
+        std::vector<half> kHost(rows);
+        std::vector<half> vHost(rows);
+        for (auto& x : qHost) x = __float2half(uniform(gen));
+        for (auto& x : kHost) x = __float2half(uniform(gen));
+        for (auto& x : vHost) x = __float2half(uniform(gen));
+        auto const intact = runEmuWriter(writer, cfg, qHost, kHost, vHost, "packed", nvinfer1::DataType::kINT8);
+        cfg.unmapSecondVPage = true;
+        auto const unmapped = runEmuWriter(writer, cfg, qHost, kHost, vHost, "packed", nvinfer1::DataType::kINT8);
+        ASSERT_EQ(intact.size(), unmapped.size());
+        // The pages of logical page 1 in the V plane stay at their sentinel; every other byte matches the intact run.
+        int32_t const maxPagesPerSeq = getMaxPagesPerSeq(cfg.capacity);
+        int32_t const numPages = cfg.batchSize * maxPagesPerSeq;
+        std::vector<int32_t> const table = makeReversedPageTable(cfg.batchSize, maxPagesPerSeq);
+        std::vector<int32_t> unmappedPages;
+        for (int32_t b = 0; b < cfg.batchSize; ++b)
+        {
+            unmappedPages.push_back(table[(b * 2 + 1) * maxPagesPerSeq + 1]);
+        }
+        size_t const pageElems = static_cast<size_t>(kPageSize) * cfg.numKVHeads * cfg.headDim;
+        int32_t differing = 0;
+        for (size_t i = 0; i < intact.size(); ++i)
+        {
+            size_t const page = i / pageElems;
+            bool const inUnmappedVPage
+                = std::find(unmappedPages.begin(), unmappedPages.end(), static_cast<int32_t>(page)) != unmappedPages.end();
+            if (inUnmappedVPage)
+            {
+                EXPECT_EQ(unmapped[i], kINT8_SENTINEL) << "byte " << i;
+            }
+            else if (intact[i] != unmapped[i])
+            {
+                ++differing;
+            }
+        }
+        EXPECT_EQ(differing, 0);
+        static_cast<void>(numPages);
+    }
+}
+
+TEST(RopeWriteKvVInt4Packed, PackedSpellingIsAcceptedByEveryWriter)
+{
     ScopedEnv const env(kVInt4EnvName, "packed");
     EXPECT_NO_THROW(runVInt4PackedCase(EmuWriter::kWriteKV));
+    EXPECT_NO_THROW(runVInt4PackedCase(EmuWriter::kSplitQKV));
+    EXPECT_NO_THROW(runVInt4PackedCase(EmuWriter::kPackedToSplit));
 }
+
 
 TEST(RopeWriteKvVInt4Emulation, ExplicitOffEqualsUnset)
 {

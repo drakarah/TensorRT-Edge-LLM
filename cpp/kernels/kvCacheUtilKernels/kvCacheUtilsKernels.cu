@@ -377,29 +377,42 @@ __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ poo
     bool const vectorizable = (elemsToCopy % kVEC == 0) && (dstOffset % kVEC == 0) && (pageElems % kVEC == 0);
     if constexpr (kPackedV)
     {
-        // K as below; V: one thread decodes eight channels of one (token, head) row.
         static_assert(sizeof(TCache) == 1, "packed V needs a one-byte pool");
         for (size_t i = threadIdx.x; i < elemsToCopy; i += blockDim.x)
         {
             storeK(dstOffset + i, kSrc[i]);
         }
-        size_t const chunks = elemsToCopy / kVEC; // elemsToCopy is a multiple of 256 (head_dim 256)
+        size_t const chunks = elemsToCopy / kVEC; // head_dim 256: a whole number of rows
+        int32_t const liveLen = kvSeqLens[batch];
+        size_t const rowsPerToken = static_cast<size_t>(tokenElems) / 256;
         for (size_t v = threadIdx.x; v < chunks; v += blockDim.x)
         {
             size_t const row = v / 32;
             uint32_t const lane = static_cast<uint32_t>(v % 32);
-            uint8_t const* const rowBytes = reinterpret_cast<uint8_t const*>(vSrc) + row * 256;
-            uint32_t const word = *reinterpret_cast<uint32_t const*>(rowBytes + 4 * lane);
-            uint32_t const group = lane >> 2;
-            uint32_t const pair = *reinterpret_cast<uint32_t const*>(rowBytes + vInt4PackedScaleByte(static_cast<int32_t>(group)));
-            __half const scale = __ushort_as_half(static_cast<unsigned short>(pair & 0xFFFFu));
-            __half const zero = __ushort_as_half(static_cast<unsigned short>(pair >> 16));
             __align__(16) half vOut[kVEC];
-#pragma unroll
-            for (uint32_t j = 0; j < kVEC; ++j)
+            // Rows past the live length may never have been written, and their metadata can decode to NaN or Inf, which
+            // would poison the attention through 0 * NaN.
+            if (tokenStart + static_cast<int32_t>(row / rowsPerToken) >= liveLen)
             {
-                // The canonical decode: one fp16 fused multiply-add, as the decode kernel does.
-                vOut[j] = __hfma(__int2half_rn(static_cast<int32_t>((word >> (4 * j)) & 0xFu)), scale, zero);
+#pragma unroll
+                for (uint32_t j = 0; j < kVEC; ++j)
+                {
+                    vOut[j] = __float2half(0.F);
+                }
+            }
+            else
+            {
+                uint8_t const* const rowBytes = reinterpret_cast<uint8_t const*>(vSrc) + row * 256;
+                uint32_t const word = *reinterpret_cast<uint32_t const*>(rowBytes + 4 * lane);
+                uint32_t const pair = *reinterpret_cast<uint32_t const*>(
+                    rowBytes + vInt4PackedScaleByte(static_cast<int32_t>(lane >> 2)));
+                __half const scale = __ushort_as_half(static_cast<unsigned short>(pair & 0xFFFFu));
+                __half const zero = __ushort_as_half(static_cast<unsigned short>(pair >> 16));
+#pragma unroll
+                for (uint32_t j = 0; j < kVEC; ++j)
+                {
+                    vOut[j] = __hfma(__int2half_rn(static_cast<int32_t>((word >> (4 * j)) & 0xFu)), scale, zero);
+                }
             }
             reinterpret_cast<uint4*>(vDst + dstOffset)[v] = *reinterpret_cast<uint4 const*>(vOut);
         }

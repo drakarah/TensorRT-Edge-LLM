@@ -774,7 +774,25 @@ void runPackedGather(bool rawInt8K, int32_t zeroFillTail)
     pageTable.setRow(1, slot1KIds.data(), static_cast<int32_t>(slot1KIds.size()));
     pageTable.upload(stream);
 
-    std::vector<int32_t> const lens = {S, 2 * rt::kTOKENS_PER_PAGE};
+    // Slot 0 is live only up to 3 * 128 + 20 tokens: the rows after it, in the same page, hold NaN metadata like a pool that
+    // was never written.
+    std::vector<int32_t> const lens = {3 * rt::kTOKENS_PER_PAGE + 20, 2 * rt::kTOKENS_PER_PAGE};
+    {
+        // The rows after the live length of slot 0's last page hold NaN metadata, as a pool that was never written would.
+        int32_t const vPage = slot0KIds[3] + numPhysicalPages;
+        for (int32_t token = lens[0] - 3 * rt::kTOKENS_PER_PAGE; token < rt::kTOKENS_PER_PAGE; ++token)
+        {
+            for (int32_t h = 0; h < H; ++h)
+            {
+                uint8_t* row = reinterpret_cast<uint8_t*>(&poolHost[(size_t) vPage * pageElems + ((size_t) token * H + h) * D]);
+                for (int32_t g = 0; g < 8; ++g)
+                {
+                    uint32_t const nanPair = 0x7E007E00U;
+                    std::memcpy(row + kernel::vInt4PackedScaleByte(g), &nanPair, 4);
+                }
+            }
+        }
+    }
     size_t const vol = (size_t) B * S * H * D;
     std::vector<int8_t> expectedKRaw(vol, 0);
     std::vector<half> expectedKHalf(vol, half(0.f)), expectedV(vol, half(0.f));
@@ -803,7 +821,7 @@ void runPackedGather(bool rawInt8K, int32_t zeroFillTail)
                             expectedKHalf[dstRow + d] = __float2half(static_cast<float>(kv) * kScale);
                         }
                     }
-                    if (vPage >= 0)
+                    if (vPage >= 0 && tokenStart + t < lens[b])
                     {
                         std::vector<float> decoded(D);
                         kernel::vInt4UnpackRowHost(

@@ -115,8 +115,8 @@ static_assert(BEAM_WIDTH == 1, "Packed V is not implemented for beam search.");
 // Channels held by one 16-bit unit of an ldmatrix-loaded V word: 2 for INT8, 4 for packed nibbles. It is also the number of
 // fp16 mma column tiles one ldmatrix matrix expands to.
 constexpr uint32_t vCvtExpansion = vPacked ? 4U : cvtExpansion;
-constexpr uint32_t vPackedNibbleGrains = 8U; // 128 bytes
-constexpr uint32_t vPackedUsedGrains = 10U;  // + 32 bytes of metadata
+constexpr uint32_t vPackedNibbleGrains = 8U;
+constexpr uint32_t vPackedUsedGrains = 10U;
 constexpr uint32_t tiledQKVStagingHeadDim512VTileSeqLen = 16U;
 
 #ifndef __CUDA_ARCH__
@@ -1368,6 +1368,8 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
     constexpr uint32_t kEx = 2;
     constexpr uint32_t mnEx = 2;
     constexpr uint32_t nbInstInMatPerSliceInGemmKDim = 1;
+    static_assert(!vPacked || (grpLoadV && mha::is_same_v<InputElem, half>),
+        "Packed V reads a whole shared-memory row per token and converts to half.");
     static_assert(SharedMem::XSmemBuffer::rows == 8 * InstAcc::rows * WarpAcc::rows);
     static_assert(
         grpLoadV || sizeof(SharedMem::VSmemBuffer::Elem) / cacheElemSize * SharedMem::VSmemBuffer::cols == warpTile.x);
@@ -1450,7 +1452,6 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
 #else
             if constexpr (vPacked && mha::is_same_v<VElemType, int8_t>)
             {
-                static_assert(mha::is_same_v<InputElem, half>);
                 static_assert(vSliceRows == 1 && mnEx == 2 && kEx == 2);
                 // vSliceOrig(m, 0).data[i][j]: grain (32 channels = one scale group) 2 * (vSliceCols * idxNSplit + m) + i of
                 // the row, token block j (8 tokens); lane (q, u) holds nibble-units u of tokens 8j + 2q and 8j + 2q + 1.
@@ -1467,7 +1468,6 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
                         for (uint32_t j = 0; j < kEx; j++)
                         {
                             uint32_t const row = rowBeg + 8 * j + 2 * quad;
-                            // {scale, zero} words of the two tokens of this lane's k pair
                             uint32_t const metaA = vt.template at<true>(row, vPackedNibbleGrains + grain / 4)[grain % 4];
                             uint32_t const metaB = vt.template at<true>(row + 1, vPackedNibbleGrains + grain / 4)[grain % 4];
                             uint32_t const scale2 = prmt(metaA, metaB, PermuteOrder{0, 1, 4, 5});

@@ -49,13 +49,11 @@ enum class VInt4Mode : int32_t
 //!                   first); a pair is one 32-bit word so a reader fetches both with one load;
 //!   bytes 160..255  never written or read.
 //! Channel value = fp16 fused multiply-add code * scale + zero, rounded once to fp16 (what the decode kernel computes with one
-//! half2 FMA). Groups are those of VInt4Mode::kGroup32Asym and the parameters are the same, so the packed cache holds the values
-//! the emulation stored, up to the int8 grid of the emulation.
+//! half2 FMA). The groups and their parameters are those of VInt4Mode::kGroup32Asym.
 constexpr int32_t kVInt4PackedChannels = 256;
 constexpr int32_t kVInt4PackedNibbleBytes = 128;
 constexpr int32_t kVInt4PackedMetaOffset = 128;
 constexpr int32_t kVInt4PackedUsedBytes = 160;
-//! Byte offset of group g's fp16 scale and of its fp16 zero point inside the row.
 constexpr int32_t vInt4PackedScaleByte(int32_t group)
 {
     return kVInt4PackedMetaOffset + 4 * group;

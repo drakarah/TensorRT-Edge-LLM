@@ -509,7 +509,6 @@ __device__ __forceinline__ void storeVecVPacked(int8_t* dst, int64_t base, DVec<
     if ((lane & 3u) == 0)
     {
         uint32_t const group = lane >> 2;
-        // One 32-bit store of the {scale, zero} pair (little endian: scale in the low half).
         uint32_t const pair = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(params.scale)))
             | (static_cast<uint32_t>(__half_as_ushort(__float2half_rn(params.zero))) << 16);
         *reinterpret_cast<uint32_t*>(rowStart + vInt4PackedScaleByte(static_cast<int32_t>(group))) = pair;
@@ -539,7 +538,9 @@ __device__ __forceinline__ void storeVecV(TCache* dst, int64_t base, DVec<half> 
 
 namespace
 {
-thread_local int32_t sForcedVInt4Mode = -1;
+constexpr int32_t kNO_FORCED_MODE = -1;
+constexpr int32_t kPACKED_NOT_ALLOWED = -2;
+thread_local int32_t sForcedVInt4Mode = kNO_FORCED_MODE;
 } // namespace
 
 ScopedVInt4WriteMode::ScopedVInt4WriteMode(bool packed)
@@ -548,6 +549,10 @@ ScopedVInt4WriteMode::ScopedVInt4WriteMode(bool packed)
     if (packed)
     {
         sForcedVInt4Mode = static_cast<int32_t>(VInt4Mode::kPackedGroup32Asym);
+    }
+    else if (sForcedVInt4Mode == kNO_FORCED_MODE)
+    {
+        sForcedVInt4Mode = kPACKED_NOT_ALLOWED;
     }
 }
 
@@ -593,6 +598,8 @@ static VInt4Mode vInt4ModeFromEnvironment()
     }
     if (std::strcmp(env, "packed") == 0)
     {
+        check::check(sForcedVInt4Mode != kPACKED_NOT_ALLOWED,
+            "EDGELLM_KV_V_INT4_EMULATION=packed conflicts with a KV cache that is not packed.");
         return VInt4Mode::kPackedGroup32Asym;
     }
     check::check(false,

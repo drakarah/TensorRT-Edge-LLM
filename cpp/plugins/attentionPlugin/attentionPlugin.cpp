@@ -667,6 +667,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     FMHAKernelSelection const fmhaSelection = selectFMHAKernels(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion,
         mDataType, mSlidingWindowSize > 0, quantizedKVCache(), /*allowPagedBlackwell=*/!mSupportsBoundedKVCache);
     mContextFMHABackend = fmhaSelection.backend;
+    ELLM_CHECK(!packedV4KVCache() || mContextFMHABackend != ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL,
+        "Packed 4-bit V is not supported with the Blackwell CuTe DSL prefill backend, which reads the pool directly.");
     mCanImplementFMHA = fmhaSelection.canImplement;
     LOG_DEBUG("AttentionPlugin FMHA backend: %d, sliding_window: %s", static_cast<int32_t>(mContextFMHABackend),
         mSlidingWindowSize > 0 ? std::to_string(mSlidingWindowSize).c_str() : "disabled");
@@ -821,6 +823,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
         mDataType, mSlidingWindowSize > 0, quantizedKVCache(),
         /*allowPagedBlackwell=*/!mSupportsBoundedKVCache);
     mContextFMHABackend = fmhaSelection.backend;
+    ELLM_CHECK(!packedV4KVCache() || mContextFMHABackend != ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL,
+        "Packed 4-bit V is not supported with the Blackwell CuTe DSL prefill backend, which reads the pool directly.");
     mCanImplementFMHA = fmhaSelection.canImplement;
     LOG_DEBUG("AttentionPlugin FMHA backend: %d", static_cast<int32_t>(mContextFMHABackend));
 

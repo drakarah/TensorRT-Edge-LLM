@@ -203,7 +203,7 @@ protected:
     int32_t mSMVersion; //!< CUDA SM version
 
     int32_t mEnableFp8KVCache{};  //!< Whether FP8 KV cache is enabled
-    int32_t mEnableInt8KVCache{}; //!< Whether INT8 KV cache is enabled (symmetric, per-layer K/V scales)
+    int32_t mEnableInt8KVCache{}; //!< 0: off, 1: INT8 K and V with per-layer scales, 2: INT8 K with V packed to 4 bits
     //! XQA decode/verify split-KV mode, fixed at engine build (EDGELLM_XQA_MULTI_BLOCK) because the
     //! workspace reserved for the merge scratch is sized then: 1 = off (one CTA per sequence, the
     //! default), 0 = auto (fill the SMs), N > 1 = N splits per sequence.

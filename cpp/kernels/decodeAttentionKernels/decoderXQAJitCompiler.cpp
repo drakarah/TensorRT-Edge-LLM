@@ -67,9 +67,11 @@ struct XQAJitKeyHasher
 
 void validateXQAJitKey(XQAJitKey const& key)
 {
-    if (key.kvDataType == nvinfer1::DataType::kINT4 && key.headSize != 256)
+    if (key.kvDataType == nvinfer1::DataType::kINT4
+        && (key.headSize != 256 || key.specDecode || key.slidingWindow || key.contiguousQuerySwa))
     {
-        throw std::runtime_error("The packed K8V4 XQA kernel is implemented for head_dim 256 only.");
+        throw std::runtime_error(
+            "The packed K8V4 XQA kernel is implemented for head_dim 256 without spec-decode or sliding window.");
     }
     if (key.contiguousQuerySwa && (!key.specDecode || !key.slidingWindow))
     {
@@ -89,7 +91,6 @@ int32_t getKVCacheEnum(nvinfer1::DataType kvDataType)
     }
     if (kvDataType == nvinfer1::DataType::kINT8 || kvDataType == nvinfer1::DataType::kINT4)
     {
-        // kINT4: INT8 K cache with packed 4-bit V rows; the kernel source takes the V format from XQA_V_INT4_PACKED.
         return xqa::kernels::kKV_CACHE_ELEM_INT8;
     }
     throw std::runtime_error("XQA NVRTC JIT supports only FP16, FP8, INT8 and packed K8V4 KV cache.");

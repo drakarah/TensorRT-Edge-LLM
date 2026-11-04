@@ -36,8 +36,10 @@ namespace kernel
 //! tables cover every slot by construction, and reuse-mode table builders enforce coverage on the
 //! host at build time.
 
-//! While alive, the KV writers launched from this thread store V as packed 4-bit rows (see kvInt4Quant.h). Otherwise they
-//! follow EDGELLM_KV_V_INT4_EMULATION. The guard is per thread, so engines with different V formats can share a process.
+//! While alive, the KV writers launched from this thread store V as packed 4-bit rows (see kvInt4Quant.h) when @p packed is
+//! true. A guard with @p packed false makes EDGELLM_KV_V_INT4_EMULATION=packed an error for these writers, so a cache that is
+//! not packed never receives packed rows; other emulation values still apply. Per thread, so engines with different V formats
+//! can share a process; a nested guard keeps the mode of the outer one.
 class ScopedVInt4WriteMode
 {
 public:

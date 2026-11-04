@@ -28,7 +28,10 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "common/cudaUtils.h"
+#include "common/tensor.h"
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
+#include "kernels/posEncoding/applyRopeWriteKV.h"
+#include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/posEncoding/kvInt4Quant.h"
 #include "testUtils.h"
 #include "xqaJitTestUtils.h"
@@ -111,6 +114,7 @@ struct PackedCase
     uint32_t seed{1};
     int32_t fixedPattern{-1};    //!< >= 0: every row uses this pattern
     float largeAmplitude{6.0F}; //!< amplitude of pattern 5
+    bool peaked{false};         //!< sequence b attends to token b only (every q head of a sequence is the same vector)
 };
 
 //! Fills garbage that must never influence the result: fp16 NaN pairs and random bytes.
@@ -150,9 +154,28 @@ void runPackedDecode(PackedCase const& tc)
     // Q, K (int8 with a per-tensor scale) and V rows.
     std::vector<half> q(static_cast<size_t>(batch) * tc.numQHeads * kHEAD);
     for (auto& x : q) x = __float2half(uni(gen));
-    float const kScale = 1.0F / 127.0F;
+    float const kScale = (tc.peaked ? 8.0F : 1.0F) / 127.0F;
     std::vector<int8_t> kQuant(static_cast<size_t>(batch) * H * maxLen * kHEAD);
     for (auto& x : kQuant) x = static_cast<int8_t>(std::lround(uni(gen) * 127.0F));
+    if (tc.peaked)
+    {
+        // Every q head of sequence b is head 0's vector and K is zero except at token b, aligned with it: the logit gap is
+        // about 32, so the output is the V row of token b and any token mix-up is a large error.
+        for (int32_t b = 0; b < batch; ++b)
+        {
+            for (int32_t qh = 1; qh < tc.numQHeads; ++qh)
+                std::copy_n(&q[(static_cast<size_t>(b) * tc.numQHeads) * kHEAD], kHEAD,
+                    &q[(static_cast<size_t>(b) * tc.numQHeads + qh) * kHEAD]);
+            for (int32_t h = 0; h < H; ++h)
+                for (int32_t s = 0; s < tc.lengths[b]; ++s)
+                    for (int32_t d = 0; d < kHEAD; ++d)
+                    {
+                        float const qd = __half2float(q[(static_cast<size_t>(b) * tc.numQHeads) * kHEAD + d]);
+                        kQuant[((static_cast<size_t>(b) * H + h) * maxLen + s) * kHEAD + d]
+                            = static_cast<int8_t>(s == b ? (qd >= 0.0F ? 127 : -127) : 0);
+                    }
+        }
+    }
     std::vector<uint8_t> vRows(static_cast<size_t>(batch) * H * maxLen * kHEAD, 0); // packed rows
     std::vector<float> vDecoded(vRows.size(), 0.0F);
     {
@@ -214,11 +237,8 @@ void runPackedDecode(PackedCase const& tc)
             for (int32_t p = 0; p < pagesNeeded; ++p)
             {
                 int32_t const kPage = perm[b * maxPages + p];
-                int32_t const vPage = totalPages + perm[(b * maxPages + p + 1) % totalPages] % totalPages;
                 pageList[(static_cast<size_t>(b) * 2 + 0) * maxPages + p] = kPage;
-                // V pages use their own id range; make them unique by construction.
                 pageList[(static_cast<size_t>(b) * 2 + 1) * maxPages + p] = totalPages + perm[b * maxPages + p];
-                static_cast<void>(vPage);
             }
             for (int32_t h = 0; h < H; ++h)
                 for (int32_t s = 0; s < tc.lengths[b]; ++s)
@@ -403,4 +423,153 @@ TEST(XQAPackedVDecodingTest, ExtremeValueRangesOnePatternAtATime)
         tc.largeAmplitude = 3000.0F;
         runPackedDecode(tc);
     }
+}
+
+TEST(XQAPackedVDecodingTest, PeakedAttentionSelectsEachTokenOfEveryTile)
+{
+    for (int32_t length : {40, 70, 130, 260})
+    {
+        for (bool paged : {false, true})
+        {
+            SCOPED_TRACE("length=" + std::to_string(length) + " paged=" + std::to_string(paged));
+            PackedCase tc{8, 2, std::vector<int32_t>(length, length), paged, 1, 700U + static_cast<uint32_t>(length)};
+            tc.peaked = true;
+            runPackedDecode(tc);
+        }
+    }
+}
+
+//! The writer's output, read back from the pool, is what the decoder must see: the format is checked across the two kernels
+//! without a hand-built row.
+TEST(XQAPackedVDecodingTest, WriterOutputIsReadByTheDecoder)
+{
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    constexpr int32_t kBATCH = 2;
+    constexpr int32_t kQ_HEADS = 8;
+    constexpr int32_t kKV_HEADS = 2;
+    constexpr int32_t kPAGES = 2;
+    constexpr int32_t kNUM_PAGES = kBATCH * kPAGES;
+    constexpr int32_t kCAPACITY = kPAGES * kTOKENS_PER_PAGE;
+    std::vector<int32_t> const lengths{kCAPACITY, 150};
+    std::mt19937 gen(8080U);
+    std::uniform_real_distribution<float> uni(-1.0F, 1.0F);
+
+    // Prefill: write both sequences' K and V through the real writer.
+    std::vector<half> qIn(static_cast<size_t>(kBATCH) * kCAPACITY * kQ_HEADS * kHEAD);
+    std::vector<half> kIn(static_cast<size_t>(kBATCH) * kCAPACITY * kKV_HEADS * kHEAD);
+    std::vector<half> vIn(kIn.size());
+    std::vector<float> row;
+    for (auto& x : qIn) x = __float2half(uni(gen));
+    for (auto& x : kIn) x = __float2half(uni(gen));
+    for (size_t r = 0; r * kHEAD < vIn.size(); ++r)
+    {
+        fillVRow(gen, static_cast<int32_t>(r % kNUM_PATTERNS), row, 6.0F);
+        for (int32_t d = 0; d < kHEAD; ++d) vIn[r * kHEAD + d] = __float2half(row[d]);
+    }
+    cudaStream_t stream{nullptr};
+    rt::Tensor cosSin(rt::Coords{1, kCAPACITY, kHEAD}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    initializeNormalRopeCosSin(cosSin.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, kHEAD, kCAPACITY, stream);
+    rt::Tensor qT(rt::Coords{kBATCH, kCAPACITY, kQ_HEADS, kHEAD}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kT(rt::Coords{kBATCH, kCAPACITY, kKV_HEADS, kHEAD}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vT(rt::Coords{kBATCH, kCAPACITY, kKV_HEADS, kHEAD}, rt::DeviceType::kGPU, DataType::kHALF);
+    copyHostToDevice(qT, qIn);
+    copyHostToDevice(kT, kIn);
+    copyHostToDevice(vT, vIn);
+    rt::Tensor endLens(rt::Coords{kBATCH}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(endLens, std::vector<int32_t>(kBATCH, kCAPACITY)); // both sequences write the whole tensor
+    std::vector<int32_t> pageTableHost(static_cast<size_t>(kBATCH) * 2 * kPAGES);
+    for (int32_t b = 0; b < kBATCH; ++b)
+        for (int32_t p = 0; p < kPAGES; ++p)
+        {
+            int32_t const page = kNUM_PAGES - 1 - (b * kPAGES + p); // scrambled
+            pageTableHost[(b * 2 + 0) * kPAGES + p] = page;
+            pageTableHost[(b * 2 + 1) * kPAGES + p] = page + kNUM_PAGES;
+        }
+    rt::Tensor pageTable(rt::Coords{kBATCH, 2, kPAGES}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(pageTable, pageTableHost);
+    rt::Tensor pool(
+        rt::Coords{2, kNUM_PAGES, kTOKENS_PER_PAGE, kKV_HEADS, kHEAD}, rt::DeviceType::kGPU, DataType::kINT8);
+    copyHostToDevice(pool, std::vector<int8_t>(pool.getShape().volume(), static_cast<int8_t>(-128)));
+    float const kScale = 1.0F / 20.0F;
+    {
+        ScopedVInt4WriteMode const packedRows(true);
+        launchApplyRopeWriteKV(cosSin, endLens, qT, kT, vT, pool, kScale, 0.05F, stream, false,
+            pageTable.dataPointer<int32_t>(), kPAGES);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<int8_t> const poolHost = copyDeviceToHost<int8_t>(pool);
+
+    // Reference from the bytes the writer produced.
+    auto rowAt = [&](int32_t plane, int32_t b, int32_t s, int32_t h) {
+        int32_t const page = pageTableHost[(b * 2 + plane) * kPAGES + s / kTOKENS_PER_PAGE];
+        return &poolHost[((static_cast<size_t>(page) * kTOKENS_PER_PAGE + s % kTOKENS_PER_PAGE) * kKV_HEADS + h) * kHEAD];
+    };
+    std::vector<half> q(static_cast<size_t>(kBATCH) * kQ_HEADS * kHEAD);
+    for (auto& x : q) x = __float2half(uni(gen));
+    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(kHEAD));
+    std::vector<double> ref(q.size(), 0.0);
+    std::vector<double> vMax(static_cast<size_t>(kBATCH) * kKV_HEADS, 0.0);
+    for (int32_t b = 0; b < kBATCH; ++b)
+        for (int32_t qh = 0; qh < kQ_HEADS; ++qh)
+        {
+            int32_t const h = qh / (kQ_HEADS / kKV_HEADS);
+            std::vector<double> score(lengths[b]);
+            std::vector<std::vector<float>> vDecoded(lengths[b], std::vector<float>(kHEAD));
+            double best = -1e300;
+            for (int32_t s = 0; s < lengths[b]; ++s)
+            {
+                int8_t const* kRow = rowAt(0, b, s, h);
+                double acc = 0.0;
+                for (int32_t d = 0; d < kHEAD; ++d)
+                    acc += static_cast<double>(__half2float(q[(static_cast<size_t>(b) * kQ_HEADS + qh) * kHEAD + d]))
+                        * kRow[d] * kScale;
+                score[s] = acc * attentionScale;
+                best = std::max(best, score[s]);
+                vInt4UnpackRowHost(reinterpret_cast<uint8_t const*>(rowAt(1, b, s, h)), vDecoded[s].data());
+            }
+            double sum = 0.0;
+            for (auto& x : score) { x = std::exp(x - best); sum += x; }
+            for (int32_t s = 0; s < lengths[b]; ++s)
+                for (int32_t d = 0; d < kHEAD; ++d)
+                {
+                    ref[(static_cast<size_t>(b) * kQ_HEADS + qh) * kHEAD + d] += score[s] / sum * vDecoded[s][d];
+                    vMax[static_cast<size_t>(b) * kKV_HEADS + h]
+                        = std::max(vMax[static_cast<size_t>(b) * kKV_HEADS + h], static_cast<double>(std::fabs(vDecoded[s][d])));
+                }
+        }
+
+    ASSERT_TRUE(loadXQAJitKernelForTest(
+        smVersion, DataType::kHALF, DataType::kINT4, kHEAD, kQ_HEADS, kKV_HEADS, false, false, kTOKENS_PER_PAGE));
+    DecoderXQARunner runner(DataType::kHALF, DataType::kINT4, kBATCH, kQ_HEADS, kKV_HEADS, kHEAD, smVersion);
+    auto params = runner.initXQAParams();
+    thrust::device_vector<half> qDevice(q);
+    thrust::device_vector<int32_t> lengthsDevice(lengths);
+    thrust::device_vector<half> outDevice(ref.size(), __float2half(0.0F));
+    params.qInputPtr = thrust::raw_pointer_cast(qDevice.data());
+    params.kvCache.data = pool.rawPointer();
+    params.kvCache.pageList = pageTable.dataPointer<int32_t>();
+    params.kvCache.tokensPerPage = kTOKENS_PER_PAGE;
+    params.kvCache.sequence_lengths = thrust::raw_pointer_cast(lengthsDevice.data());
+    params.kvCache.capacity = kCAPACITY;
+    params.output = thrust::raw_pointer_cast(outDevice.data());
+    params.attentionScale = attentionScale;
+    params.kScale = kScale;
+    params.vScale = 1.0F;
+    runner.dispatchXQAKernel(params, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+    thrust::host_vector<half> out(outDevice.size());
+    thrust::copy(outDevice.begin(), outDevice.end(), out.begin());
+    double worst = 0.0;
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        size_t const b = i / (static_cast<size_t>(kQ_HEADS) * kHEAD);
+        size_t const h = ((i / kHEAD) % kQ_HEADS) / (kQ_HEADS / kKV_HEADS);
+        double const tol = 1e-7 + 2e-3 * vMax[b * kKV_HEADS + h] + 1e-2 * std::fabs(ref[i]);
+        double const err = std::fabs(__half2float(out[i]) - ref[i]);
+        worst = std::max(worst, err / tol);
+        EXPECT_LE(err, tol) << "output " << i;
+    }
+    std::cout << "XQA packed-V decode of writer output: worst err/tol " << worst << std::endl;
 }
