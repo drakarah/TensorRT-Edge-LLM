@@ -568,6 +568,14 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
 
     // Top-level: kv_cache_dtype. Required — all current exports write this.
     parseRequiredStateDtype(configJson, "kv_cache_dtype", cfg.kvCacheDtype);
+    if (configJson.contains("kv_cache_v_packed"))
+    {
+        ELLM_CHECK(configJson["kv_cache_v_packed"].is_boolean(),
+            "parseEngineConfig: 'kv_cache_v_packed' must be a boolean");
+        cfg.kvCacheVPacked = configJson["kv_cache_v_packed"].get<bool>();
+    }
+    ELLM_CHECK(!cfg.kvCacheVPacked || cfg.kvCacheDtype == nvinfer1::DataType::kINT8,
+        "parseEngineConfig: 'kv_cache_v_packed' requires kv_cache_dtype 'int8'");
 
     // builder_config: required batch / input / kv limits.
     ELLM_CHECK(configJson.contains("builder_config"), "parseEngineConfig: missing required 'builder_config' section");

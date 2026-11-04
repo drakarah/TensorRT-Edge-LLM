@@ -130,11 +130,13 @@ enum class KVPoolQuant
 //!                            before that (one page of margin) are left untouched.
 //! \param[in]  rawInt8K       INT8 pools only: copy K's bytes unchanged into an int8 kDst (for the INT8 Q·Kᵀ FMHA,
 //!                            which dequantises with kScale itself); V is still dequantised to FP16.
+//! \param[in]  numPagesPerPlane Packed-V pools only: pages in the K plane. The V plane follows it with
+//!                            160-byte rows, so a V page id p reads at plane offset (p - numPagesPerPlane) pages.
 //! \throws std::runtime_error if ceil(seqLen/128) exceeds maxPagesPerSeq.
 void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t const* pageTable, int32_t const* kvSeqLens,
     int32_t maxPagesPerSeq, int32_t batchSize, int32_t seqLen, int32_t numKVHeads, int32_t headDim, size_t elemSize,
     KVPoolQuant poolQuant, float kScale, float vScale, cudaStream_t stream, int32_t zeroFillTailTokens = -1,
-    int32_t keepTrailingTokens = -1, bool rawInt8K = false);
+    int32_t keepTrailingTokens = -1, bool rawInt8K = false, int32_t numPagesPerPlane = 0);
 
 //! Gather a paged NHD K/V pool into the head-major [B,H,S,D] layout consumed by action engines.
 //! Tokens at or beyond each slot's live length are zero-filled, including the tail of a partial page.

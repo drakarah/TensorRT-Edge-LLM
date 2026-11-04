@@ -232,6 +232,7 @@ struct KernelPagedKVCache
     int32_t const* pageList{nullptr};
     int32_t const* sequenceLengths{nullptr};
     uint32_t maxNbPagesPerSeq{0};
+    void const* vPool{nullptr}; //!< read by packed-V kernels only
 };
 
 using KernelKVCacheArg = std::variant<KernelContiguousKVCache, KernelPagedKVCache>;
@@ -262,7 +263,8 @@ KernelKVCacheArg makeKernelKVCacheArg(XQALaunchParams::KVCache const& kvCache, b
         return KernelContiguousKVCache{kvCache.data, kvCache.sequence_lengths, kvCache.capacity};
     }
 
-    return KernelPagedKVCache{kvCache.data, kvCache.pageList, kvCache.sequence_lengths, getMaxNbPagesPerSeq(kvCache)};
+    return KernelPagedKVCache{
+        kvCache.data, kvCache.pageList, kvCache.sequence_lengths, getMaxNbPagesPerSeq(kvCache), kvCache.vData};
 }
 
 void* getKernelKVCacheArg(KernelKVCacheArg& kvCacheArg)
@@ -742,6 +744,9 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
             && params.kvCache.sequence_lengths != nullptr
             && (!usePagedKVCache(params.kvCache) || params.kvCache.pageList != nullptr),
         "Invalid device pointer passed to kernel dispatch function");
+    check::check(mKVDataType != nvinfer1::DataType::kINT4 || !usePagedKVCache(params.kvCache)
+            || params.kvCache.vData != nullptr,
+        "A packed-V XQA launch needs the V plane pointer (kvCache.vData).");
 
     constexpr bool useSpecDecode = false;
     bool const usePagedKV = usePagedKVCache(params.kvCache);
@@ -775,6 +780,9 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
             && params.kvCache.sequence_lengths != nullptr && params.treeAttnMask != nullptr
             && (!usePagedKVCache(params.kvCache) || params.kvCache.pageList != nullptr),
         "Invalid device pointer passed to kernel dispatch function");
+    check::check(mKVDataType != nvinfer1::DataType::kINT4 || !usePagedKVCache(params.kvCache)
+            || params.kvCache.vData != nullptr,
+        "A packed-V XQA launch needs the V plane pointer (kvCache.vData).");
 
     constexpr bool useSpecDecode = true;
     bool const usePagedKV = usePagedKVCache(params.kvCache);

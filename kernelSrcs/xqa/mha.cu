@@ -2745,12 +2745,14 @@ CUBIN_EXPORT __global__
 #if PAGED_KV_CACHE_LAYOUT == 1
                   auto* const vCachePool = cacheList.vCacheVLLM;
 
+#elif XQA_V_INT4_PACKED
+                  auto* const vCachePool = cacheList.vPool;
 #else
                   auto* const vCachePool = cacheList.pool;
 #endif
 #if BEAM_WIDTH == 1
                   // 2CTA head_dim=512 kernels read one slice from each paged cache head; other kernels read the full head.
-                  auto const src = makePagedHeadPtr<GMemCacheHead const, PaddedCacheHead const, nbPagesPerVTile>(
+                  auto const src = makePagedHeadPtr<GMemVCacheHead const, PaddedCacheHead const, nbPagesPerVTile>(
                       vCachePool, pageIdx, nbKHeads, idxHeadBeg, splitCacheHeadByteOffset, tokensPerPageLog2);
 #else
                   IndexedHeadPtr<GMemCacheHead const, nbPagesPerVTile> const src

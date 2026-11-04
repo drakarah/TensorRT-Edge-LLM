@@ -135,6 +135,9 @@ struct LLMEngineConfig
     //! "fp16" → kHALF, "fp8" → kFP8, "int8" → kINT8, "bf16" → kBF16.
     //! The runtime validates this against the engine's actual KV binding dtype.
     nvinfer1::DataType kvCacheDtype{nvinfer1::DataType::kHALF};
+    //! True when V rows are packed 4-bit rows (INT8 K, 160-byte V rows). Parsed from the optional top-level boolean
+    //! `kv_cache_v_packed`; requires `kv_cache_dtype` "int8".
+    bool kvCacheVPacked{false};
 
     //! Recurrent state data type (hybrid models only). Parsed from required
     //! top-level `recurrent_state_dtype` when `numLinearAttnLayers > 0`;

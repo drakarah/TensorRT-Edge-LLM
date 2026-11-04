@@ -19,6 +19,7 @@
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/pagedKvTypes.h"
+#include "kernels/posEncoding/kvInt4Quant.h"
 
 #include <algorithm>
 #include <limits>
@@ -33,17 +34,36 @@ namespace rt
 namespace
 {
 
-size_t computeLayerBytes(int32_t numPages, KVLayerConfig const& layerConfig, size_t elemSize)
+size_t planeBytes(int32_t numPages, KVLayerConfig const& layerConfig, size_t rowBytes)
 {
-    size_t volume = 2;
+    size_t volume = 1;
     for (size_t const factor : {static_cast<size_t>(numPages), static_cast<size_t>(kTOKENS_PER_PAGE),
-             static_cast<size_t>(layerConfig.numKVHeads), static_cast<size_t>(layerConfig.headDim), elemSize})
+             static_cast<size_t>(layerConfig.numKVHeads), rowBytes})
     {
         check::check(factor > 0 && volume <= std::numeric_limits<size_t>::max() / factor,
             "KVCacheManager: layer allocation size overflow.");
         volume *= factor;
     }
     return volume;
+}
+
+size_t kPlaneBytes(int32_t numPages, KVLayerConfig const& layerConfig, size_t elemSize)
+{
+    return planeBytes(numPages, layerConfig, static_cast<size_t>(layerConfig.headDim) * elemSize);
+}
+
+size_t vPlaneBytes(int32_t numPages, KVLayerConfig const& layerConfig, size_t elemSize, bool packedV)
+{
+    return packedV ? planeBytes(numPages, layerConfig, static_cast<size_t>(kernel::kVInt4PackedUsedBytes))
+                   : kPlaneBytes(numPages, layerConfig, elemSize);
+}
+
+size_t computeLayerBytes(int32_t numPages, KVLayerConfig const& layerConfig, size_t elemSize, bool packedV = false)
+{
+    size_t const k = kPlaneBytes(numPages, layerConfig, elemSize);
+    size_t const v = vPlaneBytes(numPages, layerConfig, elemSize, packedV);
+    check::check(k <= std::numeric_limits<size_t>::max() - v, "KVCacheManager: layer allocation size overflow.");
+    return k + v;
 }
 
 } // namespace
@@ -55,6 +75,8 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     check::check(mConfig.kvCacheType == nvinfer1::DataType::kHALF || mConfig.kvCacheType == nvinfer1::DataType::kFP8
             || mConfig.kvCacheType == nvinfer1::DataType::kINT8,
         "Unsupported KV cache dtype.");
+    check::check(!mConfig.packedV || mConfig.kvCacheType == nvinfer1::DataType::kINT8,
+        "KVCacheManager: packed V rows need an INT8 KV cache.");
     check::check(mConfig.numAttentionLayers >= 0, "numAttentionLayers must be non-negative.");
     check::check(mConfig.maxBatchSize > 0, "maxBatchSize must be positive.");
     check::check(mConfig.maxSequenceLength > 0, "maxSequenceLength must be positive.");
@@ -112,6 +134,17 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
         }
     }
 
+    if (mConfig.packedV)
+    {
+        check::check(!boundedCapability.has_value() && mConfig.kvSharingDonors.empty(),
+            "KVCacheManager: packed V rows do not support bounded SWA or KV sharing.");
+        for (KVLayerConfig const& lc : mConfig.layerConfigs)
+        {
+            check::check(lc.headDim == kernel::kVInt4PackedChannels,
+                "KVCacheManager: packed V rows need head_dim " + std::to_string(kernel::kVInt4PackedChannels) + ".");
+        }
+    }
+
     // Pure-Mamba / pure-recurrent models legitimately have zero attention layers.
     // Leave mLayerCaches empty and skip uniformity detection.
     if (mConfig.numAttentionLayers == 0)
@@ -164,7 +197,7 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
                 bool const reduced = mConfig.useBoundedSwaKVCache
                     && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.maxSequenceLength);
                 if (!isKVSharingRecipient(i) && !reduced
-                    && computeLayerBytes(mNumPages, lc, elemSize) / 2 % granule != 0)
+                    && kPlaneBytes(mNumPages, lc, elemSize) % granule != 0)
                 {
                     LOG_WARNING("KVCacheManager: layer %d pool half is not a multiple of the %zu-byte mapping granule; "
                                 "allocating the full pool.",
@@ -213,7 +246,7 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
                 "KVCacheManager: KV-sharing recipient and donor head shapes must match.");
             mLayerNumPages.push_back(mLayerNumPages[donor]);
             mLayerCapPadded.push_back(mLayerCapPadded[donor]);
-            sharedBytesSkipped += computeLayerBytes(mLayerNumPages[donor], lc, elemSize);
+            sharedBytesSkipped += computeLayerBytes(mLayerNumPages[donor], lc, elemSize, mConfig.packedV);
             mLayerCaches.emplace_back();
             continue;
         }
@@ -224,18 +257,30 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
         mLayerNumPages.push_back(layerNumPages);
         mLayerCapPadded.push_back(layerCapPadded);
 
-        size_t const layerBytes = computeLayerBytes(layerNumPages, lc, elemSize);
+        size_t const layerBytes = computeLayerBytes(layerNumPages, lc, elemSize, mConfig.packedV);
         check::check(totalBytes <= std::numeric_limits<size_t>::max() - layerBytes,
             "KVCacheManager: total allocation size overflow.");
         totalBytes += (growable && !isReduced) ? layerBytes / layerNumPages * mMappedPages : layerBytes;
 
         if (growable && !isReduced)
         {
-            size_t const pageBytes = computeLayerBytes(1, lc, elemSize) / 2;
-            mRegions[i] = std::make_unique<VmmRegion>(pageBytes * static_cast<size_t>(layerNumPages), device);
-            check::check(mRegions[i]->growTo(pageBytes * static_cast<size_t>(mMappedPages)),
+            size_t const kPage = kPageBytes(i);
+            size_t const vPage = vPageBytes(i);
+            mRegions[i] = std::make_unique<VmmRegion>(
+                kPage * static_cast<size_t>(layerNumPages), vPage * static_cast<size_t>(layerNumPages), device);
+            check::check(mRegions[i]->growTo(
+                             kPage * static_cast<size_t>(mMappedPages), vPage * static_cast<size_t>(mMappedPages)),
                 "KVCacheManager: not enough device memory for the initial KV mapping.");
             mLayerCaches.emplace_back(rt::Tensor(mRegions[i]->base(),
+                {2, layerNumPages, kTOKENS_PER_PAGE, lc.numKVHeads, lc.headDim}, DeviceType::kGPU,
+                mConfig.kvCacheType, "KVCacheManager::layer_" + std::to_string(i)));
+            continue;
+        }
+        if (mConfig.packedV)
+        {
+            mPackedStorage.emplace_back(rt::Tensor({static_cast<int64_t>(layerBytes)}, DeviceType::kGPU,
+                nvinfer1::DataType::kINT8, "KVCacheManager::packed_layer_" + std::to_string(i)));
+            mLayerCaches.emplace_back(rt::Tensor(mPackedStorage.back().rawPointer(),
                 {2, layerNumPages, kTOKENS_PER_PAGE, lc.numKVHeads, lc.headDim}, DeviceType::kGPU,
                 mConfig.kvCacheType, "KVCacheManager::layer_" + std::to_string(i)));
             continue;
@@ -260,6 +305,7 @@ KVCacheManager::KVCacheManager(KVCacheManager&& other) noexcept
 {
     mConfig = std::move(other.mConfig);
     mLayerCaches = std::move(other.mLayerCaches);
+    mPackedStorage = std::move(other.mPackedStorage);
     mLayerCapPadded = std::move(other.mLayerCapPadded);
     mLayerNumPages = std::move(other.mLayerNumPages);
     mReducedKVCacheCapacity = other.mReducedKVCacheCapacity;
@@ -285,6 +331,8 @@ KVCacheManager& KVCacheManager::operator=(KVCacheManager&& other) noexcept
     {
         mConfig = std::move(other.mConfig);
         mLayerCaches = std::move(other.mLayerCaches);
+        mPackedStorage = std::move(other.mPackedStorage);
+    mPackedStorage = std::move(other.mPackedStorage);
         mLayerCapPadded = std::move(other.mLayerCapPadded);
         mLayerNumPages = std::move(other.mLayerNumPages);
         mReducedKVCacheCapacity = other.mReducedKVCacheCapacity;
@@ -323,24 +371,23 @@ bool KVCacheManager::ensureTokens(int32_t tokens) noexcept
         return true;
     }
     int32_t const wantPages = std::min(mNumPages, (std::min(tokens, mConfig.maxSequenceLength) + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE);
-    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
     size_t const before = mRegions.size();
-    std::vector<size_t> previous(before, 0);
+    std::vector<std::pair<size_t, size_t>> previous(before, {0, 0});
     for (size_t i = 0; i < before; ++i)
     {
         if (mRegions[i] == nullptr)
         {
             continue;
         }
-        previous[i] = mRegions[i]->mappedPerHalf();
-        size_t const pageBytes = computeLayerBytes(1, mConfig.layerConfigs[i], elemSize) / 2;
-        if (!mRegions[i]->growTo(pageBytes * static_cast<size_t>(wantPages)))
+        previous[i] = {mRegions[i]->mappedBytes(0), mRegions[i]->mappedBytes(1)};
+        if (!mRegions[i]->growTo(kPageBytes(static_cast<int32_t>(i)) * static_cast<size_t>(wantPages),
+                vPageBytes(static_cast<int32_t>(i)) * static_cast<size_t>(wantPages)))
         {
             for (size_t k = 0; k < i; ++k)
             {
                 if (mRegions[k] != nullptr)
                 {
-                    mRegions[k]->shrinkTo(previous[k]);
+                    mRegions[k]->shrinkTo(previous[k].first, previous[k].second);
                 }
             }
             return false;
@@ -361,7 +408,6 @@ size_t KVCacheManager::shrinkTokens(int32_t tokens) noexcept
     {
         return 0;
     }
-    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
     size_t released = 0;
     for (size_t i = 0; i < mRegions.size(); ++i)
     {
@@ -369,10 +415,10 @@ size_t KVCacheManager::shrinkTokens(int32_t tokens) noexcept
         {
             continue;
         }
-        size_t const pageBytes = computeLayerBytes(1, mConfig.layerConfigs[i], elemSize) / 2;
-        size_t const before = mRegions[i]->mappedPerHalf();
-        mRegions[i]->shrinkTo(pageBytes * static_cast<size_t>(keepPages));
-        released += 2 * (before - mRegions[i]->mappedPerHalf());
+        size_t const before = mRegions[i]->mappedTotal();
+        mRegions[i]->shrinkTo(kPageBytes(static_cast<int32_t>(i)) * static_cast<size_t>(keepPages),
+            vPageBytes(static_cast<int32_t>(i)) * static_cast<size_t>(keepPages));
+        released += before - mRegions[i]->mappedTotal();
     }
     mMappedPages = keepPages;
     return released;
@@ -385,7 +431,6 @@ size_t KVCacheManager::bytesToMap(int32_t tokens) const noexcept
         return 0;
     }
     int32_t const wantPages = std::min(mNumPages, (std::min(tokens, mConfig.maxSequenceLength) + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE);
-    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
     size_t bytes = 0;
     for (size_t i = 0; i < mRegions.size(); ++i)
     {
@@ -393,10 +438,15 @@ size_t KVCacheManager::bytesToMap(int32_t tokens) const noexcept
         {
             continue;
         }
-        size_t const pageBytes = computeLayerBytes(1, mConfig.layerConfigs[i], elemSize) / 2;
         size_t const granule = mRegions[i]->granuleBytes();
-        size_t const target = (pageBytes * static_cast<size_t>(wantPages) + granule - 1) / granule * granule;
-        bytes += 2 * (target - std::min(target, mRegions[i]->mappedPerHalf()));
+        size_t const pageBytesOf[2] = {kPageBytes(static_cast<int32_t>(i)), vPageBytes(static_cast<int32_t>(i))};
+        for (int half = 0; half < 2; ++half)
+        {
+            size_t const target
+                = std::min((pageBytesOf[half] * static_cast<size_t>(wantPages) + granule - 1) / granule * granule,
+                    half == 0 ? mRegions[i]->halfBytes() : mRegions[i]->secondHalfBytes());
+            bytes += target - std::min(target, mRegions[i]->mappedBytes(half));
+        }
     }
     return bytes;
 }
@@ -412,8 +462,8 @@ size_t KVCacheManager::mappedBytes() const noexcept
             continue;
         }
         bytes += isGrowable() && mRegions[i] != nullptr
-            ? 2 * mRegions[i]->mappedPerHalf()
-            : computeLayerBytes(mLayerNumPages[i], mConfig.layerConfigs[i], elemSize);
+            ? mRegions[i]->mappedTotal()
+            : computeLayerBytes(mLayerNumPages[i], mConfig.layerConfigs[i], elemSize, mConfig.packedV);
     }
     return bytes;
 }
@@ -426,10 +476,23 @@ size_t KVCacheManager::capacityBytes() const noexcept
     {
         if (!isKVSharingRecipient(i))
         {
-            bytes += computeLayerBytes(mLayerNumPages[i], mConfig.layerConfigs[i], elemSize);
+            bytes += computeLayerBytes(mLayerNumPages[i], mConfig.layerConfigs[i], elemSize, mConfig.packedV);
         }
     }
     return bytes;
+}
+
+size_t KVCacheManager::kPageBytes(int32_t attnLayerIdx) const noexcept
+{
+    KVLayerConfig const& lc = mConfig.layerConfigs[attnLayerIdx];
+    return static_cast<size_t>(kTOKENS_PER_PAGE) * lc.numKVHeads * lc.headDim * rt::utils::getTypeSize(mConfig.kvCacheType);
+}
+
+size_t KVCacheManager::vPageBytes(int32_t attnLayerIdx) const noexcept
+{
+    KVLayerConfig const& lc = mConfig.layerConfigs[attnLayerIdx];
+    return mConfig.packedV ? static_cast<size_t>(kTOKENS_PER_PAGE) * lc.numKVHeads * kernel::kVInt4PackedUsedBytes
+                           : kPageBytes(attnLayerIdx);
 }
 
 int32_t KVCacheManager::storageLayer(int32_t attnLayerIdx) const noexcept
@@ -454,6 +517,7 @@ rt::Tensor const& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx) const
 
 std::pair<rt::Tensor, rt::Tensor> KVCacheManager::getSeparateKVCache(int32_t attnLayerIdx) const noexcept
 {
+    check::check(!mConfig.packedV, "KVCacheManager: a packed-V pool has no FP-shaped separate V view.");
     KVLayerConfig const& lc = mConfig.layerConfigs[attnLayerIdx];
     if (mConfig.useBoundedSwaKVCache && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.maxSequenceLength))
     {

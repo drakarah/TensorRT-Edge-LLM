@@ -64,6 +64,16 @@ constexpr int32_t vInt4PackedZeroByte(int32_t group)
 }
 constexpr int32_t kVInt4PackedGroups = 8;
 
+//! Element offset of a packed V row in the compact layout: the V plane starts after the full-size K plane
+//! (@p numPages pages of @p kRowElems-wide rows) and stores kVInt4PackedUsedBytes-wide rows.
+__host__ __device__ constexpr int64_t vPackedCompactRowOffset(int64_t vPage, int64_t inPage, int64_t numKVHead,
+    int64_t kvHead, int64_t numPages, int64_t kRowElems, int64_t tokensPerPage)
+{
+    return numPages * tokensPerPage * numKVHead * kRowElems
+        + ((vPage - numPages) * tokensPerPage + inPage) * numKVHead * kVInt4PackedUsedBytes
+        + kvHead * kVInt4PackedUsedBytes;
+}
+
 //! Largest code magnitude. Codes lie in [-7, 7]; the code -8 is never produced so that negation stays exact.
 constexpr int32_t kVInt4MaxCode = 7;
 //! Channels that share a scale in VInt4Mode::kGroup32.

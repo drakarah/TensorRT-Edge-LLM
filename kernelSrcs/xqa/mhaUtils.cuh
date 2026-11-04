@@ -550,6 +550,9 @@ struct KVCacheList<true>
     KVCachePageIndex const* kvCachePageList; // shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
     SeqLenDataType const* seqLenList;        // shape: [batchSize][beamWidth] (for compatibility)
     uint32_t maxNbPagesPerSeq;
+#if XQA_V_INT4_PACKED
+    GMemVCacheHead const* vPool; // V plane base biased so that vPool + pageId * pageStride addresses V page pageId.
+#endif
 };
 
 template <>

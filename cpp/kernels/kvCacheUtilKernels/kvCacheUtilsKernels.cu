@@ -325,7 +325,7 @@ __global__ void gatherPagedKVToSplitKernel(uint8_t const* __restrict__ pool, uin
 template <typename TCache, bool kRawK = false, bool kPackedV = false>
 __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ pool, void* __restrict__ kDstRaw,
     half* __restrict__ vDst, int32_t const* __restrict__ pageTable, int32_t const* __restrict__ kvSeqLens,
-    int32_t maxPagesPerSeq, int32_t seqLen, int32_t tokenElems, float kScale, float vScale, int32_t zeroFillTailTokens, int32_t keepTrailingTokens)
+    int32_t maxPagesPerSeq, int32_t seqLen, int32_t tokenElems, float kScale, float vScale, int32_t zeroFillTailTokens, int32_t keepTrailingTokens, int32_t numPagesPerPlane)
 {
     int32_t const batch = blockIdx.x;
     int32_t kPage, vPage, tokenStart, tokensInPage;
@@ -383,6 +383,12 @@ __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ poo
             storeK(dstOffset + i, kSrc[i]);
         }
         size_t const chunks = elemsToCopy / kVEC; // head_dim 256: a whole number of rows
+        // V rows are 160 bytes in a plane that follows the full-size K plane; page ids >= numPagesPerPlane are V pages.
+        size_t const vPageBytes
+            = static_cast<size_t>(rt::kTOKENS_PER_PAGE) * (static_cast<size_t>(tokenElems) / 256) * kVInt4PackedUsedBytes;
+        uint8_t const* const vPackedPage = reinterpret_cast<uint8_t const*>(pool)
+            + static_cast<size_t>(numPagesPerPlane) * pageElems
+            + (static_cast<size_t>(vPage) - static_cast<size_t>(numPagesPerPlane)) * vPageBytes;
         int32_t const liveLen = kvSeqLens[batch];
         size_t const rowsPerToken = static_cast<size_t>(tokenElems) / 256;
         for (size_t v = threadIdx.x; v < chunks; v += blockDim.x)
@@ -402,7 +408,7 @@ __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ poo
             }
             else
             {
-                uint8_t const* const rowBytes = reinterpret_cast<uint8_t const*>(vSrc) + row * 256;
+                uint8_t const* const rowBytes = vPackedPage + row * kVInt4PackedUsedBytes;
                 uint32_t const word = *reinterpret_cast<uint32_t const*>(rowBytes + 4 * lane);
                 uint32_t const pair = *reinterpret_cast<uint32_t const*>(
                     rowBytes + vInt4PackedScaleByte(static_cast<int32_t>(lane >> 2)));
@@ -460,7 +466,7 @@ __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ poo
 void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t const* pageTable, int32_t const* kvSeqLens,
     int32_t maxPagesPerSeq, int32_t batchSize, int32_t seqLen, int32_t numKVHeads, int32_t headDim, size_t elemSize,
     KVPoolQuant poolQuant, float kScale, float vScale, cudaStream_t stream, int32_t zeroFillTailTokens, int32_t keepTrailingTokens,
-    bool rawInt8K)
+    bool rawInt8K, int32_t numPagesPerPlane)
 {
     check::check(!rawInt8K || poolQuant == KVPoolQuant::kINT8 || poolQuant == KVPoolQuant::kINT8PackedV,
         "gatherPagedKVToSplit: rawInt8K needs an INT8 pool.");
@@ -484,7 +490,7 @@ void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t cons
 #if SUPPORTS_FP8
         gatherDequantPagedKVToSplitKernel<__nv_fp8_e4m3><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
             static_cast<__nv_fp8_e4m3 const*>(pool), kDst, static_cast<half*>(vDst), pageTable,
-            kvSeqLens, maxPagesPerSeq, seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens);
+            kvSeqLens, maxPagesPerSeq, seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens, numPagesPerPlane);
 #else
         throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
 #endif
@@ -493,30 +499,31 @@ void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t cons
     {
         check::check(headDim == kVInt4PackedChannels && elemSize == 1,
             "gatherPagedKVToSplit: a packed-V pool needs head_dim 256 and one-byte elements.");
+        check::check(numPagesPerPlane > 0, "gatherPagedKVToSplit: a packed-V pool needs numPagesPerPlane.");
         if (rawInt8K)
         {
             gatherDequantPagedKVToSplitKernel<int8_t, true, true><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
                 static_cast<int8_t const*>(pool), kDst, static_cast<half*>(vDst), pageTable, kvSeqLens, maxPagesPerSeq,
-                seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens);
+                seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens, numPagesPerPlane);
         }
         else
         {
             gatherDequantPagedKVToSplitKernel<int8_t, false, true><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
                 static_cast<int8_t const*>(pool), kDst, static_cast<half*>(vDst), pageTable, kvSeqLens, maxPagesPerSeq,
-                seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens);
+                seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens, numPagesPerPlane);
         }
     }
     else if (poolQuant == KVPoolQuant::kINT8 && rawInt8K)
     {
         gatherDequantPagedKVToSplitKernel<int8_t, true><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
             static_cast<int8_t const*>(pool), kDst, static_cast<half*>(vDst), pageTable, kvSeqLens, maxPagesPerSeq,
-            seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens);
+            seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens, numPagesPerPlane);
     }
     else if (poolQuant == KVPoolQuant::kINT8)
     {
         gatherDequantPagedKVToSplitKernel<int8_t><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
             static_cast<int8_t const*>(pool), kDst, static_cast<half*>(vDst), pageTable,
-            kvSeqLens, maxPagesPerSeq, seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens);
+            kvSeqLens, maxPagesPerSeq, seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens, numPagesPerPlane);
     }
     else
     {

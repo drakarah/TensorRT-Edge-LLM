@@ -55,6 +55,15 @@ constexpr bool usePagedKVCache = (TOKENS_PER_PAGE != 0);
 using IOHead = Vec<InputElem, validElemsPerHead>;
 using InputHead = IOHead;
 using GMemCacheHead = Vec<CacheElem, validElemsPerHead>;
+#ifndef XQA_V_INT4_PACKED
+#define XQA_V_INT4_PACKED 0
+#endif
+// Packed K8V4 V rows occupy 160 bytes (see cpp/kernels/posEncoding/kvInt4Quant.h) in a V plane separate from the K plane.
+#if XQA_V_INT4_PACKED
+using GMemVCacheHead = Vec<CacheElem, 160>;
+#else
+using GMemVCacheHead = GMemCacheHead;
+#endif
 
 constexpr uint32_t validElemsPerKHead = validElemsPerHead;
 constexpr bool lowPrecOutput = LOW_PREC_OUTPUT;

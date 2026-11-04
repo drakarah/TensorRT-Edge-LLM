@@ -59,6 +59,7 @@ HostKvPageStore::HostKvPageStore(KVCacheManager const& kvCache, int32_t slotCoun
 {
     ELLM_CHECK(slotCount >= 0, "Host KV page store slot count must be non-negative");
     ELLM_CHECK(kvCache.numLayers() > 0, "Host KV page store needs at least one attention layer");
+    ELLM_CHECK(!kvCache.getConfig().packedV, "The host KV tier does not support packed V rows");
     for (int32_t layer = 0; layer < kvCache.numLayers(); ++layer)
     {
         KVLayerConfig const& config = kvCache.getLayerConfig(layer);

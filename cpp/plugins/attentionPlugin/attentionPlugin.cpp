@@ -28,6 +28,7 @@
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
+#include "kernels/posEncoding/kvInt4Quant.h"
 #include "plugins/utils/pluginUtils.h"
 #include "plugins/utils/raggedPluginMetadata.h"
 
@@ -584,7 +585,8 @@ std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::splitPagedKV(rt::Tensor const
 
     kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(), pageTable,
         kvSeqLens, maxPagesPerSeq, batchSize, outSeqDim, numKVHeads, headSize, elemSize, poolQuant, kScale, vScale,
-        stream, consumerTailTokens, consumerKeepTrailingTokens, rawInt8K);
+        stream, consumerTailTokens, consumerKeepTrailingTokens, rawInt8K,
+        packedV ? static_cast<int32_t>(poolTensor.getShape()[1]) : 0);
 
     return std::make_pair(std::move(kTensor), std::move(vTensor));
 }
@@ -2465,6 +2467,14 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         params.kvCache.capacity = static_cast<uint32_t>(kvCacheCapacity);
         params.kvCache.pageList = pageTable;
         params.kvCache.tokensPerPage = static_cast<uint32_t>(rt::kTOKENS_PER_PAGE);
+        if (packedV4KVCache())
+        {
+            int64_t const numPages = kvCacheTensor.getShape()[1];
+            int64_t const rowsPerPage = static_cast<int64_t>(rt::kTOKENS_PER_PAGE) * mNumKVHeads;
+            int64_t const planeBytes = numPages * rowsPerPage * mHeadSize;
+            int64_t const vPlaneBytes = numPages * rowsPerPage * kernel::kVInt4PackedUsedBytes;
+            params.kvCache.vData = static_cast<std::byte const*>(kvCacheTensor.rawPointer()) + planeBytes - vPlaneBytes;
+        }
         params.slidingWinSize = mSlidingWindowSize > 0 ? static_cast<uint32_t>(mSlidingWindowSize) : 0U;
         params.attentionSinks = attentionSinkDevicePtr;
         if (mXqaMultiBlock != 1 && mXqaSemaphores != nullptr)

@@ -101,6 +101,10 @@ public:
         //! When non-zero, full-capacity pools reserve their whole virtual range but map physical memory only for
         //! this many tokens; ensureTokens() maps more. Single-slot engines only. Pointers never change.
         int32_t initialMappedTokens{0};
+        //! INT8 pools only: V rows are packed 4-bit rows of kVInt4PackedUsedBytes bytes (head_dim 256). The V plane then
+        //! holds numPages pages of that stride and starts, as before, right after the K plane, so the binding keeps its
+        //! nominal [2, numPages, kTOKENS_PER_PAGE, H, D] shape over a smaller allocation.
+        bool packedV{false};
     };
     //! \endcond
 
@@ -188,6 +192,10 @@ public:
     //! @return Device pointer to the V pool.
     void* vPoolPtr(int32_t attnLayerIdx) const noexcept;
 
+    //! Bytes of one K page and of one V page of the given layer (equal unless Config::packedV).
+    size_t kPageBytes(int32_t attnLayerIdx) const noexcept;
+    size_t vPageBytes(int32_t attnLayerIdx) const noexcept;
+
     //! @brief Whether physical memory is mapped on demand (Config::initialMappedTokens).
     bool isGrowable() const noexcept;
 
@@ -234,6 +242,7 @@ public:
 private:
     Config mConfig{};                     //!< Cache configuration
     std::vector<rt::Tensor> mLayerCaches; //!< Per-layer KV page pools on device
+    std::vector<rt::Tensor> mPackedStorage; //!< Owners of the compact allocations behind mLayerCaches (packed V, not growable)
     bool mIsUniform{true};                //!< True if all layers share the same numKVHeads and headDim
     int32_t mCapPadded{};                 //!< Full-engine capacity padded up to a multiple of kTOKENS_PER_PAGE
     int32_t mNumPages{};                  //!< Full-pool page count (Config::numPages, or the floor if 0)

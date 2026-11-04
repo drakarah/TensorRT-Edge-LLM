@@ -536,6 +536,21 @@ __device__ __forceinline__ void storeVecV(TCache* dst, int64_t base, DVec<half> 
     }
 }
 
+
+template <int32_t kVInt4Mode>
+__device__ __forceinline__ int64_t vRowOffset(int64_t vPage, int64_t inPage, int64_t numKVHead, int64_t kvHead,
+    int64_t numPages, int64_t rowElems)
+{
+    if constexpr (kVInt4Mode == static_cast<int32_t>(VInt4Mode::kPackedGroup32Asym))
+    {
+        return vPackedCompactRowOffset(vPage, inPage, numKVHead, kvHead, numPages, rowElems, rt::kTOKENS_PER_PAGE);
+    }
+    else
+    {
+        return (vPage * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * rowElems + kvHead * rowElems;
+    }
+}
+
 namespace
 {
 constexpr int32_t kNO_FORCED_MODE = -1;
@@ -775,8 +790,7 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
             if (vPage >= numPages && static_cast<int64_t>(vPage) < 2 * static_cast<int64_t>(numPages))
             {
                 int64_t const vOffset
-                    = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
-                    + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
+                    = vRowOffset<kVInt4Mode>(vPage, inPage, numKVHead, kvHeadIdx, numPages, headDim) + vecBase;
                 storeVecV<TCache, kVInt4Mode>(kvCache, vOffset, vSrc, vScaleQuantOrig);
             }
         }
@@ -1030,8 +1044,8 @@ __global__ void applyRopeWriteKVSplitQKVKernel(T* __restrict__ q, T const* __res
         }
         if (vPage >= numPages && static_cast<int64_t>(vPage) < 2 * static_cast<int64_t>(numPages))
         {
-            int64_t const vOffset = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
-                + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
+            int64_t const vOffset
+                = vRowOffset<kVInt4Mode>(vPage, inPage, numKVHead, kvHeadIdx, numPages, headDim) + vecBase;
             storeVecV<TCache, kVInt4Mode>(kvCache, vOffset, vSrc, vScaleQuantOrig);
         }
     }
@@ -1348,8 +1362,7 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
                 if (vPage >= numPages && static_cast<int64_t>(vPage) < 2 * static_cast<int64_t>(numPages))
                 {
                     int64_t const vOffset
-                        = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * poolHeadDim
-                        + static_cast<int64_t>(kvHeadIdx) * poolHeadDim + vecBase;
+                        = vRowOffset<kVInt4Mode>(vPage, inPage, numKVHead, kvHeadIdx, numPages, poolHeadDim) + vecBase;
                     storeVecV<TCache, kVInt4Mode>(kvCache, vOffset, vSrc, vScaleQuantOrig);
                 }
             }

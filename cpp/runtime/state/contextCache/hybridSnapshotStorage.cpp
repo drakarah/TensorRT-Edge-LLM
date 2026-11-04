@@ -386,7 +386,9 @@ void HybridSnapshotStorage::capturePartialKv(HybridCacheManager& cacheManager, s
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(snapshot.rawPointer(), snapshotBase),
             byteOffset(kvCache.kPoolPtr(layer), pageOffset), copyBytes, captureKind(), stream));
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(snapshot.rawPointer(), snapshotBase + pageBytes),
-            byteOffset(kvCache.vPoolPtr(layer), pageOffset), copyBytes, captureKind(), stream));
+            byteOffset(kvCache.vPoolPtr(layer), static_cast<size_t>(sourcePage) * kvCache.vPageBytes(layer)),
+            kvCache.vPageBytes(layer) / static_cast<size_t>(kTOKENS_PER_PAGE) * static_cast<size_t>(validTokenCount),
+            captureKind(), stream));
     }
 }
 
@@ -411,8 +413,11 @@ void HybridSnapshotStorage::restorePartialKv(HybridCacheManager& cacheManager, s
         Tensor& snapshot = snapshots[static_cast<size_t>(layer)];
         CUDA_CHECK(cudaMemcpyAsync(byteOffset(kvCache.kPoolPtr(layer), pageOffset),
             byteOffset(snapshot.rawPointer(), snapshotBase), copyBytes, restoreKind(), stream));
-        CUDA_CHECK(cudaMemcpyAsync(byteOffset(kvCache.vPoolPtr(layer), pageOffset),
-            byteOffset(snapshot.rawPointer(), snapshotBase + pageBytes), copyBytes, restoreKind(), stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            byteOffset(kvCache.vPoolPtr(layer), static_cast<size_t>(destinationPage) * kvCache.vPageBytes(layer)),
+            byteOffset(snapshot.rawPointer(), snapshotBase + pageBytes),
+            kvCache.vPageBytes(layer) / static_cast<size_t>(kTOKENS_PER_PAGE) * static_cast<size_t>(validTokenCount),
+            restoreKind(), stream));
     }
 }
 

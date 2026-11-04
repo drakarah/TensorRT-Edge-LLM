@@ -127,6 +127,7 @@ Tensor copyKVCacheAsHND(HybridCacheManager& cacheManager, KVPageTable const& ful
     ELLM_CHECK(pageTable->numPages() == storage.physicalPages,
         "LayerDebugger: page-table physical namespace does not match the KV pool");
 
+    ELLM_CHECK(!cacheManager.getKVCacheManager().getConfig().packedV, "LayerDebugger: packed-V pools cannot be dumped");
     Tensor const& pool = cacheManager.getCombinedKVCache(layer);
     Coords const poolShape = pool.getShape();
     ELLM_CHECK(poolShape.getNumDims() == 5 && poolShape[0] == 2 && poolShape[1] == storage.physicalPages

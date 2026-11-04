@@ -41,6 +41,9 @@ struct XQALaunchParams
         int32_t const* sequence_lengths = nullptr; //!< Sequence lengths for each request
         uint32_t capacity = 0;                     //!< Cache capacity
         uint32_t tokensPerPage = 0;                //!< Tokens per page (0 = contiguous KV cache)
+        //! Packed-V kernels only: the V plane base biased by -numPages * vPageBytes, so that vData + pageId * vPageBytes
+        //! addresses V page pageId (ids numPages..2*numPages-1) in a plane of 160-byte rows following the K plane.
+        void const* vData = nullptr;
     };
     //! \endcond
 
