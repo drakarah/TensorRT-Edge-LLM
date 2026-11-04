@@ -175,7 +175,7 @@ def _message_runtime():
                            MessageToolCall=_NativeMessageValue)
 
 
-def test_message_conversion_preserves_string_tool_call_arguments():
+def test_message_conversion_parses_string_tool_call_arguments_to_objects():
     messages = _convert_messages_to_cpp(
         _message_runtime(),
         [{
@@ -197,7 +197,8 @@ def test_message_conversion_preserves_string_tool_call_arguments():
     assert messages[0].has_tool_calls
     assert messages[0].has_content
     assert messages[0].content_is_null
-    assert messages[0].tool_calls[0].arguments_is_string
+    # String arguments are parsed and handed to the template as an object (provider templates iterate them).
+    assert not messages[0].tool_calls[0].arguments_is_string
     assert messages[0].tool_calls[0].arguments == '{"city":"Paris"}'
 
 
@@ -752,6 +753,8 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
     llm._media_dir = ""
     llm._model_dir = "/model"
     llm._draft_model_dir = "/draft"
+    llm._checkpoint_dir = "/model"
+    llm._draft_checkpoint_dir = "/draft"
     llm._draft_top_k = 4
     llm._draft_step = 3
     llm._verify_tree_size = 8

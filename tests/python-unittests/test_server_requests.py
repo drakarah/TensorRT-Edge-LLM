@@ -1770,7 +1770,7 @@ def test_allowed_local_media_path_is_honored_by_http(tmp_path):
 
 @pytest.mark.parametrize("marker,status", [
     ("EDGELLM_BAD_MEDIA_COUNT: expected one image", 400),
-    ("EDGELLM_INPUT_TOO_LONG: rebuild for this prompt", 413),
+    ("EDGELLM_INPUT_TOO_LONG: rebuild for this prompt", 400),
     ("CUDA error: out of memory", 500),
 ])
 def test_native_errors_map_to_protocol_status(client_and_llm, marker, status):
