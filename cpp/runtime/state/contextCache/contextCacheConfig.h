@@ -54,6 +54,9 @@ struct ContextCacheConfig
     int64_t recurrentSnapshotPoolBytes{};
     //! Device-memory budget for preallocated partial attention-KV checkpoints.
     int64_t partialKvSnapshotPoolBytes{};
+    //! Hold the recurrent and partial-KV checkpoints in pinned host memory: the two budgets above then count host bytes,
+    //! capture is a D2H and restore an H2D copy, and no device memory is spent on snapshots.
+    bool snapshotsInHostMemory{false};
     //! Device-memory budget for encoder embedding cache (ViT/audio). Zero disables.
     int64_t encoderEmbeddingCacheBudgetBytes{256LL * 1024 * 1024};
 };

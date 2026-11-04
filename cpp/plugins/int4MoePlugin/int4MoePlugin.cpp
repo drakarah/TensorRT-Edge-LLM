@@ -22,11 +22,13 @@
 #include "common/logger.h"
 #include "common/stringUtils.h"
 #include "common/tensor.h"
+#include "cpuMissPool.h"
 #include "kernels/moe/moeActivationKernels.h"
 #include "kernels/moe/moeAlignSumKernels.h"
 #include "kernels/moe/moeMarlinIndicesKernels.h"
 #include "kernels/moe/moeTopkSoftmaxKernels.h"
 #include "kernels/moe/moe_marlin/moeMarlin.h"
+#include "routedExpertRing.h"
 #include "plugins/utils/pluginUtils.h"
 
 #include <algorithm>
@@ -34,9 +36,20 @@
 #include <cassert>
 #include <cstdlib>
 #include <cuda_fp16.h>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <string>
+#include <thread>
+#include <vector>
 #include <cuda_runtime.h>
 #include <limits>
+#include <map>
 #include <mutex>
+#include <set>
+#include <stdexcept>
 
 using namespace nvinfer1;
 namespace trt_edgellm
@@ -106,8 +119,899 @@ bool hasValidRoutedRowCapacity(int64_t numTokens, int32_t numExperts, int32_t to
 
 // Workspace size for Int4 MoE plugin using accumulateWorkspaceSize (same order as assignTensorFromWorkspace in
 // enqueue).
+//! EDGELLM_MOE_STAGE_EXPERTS=1 at engine build: experts that live in pinned host memory (EDGELLM_HOST_EXTERNAL_WEIGHTS) are
+//! copied to a device staging area, only the ones the routing selected, instead of being read by the GEMM over PCIe.
+//! 0 = off, 1 = stage into the head of the TRT workspace, 2 = stage into private device buffers (no workspace reservation; the buffers also serve the
+//! prefill prefetch, EDGELLM_MOE_PREFILL_OVERLAP).
+int32_t stageExpertsFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_STAGE_EXPERTS");
+    int32_t const mode = value != nullptr ? std::atoi(value) : 0;
+    return mode < 0 ? 0 : (mode > 2 ? 2 : mode);
+}
+
+//! EDGELLM_MOE_TOKEN_TILE=<tokens> at engine build: the expert GEMM pipeline of a prefill pass runs over tiles of that many tokens (the experts are
+//! staged once per layer for all tokens), so the workspace holds the intermediates of one tile instead of the whole prompt. 0 = off (default).
+int32_t tokenTileFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_TOKEN_TILE");
+    int32_t const tile = value != nullptr ? std::atoi(value) : 0;
+    return tile < 16 ? 0 : tile;
+}
+
+//! Bytes of one staged layer: the four per-expert weight / scale tensors (inputs 2..5), 256-byte aligned each.
+size_t stagedExpertBytes(nvinfer1::Dims const* const dims[4], nvinfer1::DataType const types[4]) noexcept
+{
+    size_t total = 0;
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        size_t bytes = 1;
+        for (int32_t d = 0; d < dims[i]->nbDims; ++d)
+        {
+            bytes *= static_cast<size_t>(dims[i]->d[d]);
+        }
+        bytes *= (types[i] == nvinfer1::DataType::kHALF || types[i] == nvinfer1::DataType::kBF16)
+            ? 2
+            : (types[i] == nvinfer1::DataType::kINT32 || types[i] == nvinfer1::DataType::kFLOAT) ? 4 : 1;
+        total += (bytes + 255) & ~static_cast<size_t>(255);
+    }
+    return total + 256; // + the routed-expert bitmap
+}
+
+//! EDGELLM_MOE_PREFILL_OVERLAP=1 (runtime): during prefill passes (>= kPrefetchMinTokens tokens) the experts of layer L+1 are copied by DMA on a
+//! side stream into one of two private device buffers while layer L computes, so the PCIe copy that the routed-expert staging puts in front of every
+//! layer's GEMMs (about 40% of a 3k-token prefill, METRICS R25m) is hidden behind compute. With that many tokens nearly every expert is routed in
+//! every layer, so copying the whole layer is not wasteful. The first layer of a pass, chunks below the threshold and decode steps keep the staging
+//! kernel / the expert cache. With stage mode 2 (engine built with EDGELLM_MOE_STAGE_EXPERTS=2) the staging kernel writes into buffer 0 of the same
+//! private pair instead of the TRT workspace, so the pair replaces the workspace head (net cost: one layer of INT4 experts, ~386 MB for the 26B).
+constexpr int32_t kPrefetchMinTokens = 128;
+
+bool prefillOverlapFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_PREFILL_OVERLAP");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
+//! EDGELLM_MOE_PREFILL_FROM_CACHE (default on, 0 = off): the prefill prefetch copies the experts that the decode cache already holds with a device-to-device copy
+//! from their cache slot instead of over PCIe (the cache is not modified during prefill).
+bool prefillFromCacheFromEnv()
+{
+    static bool const on = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_PREFILL_FROM_CACHE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+//! EDGELLM_MOE_CACHE_BIAS=<beta> (lossy, decode only; default 0.5, measured on Qwen3.6 only, set 0 for exact routing): the router prefers experts that are resident in the per-layer GPU expert cache by adding beta to their
+//! logits before the top-k selection (combine weights stay the softmax of the original logits over the selected experts). Default 0.5 when unset; EDGELLM_MOE_CACHE_BIAS=0 gives exact routing.
+//! beta 0.5: ~65% fewer cache misses for +0.09% perplexity, beta 1: 85% fewer for +1.5% (METRICS R25ar/R25av, Qwen3.6).
+float cacheBiasFromEnv()
+{
+    static float const beta = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_CACHE_BIAS");
+        return v != nullptr ? std::max(0.0f, static_cast<float>(std::atof(v))) : 0.5f;
+    }();
+    return beta;
+}
+
+//! EDGELLM_MOE_TAIL_SKIP=<N> (lossy, opt-in, decode only; default 0 = off): with N > 0 an expert that is not resident in the cache and ranks at place N+1 or lower of the top-k is skipped
+//! (not fetched, its weight dropped without renormalising), the rule of PolyStrata's --tail-skip. Measured offline on Qwen3.6 at 55 slots (METRICS R25bw): N=6 on exact routing removes 38% of the loaded
+//! misses for +0.04% perplexity, N=5 54% for +0.26%; on top of EDGELLM_MOE_CACHE_BIAS=0.5 it adds +0.56% perplexity for 2.7 fewer miss points, so it is meant for exact routing (beta 0).
+int32_t tailSkipFromEnv()
+{
+    static int32_t const n = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_TAIL_SKIP");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+    }();
+    return n;
+}
+
+//! EDGELLM_MOE_CPU_MISS=1 (decode steps of <= 4 tokens served by the expert cache): a routed expert outside the cache is computed on the CPU from the pinned
+//! host copy instead of being copied in. EDGELLM_MOE_CPU_ADMIT=<n> (default 2): the n-th miss of an expert brings it into the cache; 0 never does.
+//! EDGELLM_MOE_CPU_THREADS=<n> (default 8): threads that spin for the work; EDGELLM_MOE_CPU_IDLE_MS=<ms> (default 1000, 0 = never): idle time after which they sleep 1 ms at a time.
+bool cpuMissFromEnv()
+{
+    static bool const on = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_MISS"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
+int32_t cpuMissAdmitFromEnv()
+{
+    static int32_t const n = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_ADMIT"); return v != nullptr ? std::atoi(v) : 2; }();
+    return n;
+}
+
+int32_t cpuMissThreadsFromEnv()
+{
+    static int32_t const n = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_THREADS"); return v != nullptr ? std::clamp(std::atoi(v), 1, 64) : 8; }();
+    return n;
+}
+
+//! Layer position inside the engine: the trailing integer of the plugin node name ("n0_18" -> 18); layers run in ascending order.
+int32_t layerIdFromName(std::string const& name) noexcept
+{
+    size_t const pos = name.find_last_of('_');
+    return pos == std::string::npos ? -1 : std::atoi(name.c_str() + pos + 1);
+}
+
+//! EDGELLM_FINITE_WATCH=1: every MoE layer records, for its input and output, the count of non-finite values, the largest finite |x| and the count of
+//! |x| >= 30000 (fp16 limit 65504). A host thread reads the device counters on its own stream and logs changes; nothing else synchronises with it.
+class FiniteWatch
+{
+public:
+    static constexpr int32_t kSlots = 512;
+
+    static FiniteWatch* get() noexcept
+    {
+        static FiniteWatch* instance = []() -> FiniteWatch* {
+            char const* value = std::getenv("EDGELLM_FINITE_WATCH");
+            if (value == nullptr || std::atoi(value) == 0)
+            {
+                return nullptr;
+            }
+            auto* watch = new FiniteWatch();
+            return watch->mReady ? watch : nullptr;
+        }();
+        return instance;
+    }
+
+    uint32_t* counters(int32_t layerId, int32_t which) noexcept
+    {
+        int32_t const slot = layerId >= 0 && layerId < kSlots ? layerId : 0;
+        return mDevice + (static_cast<size_t>(slot) * 2 + which) * 3;
+    }
+
+private:
+    FiniteWatch()
+    {
+        size_t const bytes = static_cast<size_t>(kSlots) * 2 * 3 * sizeof(uint32_t);
+        if (cudaMalloc(reinterpret_cast<void**>(&mDevice), bytes) != cudaSuccess || cudaMemset(mDevice, 0, bytes) != cudaSuccess
+            || cudaStreamCreateWithFlags(&mStream, cudaStreamNonBlocking) != cudaSuccess)
+        {
+            cudaGetLastError();
+            return;
+        }
+        mHost.assign(static_cast<size_t>(kSlots) * 2 * 3, 0);
+        mLast.assign(mHost.size(), 0);
+        mReady = true;
+        std::thread([this]() { run(); }).detach();
+    }
+
+    void run() noexcept
+    {
+        int32_t tick = 0;
+        while (true)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (cudaMemcpyAsync(mHost.data(), mDevice, mHost.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, mStream) != cudaSuccess
+                || cudaStreamSynchronize(mStream) != cudaSuccess)
+            {
+                cudaGetLastError();
+                continue;
+            }
+            float worst = 0.0F;
+            int32_t worstSlot = -1;
+            for (int32_t slot = 0; slot < kSlots * 2; ++slot)
+            {
+                uint32_t const bad = mHost[slot * 3];
+                float maxAbs;
+                std::memcpy(&maxAbs, &mHost[slot * 3 + 1], sizeof(float));
+                if (bad != mLast[slot * 3])
+                {
+                    LOG_ERROR("FINITE: layer node %d %s: %u non-finite values so far (largest finite |x| %.1f)", slot / 2, slot % 2 == 0 ? "input" : "output", bad, maxAbs);
+                    mLast[slot * 3] = bad;
+                }
+                if (maxAbs > worst)
+                {
+                    worst = maxAbs;
+                    worstSlot = slot;
+                }
+            }
+            if (++tick % 12 == 0 && worstSlot >= 0)
+            {
+                uint32_t near = 0;
+                for (int32_t slot = 0; slot < kSlots * 2; ++slot)
+                {
+                    near += mHost[slot * 3 + 2];
+                }
+                LOG_INFO("FINITE: largest |x| %.1f (%.0f%% of the fp16 limit) at layer node %d %s; values >= 30000 so far: %u", worst, 100.0F * worst / 65504.0F,
+                    worstSlot / 2, worstSlot % 2 == 0 ? "input" : "output", near);
+            }
+        }
+    }
+
+    uint32_t* mDevice{nullptr};
+    cudaStream_t mStream{nullptr};
+    std::vector<uint32_t> mHost;
+    std::vector<uint32_t> mLast;
+    bool mReady{false};
+};
+
+//! Layer ids of the MoE plugins of this process (for the automatic cache sizing). The node name carries a " [profile N]" suffix per optimisation
+//! profile, so the layers are counted by their id, not by the name string.
+std::set<int32_t>& moeLayerNames()
+{
+    static std::set<int32_t> names;
+    return names;
+}
+
+std::mutex& moeLayerNamesMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+void registerMoeLayerName(std::string const& name)
+{
+    std::lock_guard<std::mutex> lock(moeLayerNamesMutex());
+    moeLayerNames().insert(layerIdFromName(name));
+}
+
+size_t moeLayerCount()
+{
+    std::lock_guard<std::mutex> lock(moeLayerNamesMutex());
+    return moeLayerNames().size();
+}
+
+class PrefillExpertPrefetcher
+{
+public:
+    enum class Result
+    {
+        kNone,       //!< no private buffer available
+        kPrefetched, //!< ptrs hold this layer's experts, copied during the previous layer: no staging needed
+        kTarget      //!< ptrs is an empty private buffer the staging kernel must fill (mode 2 only)
+    };
+
+    static PrefillExpertPrefetcher& get()
+    {
+        static PrefillExpertPrefetcher instance;
+        return instance;
+    }
+
+    //! Allocate the private buffers (one, or two when prefetching) for layers of `bytes` bytes; false when the device is full.
+    bool reserve(size_t bytes, bool two) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return ensure(bytes, two);
+    }
+
+    //! Called at the start of a layer's enqueue that needs staged experts (main stream `stream`). `prefetch` = this pass is long enough to prefetch the
+    //! next layer; `wantTarget` = stage mode 2, a not-prefetched layer is staged into buffer 0 by the staging kernel.
+    Result begin(int32_t layerId, void const* const src[4], size_t const bytes[4], cudaStream_t stream, bool prefetch, bool wantTarget,
+        uint8_t* outPtrs[4]) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (layerId < 0)
+        {
+            return Result::kNone;
+        }
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess)
+        {
+            cudaGetLastError();
+        }
+        bool const capturing = capture != cudaStreamCaptureStatusNone; // graph capture: no cross-stream events, no prefetch
+        if (capturing)
+        {
+            prefetch = false;
+        }
+        Layer& layer = mLayers[layerId];
+        size_t total = 0;
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            layer.src[i] = src[i];
+            layer.bytes[i] = bytes[i];
+            layer.offset[i] = total;
+            total += (bytes[i] + 255) & ~static_cast<size_t>(255);
+        }
+        layer.total = total;
+        if (!ensure(total, prefetch || mTwo))
+        {
+            return Result::kNone;
+        }
+        int32_t current = -1;
+        if (prefetch && mPendingLayer == layerId && mPendingBuf >= 0)
+        {
+            cudaStreamWaitEvent(stream, mCopyDone[mPendingBuf], 0);
+            current = mPendingBuf;
+        }
+        else if (wantTarget && !capturing)
+        {
+            // a stale prefetch into buffer 0 may still be in flight: the staging kernel must not overwrite it before it lands
+            for (int32_t b = 0; b < 2; ++b)
+            {
+                if (mCopyRecorded[b])
+                {
+                    cudaStreamWaitEvent(stream, mCopyDone[b], 0);
+                }
+            }
+        }
+        if (current < 0)
+        {
+            // first layer of a pass (nothing was prefetched for it): decode steps replay as a CUDA graph, so no host call tells us the cache changed since the snapshot
+            mSnapshotValid = false;
+        }
+        mPendingLayer = -1;
+        mPendingBuf = -1;
+        int32_t const used = current >= 0 ? current : 0;
+        if (current >= 0 || wantTarget)
+        {
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                outPtrs[i] = mBuf[used] + layer.offset[i];
+            }
+        }
+        auto next = mLayers.upper_bound(layerId);
+        if (prefetch && mTwo && next != mLayers.end() && next->second.total <= mBufBytes)
+        {
+            int32_t const target = 1 - used;
+            // everything queued on the main stream so far (the previous layer's GEMMs, which may still read this buffer) must finish first
+            cudaEventRecord(mBufFree, stream);
+            cudaStreamWaitEvent(mSide, mBufFree, 0);
+            bool ok = true;
+            CacheView const* const view = prefillFromCacheFromEnv() && snapshotCaches(stream) ? cacheView(next->first, next->second) : nullptr;
+            mBatchDst.clear();
+            mBatchSrc.clear();
+            mBatchSize.clear();
+            for (int32_t i = 0; i < 4 && ok; ++i)
+            {
+                uint8_t* const dst = mBuf[target] + next->second.offset[i];
+                if (view == nullptr)
+                {
+                    ok = cudaMemcpyAsync(dst, next->second.src[i], next->second.bytes[i], cudaMemcpyHostToDevice, mSide) == cudaSuccess;
+                    continue;
+                }
+                size_t const bpe = view->bytesPerExpert[i];
+                int32_t const* const slots = mSnapshot.data() + static_cast<size_t>(view->snapshotAt) * view->numExperts;
+                for (int32_t e = 0; e < view->numExperts;)
+                {
+                    if (slots[e] >= 0)
+                    {
+                        mBatchDst.push_back(dst + e * bpe);
+                        mBatchSrc.push_back(view->tensors[i] + static_cast<size_t>(slots[e]) * bpe);
+                        mBatchSize.push_back(bpe);
+                        ++e;
+                        continue;
+                    }
+                    int32_t run = e;
+                    while (run < view->numExperts && slots[run] < 0)
+                    {
+                        ++run;
+                    }
+                    mBatchDst.push_back(dst + e * bpe);
+                    mBatchSrc.push_back(static_cast<uint8_t const*>(next->second.src[i]) + e * bpe);
+                    mBatchSize.push_back((run - e) * bpe);
+                    e = run;
+                }
+            }
+            if (ok && !mBatchDst.empty())
+            {
+                // one driver call for the whole layer instead of a few hundred cudaMemcpyAsync calls
+                cudaMemcpyAttributes attrs{};
+                attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+                size_t attrsIdx = 0;
+                if (cudaMemcpyBatchAsync(mBatchDst.data(), mBatchSrc.data(), mBatchSize.data(), mBatchDst.size(), &attrs, &attrsIdx, 1, mSide)
+                    != cudaSuccess)
+                {
+                    cudaGetLastError();
+                    for (size_t k = 0; k < mBatchDst.size() && ok; ++k)
+                    {
+                        ok = cudaMemcpyAsync(mBatchDst[k], mBatchSrc[k], mBatchSize[k], cudaMemcpyDefault, mSide) == cudaSuccess;
+                    }
+                }
+            }
+            if (ok && cudaEventRecord(mCopyDone[target], mSide) == cudaSuccess)
+            {
+                mPendingLayer = next->first;
+                mPendingBuf = target;
+                mCopyRecorded[target] = true;
+            }
+            else
+            {
+                cudaGetLastError();
+            }
+        }
+        if (current >= 0)
+        {
+            return Result::kPrefetched;
+        }
+        return wantTarget ? Result::kTarget : Result::kNone;
+    }
+
+    //! The decode cache of a layer (device slotOf[numExperts] and the four slot-major tensors); called by the plugin once its cache is allocated.
+    void registerCache(int32_t layerId, int32_t const* slotOf, uint8_t const* const tensors[4], size_t const bytesPerExpert[4], int32_t numExperts) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        CacheView& view = mCache[layerId];
+        view.slotOf = slotOf;
+        view.numExperts = numExperts;
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            view.tensors[i] = tensors[i];
+            view.bytesPerExpert[i] = bytesPerExpert[i];
+        }
+        mSnapshotValid = false;
+    }
+
+    //! The plugin gave its cache up (a failed resize): drop the view so the freed memory is not read.
+    void unregisterCache(int32_t layerId) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mCache.erase(layerId);
+        mSnapshotValid = false;
+    }
+
+    //! A decode step (or any non-prefill call) breaks the layer sequence: a prefetch issued for a layer that now will not run must not be consumed.
+    void invalidate() noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mPendingLayer = -1;
+        mPendingBuf = -1;
+        mSnapshotValid = false;
+    }
+
+private:
+    struct CacheView
+    {
+        int32_t const* slotOf{nullptr};
+        uint8_t const* tensors[4]{};
+        size_t bytesPerExpert[4]{};
+        int32_t numExperts{0};
+        int32_t snapshotAt{-1}; //!< index of this layer's slotOf copy in the host snapshot
+    };
+
+    struct Layer
+    {
+        void const* src[4]{};
+        size_t bytes[4]{};
+        size_t offset[4]{};
+        size_t total{0};
+    };
+
+    bool ensure(size_t needed, bool two) noexcept
+    {
+        if (mFailed)
+        {
+            return false;
+        }
+        if (mReady && (mTwo || !two))
+        {
+            return needed <= mBufBytes;
+        }
+        // layer sizes are equal across the layers of this model; sized for the first layer seen
+        size_t const size = mReady ? mBufBytes : needed;
+        if (mBuf[0] == nullptr && cudaMalloc(reinterpret_cast<void**>(&mBuf[0]), size) != cudaSuccess)
+        {
+            cudaGetLastError();
+            mFailed = true;
+            LOG_WARNING("Int4MoePlugin: private expert buffer (%zu bytes) not allocated", size);
+            return false;
+        }
+        if (two)
+        {
+            if (cudaMalloc(reinterpret_cast<void**>(&mBuf[1]), size) != cudaSuccess || cudaStreamCreateWithFlags(&mSide, cudaStreamNonBlocking) != cudaSuccess
+                || cudaEventCreateWithFlags(&mCopyDone[0], cudaEventDisableTiming) != cudaSuccess
+                || cudaEventCreateWithFlags(&mCopyDone[1], cudaEventDisableTiming) != cudaSuccess
+                || cudaEventCreateWithFlags(&mBufFree, cudaEventDisableTiming) != cudaSuccess)
+            {
+                cudaGetLastError();
+                if (mBuf[1] != nullptr)
+                {
+                    cudaFree(mBuf[1]);
+                    mBuf[1] = nullptr;
+                }
+                LOG_WARNING("Int4MoePlugin: prefill prefetch buffer (%zu bytes) not allocated; staging without overlap", size);
+                two = false;
+            }
+            else
+            {
+                mTwo = true;
+            }
+        }
+        if (!mReady)
+        {
+            mBufBytes = size;
+            mReady = true;
+            LOG_INFO("Int4MoePlugin: private expert buffers %d x %.1f MiB (prefill overlap %s)", mTwo ? 2 : 1, size / 1048576.0, mTwo ? "on" : "off");
+        }
+        return needed <= mBufBytes;
+    }
+
+    //! Copies every registered layer's slotOf to the host once per run of prefill passes (decode steps invalidate it); the stream is synchronised once.
+    bool snapshotCaches(cudaStream_t stream) noexcept
+    {
+        if (mSnapshotValid)
+        {
+            return true;
+        }
+        if (mCache.empty())
+        {
+            return false;
+        }
+        size_t const perLayer = mCache.begin()->second.numExperts;
+        size_t const needed = perLayer * mCache.size();
+        if (mSnapshotHost == nullptr || mSnapshotCapacity < needed)
+        {
+            if (mSnapshotHost != nullptr)
+            {
+                cudaFreeHost(mSnapshotHost);
+            }
+            mSnapshotHost = nullptr;
+            if (cudaMallocHost(reinterpret_cast<void**>(&mSnapshotHost), needed * sizeof(int32_t)) != cudaSuccess)
+            {
+                cudaGetLastError();
+                return false;
+            }
+            mSnapshotCapacity = needed;
+        }
+        int32_t index = 0;
+        for (auto& entry : mCache)
+        {
+            CacheView& view = entry.second;
+            if (view.numExperts != static_cast<int32_t>(perLayer)
+                || cudaMemcpyAsync(mSnapshotHost + static_cast<size_t>(index) * perLayer, view.slotOf, perLayer * sizeof(int32_t), cudaMemcpyDeviceToHost, stream)
+                    != cudaSuccess)
+            {
+                cudaGetLastError();
+                return false;
+            }
+            view.snapshotAt = index++;
+        }
+        if (cudaStreamSynchronize(stream) != cudaSuccess)
+        {
+            cudaGetLastError();
+            return false;
+        }
+        mSnapshot.assign(mSnapshotHost, mSnapshotHost + needed);
+        mSnapshotValid = true;
+        return true;
+    }
+
+    //! The cache view of a layer when its tensors have the cache's per-expert sizes, else null.
+    CacheView const* cacheView(int32_t layerId, Layer const& layer) const noexcept
+    {
+        auto const it = mCache.find(layerId);
+        if (it == mCache.end() || it->second.snapshotAt < 0 || it->second.numExperts <= 0)
+        {
+            return nullptr;
+        }
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            if (layer.bytes[i] != it->second.bytesPerExpert[i] * it->second.numExperts)
+            {
+                return nullptr;
+            }
+        }
+        return &it->second;
+    }
+
+    std::mutex mMutex;
+    std::map<int32_t, CacheView> mCache;
+    int32_t* mSnapshotHost{nullptr};
+    size_t mSnapshotCapacity{0};
+    std::vector<int32_t> mSnapshot;
+    std::vector<void*> mBatchDst;
+    std::vector<void const*> mBatchSrc;
+    std::vector<size_t> mBatchSize;
+    bool mSnapshotValid{false};
+    std::map<int32_t, Layer> mLayers;
+    uint8_t* mBuf[2]{nullptr, nullptr};
+    size_t mBufBytes{0};
+    cudaStream_t mSide{nullptr};
+    cudaEvent_t mCopyDone[2]{nullptr, nullptr};
+    cudaEvent_t mBufFree{nullptr};
+    bool mCopyRecorded[2]{false, false};
+    int32_t mPendingLayer{-1};
+    int32_t mPendingBuf{-1};
+    bool mReady{false};
+    bool mTwo{false};
+    bool mFailed{false};
+};
+
+//! EDGELLM_MOE_PREFILL_CHUNK=<experts> (serve time, needs an engine built with EDGELLM_MOE_STAGE_EXPERTS=2): the prefill expert GEMMs run in chunks of that many
+//! experts. The experts of every chunk (gate/up tensors, then down tensors) are copied by DMA on a side stream into a small ring of private device buffers
+//! (EDGELLM_MOE_PREFILL_RING slots, default 3) while the previous chunk's GEMM runs, across the layer boundary as well, so the whole layer never has to
+//! be resident: the cost is RING x one chunk instead of one or two whole layers, and it does not grow with the number of experts. The Marlin GEMM is run once
+//! per chunk on a compact copy of the routing arrays of that chunk (no kernel change).
+int32_t prefillChunkFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_PREFILL_CHUNK");
+    int32_t const chunk = value != nullptr ? std::atoi(value) : 0;
+    return chunk > 0 ? chunk : 0;
+}
+
+//! EDGELLM_MOE_PREFILL_ROUTED_CHUNK=<experts> (serve time, default 0 = off, a value such as 16 turns it on; needs an engine built with EDGELLM_MOE_STAGE_EXPERTS=2): prefill passes that fit one
+//! token tile run the expert GEMMs in chunks of that many routed experts; after the router has run, only the routed experts are copied by DMA into a small ring
+//! (EDGELLM_MOE_PREFILL_ROUTED_RING slots, default 4) while the previous chunk's GEMM runs. Costs one host round trip of the routed list per layer. Pays only when a
+//! pass routes to a small share of the experts: prompts of ordinary text do, application prompts route to 80-90% of them and run slower than with the whole-layer overlap.
+int32_t routedChunkFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_PREFILL_ROUTED_CHUNK");
+    int32_t const chunk = value != nullptr ? std::atoi(value) : 0;
+    return chunk > 0 ? chunk : 0;
+}
+
+int32_t routedRingFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_MOE_PREFILL_ROUTED_RING");
+    int32_t const slots = value != nullptr ? std::atoi(value) : 4;
+    return slots < 2 ? 2 : (slots > 16 ? 16 : slots);
+}
+
+class ExpertChunkRing
+{
+public:
+    static ExpertChunkRing& get()
+    {
+        static ExpertChunkRing instance;
+        return instance;
+    }
+
+    //! Allocate the ring for experts with `bpe[i]` bytes per expert in tensor i (0/1 gate-up weights/scales, 2/3 down weights/scales).
+    bool reserve(size_t const bpe[4], int32_t numExperts, int32_t chunkExperts) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return ensure(bpe, numExperts, chunkExperts);
+    }
+
+    size_t ringBytes(size_t const bpe[4], int32_t chunkExperts) const noexcept
+    {
+        return static_cast<size_t>(slotCount()) * slotBytesFor(bpe, chunkExperts);
+    }
+
+    void registerLayer(int32_t layerId, void const* const src[4], size_t const bpe[4])
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        LayerSrc& layer = mLayers[layerId];
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            layer.src[i] = src[i];
+            layer.bpe[i] = bpe[i];
+        }
+    }
+
+    //! Wait for the copy of task (layerId, phase, chunk) (phase 0 = gate-up, 1 = down) and return its slot base pointer; the copies of the next tasks are
+    //! issued first. Call release() after the GEMM of the task has been enqueued.
+    bool acquire(int32_t layerId, int32_t phase, int32_t chunk, cudaStream_t stream, uint8_t** base, int32_t* weightsOffset, int32_t* scalesOffset) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!mReady)
+        {
+            return false;
+        }
+        if (mQueue.empty() || mQueue.front().layerId != layerId || mQueue.front().phase != phase || mQueue.front().chunk != chunk)
+        {
+            // a new pass (or a break in the sequence): start the pipeline at this task; stale copies already queued on the side stream finish first
+            // (single side stream, in order), so reusing their slots is safe
+            mQueue.clear();
+            mCursorValid = false;
+            issue(layerId, phase, chunk, stream);
+        }
+        issueAhead(stream);
+        if (mQueue.empty())
+        {
+            return false;
+        }
+        Issued const& task = mQueue.front();
+        cudaStreamWaitEvent(stream, mCopyDone[task.slot], 0);
+        *base = mBuf[task.slot];
+        *weightsOffset = 0;
+        *scalesOffset = static_cast<int32_t>(mScalesOffset[phase]);
+        return true;
+    }
+
+    void release(cudaStream_t stream) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mQueue.empty())
+        {
+            return;
+        }
+        int32_t const slot = mQueue.front().slot;
+        cudaEventRecord(mSlotFree[slot], stream);
+        mSlotUsed[slot] = true;
+        mQueue.pop_front();
+        issueAhead(stream);
+    }
+
+    int32_t chunkExperts() const noexcept
+    {
+        return mChunk;
+    }
+
+private:
+    struct LayerSrc
+    {
+        void const* src[4]{};
+        size_t bpe[4]{};
+    };
+    struct Issued
+    {
+        int32_t layerId;
+        int32_t phase;
+        int32_t chunk;
+        int32_t slot;
+    };
+
+    static int32_t slotCount() noexcept
+    {
+        char const* const value = std::getenv("EDGELLM_MOE_PREFILL_RING");
+        int32_t const slots = value != nullptr ? std::atoi(value) : 3;
+        return slots < 2 ? 2 : (slots > 8 ? 8 : slots);
+    }
+
+    static size_t align256(size_t bytes) noexcept
+    {
+        return (bytes + 255) & ~static_cast<size_t>(255);
+    }
+
+    //! Bytes of one ring slot: the larger of a gate-up chunk (tensors 0 + 1) and a down chunk (tensors 2 + 3), each tensor 256-byte aligned.
+    static size_t slotBytesFor(size_t const bpe[4], int32_t chunkExperts) noexcept
+    {
+        size_t const e = static_cast<size_t>(chunkExperts);
+        size_t const gateUp = align256(e * bpe[0]) + align256(e * bpe[1]);
+        size_t const down = align256(e * bpe[2]) + align256(e * bpe[3]);
+        return std::max(gateUp, down);
+    }
+
+    bool ensure(size_t const bpe[4], int32_t numExperts, int32_t chunkExperts) noexcept
+    {
+        if (mFailed)
+        {
+            return false;
+        }
+        if (mReady)
+        {
+            return true;
+        }
+        mNumExperts = numExperts;
+        mChunk = std::min(chunkExperts, numExperts);
+        mRing = slotCount();
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            mBpe[i] = bpe[i];
+        }
+        mScalesOffset[0] = align256(static_cast<size_t>(mChunk) * bpe[0]);
+        mScalesOffset[1] = align256(static_cast<size_t>(mChunk) * bpe[2]);
+        mSlotBytes = slotBytesFor(bpe, mChunk);
+        bool ok = cudaStreamCreateWithFlags(&mSide, cudaStreamNonBlocking) == cudaSuccess;
+        for (int32_t i = 0; i < mRing && ok; ++i)
+        {
+            ok = cudaMalloc(reinterpret_cast<void**>(&mBuf[i]), mSlotBytes) == cudaSuccess
+                && cudaEventCreateWithFlags(&mCopyDone[i], cudaEventDisableTiming) == cudaSuccess
+                && cudaEventCreateWithFlags(&mSlotFree[i], cudaEventDisableTiming) == cudaSuccess;
+        }
+        if (!ok)
+        {
+            cudaGetLastError();
+            for (int32_t i = 0; i < mRing; ++i)
+            {
+                if (mBuf[i] != nullptr)
+                {
+                    cudaFree(mBuf[i]);
+                    mBuf[i] = nullptr;
+                }
+            }
+            mFailed = true;
+            LOG_ERROR("Int4MoePlugin: prefill chunk ring (%d x %zu bytes) not allocated", mRing, mSlotBytes);
+            return false;
+        }
+        mReady = true;
+        LOG_INFO("Int4MoePlugin: prefill chunk ring %d x %.1f MiB (%d experts per chunk)", mRing, mSlotBytes / 1048576.0, mChunk);
+        return true;
+    }
+
+    int32_t chunksPerPhase() const noexcept
+    {
+        return (mNumExperts + mChunk - 1) / mChunk;
+    }
+
+    //! The task that follows (layer, phase, chunk) in execution order, false when the next layer is not known yet.
+    bool nextTask(int32_t& layer, int32_t& phase, int32_t& chunk) const
+    {
+        if (chunk + 1 < chunksPerPhase())
+        {
+            ++chunk;
+            return true;
+        }
+        if (phase == 0)
+        {
+            phase = 1;
+            chunk = 0;
+            return true;
+        }
+        auto it = mLayers.upper_bound(layer);
+        if (it == mLayers.end())
+        {
+            return false;
+        }
+        layer = it->first;
+        phase = 0;
+        chunk = 0;
+        return true;
+    }
+
+    void issue(int32_t layerId, int32_t phase, int32_t chunk, cudaStream_t mainStream) noexcept
+    {
+        auto it = mLayers.find(layerId);
+        if (it == mLayers.end())
+        {
+            return;
+        }
+        int32_t const slot = mIssueCounter % mRing;
+        ++mIssueCounter;
+        if (mSlotUsed[slot])
+        {
+            cudaStreamWaitEvent(mSide, mSlotFree[slot], 0); // the GEMM that last read this slot has been enqueued on the main stream
+        }
+        (void) mainStream;
+        int32_t const e0 = chunk * mChunk;
+        int32_t const count = std::min(mChunk, mNumExperts - e0);
+        int32_t const t0 = phase == 0 ? 0 : 2;
+        size_t offset = 0;
+        for (int32_t t = 0; t < 2; ++t)
+        {
+            size_t const bytes = static_cast<size_t>(count) * it->second.bpe[t0 + t];
+            cudaMemcpyAsync(mBuf[slot] + offset, static_cast<uint8_t const*>(it->second.src[t0 + t]) + static_cast<size_t>(e0) * it->second.bpe[t0 + t], bytes,
+                cudaMemcpyHostToDevice, mSide);
+            offset = align256(static_cast<size_t>(mChunk) * it->second.bpe[t0]);
+        }
+        cudaEventRecord(mCopyDone[slot], mSide);
+        mQueue.push_back({layerId, phase, chunk, slot});
+        mCursorLayer = layerId;
+        mCursorPhase = phase;
+        mCursorChunk = chunk;
+        mCursorValid = true;
+    }
+
+    void issueAhead(cudaStream_t mainStream) noexcept
+    {
+        while (static_cast<int32_t>(mQueue.size()) < mRing && mCursorValid)
+        {
+            int32_t layer = mCursorLayer;
+            int32_t phase = mCursorPhase;
+            int32_t chunk = mCursorChunk;
+            if (!nextTask(layer, phase, chunk))
+            {
+                break;
+            }
+            issue(layer, phase, chunk, mainStream);
+        }
+    }
+
+    std::mutex mMutex;
+    std::map<int32_t, LayerSrc> mLayers;
+    std::deque<Issued> mQueue;
+    uint8_t* mBuf[8]{};
+    cudaEvent_t mCopyDone[8]{};
+    cudaEvent_t mSlotFree[8]{};
+    bool mSlotUsed[8]{};
+    cudaStream_t mSide{nullptr};
+    size_t mBpe[4]{};
+    size_t mScalesOffset[2]{};
+    size_t mSlotBytes{0};
+    int32_t mNumExperts{0};
+    int32_t mChunk{0};
+    int32_t mRing{0};
+    int32_t mIssueCounter{0};
+    int32_t mCursorLayer{-1};
+    int32_t mCursorPhase{0};
+    int32_t mCursorChunk{0};
+    bool mCursorValid{false};
+    bool mReady{false};
+    bool mFailed{false};
+};
+
+//! Workspace bytes reserved for staging: the whole layer in mode 1, only the routed-expert bitmap in mode 2.
+size_t stagedWorkspaceBytes(int32_t mode, nvinfer1::Dims const* const dims[4], nvinfer1::DataType const types[4]) noexcept
+{
+    return mode == 1 ? stagedExpertBytes(dims, types) : (mode == 2 ? 256 : 0);
+}
+
 size_t computeInt4MoeWorkspaceSize(
-    int64_t numTokens, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize) noexcept
+    int64_t numTokens, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize, int32_t tokenTile) noexcept
 {
     try
     {
@@ -121,7 +1025,8 @@ size_t computeInt4MoeWorkspaceSize(
         CUDA_CHECK(cudaGetDevice(&dev));
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
 
-        int32_t const totalSlots = static_cast<int32_t>(numTokens) * topK;
+        int32_t const tileTokens = tokenTile > 0 ? static_cast<int32_t>(std::min<int64_t>(numTokens, tokenTile)) : static_cast<int32_t>(numTokens);
+        int32_t const totalSlots = tileTokens * topK;
         int32_t const maxPaddedSlots = totalSlots + numExperts * kLARGE_TOKEN_BLOCK_SIZE;
         int32_t const maxPaddedBlocks = std::max(
             static_cast<int32_t>(divUp(totalSlots + numExperts * kSMALL_TOKEN_BLOCK_SIZE, kSMALL_TOKEN_BLOCK_SIZE)),
@@ -165,6 +1070,10 @@ size_t computeInt4MoeWorkspaceSize(
         size = accumulateWorkspaceSize(size, rt::Coords{totalSlots, hiddenSize}, DataType::kHALF);
         // Marlin W4A16 GEMM workspace (locks + FP32 reduction buffer)
         size = accumulateWorkspaceSize(size, rt::Coords{marlinWorkspaceSize}, DataType::kINT32);
+        // Routing arrays of one expert chunk (chunked prefill GEMMs, EDGELLM_MOE_PREFILL_CHUNK)
+        size = accumulateWorkspaceSize(size, rt::Coords{maxPaddedSlots}, DataType::kINT32);
+        size = accumulateWorkspaceSize(size, rt::Coords{maxPaddedBlocks}, DataType::kINT32);
+        size = accumulateWorkspaceSize(size, rt::Coords{1}, DataType::kINT32);
         // Routing weights in padded slot order for down GEMM (mulTopkWeights=true)
         size = accumulateWorkspaceSize(size, rt::Coords{maxPaddedSlots}, DataType::kFLOAT);
         return size;
@@ -194,6 +1103,8 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, int32_t const numExperts, 
     , mActivationType(activationType)
     , mQuantizationGroupSize(quantizationGroupSize)
 {
+    registerMoeLayerName(mLayerName);
+    FiniteWatch::get();
     if (std::find(kSUPPORTED_ACTIVATION_TYPES.begin(), kSUPPORTED_ACTIVATION_TYPES.end(), mActivationType)
         == kSUPPORTED_ACTIVATION_TYPES.end())
     {
@@ -205,6 +1116,8 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, int32_t const numExperts, 
 Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection const* fc)
     : mLayerName(name)
 {
+    registerMoeLayerName(mLayerName);
+    FiniteWatch::get();
     for (int32_t i = 0; i < fc->nbFields; ++i)
     {
         std::string fieldName(fc->fields[i].name);
@@ -232,6 +1145,16 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
         {
             mQuantizationGroupSize = *static_cast<int32_t const*>(fc->fields[i].data);
         }
+        else if (fieldName == "stage_experts")
+        {
+            mStageExperts = *static_cast<int32_t const*>(fc->fields[i].data);
+            mStageExpertsFieldSeen = true;
+        }
+        else if (fieldName == "token_tile")
+        {
+            mTokenTile = *static_cast<int32_t const*>(fc->fields[i].data);
+            mTokenTileFieldSeen = true;
+        }
     }
 
     if (std::find(kSUPPORTED_ACTIVATION_TYPES.begin(), kSUPPORTED_ACTIVATION_TYPES.end(), mActivationType)
@@ -242,7 +1165,504 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
     }
 }
 
-Int4MoePlugin::~Int4MoePlugin() noexcept {}
+namespace
+{
+//! EDGELLM_MOE_HOSTFUNC_PROBE=1: add a device-to-host copy of the router ids and an empty host node to every cached decode layer (cost probe for a CPU miss path).
+bool hostRoundTripProbeFromEnv()
+{
+    static bool const on = []() { char const* v = std::getenv("EDGELLM_MOE_HOSTFUNC_PROBE"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+} // namespace
+
+namespace
+{
+//! EDGELLM_MOE_STATS=<prefix>: every 15 s (and at destruction) the selection counters of a layer instance are written
+//! to <prefix>.<layer>.json: {"decode":[per expert], "prefill":[per expert], "cache":{lookups, needed, misses}} (decode = passes of <= 16 rows;
+//! cache = device expert cache lookups, distinct experts needed and misses summed over all calls, present once the cache is allocated).
+void writeMoeStats(std::string const& prefix, std::string const& layer, int32_t const* device, int32_t numExperts,
+    int32_t const* cacheTally)
+{
+    std::vector<int32_t> host(2 * static_cast<size_t>(numExperts));
+    if (cudaMemcpy(host.data(), device, host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess)
+    {
+        cudaGetLastError();
+        return;
+    }
+    std::string text = "{\"decode\":[";
+    for (int32_t e = 0; e < numExperts; ++e)
+    {
+        text += (e ? "," : "") + std::to_string(host[e]);
+    }
+    text += "],\"prefill\":[";
+    for (int32_t e = 0; e < numExperts; ++e)
+    {
+        text += (e ? "," : "") + std::to_string(host[numExperts + e]);
+    }
+    text += "]";
+    int32_t tally[3]{};
+    if (cacheTally != nullptr && cudaMemcpy(tally, cacheTally, sizeof(tally), cudaMemcpyDeviceToHost) == cudaSuccess)
+    {
+        text += ",\"cache\":{\"lookups\":" + std::to_string(tally[0]) + ",\"needed\":" + std::to_string(tally[1])
+            + ",\"misses\":" + std::to_string(tally[2]) + "}";
+    }
+    text += "}\n";
+    std::string safe = layer;
+    for (char& c : safe)
+    {
+        if (c == '/' || c == ' ')
+        {
+            c = '_';
+        }
+    }
+    FILE* file = std::fopen((prefix + "." + safe + ".json").c_str(), "w");
+    if (file != nullptr)
+    {
+        std::fputs(text.c_str(), file);
+        std::fclose(file);
+    }
+}
+} // namespace
+
+namespace
+{
+std::mutex gLiveCacheMutex;
+std::atomic<int64_t> gCacheAllocFailures{0};
+
+std::vector<Int4MoePlugin*>& liveCachePlugins()
+{
+    static std::vector<Int4MoePlugin*> plugins;
+    return plugins;
+}
+
+void unregisterLiveCache(Int4MoePlugin* plugin)
+{
+    std::lock_guard<std::mutex> lock(gLiveCacheMutex);
+    auto& plugins = liveCachePlugins();
+    plugins.erase(std::remove(plugins.begin(), plugins.end(), plugin), plugins.end());
+}
+} // namespace
+
+Int4MoePlugin::~Int4MoePlugin() noexcept
+{
+    unregisterLiveCache(this);
+    if (mStatsThread.joinable())
+    {
+        mStatsStop = true;
+        mStatsThread.join();
+    }
+    if (mStats != nullptr)
+    {
+        cudaFree(mStats);
+    }
+    if (mCacheMem != nullptr)
+    {
+        cudaFree(mCacheMem);
+    }
+    if (mCacheState != nullptr)
+    {
+        cudaFree(mCacheState);
+        if (mCpuAdmit != nullptr)
+        {
+            cudaFree(mCpuAdmit);
+        }
+    }
+}
+
+bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc) noexcept
+{
+    if (mCacheSlots < 0)
+    {
+        char const* value = std::getenv("EDGELLM_MOE_CACHE_SLOTS");
+        if (value != nullptr && std::string(value) == "auto")
+        {
+            // EDGELLM_MOE_CACHE_SLOTS=auto: as many slots per layer as the free device memory holds, decided once (first decode step: the engine,
+            // KV and every plugin workspace exist by then), after the private staging / prefetch buffers are reserved. EDGELLM_MOE_CACHE_RESERVE_MB
+            // (default 250) stays free for transient allocations.
+            static std::mutex autoMutex;
+            static int32_t autoSlots = -1;
+            std::lock_guard<std::mutex> lock(autoMutex);
+            if (autoSlots < 0)
+            {
+                size_t perSlot = 0;
+                size_t layerBytes = 0;
+                for (int32_t i = 0; i < 4; ++i)
+                {
+                    size_t bytes = 1;
+                    for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+                    {
+                        bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+                    }
+                    bytes *= inputDesc[2 + i].type == DataType::kHALF ? 2 : 1;
+                    perSlot += bytes / mNumExperts + 256;
+                    layerBytes += (bytes + 255) & ~static_cast<size_t>(255);
+                }
+                if (mStageExperts == 2 && routedChunkFromEnv() > 0 && mNumExperts <= 1024)
+                {
+                    size_t bpe[4];
+                    for (int32_t i = 0; i < 4; ++i)
+                    {
+                        size_t bytes = 1;
+                        for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+                        {
+                            bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+                        }
+                        bpe[i] = bytes * (inputDesc[2 + i].type == DataType::kHALF ? 2 : 1) / mNumExperts;
+                    }
+                    routedring::RoutedExpertRing::get().reserve(bpe, mNumExperts, routedChunkFromEnv(), routedRingFromEnv());
+                }
+                if (mStageExperts == 2 && prefillChunkFromEnv() > 0)
+                {
+                    size_t bpe[4];
+                    for (int32_t i = 0; i < 4; ++i)
+                    {
+                        size_t bytes = 1;
+                        for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+                        {
+                            bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+                        }
+                        bpe[i] = bytes * (inputDesc[2 + i].type == DataType::kHALF ? 2 : 1) / mNumExperts;
+                    }
+                    ExpertChunkRing::get().reserve(bpe, mNumExperts, prefillChunkFromEnv());
+                }
+                else if (mStageExperts == 2 || prefillOverlapFromEnv())
+                {
+                    PrefillExpertPrefetcher::get().reserve(layerBytes, prefillOverlapFromEnv());
+                }
+                size_t freeBytes = 0;
+                size_t totalBytes = 0;
+                cudaMemGetInfo(&freeBytes, &totalBytes);
+                // EDGELLM_MOE_MAX_VRAM_MB: total device memory the server may occupy (what is in use now, the engine, KV, workspaces and the private
+                // buffers, counts against it); makes the slot count independent of other GPU tenants and emulates a smaller card.
+                if (char const* maxEnv = std::getenv("EDGELLM_MOE_MAX_VRAM_MB"))
+                {
+                    size_t const maxBytes = static_cast<size_t>(std::atoll(maxEnv)) << 20;
+                    size_t const usedBytes = totalBytes - freeBytes;
+                    size_t const capFree = maxBytes > usedBytes ? maxBytes - usedBytes : 0;
+                    freeBytes = std::min(freeBytes, capFree);
+                }
+                char const* reserveEnv = std::getenv("EDGELLM_MOE_CACHE_RESERVE_MB");
+                size_t const reserve = (reserveEnv != nullptr ? static_cast<size_t>(std::atoi(reserveEnv)) : 250) << 20;
+                size_t const layers = std::max<size_t>(1, moeLayerCount());
+                size_t const fit = freeBytes > reserve ? (freeBytes - reserve) / (layers * perSlot) : 0;
+                autoSlots = static_cast<int32_t>(std::min<size_t>(fit, static_cast<size_t>(mNumExperts)));
+                if (autoSlots < static_cast<int32_t>(mTopK))
+                {
+                    autoSlots = 0;
+                }
+                LOG_INFO("Int4MoePlugin: automatic expert cache size %d slots per layer x %zu layers (usable free %.0f MiB, reserve %.0f MiB, %.2f MiB per slot-layer)",
+                    autoSlots, layers, freeBytes / 1048576.0, reserve / 1048576.0, perSlot / 1048576.0);
+            }
+            mCacheSlots = autoSlots;
+        }
+        else
+        {
+            mCacheSlots = value != nullptr ? std::atoi(value) : 0;
+        }
+    }
+    if (mCacheSlots <= 0)
+    {
+        return false;
+    }
+    if (mCacheReady)
+    {
+        return true;
+    }
+    size_t total = 0;
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        size_t bytes = 1;
+        for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+        {
+            bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+        }
+        bytes *= inputDesc[2 + i].type == DataType::kHALF ? 2 : 1;
+        mCacheBytesPerExpert[i] = bytes / mNumExperts;
+        if (mCacheBytesPerExpert[i] % 16 != 0)
+        {
+            // the fill kernel moves 16-byte vectors
+            LOG_WARNING("Int4MoePlugin %s: expert cache disabled, tensor %d holds %zu bytes per expert (not a multiple of 16)", mLayerName.c_str(), i,
+                mCacheBytesPerExpert[i]);
+            mCacheSlots = 0;
+            return false;
+        }
+        total += (mCacheBytesPerExpert[i] * mCacheSlots + 255) & ~static_cast<size_t>(255);
+    }
+    size_t const stateInts = mNumExperts + 2 * static_cast<size_t>(mCacheSlots) + 1 + 1 + 2 * mCacheSlots + 3;
+    if (cudaMalloc(&mCacheMem, total) != cudaSuccess || cudaMalloc(reinterpret_cast<void**>(&mCacheState), stateInts * 4) != cudaSuccess)
+    {
+        cudaGetLastError();
+        LOG_WARNING("Int4MoePlugin %s: expert cache of %d slots not allocated (%zu bytes); using staging", mLayerName.c_str(),
+            mCacheSlots, total);
+        ++gCacheAllocFailures;
+        mCacheSlots = 0;
+        return false;
+    }
+    uint8_t* cursor = static_cast<uint8_t*>(mCacheMem);
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        mCacheTensors[i] = cursor;
+        cursor += (mCacheBytesPerExpert[i] * mCacheSlots + 255) & ~static_cast<size_t>(255);
+    }
+    cudaMemset(mCacheState, 0xFF, (static_cast<size_t>(mNumExperts) + mCacheSlots) * 4); // slotOf, expertOf = -1
+    cudaMemset(mCacheState + mNumExperts + mCacheSlots, 0, (stateInts - mNumExperts - mCacheSlots) * 4);
+    mCacheTally = mCacheState + stateInts - 3;
+    mCacheReady = true;
+    if (cpuMissFromEnv() && cudaMalloc(reinterpret_cast<void**>(&mCpuAdmit), (static_cast<size_t>(mNumExperts) + 1) * sizeof(int32_t)) == cudaSuccess)
+    {
+        cudaMemset(mCpuAdmit, 0, (static_cast<size_t>(mNumExperts) + 1) * sizeof(int32_t));
+    }
+    PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
+    {
+        std::lock_guard<std::mutex> lock(gLiveCacheMutex);
+        liveCachePlugins().push_back(this);
+    }
+    LOG_INFO("Int4MoePlugin %s: expert cache %d slots, %.1f MiB", mLayerName.c_str(), mCacheSlots, total / 1048576.0);
+    return true;
+}
+
+size_t Int4MoePlugin::cacheBytesPerSlot() const noexcept
+{
+    size_t bytes = 0;
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        bytes += mCacheBytesPerExpert[i];
+    }
+    return mCacheReady ? bytes : 0;
+}
+
+int64_t Int4MoePlugin::resizeExpertCache(int32_t newSlots) noexcept
+{
+    if (!mCacheReady || newSlots == mCacheSlots || newSlots < 1 || newSlots > mNumExperts)
+    {
+        return 0;
+    }
+    int32_t const oldSlots = mCacheSlots;
+    size_t const experts = static_cast<size_t>(mNumExperts);
+    auto stateInts = [experts](int32_t slots) { return experts + 4 * static_cast<size_t>(slots) + 5; };
+    auto tensorBytes = [this](int32_t i, int32_t slots) { return (mCacheBytesPerExpert[i] * slots + 255) & ~static_cast<size_t>(255); };
+    auto totalBytes = [&](int32_t slots) {
+        size_t total = 0;
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            total += tensorBytes(i, slots);
+        }
+        return total;
+    };
+
+    // Everything that survives goes through host memory, so the old block can be freed before the new one is allocated: a shrink must
+    // work when the device has no free memory left.
+    int32_t const kept = std::min(oldSlots, newSlots);
+    std::vector<int32_t> oldState(stateInts(oldSlots));
+    std::vector<uint8_t> keptTensors[4];
+    cudaError_t status = cudaDeviceSynchronize();
+    if (status == cudaSuccess)
+    {
+        status = cudaMemcpy(oldState.data(), mCacheState, oldState.size() * 4, cudaMemcpyDeviceToHost);
+    }
+    for (int32_t i = 0; i < 4 && status == cudaSuccess; ++i)
+    {
+        try
+        {
+            keptTensors[i].resize(mCacheBytesPerExpert[i] * kept);
+        }
+        catch (std::exception const&)
+        {
+            status = cudaErrorMemoryAllocation;
+            break;
+        }
+        status = cudaMemcpy(keptTensors[i].data(), mCacheTensors[i], keptTensors[i].size(), cudaMemcpyDeviceToHost);
+    }
+    if (status != cudaSuccess)
+    {
+        LOG_WARNING("Int4MoePlugin %s: expert cache resize cannot read the cache: %s", mLayerName.c_str(), cudaGetErrorString(status));
+        cudaGetLastError();
+        return 0;
+    }
+
+    auto buildState = [&](int32_t slots) {
+        // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S], tally[3]
+        std::vector<int32_t> state(stateInts(slots), 0);
+        int32_t const live = std::min(kept, slots);
+        for (size_t e = 0; e < experts; ++e)
+        {
+            state[e] = oldState[e] >= live ? -1 : oldState[e];
+        }
+        for (int32_t s = 0; s < slots; ++s)
+        {
+            state[experts + s] = s < live ? oldState[experts + s] : -1;
+            state[experts + slots + s] = s < live ? oldState[experts + oldSlots + s] : 0;
+        }
+        state[experts + 2 * static_cast<size_t>(slots)] = oldState[experts + 2 * static_cast<size_t>(oldSlots)];
+        for (size_t k = 0; k < 3; ++k)
+        {
+            state[state.size() - 3 + k] = oldState[oldState.size() - 3 + k];
+        }
+        return state;
+    };
+
+    size_t const oldTotal = totalBytes(oldSlots) + stateInts(oldSlots) * 4;
+    void* const retiredMem = mCacheMem;
+    int32_t* const retiredState = mCacheState;
+    mCacheTally = nullptr;
+    PrefillExpertPrefetcher::get().invalidate();
+    cudaFree(retiredMem);
+    cudaFree(retiredState);
+    mCacheMem = nullptr;
+    mCacheState = nullptr;
+
+    // Allocate the requested size; if a growth does not fit, fall back to the old size, which is always free again.
+    for (int32_t slots : {newSlots, oldSlots})
+    {
+        if (slots == oldSlots && newSlots < oldSlots)
+        {
+            break;
+        }
+        std::vector<int32_t> state = buildState(slots);
+        size_t const total = totalBytes(slots);
+        void* mem = nullptr;
+        int32_t* deviceState = nullptr;
+        cudaError_t allocStatus = cudaMalloc(&mem, total);
+        if (allocStatus == cudaSuccess)
+        {
+            allocStatus = cudaMalloc(reinterpret_cast<void**>(&deviceState), state.size() * 4);
+        }
+        if (allocStatus == cudaSuccess)
+        {
+            allocStatus = cudaMemcpy(deviceState, state.data(), state.size() * 4, cudaMemcpyHostToDevice);
+        }
+        uint8_t* cursor = static_cast<uint8_t*>(mem);
+        uint8_t* tensors[4]{};
+        for (int32_t i = 0; i < 4 && allocStatus == cudaSuccess; ++i)
+        {
+            tensors[i] = cursor;
+            if (!keptTensors[i].empty())
+            {
+                allocStatus = cudaMemcpy(cursor, keptTensors[i].data(), mCacheBytesPerExpert[i] * std::min(kept, slots), cudaMemcpyHostToDevice);
+            }
+            cursor += tensorBytes(i, slots);
+        }
+        if (allocStatus != cudaSuccess)
+        {
+            LOG_WARNING("Int4MoePlugin %s: expert cache resize to %d slots failed (%zu bytes): %s", mLayerName.c_str(), slots, total,
+                cudaGetErrorString(allocStatus));
+            cudaGetLastError();
+            cudaFree(mem);
+            cudaFree(deviceState);
+            continue;
+        }
+        mCacheMem = mem;
+        mCacheState = deviceState;
+        mCacheSlots = slots;
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            mCacheTensors[i] = tensors[i];
+        }
+        mCacheTally = mCacheState + state.size() - 3;
+        PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
+        return static_cast<int64_t>(oldTotal) - static_cast<int64_t>(total + state.size() * 4);
+    }
+
+    // No cache could be rebuilt: continue without one (decode falls back to staging).
+    LOG_WARNING("Int4MoePlugin %s: expert cache disabled after a failed resize.", mLayerName.c_str());
+    mCacheReady = false;
+    mCacheSlots = 0;
+    PrefillExpertPrefetcher::get().unregisterCache(layerIdFromName(mLayerName));
+    return static_cast<int64_t>(oldTotal);
+}
+
+bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
+{
+    if (mCpuMissChecked)
+    {
+        return mCpuMissReady;
+    }
+    mCpuMissChecked = true;
+    if (mCpuAdmit == nullptr)
+    {
+        return false;
+    }
+    size_t const hidden = static_cast<size_t>(mHiddenSize);
+    size_t const inter = static_cast<size_t>(mMoeInterSize);
+    size_t const n1 = 2 * inter;
+    size_t const expected[4] = {(hidden / 16) * 2 * n1 * 4, (hidden / 128) * n1 * 2, (inter / 16) * 2 * hidden * 4, (inter / 128) * hidden * 2};
+    bool ok = mActivationType != kACTIVATION_GEGLU
+        && cpumiss::shapeSupported(mHiddenSize, mMoeInterSize, mQuantizationGroupSize, kernel::kCpuMissMaxHidden);
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        ok = ok && mCacheBytesPerExpert[i] == expected[i];
+    }
+    int32_t const layerId = layerIdFromName(mLayerName);
+    ok = ok && layerId >= 0 && layerId < cpumiss::Pool::kMaxLayers && cpumiss::Pool::get().init(cpuMissThreadsFromEnv());
+    // The packed weights sit in pinned host memory, which the CPU reads at its own address; the scales may sit in device memory, so they are mirrored once.
+    uint8_t const* host[4]{};
+    bool mirrored[4]{};
+    for (int32_t i = 0; i < 4 && ok; ++i)
+    {
+        cudaPointerAttributes attributes{};
+        bool const known = cudaPointerGetAttributes(&attributes, inputs[2 + i]) == cudaSuccess;
+        cudaGetLastError();
+        if (known && attributes.type == cudaMemoryTypeHost && attributes.hostPointer != nullptr)
+        {
+            host[i] = static_cast<uint8_t const*>(attributes.hostPointer);
+            continue;
+        }
+        size_t const bytes = mCacheBytesPerExpert[i] * static_cast<size_t>(mNumExperts);
+        mCpuMirror[i].resize(bytes);
+        if (cudaMemcpy(mCpuMirror[i].data(), inputs[2 + i], bytes, cudaMemcpyDefault) != cudaSuccess)
+        {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+        host[i] = mCpuMirror[i].data();
+        mirrored[i] = true;
+    }
+    mCpuMissReady = ok;
+    LOG_INFO("Int4MoePlugin %s: CPU miss path %s (%d threads, admit after %d misses; tensors mirrored to host: %d%d%d%d)", mLayerName.c_str(),
+        ok ? "on" : "unavailable for this layer shape, CPU or memory", cpuMissThreadsFromEnv(), cpuMissAdmitFromEnv(), mirrored[0], mirrored[1], mirrored[2],
+        mirrored[3]);
+    if (!ok)
+    {
+        return false;
+    }
+    cpumiss::LayerWeights weights;
+    weights.guW = host[0];
+    weights.guS = host[1];
+    weights.dnW = host[2];
+    weights.dnS = host[3];
+    weights.guWBytes = mCacheBytesPerExpert[0];
+    weights.guSBytes = mCacheBytesPerExpert[1];
+    weights.dnWBytes = mCacheBytesPerExpert[2];
+    weights.dnSBytes = mCacheBytesPerExpert[3];
+    weights.hidden = mHiddenSize;
+    weights.inter = mMoeInterSize;
+    cpumiss::Pool::get().registerLayer(layerId, weights);
+    return true;
+}
+
+void Int4MoePlugin::startStats(std::string const& prefix)
+{
+    size_t const bytes = 2 * static_cast<size_t>(mNumExperts) * sizeof(int32_t);
+    if (cudaMalloc(reinterpret_cast<void**>(&mStats), bytes) != cudaSuccess)
+    {
+        mStats = nullptr;
+        return;
+    }
+    cudaMemset(mStats, 0, bytes);
+    mStatsThread = std::thread([this, prefix]() {
+        int32_t waited = 0;
+        while (!mStatsStop)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (++waited % 30 == 0 || mStatsStop)
+            {
+                writeMoeStats(prefix, mLayerName, mStats, mNumExperts, mCacheTally.load());
+            }
+        }
+        writeMoeStats(prefix, mLayerName, mStats, mNumExperts, mCacheTally.load());
+    });
+}
 
 IPluginCapability* Int4MoePlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
 {
@@ -264,6 +1684,8 @@ IPluginV3* Int4MoePlugin::clone() noexcept
         auto* plugin = new Int4MoePlugin(
             mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType, mQuantizationGroupSize);
         plugin->setPluginNamespace(mNamespace.c_str());
+        plugin->setStageExperts(mStageExperts);
+        plugin->setTokenTile(mTokenTile);
         return plugin;
     }
     catch (std::exception const& e)
@@ -479,7 +1901,14 @@ size_t Int4MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, in
         LOG_ERROR("Int4MoePlugin: invalid profile maximum shapes while computing workspace");
         return 0;
     }
-    return computeInt4MoeWorkspaceSize(maxTokens, mNumExperts, mTopK, mHiddenSize, mMoeInterSize);
+    size_t staged = 0;
+    if (mStageExperts != 0)
+    {
+        nvinfer1::Dims const* const dims[4] = {&inputs[2].desc.dims, &inputs[3].desc.dims, &inputs[4].desc.dims, &inputs[5].desc.dims};
+        nvinfer1::DataType const types[4] = {inputs[2].desc.type, inputs[3].desc.type, inputs[4].desc.type, inputs[5].desc.type};
+        staged = stagedWorkspaceBytes(mStageExperts, dims, types);
+    }
+    return computeInt4MoeWorkspaceSize(maxTokens, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mTokenTile) + staged;
 }
 
 int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
@@ -517,23 +1946,181 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             return -1;
         }
         int32_t const numTokens = static_cast<int32_t>(numTokens64);
-        int32_t const moeBlockSize = getTunedMoeBlockSize(numTokens64);
+        if (FiniteWatch* watch = FiniteWatch::get(); watch != nullptr && hiddenStatesDesc.type == DataType::kHALF)
+        {
+            kernel::launchFiniteWatch(static_cast<half const*>(inputs[1]), numTokens64 * mHiddenSize, watch->counters(layerIdFromName(mLayerName), 0), stream);
+        }
+        int32_t const tileTokens = mTokenTile > 0 ? std::min(numTokens, mTokenTile) : numTokens;
+        int32_t const moeBlockSize = getTunedMoeBlockSize(tileTokens);
 
         rt::Tensor hiddenStatesTensor(const_cast<void*>(inputs[1]), rt::Coords{hiddenStatesDesc.dims},
             rt::DeviceType::kGPU, hiddenStatesDesc.type);
 
+        // With staging on, expert weights that live in pinned host memory are copied (routed experts only) into the head of the
+        // workspace and the GEMMs read that copy; otherwise the GEMMs read the engine input directly.
+        void const* weightPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
+        std::byte* alignedWorkspacePtr = static_cast<std::byte*>(workspace);
+        bool stageNow = false;
+        trt_edgellm::kernel::ExpertStagingCopy stagingCopy{};
+        uint8_t* neededPtr = nullptr;
+        if (mStageExperts != 0)
+        {
+            cudaPointerAttributes attributes{};
+            if (cudaPointerGetAttributes(&attributes, inputs[2]) != cudaSuccess)
+            {
+                cudaGetLastError();
+            }
+            else
+            {
+                stageNow = attributes.type == cudaMemoryTypeHost;
+            }
+        }
+        bool useCache = false;
+        static bool const prefillOverlap = prefillOverlapFromEnv();
+        nvinfer1::Dims const* const stageDims[4] = {&inputDesc[2].dims, &inputDesc[3].dims, &inputDesc[4].dims, &inputDesc[5].dims};
+        nvinfer1::DataType const stageTypes[4] = {inputDesc[2].type, inputDesc[3].type, inputDesc[4].type, inputDesc[5].type};
+        size_t tensorBytes[4];
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            size_t bytes = 1;
+            for (int32_t d = 0; d < inputDesc[2 + i].dims.nbDims; ++d)
+            {
+                bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
+            }
+            tensorBytes[i] = bytes * (inputDesc[2 + i].type == DataType::kHALF ? 2 : 1);
+        }
+        // decode steps served by the expert cache never stage
+        bool const cacheStep = stageNow && numTokens <= 4 && ensureExpertCache(inputDesc) && numTokens * mTopK <= mCacheSlots;
+        auto pfResult = PrefillExpertPrefetcher::Result::kNone;
+        uint8_t* privatePtrs[4]{};
+        static int32_t const chunkExperts = prefillChunkFromEnv();
+        bool chunkMode = false;
+        static int32_t const routedChunk = routedChunkFromEnv();
+        bool routedMode = false;
+        if (routedChunk > 0 && mStageExperts == 2 && stageNow && !cacheStep && tileTokens == numTokens && mNumExperts <= 1024)
+        {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess)
+            {
+                cudaGetLastError();
+            }
+            if (capture == cudaStreamCaptureStatusNone)
+            {
+                size_t bpe[4];
+                for (int32_t i = 0; i < 4; ++i)
+                {
+                    bpe[i] = tensorBytes[i] / mNumExperts;
+                }
+                routedMode = routedring::RoutedExpertRing::get().reserve(bpe, mNumExperts, routedChunk, routedRingFromEnv());
+            }
+        }
+        if (!routedMode && chunkExperts > 0 && mStageExperts == 2 && stageNow && !cacheStep && tileTokens == numTokens)
+        {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess)
+            {
+                cudaGetLastError();
+            }
+            if (capture == cudaStreamCaptureStatusNone)
+            {
+                size_t bpe[4];
+                for (int32_t i = 0; i < 4; ++i)
+                {
+                    bpe[i] = tensorBytes[i] / mNumExperts;
+                }
+                void const* srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
+                if (ExpertChunkRing::get().reserve(bpe, mNumExperts, chunkExperts))
+                {
+                    ExpertChunkRing::get().registerLayer(layerIdFromName(mLayerName), srcPtrs, bpe);
+                    chunkMode = true;
+                }
+            }
+        }
+        if (stageNow && !cacheStep && !chunkMode && !routedMode && (prefillOverlap || mStageExperts == 2))
+        {
+            void const* srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
+            pfResult = PrefillExpertPrefetcher::get().begin(layerIdFromName(mLayerName), srcPtrs, tensorBytes, stream,
+                prefillOverlap && numTokens >= kPrefetchMinTokens, mStageExperts == 2, privatePtrs);
+            if (mStageExperts == 2 && pfResult == PrefillExpertPrefetcher::Result::kNone)
+            {
+                LOG_ERROR("Int4MoePlugin %s: private staging buffer unavailable", mLayerName.c_str());
+                return 1;
+            }
+        }
+        else if (stageNow && prefillOverlap)
+        {
+            PrefillExpertPrefetcher::get().invalidate();
+        }
+        if (chunkMode || routedMode)
+        {
+            // the GEMMs run chunk by chunk on the ring buffers: no layer-wide staging
+            alignedWorkspacePtr += stagedWorkspaceBytes(mStageExperts, stageDims, stageTypes);
+            stageNow = false;
+        }
+        else if (pfResult == PrefillExpertPrefetcher::Result::kPrefetched)
+        {
+            // this layer's experts were copied during the previous layer: the GEMMs read the private buffer, the staging kernel is skipped
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                weightPtrs[i] = privatePtrs[i];
+            }
+            alignedWorkspacePtr += stagedWorkspaceBytes(mStageExperts, stageDims, stageTypes); // the staging region stays unused
+            stageNow = false;
+        }
+        else if (cacheStep)
+        {
+            useCache = true;
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                stagingCopy.src[i] = static_cast<uint8_t const*>(inputs[2 + i]);
+                stagingCopy.dst[i] = mCacheTensors[i];
+                stagingCopy.bytesPerExpert[i] = mCacheBytesPerExpert[i];
+                weightPtrs[i] = mCacheTensors[i];
+            }
+            stagingCopy.numTensors = 4;
+            alignedWorkspacePtr += stagedWorkspaceBytes(mStageExperts, stageDims, stageTypes); // the staging region stays unused
+        }
+        else if (stageNow)
+        {
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                size_t const bytes = tensorBytes[i];
+                stagingCopy.src[i] = static_cast<uint8_t const*>(inputs[2 + i]);
+                stagingCopy.bytesPerExpert[i] = bytes / mNumExperts;
+                if (mStageExperts == 2)
+                {
+                    stagingCopy.dst[i] = privatePtrs[i];
+                    weightPtrs[i] = privatePtrs[i];
+                }
+                else
+                {
+                    stagingCopy.dst[i] = reinterpret_cast<uint8_t*>(alignedWorkspacePtr);
+                    weightPtrs[i] = alignedWorkspacePtr;
+                    alignedWorkspacePtr += (bytes + 255) & ~static_cast<size_t>(255);
+                }
+            }
+            stagingCopy.numTensors = 4;
+            neededPtr = reinterpret_cast<uint8_t*>(alignedWorkspacePtr);
+            alignedWorkspacePtr += 256;
+        }
+        else if (mStageExperts != 0)
+        {
+            // staging space is reserved but unused; skip it so the later carving matches the size computation
+            alignedWorkspacePtr += stagedWorkspaceBytes(mStageExperts, stageDims, stageTypes);
+        }
+
         // Weights arrive as INT8 (view of Marlin int32-packed); Marlin expects INT32
-        rt::Tensor gateUpQWeightsTensor(const_cast<void*>(inputs[2]),
+        rt::Tensor gateUpQWeightsTensor(const_cast<void*>(weightPtrs[0]),
             rt::Coords{mNumExperts, mHiddenSize / 16, 2 * mMoeInterSize}, rt::DeviceType::kGPU, DataType::kINT32);
 
         rt::Tensor gateUpScalesTensor(
-            const_cast<void*>(inputs[3]), rt::Coords{inputDesc[3].dims}, rt::DeviceType::kGPU, inputDesc[3].type);
+            const_cast<void*>(weightPtrs[1]), rt::Coords{inputDesc[3].dims}, rt::DeviceType::kGPU, inputDesc[3].type);
 
-        rt::Tensor downQWeightsTensor(const_cast<void*>(inputs[4]),
+        rt::Tensor downQWeightsTensor(const_cast<void*>(weightPtrs[2]),
             rt::Coords{mNumExperts, mMoeInterSize / 16, 2 * mHiddenSize}, rt::DeviceType::kGPU, DataType::kINT32);
 
         rt::Tensor downScalesTensor(
-            const_cast<void*>(inputs[5]), rt::Coords{inputDesc[5].dims}, rt::DeviceType::kGPU, inputDesc[5].type);
+            const_cast<void*>(weightPtrs[3]), rt::Coords{inputDesc[5].dims}, rt::DeviceType::kGPU, inputDesc[5].type);
 
         rt::Tensor outputTensor(outputs[0], rt::Coords{outputDesc[0].dims}, rt::DeviceType::kGPU, outputDesc[0].type);
 
@@ -543,10 +2130,8 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         CUDA_CHECK(cudaGetDevice(&dev));
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
 
-        std::byte* alignedWorkspacePtr = static_cast<std::byte*>(workspace);
-
         // ==================== Workspace Allocation ====================
-        int32_t totalSlots = numTokens * mTopK;
+        int32_t totalSlots = tileTokens * mTopK;
         int32_t maxPaddedSlots = totalSlots + mNumExperts * moeBlockSize;
         int32_t maxPaddedBlocks = divUp(maxPaddedSlots, moeBlockSize);
 
@@ -603,6 +2188,12 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             trt_edgellm::kernel::getMoeMarlinWorkspaceSize(maxPaddedSlots, mHiddenSize, moeBlockSize, sms));
         int32_t* marlinWorkspacePtr = static_cast<int32_t*>(
             assignTensorFromWorkspace(alignedWorkspacePtr, {marlinWorkspaceSize}, DataType::kINT32).rawPointer());
+        int32_t* chunkSortedIdsPtr = static_cast<int32_t*>(
+            assignTensorFromWorkspace(alignedWorkspacePtr, {maxPaddedSlots}, DataType::kINT32).rawPointer());
+        int32_t* chunkExpertIdsPtr = static_cast<int32_t*>(
+            assignTensorFromWorkspace(alignedWorkspacePtr, {maxPaddedBlocks}, DataType::kINT32).rawPointer());
+        int32_t* chunkNumPostPtr
+            = static_cast<int32_t*>(assignTensorFromWorkspace(alignedWorkspacePtr, {1}, DataType::kINT32).rawPointer());
 
         // ==================== Step 1: TopK Softmax on router_logits ====================
         rt::Tensor topkWeightsTensor(
@@ -610,19 +2201,87 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor topkIndicesTensor(
             topkIndicesPtr, {numTokens, mTopK}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
-        moeTopkSoftmax(routerLogitsTensor, topkWeightsTensor, topkIndicesTensor, mTopK, softmaxWorkspacePtr,
-            softmaxWorkspaceSizeBytes, stream, true, 0.0f);
+        if (useCache && (cacheBiasFromEnv() > 0.0f || tailSkipFromEnv() > 0) && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
+        {
+            kernel::ExpertCacheState const biasState{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
+                mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
+            if (mTopK > kernel::kRouterMaxTopK)
+            {
+                LOG_ERROR("Int4MoePlugin %s: cache-aware routing supports at most %d experts per token (top-k %d)", mLayerName.c_str(), kernel::kRouterMaxTopK, mTopK);
+                return -1;
+            }
+            kernel::launchCacheAwareTopk(static_cast<float const*>(inputs[0]), numTokens, mNumExperts, mTopK, cacheBiasFromEnv(), tailSkipFromEnv(), biasState,
+                topkIndicesPtr, topkWeightsPtr, stream);
+        }
+        else
+        {
+            moeTopkSoftmax(routerLogitsTensor, topkWeightsTensor, topkIndicesTensor, mTopK, softmaxWorkspacePtr,
+                softmaxWorkspaceSizeBytes, stream, true, 0.0f);
+        }
         CUDA_CHECK(cudaGetLastError());
 
+        bool const cpuMiss = useCache && cpuMissFromEnv() && numTokens <= kernel::kCpuMissMaxTokens
+            && numTokens * mTopK <= kernel::kCpuMissMaxSlots && tileTokens == numTokens && prepareCpuMiss(inputs);
+        if (useCache && hostRoundTripProbeFromEnv())
+        {
+            // rtx4060/moe-cpu-miss step 1: cost of the host round trip a CPU miss path needs (router ids to pinned host memory + a stream-blocking host node), no compute
+            static int32_t* const probeHost = []() { void* p = nullptr; cudaMallocHost(&p, 4096); return static_cast<int32_t*>(p); }();
+            cudaMemcpyAsync(probeHost, topkIndicesPtr, static_cast<size_t>(numTokens) * mTopK * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+            cudaLaunchHostFunc(stream, [](void*) {}, nullptr);
+        }
+        if (useCache)
+        {
+            kernel::ExpertCacheState state{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
+                mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
+            if (cpuMiss)
+            {
+                cpumiss::Pool& pool = cpumiss::Pool::get();
+                kernel::launchCpuMissDoorbell(topkIndicesPtr, topkWeightsPtr, numTokens, mTopK, mNumExperts,
+                    static_cast<half const*>(hiddenStatesTensor.rawPointer()), mHiddenSize, state, mCpuAdmit, cpuMissAdmitFromEnv(),
+                    pool.mailboxDevice(), pool.stateDevice(), layerIdFromName(mLayerName), stream);
+            }
+            kernel::launchExpertCacheLookup(topkIndicesPtr, numTokens * mTopK, mNumExperts, state, stream);
+            kernel::launchExpertCacheFill(state, stagingCopy, numTokens * mTopK, stream);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        else if (stageNow)
+        {
+            kernel::launchStageRoutedExperts(topkIndicesPtr, numTokens * mTopK, mNumExperts, neededPtr, stagingCopy, stream,
+                mStats == nullptr ? nullptr : mStats + (numTokens > 16 ? mNumExperts : 0));
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        float* const topkWeightsPaddedPtr = static_cast<float*>(
+            assignTensorFromWorkspace(alignedWorkspacePtr, {maxPaddedSlots}, DataType::kFLOAT).rawPointer());
+
+        // Everything below runs once per tile of tokens: the workspace holds the intermediates of one tile.
+        auto runTile = [&](int32_t t0, int32_t tokens)
+        {
+            int32_t const tileSlots = tokens * mTopK;
+            int32_t const tilePadded = tileSlots + mNumExperts * moeBlockSize;
+            int32_t const tileBlocks = divUp(tilePadded, moeBlockSize);
+            int32_t* const tileTopkIdx = topkIndicesPtr + static_cast<int64_t>(t0) * mTopK;
+            float* const tileTopkW = topkWeightsPtr + static_cast<int64_t>(t0) * mTopK;
         // Reshape hidden_states to 2D for expert GEMMs
-        rt::Tensor hiddenStates2D(const_cast<void*>(hiddenStatesTensor.rawPointer()), {numTokens, mHiddenSize},
-            rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::Tensor hiddenStates2D(const_cast<half*>(static_cast<half const*>(hiddenStatesTensor.rawPointer())) + static_cast<int64_t>(t0) * mHiddenSize,
+            {tokens, mHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // ==================== Step 2: Prepare Marlin GEMM Indices ====================
         CUDA_CHECK(cudaMemsetAsync(slotsPerExpertWorkspace, 0, mNumExperts * sizeof(int32_t), stream));
         kernel::launchCountSlotsPerExpertKernel(
-            topkIndicesPtr, slotsPerExpertWorkspace, numTokens, mTopK, mNumExperts, stream);
+            tileTopkIdx, slotsPerExpertWorkspace, tokens, mTopK, mNumExperts, stream);
         CUDA_CHECK(cudaGetLastError());
+        if (routedMode)
+        {
+            routedring::RoutedExpertRing& ring = routedring::RoutedExpertRing::get();
+            kernel::launchBuildRoutedList(
+                slotsPerExpertWorkspace, mNumExperts, ring.routedListDevice(), ring.rankOfDevice(), ring.numRoutedDevice(), stream);
+            void const* const srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
+            if (ring.readRouted(stream) < 1 || !ring.beginLayer(srcPtrs, stream))
+            {
+                throw std::runtime_error("routed expert ring: layer not available");
+            }
+        }
 
         kernel::launchComputePaddedOffsetsKernel(slotsPerExpertWorkspace, paddedCountsPtr, paddedOffsetsPtr,
             numTokensPostPaddedPtr, mNumExperts, moeBlockSize, stream);
@@ -630,64 +2289,154 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
 
         CUDA_CHECK(cudaMemsetAsync(slotsPerExpertWorkspace, 0, mNumExperts * sizeof(int32_t), stream));
         kernel::launchBuildSlotListsKernel(
-            topkIndicesPtr, slotsByExpertWorkspace, slotsPerExpertWorkspace, numTokens, mTopK, mNumExperts, stream);
+            tileTopkIdx, slotsByExpertWorkspace, slotsPerExpertWorkspace, tokens, mTopK, mNumExperts, stream);
         CUDA_CHECK(cudaGetLastError());
 
         rt::Tensor sortedTokenIdsTensor(
-            sortedTokenIdsPtr, {maxPaddedSlots}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-        rt::Tensor expertIdsTensor(expertIdsPtr, {maxPaddedBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+            sortedTokenIdsPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+        rt::Tensor expertIdsTensor(expertIdsPtr, {tileBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
         rt::Tensor numTokensPostPaddedTensor(
             numTokensPostPaddedPtr, {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
         rt::Tensor topkWeightsFlatTensor(
-            topkWeightsFlatPtr, {maxPaddedSlots}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+            topkWeightsFlatPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
         rt::Tensor marlinWorkspaceTensor(
             marlinWorkspacePtr, {marlinWorkspaceSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
         kernel::launchBuildMarlinIndicesKernel(slotsByExpertWorkspace, slotsPerExpertWorkspace, paddedCountsPtr,
-            paddedOffsetsPtr, topkWeightsPtr, sortedTokenIdsPtr, topkWeightsFlatPtr, expertIdsPtr, numTokens, mTopK,
+            paddedOffsetsPtr, tileTopkW, sortedTokenIdsPtr, topkWeightsFlatPtr, expertIdsPtr, tokens, mTopK,
             mNumExperts, moeBlockSize, stream);
 
         // ==================== Step 3: Gate-Up Projection (Marlin INT4 GEMM) ====================
         rt::Tensor gateUpOutputTensor(
-            gateUpOutputPtr, {totalSlots, 2 * mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+            gateUpOutputPtr, {tileSlots, 2 * mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-        moeAwqW4A16MarlinGemm(hiddenStates2D, gateUpOutputTensor, gateUpQWeightsTensor, gateUpScalesTensor,
-            sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsFlatTensor,
-            marlinWorkspaceTensor, moeBlockSize, mTopK, false, stream);
+        // Chunked prefill (EDGELLM_MOE_PREFILL_CHUNK): the same GEMM once per chunk of experts, weights from the ring, routing arrays sliced per chunk.
+        // phase 0 = gate-up, 1 = down; the weight tensors are the chunk's slice with the chunk's expert count as leading dimension.
+        auto runChunkedGemm = [&](int32_t phase, rt::Tensor const& gemmInput, rt::Tensor& gemmOutput, int64_t kTile, int64_t nOut,
+                                  nvinfer1::PluginTensorDesc const& scalesDesc, rt::Tensor const& gemmTopkWeights, int64_t gemmTopK,
+                                  bool mulTopkWeights)
+        {
+            if (routedMode)
+            {
+                routedring::RoutedExpertRing& routed = routedring::RoutedExpertRing::get();
+                for (int32_t c = 0; c < routed.chunksPerPhase(); ++c)
+                {
+                    int32_t const count = routed.chunkCount(c);
+                    kernel::launchBuildRoutedChunkIndices(paddedOffsetsPtr, paddedCountsPtr, sortedTokenIdsPtr, expertIdsPtr,
+                        routed.routedListDevice(), routed.rankOfDevice(), c * routed.chunkExperts(), count, moeBlockSize, tilePadded,
+                        chunkSortedIdsPtr, chunkExpertIdsPtr, chunkNumPostPtr, stream);
+                    uint8_t* base = nullptr;
+                    int32_t weightsOffset = 0;
+                    int32_t scalesOffset = 0;
+                    if (!routed.acquire(phase, c, stream, &base, &weightsOffset, &scalesOffset))
+                    {
+                        throw std::runtime_error("routed expert ring: task not available");
+                    }
+                    rt::Tensor chunkWeights(base + weightsOffset, rt::Coords{count, kTile, nOut}, rt::DeviceType::kGPU, DataType::kINT32);
+                    rt::Tensor chunkScales(base + scalesOffset, rt::Coords{count, scalesDesc.dims.d[1], scalesDesc.dims.d[2]},
+                        rt::DeviceType::kGPU, scalesDesc.type);
+                    rt::Tensor chunkSortedIds(chunkSortedIdsPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                    rt::Tensor chunkExpertIds(chunkExpertIdsPtr, {tileBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                    rt::Tensor chunkNumPost(chunkNumPostPtr, {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                    moeAwqW4A16MarlinGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, chunkSortedIds, chunkExpertIds, chunkNumPost,
+                        gemmTopkWeights, marlinWorkspaceTensor, moeBlockSize, gemmTopK, mulTopkWeights, stream);
+                    CUDA_CHECK(cudaGetLastError());
+                    routed.release(stream);
+                }
+                return;
+            }
+            ExpertChunkRing& ring = ExpertChunkRing::get();
+            int32_t const chunk = ring.chunkExperts();
+            for (int32_t e0 = 0, c = 0; e0 < mNumExperts; e0 += chunk, ++c)
+            {
+                int32_t const e1 = std::min(e0 + chunk, mNumExperts);
+                kernel::launchBuildChunkMarlinIndicesKernel(paddedOffsetsPtr, numTokensPostPaddedPtr, sortedTokenIdsPtr, expertIdsPtr, e0, e1,
+                    mNumExperts, moeBlockSize, tilePadded, chunkSortedIdsPtr, chunkExpertIdsPtr, chunkNumPostPtr, stream);
+                uint8_t* base = nullptr;
+                int32_t weightsOffset = 0;
+                int32_t scalesOffset = 0;
+                if (!ring.acquire(layerIdFromName(mLayerName), phase, c, stream, &base, &weightsOffset, &scalesOffset))
+                {
+                    throw std::runtime_error("expert chunk ring: task not available");
+                }
+                int64_t const count = e1 - e0;
+                rt::Tensor chunkWeights(base + weightsOffset, rt::Coords{count, kTile, nOut}, rt::DeviceType::kGPU, DataType::kINT32);
+                rt::Tensor chunkScales(base + scalesOffset, rt::Coords{count, scalesDesc.dims.d[1], scalesDesc.dims.d[2]}, rt::DeviceType::kGPU,
+                    scalesDesc.type);
+                rt::Tensor chunkSortedIds(chunkSortedIdsPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                rt::Tensor chunkExpertIds(chunkExpertIdsPtr, {tileBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                rt::Tensor chunkNumPost(chunkNumPostPtr, {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                moeAwqW4A16MarlinGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, chunkSortedIds, chunkExpertIds, chunkNumPost,
+                    gemmTopkWeights, marlinWorkspaceTensor, moeBlockSize, gemmTopK, mulTopkWeights, stream);
+                CUDA_CHECK(cudaGetLastError());
+                ring.release(stream);
+            }
+        };
+
+        if (chunkMode || routedMode)
+        {
+            runChunkedGemm(0, hiddenStates2D, gateUpOutputTensor, mHiddenSize / 16, 2 * mMoeInterSize, inputDesc[3], topkWeightsFlatTensor, mTopK, false);
+        }
+        else
+        {
+            moeAwqW4A16MarlinGemm(hiddenStates2D, gateUpOutputTensor, gateUpQWeightsTensor, gateUpScalesTensor,
+                sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsFlatTensor,
+                marlinWorkspaceTensor, moeBlockSize, mTopK, false, stream);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         // ==================== Step 4: Gated Activation ====================
         rt::Tensor activationOutputTensor(
-            activationOutputPtr, {totalSlots, mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+            activationOutputPtr, {tileSlots, mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         int32_t const kernelActivationType = (mActivationType == kACTIVATION_GEGLU)
             ? trt_edgellm::kernel::MoeActivationType::kMoeGeGlu
             : trt_edgellm::kernel::MoeActivationType::kMoeSwiGlu;
         moeActivation(
-            gateUpOutputTensor, activationOutputTensor, totalSlots, mMoeInterSize, kernelActivationType, stream);
+            gateUpOutputTensor, activationOutputTensor, tileSlots, mMoeInterSize, kernelActivationType, stream);
         CUDA_CHECK(cudaGetLastError());
 
         // ==================== Step 5: Down Projection (Marlin INT4 GEMM) ====================
         rt::Tensor downOutputTensor(
-            downOutputPtr, {totalSlots, mHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+            downOutputPtr, {tileSlots, mHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // Routing weights in padded slot order for down GEMM (mulTopkWeights=true)
-        float* topkWeightsPaddedPtr = static_cast<float*>(
-            assignTensorFromWorkspace(alignedWorkspacePtr, {maxPaddedSlots}, DataType::kFLOAT).rawPointer());
-        cudaMemsetAsync(topkWeightsPaddedPtr, 0, maxPaddedSlots * sizeof(float), stream);
+        cudaMemsetAsync(topkWeightsPaddedPtr, 0, tilePadded * sizeof(float), stream);
         cudaMemcpyAsync(
-            topkWeightsPaddedPtr, topkWeightsPtr, totalSlots * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+            topkWeightsPaddedPtr, tileTopkW, tileSlots * sizeof(float), cudaMemcpyDeviceToDevice, stream);
         rt::Tensor topkWeightsPaddedTensor(
-            topkWeightsPaddedPtr, {maxPaddedSlots}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+            topkWeightsPaddedPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
 
-        moeAwqW4A16MarlinGemm(activationOutputTensor, downOutputTensor, downQWeightsTensor, downScalesTensor,
-            sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsPaddedTensor,
-            marlinWorkspaceTensor, moeBlockSize, 1, true, stream);
+        if (chunkMode || routedMode)
+        {
+            runChunkedGemm(1, activationOutputTensor, downOutputTensor, mMoeInterSize / 16, 2 * mHiddenSize, inputDesc[5], topkWeightsPaddedTensor, 1, true);
+        }
+        else
+        {
+            moeAwqW4A16MarlinGemm(activationOutputTensor, downOutputTensor, downQWeightsTensor, downScalesTensor,
+                sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsPaddedTensor,
+                marlinWorkspaceTensor, moeBlockSize, 1, true, stream);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         // ==================== Step 6: Aggregate Slots to Tokens ====================
         kernel::launchAggregateSlotOutputsKernel(
-            downOutputPtr, outputTensor.rawPointer(), numTokens, mTopK, mHiddenSize, stream);
+            downOutputPtr, static_cast<half*>(outputTensor.rawPointer()) + static_cast<int64_t>(t0) * mHiddenSize, tokens, mTopK, mHiddenSize, stream);
+        if (cpuMiss)
+        {
+            cpumiss::Pool& pool = cpumiss::Pool::get();
+            kernel::launchCpuMissWaitAdd(static_cast<half*>(outputTensor.rawPointer()) + static_cast<int64_t>(t0) * mHiddenSize, tokens, mHiddenSize,
+                pool.mailboxDevice(), pool.stateDevice(), stream);
+        }
+        };
+        for (int32_t t0 = 0; t0 < numTokens; t0 += tileTokens)
+        {
+            runTile(t0, std::min(tileTokens, numTokens - t0));
+        }
+        if (FiniteWatch* watch = FiniteWatch::get(); watch != nullptr && outputDesc[0].type == DataType::kHALF)
+        {
+            kernel::launchFiniteWatch(static_cast<half const*>(outputs[0]), numTokens64 * mHiddenSize, watch->counters(layerIdFromName(mLayerName), 1), stream);
+        }
         return 0;
     }
     catch (std::exception const& e)
@@ -717,7 +2466,12 @@ int32_t Int4MoePlugin::onShapeChange(
 
 IPluginV3* Int4MoePlugin::attachToContext([[maybe_unused]] IPluginResourceContext* context) noexcept
 {
-    return clone();
+    auto* plugin = static_cast<Int4MoePlugin*>(clone());
+    if (plugin != nullptr && mStageExperts != 0 && std::getenv("EDGELLM_MOE_STATS") != nullptr)
+    {
+        plugin->startStats(std::getenv("EDGELLM_MOE_STATS"));
+    }
+    return plugin;
 }
 
 PluginFieldCollection const* Int4MoePlugin::getFieldsToSerialize() noexcept
@@ -731,6 +2485,8 @@ PluginFieldCollection const* Int4MoePlugin::getFieldsToSerialize() noexcept
         mDataToSerialize.emplace_back("moe_inter_size", &mMoeInterSize, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("activation_type", &mActivationType, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("quantization_group_size", &mQuantizationGroupSize, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("stage_experts", &mStageExperts, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("token_tile", &mTokenTile, PluginFieldType::kINT32, 1);
 
         mFCToSerialize.nbFields = mDataToSerialize.size();
         mFCToSerialize.fields = mDataToSerialize.data();
@@ -755,6 +2511,8 @@ Int4MoePluginCreator::Int4MoePluginCreator()
     mPluginAttributes.emplace_back(PluginField("moe_inter_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("activation_type", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("quantization_group_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("stage_experts", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("token_tile", nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
@@ -786,11 +2544,19 @@ char const* Int4MoePluginCreator::getPluginVersion() const noexcept
 }
 
 IPluginV3* Int4MoePluginCreator::createPlugin(
-    char const* name, PluginFieldCollection const* fc, [[maybe_unused]] TensorRTPhase phase) noexcept
+    char const* name, PluginFieldCollection const* fc, TensorRTPhase phase) noexcept
 {
     try
     {
         Int4MoePlugin* plugin = new Int4MoePlugin(std::string(name), fc);
+        if (!plugin->hasStageExpertsField() && phase == TensorRTPhase::kBUILD)
+        {
+            plugin->setStageExperts(stageExpertsFromEnv());
+        }
+        if (!plugin->hasTokenTileField() && phase == TensorRTPhase::kBUILD)
+        {
+            plugin->setTokenTile(tokenTileFromEnv());
+        }
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -801,5 +2567,141 @@ IPluginV3* Int4MoePluginCreator::createPlugin(
     }
 }
 
+//! Entry point for the runtime (resolved with dlsym): shrink every layer's expert cache so that at least @p bytesNeeded
+//! device bytes are released, keeping at least 2 * top-k slots (a single-token decode needs top-k; larger verify steps fall back to staging).
+//! Returns the bytes released.
+int64_t releaseLiveCacheBytes(int64_t bytesNeeded)
+{
+    std::lock_guard<std::mutex> lock(gLiveCacheMutex);
+    auto& plugins = liveCachePlugins();
+    if (plugins.empty() || bytesNeeded <= 0)
+    {
+        LOG_WARNING("Expert cache release: %zu caches registered, %lld bytes requested.", plugins.size(), static_cast<long long>(bytesNeeded));
+        return 0;
+    }
+    size_t perSlotAll = 0;
+    int32_t slots = std::numeric_limits<int32_t>::max();
+    int32_t floorSlots = 1;
+    for (Int4MoePlugin* plugin : plugins)
+    {
+        if (plugin->cacheSlots() == 0)
+        {
+            continue;
+        }
+        perSlotAll += plugin->cacheBytesPerSlot();
+        slots = std::min(slots, plugin->cacheSlots());
+        floorSlots = std::max(floorSlots, 2 * plugin->topK());
+    }
+    if (perSlotAll == 0 || slots <= floorSlots)
+    {
+        LOG_WARNING("Expert cache release: nothing to give (%zu caches, %d slots, floor %d, %zu bytes per slot).", plugins.size(), slots,
+            floorSlots, perSlotAll);
+        return 0;
+    }
+    int64_t const drop = (bytesNeeded + static_cast<int64_t>(perSlotAll) - 1) / static_cast<int64_t>(perSlotAll);
+    int32_t const target = static_cast<int32_t>(std::max<int64_t>(floorSlots, slots - drop));
+    int64_t released = 0;
+    for (Int4MoePlugin* plugin : plugins)
+    {
+        if (plugin->cacheSlots() > 0)
+        {
+            released += plugin->resizeExpertCache(target);
+        }
+    }
+    if (released <= 0)
+    {
+        LOG_WARNING("Expert cache release: resizing %zu caches from %d to %d slots freed nothing.", plugins.size(), slots, target);
+    }
+    return released;
+}
+
+//! Entry point for the runtime: give up to @p bytes of device memory to every layer's expert cache (more slots, never more than one per
+//! expert). Returns the bytes taken; the new slots start empty.
+int64_t growLiveCacheBytes(int64_t bytes)
+{
+    std::lock_guard<std::mutex> lock(gLiveCacheMutex);
+    auto& plugins = liveCachePlugins();
+    if (plugins.empty() || bytes <= 0)
+    {
+        return 0;
+    }
+    size_t perSlotAll = 0;
+    int32_t slots = std::numeric_limits<int32_t>::max();
+    for (Int4MoePlugin* plugin : plugins)
+    {
+        if (plugin->cacheSlots() == 0)
+        {
+            continue;
+        }
+        perSlotAll += plugin->cacheBytesPerSlot();
+        slots = std::min(slots, plugin->cacheSlots());
+    }
+    if (perSlotAll == 0)
+    {
+        return 0;
+    }
+    int32_t const target = static_cast<int32_t>(std::min<int64_t>(std::numeric_limits<int32_t>::max(), slots + bytes / static_cast<int64_t>(perSlotAll)));
+    int64_t taken = 0;
+    for (Int4MoePlugin* plugin : plugins)
+    {
+        if (plugin->cacheSlots() > 0)
+        {
+            taken -= plugin->resizeExpertCache(std::min(target, plugin->maxCacheSlots()));
+        }
+    }
+    return taken;
+}
+
+//! Entry point for the runtime: fills @p out with {layers with a cache, slots per layer (smallest), most slots a layer can
+//! hold, device bytes of one slot over all layers, device bytes of all caches, cache allocations that failed so far};
+//! returns the number of values written.
+int32_t liveCacheInfo(int64_t* out, int32_t capacity)
+{
+    constexpr int32_t kValues = 6;
+    if (out == nullptr || capacity < kValues)
+    {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(gLiveCacheMutex);
+    int64_t layers = 0;
+    int64_t minSlots = std::numeric_limits<int32_t>::max();
+    int64_t maxSlots = 0;
+    int64_t perSlotAll = 0;
+    int64_t total = 0;
+    for (Int4MoePlugin* plugin : liveCachePlugins())
+    {
+        if (plugin->cacheSlots() == 0)
+        {
+            continue;
+        }
+        ++layers;
+        minSlots = std::min<int64_t>(minSlots, plugin->cacheSlots());
+        maxSlots = std::max<int64_t>(maxSlots, plugin->maxCacheSlots());
+        perSlotAll += static_cast<int64_t>(plugin->cacheBytesPerSlot());
+        total += static_cast<int64_t>(plugin->cacheSlots()) * static_cast<int64_t>(plugin->cacheBytesPerSlot());
+    }
+    out[0] = layers;
+    out[1] = layers > 0 ? minSlots : 0;
+    out[2] = maxSlots;
+    out[3] = perSlotAll;
+    out[4] = total;
+    out[5] = gCacheAllocFailures.load();
+    return kValues;
+}
 } // namespace plugins
 } // namespace trt_edgellm
+
+extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeReleaseCacheBytes(int64_t bytesNeeded)
+{
+    return trt_edgellm::plugins::releaseLiveCacheBytes(bytesNeeded);
+}
+
+extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeGrowCacheBytes(int64_t bytes)
+{
+    return trt_edgellm::plugins::growLiveCacheBytes(bytes);
+}
+
+extern "C" __attribute__((visibility("default"))) int32_t edgellmMoeCacheInfo(int64_t* out, int32_t capacity)
+{
+    return trt_edgellm::plugins::liveCacheInfo(out, capacity);
+}

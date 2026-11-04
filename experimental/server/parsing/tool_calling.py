@@ -603,13 +603,17 @@ class StreamingAssistantOutputParser:
     """
 
     def __init__(self, tool_config: ToolConfig, model_dir: str,
-                 tool_parser: str, reasoning_parser: str) -> None:
+                 tool_parser: str, reasoning_parser: str,
+                 implicit_reasoning: bool = False) -> None:
         parser = _select_parser(model_dir, tool_parser)
         self._tools = parser.stream(
             tool_config) if tool_config.parse_output else None
         reasoning = REASONING_PARSERS.resolve(reasoning_parser, model_dir)
+        # With tools the parser only recognises reasoning that starts with the start token, unless the
+        # caller knows the chat template opens the reasoning block itself (Qwen3.6 with thinking enabled:
+        # the output starts inside the block and only the end token appears).
         self._reasoning = (reasoning.stream(
-            allow_implicit=not tool_config.parse_output)
+            allow_implicit=(not tool_config.parse_output) or implicit_reasoning)
                            if reasoning else None)
         self._calls: Dict[int, ToolCall] = {}
 
@@ -661,10 +665,11 @@ def stream_assistant_output(
         tool_config: ToolConfig,
         model_dir: str,
         tool_parser: str = "auto",
-        reasoning_parser: str = "none") -> StreamingAssistantOutputParser:
+        reasoning_parser: str = "none",
+        implicit_reasoning: bool = False) -> StreamingAssistantOutputParser:
     """Create incremental parsing state for one assistant response."""
     return StreamingAssistantOutputParser(tool_config, model_dir, tool_parser,
-                                          reasoning_parser)
+                                          reasoning_parser, implicit_reasoning)
 
 
 _GEMMA4_OPEN = "<|tool_call>"

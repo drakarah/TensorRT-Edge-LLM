@@ -31,7 +31,8 @@ namespace rt
 
 //! Host-side allocation and reference accounting for all context-cache storage types.
 //!
-//! Each ResourceType has an independent fixed-capacity pool and circular free list. ResourcePools manages only IDs and
+//! Each ResourceType has an independent fixed-capacity pool and circular free list (or, once switched with
+//! setLowestFirst, lowest-ID-first allocation below a usable limit). ResourcePools manages only IDs and
 //! reference counts; the corresponding GPU buffers are allocated and bound by the runtime. An active reference pins a
 //! resource for an in-flight request, while a cache reference retains it for a published CacheRecord. A resource
 //! returns to its free list only when both counts reach zero.
@@ -61,9 +62,23 @@ public:
     int32_t activeRefCount(ResourceId const& resource) const;
     int32_t cacheRefCount(ResourceId const& resource) const;
 
+    //! Free resources that can be allocated now: below the usable limit for a lowest-first pool.
     int32_t freeCount(ResourceType type) const noexcept;
     int32_t capacity(ResourceType type) const noexcept;
     bool canAllocate(ResourceDemand const& demand) const noexcept;
+
+    //! Switch a pool that has nothing allocated to lowest-ID-first allocation restricted to IDs below @p usableLimit
+    //! (clamped to the capacity), instead of the circular free list. Used when the storage behind the IDs is mapped on
+    //! demand, so that every allocated ID lies in the mapped range.
+    //! @throws std::runtime_error if a resource of this type is allocated
+    void setLowestFirst(ResourceType type, int32_t usableLimit);
+    //! Move the usable limit of a lowest-first pool; every allocated ID must stay below it.
+    //! @throws std::runtime_error if the pool is not lowest-first or an allocated ID would lie at or above the limit
+    void setUsableLimit(ResourceType type, int32_t usableLimit);
+    //! False for an ID at or above the usable limit of a lowest-first pool (it cannot be allocated even when free).
+    bool isUsable(ResourceId const& resource) const noexcept;
+    //! One past the highest allocated ID of a pool (active or cache reference), 0 when none is allocated.
+    int32_t highWater(ResourceType type) const noexcept;
 
 private:
     struct Slot
@@ -78,7 +93,10 @@ private:
         std::vector<Slot> slots;
         std::vector<int32_t> freeList;
         size_t freeListHead{};
+        //! Free resources; the circular list is only used when the pool is not lowest-first.
         size_t freeListCount{};
+        bool lowestFirst{false};
+        int32_t usableLimit{0};
     };
 
     Pool& pool(ResourceType type) noexcept;
@@ -86,6 +104,7 @@ private:
     Slot& slot(ResourceId const& resource);
     Slot const& slot(ResourceId const& resource) const;
     void releaseIfUnused(ResourceId const& resource, Slot& resourceSlot) noexcept;
+    static size_t usableFree(Pool const& resourcePool) noexcept;
 
     std::array<Pool, 4> mPools;
 };

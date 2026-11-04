@@ -30,10 +30,17 @@ namespace trt_edgellm
 namespace rt
 {
 
-//! Preallocated device storage for exact hybrid checkpoints.
+//! Where the snapshot slabs live.
+enum class SnapshotMemory : uint8_t
+{
+    kDevice,     //!< Snapshots stay on the GPU: capture and restore are D2D copies.
+    kPinnedHost, //!< Snapshots live in pinned host memory: capture is a D2H and restore an H2D copy.
+};
+
+//! Preallocated storage for exact hybrid checkpoints.
 //!
-//! ResourcePools owns snapshot slot IDs and refcounts. This class owns only the corresponding device slabs and
-//! performs stream-ordered D2D copies between one immutable snapshot slot and one live batch/page slot. Deployment
+//! ResourcePools owns snapshot slot IDs and refcounts. This class owns only the corresponding slabs and
+//! performs stream-ordered copies between one immutable snapshot slot and one live batch/page slot. Deployment
 //! compatibility is fixed by the owning runtime; this physical storage has no lookup or schema policy.
 class HybridSnapshotStorage
 {
@@ -44,7 +51,8 @@ public:
     //! non-null draftCacheManager additionally captures the paired draft KV pool page alongside every base page.
     HybridSnapshotStorage(HybridCacheManager& cacheManager, int32_t recurrentSlotCount, int32_t partialKvSlotCount,
         HybridCacheManager* draftCacheManager = nullptr, int32_t boundaryHiddenDim = 0,
-        nvinfer1::DataType boundaryHiddenType = nvinfer1::DataType::kHALF);
+        nvinfer1::DataType boundaryHiddenType = nvinfer1::DataType::kHALF,
+        SnapshotMemory memory = SnapshotMemory::kDevice);
     HybridSnapshotStorage(HybridSnapshotStorage const&) = delete;
     HybridSnapshotStorage& operator=(HybridSnapshotStorage const&) = delete;
 
@@ -77,8 +85,12 @@ public:
     int32_t recurrentSlotCount() const noexcept;
     int32_t partialKvSlotCount() const noexcept;
     int32_t boundaryHiddenDim() const noexcept;
+    SnapshotMemory memory() const noexcept;
 
 private:
+    cudaMemcpyKind captureKind() const noexcept;
+    cudaMemcpyKind restoreKind() const noexcept;
+
     void validateBatchSlot(int32_t batchSlot) const;
     void validateRecurrentSlots(int32_t snapshotSlot, int32_t batchSlot) const;
     void validatePartialSlots(
@@ -93,6 +105,7 @@ private:
     int32_t mRecurrentSlotCount{};
     int32_t mPartialKvSlotCount{};
     int32_t mBoundaryHiddenDim{};
+    SnapshotMemory mMemory{SnapshotMemory::kDevice};
     std::vector<Tensor> mRecurrentSnapshots;
     std::vector<Tensor> mConvSnapshots;
     std::vector<Tensor> mPartialKvSnapshots;

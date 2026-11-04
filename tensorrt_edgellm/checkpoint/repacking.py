@@ -197,6 +197,15 @@ def repack_to_cutedsl_fragment(nibbles_nk: np.ndarray) -> np.ndarray:
     """
     bN, bK = _CUTEDSL_BN, _CUTEDSL_BK
     n, k = int(nibbles_nk.shape[0]), int(nibbles_nk.shape[1])
+    # The layout is n-block major, so blocks of N rows repack independently. Work in chunks so a
+    # 262k-row lm_head does not need ~20 GB of int64 temporaries.
+    chunk_rows = bN * 256
+    if n > chunk_rows:
+        parts = [
+            repack_to_cutedsl_fragment(nibbles_nk[start:start + chunk_rows])
+            for start in range(0, n, chunk_rows)
+        ]
+        return np.concatenate(parts, axis=0)
     if n % 64 != 0 or k % 64 != 0:
         raise ValueError(
             f"cuteDSL fragment repack requires N%64==0 and K%64==0, got N={n}, K={k}. "

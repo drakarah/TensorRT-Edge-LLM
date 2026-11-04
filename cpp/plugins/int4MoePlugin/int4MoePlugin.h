@@ -18,7 +18,9 @@
 #pragma once
 
 #include <NvInferRuntime.h>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace trt_edgellm
@@ -170,6 +172,28 @@ public:
     //! @param pluginNamespace Namespace string
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
+    //! @brief Stage routed experts from pinned host memory into the workspace before the GEMMs (serialized)
+    void setStageExperts(int32_t mode) noexcept
+    {
+        mStageExperts = mode;
+    }
+
+    bool hasStageExpertsField() const noexcept
+    {
+        return mStageExpertsFieldSeen;
+    }
+
+    //! @brief Token tile of the expert GEMM pipeline in prefill passes (serialized, 0 = whole pass)
+    void setTokenTile(int32_t tile) noexcept
+    {
+        mTokenTile = tile;
+    }
+
+    bool hasTokenTileField() const noexcept
+    {
+        return mTokenTileFieldSeen;
+    }
+
 private:
     std::string mLayerName;
     std::string mNamespace;
@@ -179,6 +203,52 @@ private:
     int32_t mMoeInterSize{};
     nvinfer1::ActivationType mActivationType{};
     int32_t mQuantizationGroupSize{};
+    int32_t mStageExperts{0};
+    int32_t mTokenTile{0};
+    int32_t* mStats{nullptr}; // device, [2][numExperts] selection counters (EDGELLM_MOE_STATS)
+    // EDGELLM_MOE_CACHE_SLOTS=<n>: per-layer device cache of the n most recently used experts (decode steps of <= 4 tokens);
+    // allocated at the first enqueue, outside graph capture.
+    int32_t mCacheSlots{-1}; // -1 = env not read yet
+    bool mCacheReady{false};
+    void* mCacheMem{nullptr};
+    uint8_t* mCacheTensors[4]{};
+    size_t mCacheBytesPerExpert[4]{};
+    int32_t* mCacheState{nullptr}; // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S], tally[3]
+    std::atomic<int32_t*> mCacheTally{nullptr};
+    bool ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc) noexcept;
+
+public:
+    //! Device bytes the cache holds per slot (the four tensors); 0 while no cache is allocated.
+    size_t cacheBytesPerSlot() const noexcept;
+    int32_t cacheSlots() const noexcept
+    {
+        return mCacheReady ? mCacheSlots : 0;
+    }
+    int32_t topK() const noexcept
+    {
+        return mTopK;
+    }
+    //! Reallocate the cache with @p newSlots slots, keeping the first min(old, new). Experts in dropped slots become
+    //! uncached, added slots start empty. The caller guarantees no enqueue is in flight. Returns the device bytes
+    //! released (negative when the cache grew, 0 if nothing changed).
+    int64_t resizeExpertCache(int32_t newSlots) noexcept;
+    //! Largest useful slot count: one per expert.
+    int32_t maxCacheSlots() const noexcept
+    {
+        return mNumExperts;
+    }
+
+private:
+    int32_t* mCpuAdmit{nullptr}; // device [numExperts + 1]: miss counters and call counter of the CPU miss path
+    bool mCpuMissChecked{false};
+    bool mCpuMissReady{false};
+    std::vector<uint8_t> mCpuMirror[4]; // host copies of expert tensors that live in device memory
+    bool prepareCpuMiss(void const* const* inputs) noexcept;
+    std::thread mStatsThread;
+    std::atomic<bool> mStatsStop{false};
+    void startStats(std::string const& prefix);
+    bool mStageExpertsFieldSeen{false};
+    bool mTokenTileFieldSeen{false};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;

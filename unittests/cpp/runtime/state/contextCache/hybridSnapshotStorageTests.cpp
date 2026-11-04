@@ -327,3 +327,188 @@ TEST(HybridSnapshotStorageTests, PairedBaseAndDraftPartialKvRoundTrip)
     verify(baseCache, 0x21, 0x71);
     verify(draftCache, 0x31, 0x81);
 }
+
+namespace
+{
+
+class HybridSnapshotMemoryTests : public ::testing::TestWithParam<SnapshotMemory>
+{
+};
+
+size_t recurrentSlotBytes()
+{
+    return static_cast<size_t>(2 * 3 * 4) * sizeof(half);
+}
+
+size_t convSlotBytes()
+{
+    return static_cast<size_t>(5 * 6) * sizeof(half);
+}
+
+void fillBatchSlot(HybridCacheManager& cacheManager, int32_t batchSlot, uint8_t pattern, cudaStream_t stream)
+{
+    MambaCacheManager& mamba = cacheManager.getMambaCacheManager();
+    for (int32_t layer = 0; layer < mamba.numLayers(); ++layer)
+    {
+        CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(mamba.getRecurrentState(layer).rawPointer())
+                + static_cast<size_t>(batchSlot) * recurrentSlotBytes(),
+            pattern + layer, recurrentSlotBytes(), stream));
+        CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(mamba.getConvState(layer).rawPointer())
+                + static_cast<size_t>(batchSlot) * convSlotBytes(),
+            pattern + 16 + layer, convSlotBytes(), stream));
+    }
+}
+
+//! True when every byte of the batch slot holds the pattern that fillBatchSlot wrote.
+bool batchSlotHolds(HybridCacheManager& cacheManager, int32_t batchSlot, uint8_t pattern)
+{
+    MambaCacheManager& mamba = cacheManager.getMambaCacheManager();
+    for (int32_t layer = 0; layer < mamba.numLayers(); ++layer)
+    {
+        std::vector<uint8_t> recurrent(recurrentSlotBytes());
+        std::vector<uint8_t> conv(convSlotBytes());
+        CUDA_CHECK(cudaMemcpy(recurrent.data(),
+            static_cast<uint8_t const*>(mamba.getRecurrentState(layer).rawPointer())
+                + static_cast<size_t>(batchSlot) * recurrentSlotBytes(),
+            recurrentSlotBytes(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(conv.data(),
+            static_cast<uint8_t const*>(mamba.getConvState(layer).rawPointer())
+                + static_cast<size_t>(batchSlot) * convSlotBytes(),
+            convSlotBytes(), cudaMemcpyDeviceToHost));
+        auto const holds = [](std::vector<uint8_t> const& bytes, uint8_t value)
+        { return std::all_of(bytes.begin(), bytes.end(), [value](uint8_t byte) { return byte == value; }); };
+        if (!holds(recurrent, static_cast<uint8_t>(pattern + layer)) || !holds(conv, static_cast<uint8_t>(pattern + 16 + layer)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+INSTANTIATE_TEST_SUITE_P(Memory, HybridSnapshotMemoryTests,
+    ::testing::Values(SnapshotMemory::kDevice, SnapshotMemory::kPinnedHost),
+    [](::testing::TestParamInfo<SnapshotMemory> const& info)
+    { return info.param == SnapshotMemory::kDevice ? "Device" : "PinnedHost"; });
+
+TEST_P(HybridSnapshotMemoryTests, ReportsItsMemoryKind)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    HybridSnapshotStorage storage(cacheManager, 2, 2, nullptr, 0, DataType::kHALF, GetParam());
+    EXPECT_EQ(storage.memory(), GetParam());
+}
+
+TEST_P(HybridSnapshotMemoryTests, RecurrentRoundTripIntoADifferentBatchSlot)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    HybridSnapshotStorage storage(cacheManager, 3, 1, nullptr, 0, DataType::kHALF, GetParam());
+    fillBatchSlot(cacheManager, 0, 0x31, stream);
+    storage.captureRecurrent(2, 0, stream);
+    fillBatchSlot(cacheManager, 0, 0x55, stream);
+    storage.restoreRecurrent(2, 1, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    EXPECT_TRUE(batchSlotHolds(cacheManager, 1, 0x31));
+    EXPECT_TRUE(batchSlotHolds(cacheManager, 0, 0x55));
+}
+
+TEST_P(HybridSnapshotMemoryTests, SnapshotSlotsKeepTheirOwnContentsAndAreImmutable)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    HybridSnapshotStorage storage(cacheManager, 3, 1, nullptr, 0, DataType::kHALF, GetParam());
+    fillBatchSlot(cacheManager, 0, 0x10, stream);
+    storage.captureRecurrent(0, 0, stream);
+    fillBatchSlot(cacheManager, 0, 0x20, stream);
+    storage.captureRecurrent(1, 0, stream);
+    fillBatchSlot(cacheManager, 0, 0x30, stream);
+    storage.captureRecurrent(2, 0, stream);
+    fillBatchSlot(cacheManager, 0, 0x70, stream);
+    for (int32_t slot : {1, 2, 0})
+    {
+        storage.restoreRecurrent(slot, 1, stream);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_TRUE(batchSlotHolds(cacheManager, 1, static_cast<uint8_t>(0x10 * (slot + 1)))) << "snapshot slot " << slot;
+    }
+}
+
+TEST_P(HybridSnapshotMemoryTests, RestoreAfterZeroingTheLiveStateGivesTheCapturedState)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    HybridSnapshotStorage storage(cacheManager, 2, 1, nullptr, 0, DataType::kHALF, GetParam());
+    fillBatchSlot(cacheManager, 1, 0x41, stream);
+    storage.captureRecurrent(1, 1, stream);
+    storage.zeroRecurrent(1, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    EXPECT_FALSE(batchSlotHolds(cacheManager, 1, 0x41));
+    storage.restoreRecurrent(1, 1, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    EXPECT_TRUE(batchSlotHolds(cacheManager, 1, 0x41));
+}
+
+TEST_P(HybridSnapshotMemoryTests, PartialKvKeepsTheValidTokensOnlyAndLeavesTheRestOfThePage)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    HybridSnapshotStorage storage(cacheManager, 1, 2, nullptr, 0, DataType::kHALF, GetParam());
+    KVCacheManager& kv = cacheManager.getKVCacheManager();
+    int32_t constexpr kSource{5};
+    int32_t constexpr kDestination{2};
+    for (int32_t validTokens : {1, 17, kTOKENS_PER_PAGE})
+    {
+        for (int32_t layer = 0; layer < kv.numLayers(); ++layer)
+        {
+            KVLayerConfig const& layerConfig = kv.getLayerConfig(layer);
+            size_t const pageBytes
+                = static_cast<size_t>(layerConfig.numKVHeads * layerConfig.headDim) * sizeof(half) * kTOKENS_PER_PAGE;
+            CUDA_CHECK(cudaMemsetAsync(
+                static_cast<uint8_t*>(kv.kPoolPtr(layer)) + kSource * pageBytes, 0x21 + layer, pageBytes, stream));
+            CUDA_CHECK(cudaMemsetAsync(
+                static_cast<uint8_t*>(kv.vPoolPtr(layer)) + kSource * pageBytes, 0x71 + layer, pageBytes, stream));
+            CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(kv.kPoolPtr(layer)) + kDestination * pageBytes, 0x01, pageBytes, stream));
+            CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(kv.vPoolPtr(layer)) + kDestination * pageBytes, 0x01, pageBytes, stream));
+        }
+        storage.capturePartialKv(1, kSource, validTokens, stream);
+        storage.restorePartialKv(1, kDestination, validTokens, stream);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        for (int32_t layer = 0; layer < kv.numLayers(); ++layer)
+        {
+            KVLayerConfig const& layerConfig = kv.getLayerConfig(layer);
+            size_t const tokenBytes = static_cast<size_t>(layerConfig.numKVHeads * layerConfig.headDim) * sizeof(half);
+            size_t const pageBytes = tokenBytes * kTOKENS_PER_PAGE;
+            std::vector<uint8_t> keys(pageBytes);
+            CUDA_CHECK(cudaMemcpy(keys.data(), static_cast<uint8_t const*>(kv.kPoolPtr(layer)) + kDestination * pageBytes,
+                pageBytes, cudaMemcpyDeviceToHost));
+            for (size_t byte = 0; byte < pageBytes; ++byte)
+            {
+                ASSERT_EQ(keys[byte], byte < tokenBytes * validTokens ? 0x21 + layer : 0x01)
+                    << "valid tokens " << validTokens << " layer " << layer << " byte " << byte;
+            }
+        }
+    }
+}
+
+TEST_P(HybridSnapshotMemoryTests, BoundaryHiddenRoundTrip)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    int32_t constexpr kHidden{16};
+    HybridSnapshotStorage storage(cacheManager, 2, 1, nullptr, kHidden, DataType::kHALF, GetParam());
+    Tensor source({4, kHidden}, trt_edgellm::rt::DeviceType::kGPU, DataType::kHALF, "boundarySource");
+    Tensor destination({4, kHidden}, trt_edgellm::rt::DeviceType::kGPU, DataType::kHALF, "boundaryDestination");
+    CUDA_CHECK(cudaMemset(source.rawPointer(), 0x3C, source.getMemoryCapacity()));
+    CUDA_CHECK(cudaMemset(destination.rawPointer(), 0, destination.getMemoryCapacity()));
+    storage.captureBoundaryHidden(1, source, 3, stream);
+    storage.restoreBoundaryHidden(1, destination, 2, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    std::vector<uint8_t> host(destination.getMemoryCapacity());
+    CUDA_CHECK(cudaMemcpy(host.data(), destination.rawPointer(), host.size(), cudaMemcpyDeviceToHost));
+    size_t const rowBytes = kHidden * sizeof(half);
+    for (size_t byte = 0; byte < host.size(); ++byte)
+    {
+        EXPECT_EQ(host[byte], byte / rowBytes == 2 ? 0x3C : 0) << "byte " << byte;
+    }
+}

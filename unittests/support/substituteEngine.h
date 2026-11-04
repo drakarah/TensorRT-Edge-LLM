@@ -106,6 +106,7 @@ public:
         (override));
     MOCK_METHOD(bool, execute, (cudaStream_t stream), (override));
     MOCK_METHOD(bool, captureGraph, (cudaStream_t stream), (override));
+    MOCK_METHOD(void, dropGraphs, (), (noexcept, override));
     MOCK_METHOD(int64_t, getRequiredContextMemorySize, (), (const, override));
     MOCK_METHOD(bool, setContextMemory, (rt::Tensor & sharedMem), (override));
     MOCK_METHOD(int32_t, getNumIOTensors, (), (const, override));

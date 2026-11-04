@@ -227,6 +227,11 @@ metrics::LLMGenerationMetrics const& LLMInferenceRuntime::getGenerationMetrics()
     return rootRuntime().getGenerationMetrics();
 }
 
+RuntimeMemoryMetrics LLMInferenceRuntime::getMemoryMetrics() const
+{
+    return rootRuntime().getMemoryMetrics();
+}
+
 std::optional<ContextCacheMetrics> LLMInferenceRuntime::getContextCacheMetrics() const
 {
     return rootRuntime().getContextCacheMetrics();

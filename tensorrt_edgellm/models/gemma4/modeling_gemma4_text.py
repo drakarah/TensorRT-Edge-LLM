@@ -1222,6 +1222,12 @@ class Gemma4Int4MoEBlock(nn.Module):
         self.quantize_experts_from_bf16 = getattr(config,
                                                   '_needs_moe_quantization',
                                                   False)
+        if self.quantize_experts_from_bf16:
+            # The expert group size is ours to pick (RTN from BF16): a GPTQ config for the dense
+            # layers (group 128) must not force a group that moe_intermediate_size (704) cannot hold.
+            while self.group_size > 1 and (config.hidden_size % self.group_size != 0
+                                           or config.moe_intermediate_size % self.group_size != 0):
+                self.group_size //= 2
 
         self.router = Gemma4Router(config, layer_idx)
         self._experts_packed = False
@@ -1245,11 +1251,10 @@ class Gemma4Int4MoEBlock(nn.Module):
         """
 
         # Promote router projection to Linear for standard MatMul trace.
-        self.gate_linear = make_linear(self.config,
-                                       self.hidden_size,
-                                       self.num_experts,
-                                       bias=False,
-                                       module_name="moe_block.gate_linear")
+        # Always FP16: it takes the router projection's (plain) weight below, and a GPTQ/AWQ
+        # config for the dense layers must not turn this name into a quantized linear.
+        from ...models.linear import FP16Linear
+        self.gate_linear = FP16Linear(self.hidden_size, self.num_experts, False)
         self.gate_linear.weight.data = self.router.proj.weight.data
 
         if self.quantize_experts_from_bf16:

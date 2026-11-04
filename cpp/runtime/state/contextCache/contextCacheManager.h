@@ -206,6 +206,16 @@ public:
     //! boundary trimming) before committing it to lease allocation.
     AcquireResult acquire(ReusePlan plan);
 
+    //! Allocate base KV pages lowest-ID-first and only below @p pages, for a pool whose backing memory is mapped on
+    //! demand. The first call switches the pool (nothing may be allocated yet); later calls move the limit, which must
+    //! stay above every allocated page.
+    void limitBasePages(int32_t pages);
+    //! One past the highest base page held by an active request or a retained record.
+    int32_t baseHighWater() const noexcept;
+    //! Evict records that hold a base page at or above @p pages, least recently used first, until none is held. Records
+    //! below the target are kept. Between requests only. Returns the number of evicted records.
+    size_t evictToBaseHighWater(int32_t pages);
+
     ResourcePools const& pools() const noexcept;
     BaseBlockIndex const& baseIndex() const noexcept;
     SpecStateIndex const& specIndex() const noexcept;
@@ -226,6 +236,7 @@ private:
 
     int32_t mPageSize{};
     ResourcePools mPools;
+    bool mBasePagesLowestFirst{false};
     BaseBlockIndex mBaseIndex;
     SpecStateIndex mSpecIndex;
     std::optional<SpecReuseContract> mSpecReuseContract;

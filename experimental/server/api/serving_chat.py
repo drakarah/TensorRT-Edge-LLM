@@ -123,6 +123,12 @@ class OpenAIServingChat:
         self._default_max_tokens = (max_model_len if isinstance(
             max_model_len, int) and max_model_len > 0 else
                                     _FALLBACK_MAX_TOKENS)
+        # EDGELLM_DEFAULT_MAX_TOKENS bounds only requests that send no
+        # max_tokens, so a generation that never reaches its end token stops
+        # after that many tokens instead of at the end of the context.
+        cap = os.environ.get("EDGELLM_DEFAULT_MAX_TOKENS", "")
+        if cap.isdigit() and int(cap) > 0:
+            self._default_max_tokens = min(self._default_max_tokens, int(cap))
         # Fail during startup instead of after the first request.
         REASONING_PARSERS.resolve(config.reasoning_parser, self._model_dir)
         if config.tool_call_parser not in list_tool_parsers():
@@ -210,9 +216,22 @@ class OpenAIServingChat:
                 "frequency_penalty is not supported by the Edge-LLM runtime",
                 param="frequency_penalty")
         if request.presence_penalty != 0:
-            raise UnsupportedFeatureError(
-                "presence_penalty is not supported by the Edge-LLM runtime",
-                param="presence_penalty")
+            capabilities = getattr(self._client, "capabilities", None)
+            if (getattr(capabilities, "speculative_decoding", False)
+                    or (getattr(capabilities, "max_num_seqs", 1) or 1) > 1):
+                raise UnsupportedFeatureError(
+                    "presence_penalty needs a deployment without speculative "
+                    "decoding and with a single request slot",
+                    param="presence_penalty")
+        reasoning_budget = request.reasoning_budget_tokens if request.enable_thinking else -1
+        if reasoning_budget >= 0:
+            capabilities = getattr(self._client, "capabilities", None)
+            if (getattr(capabilities, "speculative_decoding", False)
+                    or (getattr(capabilities, "max_num_seqs", 1) or 1) > 1):
+                raise UnsupportedFeatureError(
+                    "reasoning_budget_tokens needs a deployment without speculative "
+                    "decoding and with a single request slot",
+                    param="reasoning_budget_tokens")
         try:
             tool_config = validate_tool_request(request.messages,
                                                 request.tools,
@@ -289,6 +308,9 @@ class OpenAIServingChat:
             temperature=0.0 if greedy else request.temperature,
             top_p=1.0 if greedy else request.top_p,
             top_k=1 if greedy else request.top_k,
+            presence_penalty=request.presence_penalty,
+            reasoning_budget_tokens=reasoning_budget,
+            reasoning_budget_message=request.reasoning_budget_message,
             seed=request.seed,
             max_tokens=(request.effective_max_tokens
                         or self._default_max_tokens),
@@ -324,6 +346,8 @@ class OpenAIServingChat:
             self._model_dir,
             tool_parser=self._config.tool_call_parser,
             reasoning_parser=prepared.reasoning_parser,
+            # a reasoning parser is only active when thinking is on, and the template then opens the block
+            implicit_reasoning=prepared.reasoning_parser != "none",
         )
 
     async def create_chat_completion(

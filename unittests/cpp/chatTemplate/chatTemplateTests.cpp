@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 
@@ -742,4 +743,90 @@ TEST(ChatTemplateTest, AppliesPreformattedPromptWithoutLoadedTemplate)
         renderer.apply(rt::LLMGenerationRequest::Request{{rt::Message{"user", {{"text", "preformatted prompt"}}}}},
             formatted, options));
     EXPECT_EQ(formatted.formattedCompleteRequest, "preformatted prompt");
+}
+
+namespace
+{
+class ScopedPreserveThinkingEnv
+{
+public:
+    explicit ScopedPreserveThinkingEnv(char const* value)
+    {
+        if (value != nullptr)
+        {
+            ::setenv("EDGELLM_PRESERVE_THINKING", value, 1);
+        }
+        else
+        {
+            ::unsetenv("EDGELLM_PRESERVE_THINKING");
+        }
+    }
+
+    ~ScopedPreserveThinkingEnv()
+    {
+        ::unsetenv("EDGELLM_PRESERVE_THINKING");
+    }
+};
+
+//! Mirrors the Qwen3.5/3.6 rule: an assistant turn keeps its reasoning only after the last user message or when preserve_thinking is true.
+std::string renderTwoTurnHistory(char const* envValue)
+{
+    ScopedPreserveThinkingEnv const env{envValue};
+    TemporaryTemplate model{{"chat_template.jinja",
+        R"JINJA({%- set ns = namespace(last=0) -%}
+{%- for m in messages -%}{%- if m.role == 'user' -%}{%- set ns.last = loop.index0 -%}{%- endif -%}{%- endfor -%}
+{%- for m in messages -%}
+{%- if m.role == 'assistant' -%}
+{%- if (preserve_thinking is defined and preserve_thinking is true) or loop.index0 > ns.last -%}[A:think+{{ m.content }}]{%- else -%}[A:{{ m.content }}]{%- endif -%}
+{%- else -%}[U:{{ m.content }}]{%- endif -%}
+{%- endfor -%})JINJA"}};
+    rt::LLMGenerationRequest::Request request{{rt::Message{"user", {{"text", "q1"}}}, rt::Message{"assistant", {{"text", "a1"}}},
+        rt::Message{"user", {{"text", "q2"}}}}};
+    chat_template::ChatTemplate renderer;
+    EXPECT_TRUE(renderer.load(model.path));
+    rt::LLMGenerationRequest::FormattedRequest formatted;
+    EXPECT_TRUE(renderer.apply(request, formatted, {}));
+    return formatted.formattedCompleteRequest;
+}
+} // namespace
+
+TEST(ChatTemplateTest, PreserveThinkingIsOffByDefault)
+{
+    EXPECT_EQ(renderTwoTurnHistory(nullptr), "[U:q1][A:a1][U:q2]");
+}
+
+TEST(ChatTemplateTest, PreserveThinkingFromEnvKeepsEarlierAssistantTurns)
+{
+    EXPECT_EQ(renderTwoTurnHistory("1"), "[U:q1][A:think+a1][U:q2]");
+}
+
+TEST(ChatTemplateTest, PreserveThinkingIgnoresZeroEmptyAndNonNumericValues)
+{
+    for (auto const* value : {"0", "", "off", "false"})
+    {
+        EXPECT_EQ(renderTwoTurnHistory(value), "[U:q1][A:a1][U:q2]") << "value: '" << value << "'";
+    }
+}
+
+TEST(ChatTemplateTest, PreservedHistoryStaysAPrefixAcrossUserTurns)
+{
+    ScopedPreserveThinkingEnv const env{"1"};
+    TemporaryTemplate model{{"chat_template.jinja",
+        R"JINJA({%- set ns = namespace(last=0) -%}
+{%- for m in messages -%}{%- if m.role == 'user' -%}{%- set ns.last = loop.index0 -%}{%- endif -%}{%- endfor -%}
+{%- for m in messages -%}
+{%- if m.role == 'assistant' -%}
+{%- if (preserve_thinking is defined and preserve_thinking is true) or loop.index0 > ns.last -%}[A:think+{{ m.content }}]{%- else -%}[A:{{ m.content }}]{%- endif -%}
+{%- else -%}[U:{{ m.content }}]{%- endif -%}
+{%- endfor -%})JINJA"}};
+    chat_template::ChatTemplate renderer;
+    ASSERT_TRUE(renderer.load(model.path));
+    rt::LLMGenerationRequest::FormattedRequest first;
+    rt::LLMGenerationRequest::FormattedRequest second;
+    ASSERT_TRUE(renderer.apply(
+        rt::LLMGenerationRequest::Request{{rt::Message{"user", {{"text", "q1"}}}, rt::Message{"assistant", {{"text", "a1"}}}}}, first, {}));
+    ASSERT_TRUE(renderer.apply(rt::LLMGenerationRequest::Request{{rt::Message{"user", {{"text", "q1"}}},
+                                   rt::Message{"assistant", {{"text", "a1"}}}, rt::Message{"user", {{"text", "q2"}}}}},
+        second, {}));
+    EXPECT_EQ(second.formattedCompleteRequest.rfind(first.formattedCompleteRequest, 0), 0U);
 }

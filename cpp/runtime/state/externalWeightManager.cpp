@@ -371,8 +371,16 @@ std::vector<CheckpointReader::TensorLocation> checkpointLocations(Json const& bi
     return result;
 }
 
+//! EDGELLM_HOST_EXTERNAL_WEIGHTS=<substring>: sidecar files whose name contains the substring stay in pinned host memory
+//! and the engine reads them over PCIe (UVA), so a model whose expert weights exceed the device memory still loads.
+bool keepSidecarOnHost(std::string const& file)
+{
+    char const* pattern = std::getenv("EDGELLM_HOST_EXTERNAL_WEIGHTS");
+    return pattern != nullptr && *pattern != '\0' && file.find(pattern) != std::string::npos;
+}
+
 void loadSidecars(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, Json const& config,
-    std::vector<Tensor>& weights, cudaStream_t stream)
+    std::vector<Tensor>& weights, std::vector<Tensor>& hostWeights, cudaStream_t stream)
 {
     Json const files = config.value("external_weight_files", Json::array());
     ELLM_CHECK(files.is_array(), "external_weight_files must be an array in " + configPath.string());
@@ -383,8 +391,22 @@ void loadSidecars(std::filesystem::path const& engineDir, std::filesystem::path 
             "Malformed external weight entry in " + configPath.string());
         std::filesystem::path const path = engineDir / entry["file"].get<std::string>();
         std::vector<Tensor> loaded;
-        ELLM_CHECK(
-            safetensors::loadSafetensors(path, loaded, stream), "Failed to load external weights: " + path.string());
+        bool const onHost = keepSidecarOnHost(entry["file"].get<std::string>());
+        ELLM_CHECK(safetensors::loadSafetensors(path, loaded, stream, onHost ? DeviceType::kCPU : DeviceType::kGPU),
+            "Failed to load external weights: " + path.string());
+        if (onHost)
+        {
+            LOG_INFO("External weights %s stay in pinned host memory (EDGELLM_HOST_EXTERNAL_WEIGHTS)", path.c_str());
+            std::vector<Tensor> views;
+            views.reserve(loaded.size());
+            for (Tensor& tensor : loaded)
+            {
+                views.emplace_back(tensor.rawPointer(), tensor.getShape(), DeviceType::kGPU, tensor.getDataType(),
+                    tensor.getName());
+                hostWeights.push_back(std::move(tensor));
+            }
+            loaded = std::move(views);
+        }
 
         if (entry.contains("tensors"))
         {
@@ -437,6 +459,7 @@ ExternalWeightManager& ExternalWeightManager::operator=(ExternalWeightManager&& 
     releasePluginResources();
     mWeightStorage = std::move(other.mWeightStorage);
     mWeights = std::move(other.mWeights);
+    mHostWeights = std::move(other.mHostWeights);
     mPluginResourceTensors = std::move(other.mPluginResourceTensors);
     mPluginResourceRegistrations = std::move(other.mPluginResourceRegistrations);
     mEmbedding = std::move(other.mEmbedding);
@@ -513,7 +536,7 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
     size_t peakRegisteredSourceBytes = 0;
     if (bindings.empty())
     {
-        loadSidecars(engineDir, configPath, config, mWeights, stream);
+        loadSidecars(engineDir, configPath, config, mWeights, mHostWeights, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     else

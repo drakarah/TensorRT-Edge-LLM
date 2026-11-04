@@ -17,7 +17,7 @@
 import hmac
 import logging
 from contextlib import asynccontextmanager
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -162,41 +162,76 @@ def _audio_size_error(request: Request) -> Optional[JSONResponse]:
     return None
 
 
-async def _buffer_request_body(request: Request) -> Optional[JSONResponse]:
-    """Buffer a bounded JSON request so downstream validation can reread it."""
+async def _buffer_request_body(receive):
+    """Read a bounded request body; returns (body, error), error being a 413 body-size ServerError."""
     body = bytearray()
-    async for chunk in request.stream():
-        body.extend(chunk)
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return None, None
+        body.extend(message.get("body", b""))
         if len(body) > MAX_REQUEST_BODY_BYTES:
-            error = ServerError(
+            return None, ServerError(
                 "request body exceeds the supported maximum",
                 status_code=413,
                 error_type="invalid_request_error",
             )
-            return _error_response(request, error)
-    request._body = bytes(body)
-    return None
+        if not message.get("more_body", False):
+            return bytes(body), None
+
+
+class _ServerGuards:
+    """Authentication and request-size guards as a plain ASGI middleware.
+
+    A BaseHTTPMiddleware would hide the client's disconnect from the route
+    (``Request.is_disconnected()`` never turns true behind it), and a
+    non-streaming request that nobody listens to any more would then decode
+    to its token limit.
+    """
+
+    def __init__(self, app, config: ApiConfig) -> None:
+        self.app = app
+        self.config = config
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        response = _authentication_error(request, self.config)
+        if response is None and request.url.path == "/v1/audio/transcriptions":
+            response = _audio_size_error(request)
+        elif response is None and request.method == "POST":
+            body, error = await _buffer_request_body(receive)
+            if body is None and error is None:
+                return
+            if error is not None:
+                response = _error_response(request, error)
+            else:
+                receive = _replay_body(body, receive)
+        if response is not None:
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+def _replay_body(body: bytes, receive):
+    """Deliver an already read body once, then pass the connection's later messages (the disconnect) through."""
+    sent = False
+
+    async def replay():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+
+    return replay
 
 
 def _register_request_guards(app: FastAPI, config: ApiConfig) -> None:
     """Register authentication and request-size guards."""
-
-    @app.middleware("http")
-    async def _server_guards(
-        request: Request,
-        call_next: Callable[[Request], Awaitable],
-    ):
-        """Reject unauthorized or oversized requests before route handling."""
-        error_response = _authentication_error(request, config)
-        if error_response is not None:
-            return error_response
-        if request.url.path == "/v1/audio/transcriptions":
-            error_response = _audio_size_error(request)
-        elif request.method == "POST":
-            error_response = await _buffer_request_body(request)
-        if error_response is not None:
-            return error_response
-        return await call_next(request)
+    app.add_middleware(_ServerGuards, config=config)
 
 
 def create_app(engine_client: EngineClient,

@@ -85,7 +85,7 @@ EvictionPlan EvictionPlanner::plan(ResourceDemand const& demand, ResourcePools c
                 simulatedRef->second > 0, "Context cache eviction record releases a resource with no cache reference");
 
             --simulatedRef->second;
-            if (simulatedRef->second == 0 && pools.activeRefCount(resource) == 0)
+            if (simulatedRef->second == 0 && pools.activeRefCount(resource) == 0 && pools.isUsable(resource))
             {
                 ++plan.reclaimed.get(resource.type);
             }

@@ -157,6 +157,30 @@ def test_streams_content_reasoning_and_tools_across_chunk_boundaries(tmp_path):
     assert json.loads(calls[0].arguments) == {"city": "Paris"}
 
 
+def test_streams_implicit_reasoning_when_the_template_opens_the_block(tmp_path):
+    # Qwen3.6 with thinking enabled: the chat template ends the prompt with the start token, so the output
+    # starts inside the reasoning block and only "</think>" appears. With tools in the request the reasoning
+    # used to stay in the visible text, ending in a literal "</think>".
+    chunks = ("I'll list the files.", " Use Glob.</th", 'ink>\n\nHere.<tool_call>{"name":"get_weather","arguments":{"city":"Rome"}}</tool_call>')
+
+    def run(implicit):
+        parser = stream_assistant_output(_config(), str(tmp_path), reasoning_parser="qwen3", implicit_reasoning=implicit)
+        events = []
+        for chunk in chunks:
+            events.extend(parser.feed(chunk))
+        events.extend(parser.flush())
+        return events
+
+    events = run(True)
+    assert "".join(e["text"] for e in events if e["type"] == "reasoning") == "I'll list the files. Use Glob."
+    content = "".join(e["text"] for e in events if e["type"] == "content")
+    assert "</think>" not in content and content.strip() == "Here."
+    assert [e["tool_call"].name for e in events if e["type"] == "tool_call"] == ["get_weather"]
+    # default behaviour is unchanged: without the flag the reasoning stays in the content
+    legacy = run(False)
+    assert "</think>" in "".join(e["text"] for e in legacy if e["type"] == "content")
+
+
 def test_stream_parser_flushes_untagged_provider_format(tmp_path):
     parser = stream_assistant_output(_config(), str(tmp_path))
     events = list(parser.feed('get_weather(city="Paris")'))

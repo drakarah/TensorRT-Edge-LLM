@@ -36,6 +36,15 @@ namespace trt_edgellm::chat_template
 {
 namespace
 {
+
+//! EDGELLM_PRESERVE_THINKING=1: templates that honour `preserve_thinking` (Qwen3.5/3.6) keep the reasoning of earlier assistant turns when a new user
+//! message follows, so the rendered history stays a prefix of the previous request and the prefix cache keeps hitting across user turns.
+bool preserveThinkingFromEnv()
+{
+    char const* const value = std::getenv("EDGELLM_PRESERVE_THINKING");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
 using Json = nlohmann::json;
 
 enum class RawProcessor
@@ -723,6 +732,10 @@ public:
                 if (!options.reasoningEffort.empty())
                 {
                     setInjaObjectField(inputs, "reasoning_effort", options.reasoningEffort);
+                }
+                if (preserveThinkingFromEnv())
+                {
+                    setInjaObjectField(inputs, "preserve_thinking", true);
                 }
                 setInjaObjectField(inputs, "parallel_tool_calls", options.parallelToolCalls);
                 setInjaObjectField(inputs, "tool_choice", toolChoiceToJson(options.toolChoice));

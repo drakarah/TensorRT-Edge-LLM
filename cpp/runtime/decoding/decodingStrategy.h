@@ -95,6 +95,7 @@ struct SamplingBuffers
     Tensor& hostOutputSpaceIds;
     Tensor& uniforms;
     Tensor& hostUniforms;
+    Tensor& presenceSeen; //!< [maxBatch, outputVocab] Int8 flags of generated tokens (presence penalty)
 };
 
 /*!

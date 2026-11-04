@@ -46,6 +46,7 @@
 #include "runtime/state/contextCache/contextCacheCoordinator.h"
 #include "sampler/sampling.h"
 #include <algorithm>
+#include <dlfcn.h>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -522,6 +523,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kINT32, "LLMRankRuntime::mSamplingIndices");
         mSamplingScores
             = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kFLOAT, "LLMRankRuntime::mSamplingScores");
+        mPresenceSeen = rt::Tensor({mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize}, rt::DeviceType::kGPU,
+            DataType::kINT8, "LLMRankRuntime::mPresenceSeen");
         mSamplingUniforms = rt::Tensor(
             {mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kFLOAT, "LLMRankRuntime::mSamplingUniforms");
         allocateLogitBias(mLogitBias, mMaxRuntimeBatchSize);
@@ -678,6 +681,13 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         ELLM_CHECK(contextCacheDeploymentProfile.has_value(), "Context-cache deployment was not validated");
         mContextCache = std::make_unique<ContextCacheCoordinator>(
             contextCacheConfig, mDeployment, *contextCacheDeploymentProfile, cacheResources, stream);
+        {
+            KVCacheManager const& kv = mSharedResources->cacheManagers[0]->getKVCacheManager();
+            if (kv.isGrowable())
+            {
+                mContextCache->limitBasePages(kv.mappedTokens() / kTOKENS_PER_PAGE);
+            }
+        }
 
         mHybridMtpContextReuseDeployment
             = contextCacheDeploymentProfile->isHybrid() && contextCacheDeploymentProfile->isSpeculative();
@@ -810,7 +820,8 @@ void LLMRankRuntime::buildDecodingRuntimeContext()
     PreprocessResources preprocessResources{
         *mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mDeepstack.get(), mGemma4Ple.get()};
     SamplingBuffers sampling{mSamplingWorkspace, mSamplingIndices, mSamplingScores, mBaseVocabMappingTable,
-        mHostDecoderTokenIds, mHostSelectedTokenIds, mHostOutputSpaceIds, mSamplingUniforms, mHostSamplingUniforms};
+        mHostDecoderTokenIds, mHostSelectedTokenIds, mHostOutputSpaceIds, mSamplingUniforms, mHostSamplingUniforms,
+        mPresenceSeen};
     LogprobsBuffers logprobs{
         mDeviceLogprobsValues, mDeviceLogprobsIndices, mHostLogprobsValues, mHostLogprobsIndices, mGatheredLogits};
     mDecodingRuntimeContext.reset(
@@ -866,6 +877,116 @@ void LLMRankRuntime::setVisualPrunerConfig(VisualPrunerConfig const& config)
     }
     LOG_INFO("Visual-token pruning enabled: algorithm=%s, reductionRatio=%.3f, minVisualTokens=%d",
         mVisualPruner->name(), config.reductionRatio, config.minVisualTokens);
+}
+
+namespace
+{
+//! Looks up an exported function of the MoE plugin library, when it is loaded.
+void* moePluginSymbol(char const* name)
+{
+    void* symbol = dlsym(RTLD_DEFAULT, name);
+    if (symbol == nullptr)
+    {
+        // The plugin library may have been loaded with local symbol scope: find the loaded object by its path or name.
+        char const* const envPath = std::getenv("EDGELLM_PLUGIN_PATH");
+        for (char const* candidate : {envPath, "libNvInfer_edgellm_plugin.so.1", "libNvInfer_edgellm_plugin.so"})
+        {
+            void* library = candidate != nullptr ? dlopen(candidate, RTLD_LAZY | RTLD_NOLOAD) : nullptr;
+            if (library != nullptr)
+            {
+                symbol = dlsym(library, name);
+                dlclose(library);
+                if (symbol != nullptr)
+                {
+                    break;
+                }
+            }
+        }
+    }
+    return symbol;
+}
+
+//! Releases expert-cache memory through the MoE plugin library; 0 when it is absent or nothing can go.
+int64_t releaseExpertCacheBytes(int64_t bytes)
+{
+    using Fn = int64_t (*)(int64_t);
+    void* symbol = moePluginSymbol("edgellmMoeReleaseCacheBytes");
+    return symbol != nullptr ? reinterpret_cast<Fn>(symbol)(bytes) : 0;
+}
+
+//! Gives device memory to the expert caches; returns the bytes they took.
+int64_t growExpertCacheBytes(int64_t bytes)
+{
+    using Fn = int64_t (*)(int64_t);
+    void* symbol = moePluginSymbol("edgellmMoeGrowCacheBytes");
+    return symbol != nullptr ? reinterpret_cast<Fn>(symbol)(bytes) : 0;
+}
+
+//! Reads the expert-cache sizes from the MoE plugin library; false when it is absent.
+bool expertCacheInfo(RuntimeMemoryMetrics& metrics)
+{
+    using Fn = int32_t (*)(int64_t*, int32_t);
+    void* symbol = moePluginSymbol("edgellmMoeCacheInfo");
+    int64_t values[6] = {};
+    if (symbol == nullptr || reinterpret_cast<Fn>(symbol)(values, 6) < 6)
+    {
+        return false;
+    }
+    metrics.expertLayers = static_cast<int32_t>(values[0]);
+    metrics.expertSlotsPerLayer = static_cast<int32_t>(values[1]);
+    metrics.expertMaxSlotsPerLayer = static_cast<int32_t>(values[2]);
+    metrics.expertBytesPerSlotAllLayers = values[3];
+    metrics.expertCacheBytes = values[4];
+    metrics.expertCacheAllocFailures = values[5];
+    return true;
+}
+
+//! Tokens by which the mapped KV may exceed the recent peak need before it is trimmed back (EDGELLM_KV_SHRINK_SLACK_TOKENS).
+int64_t kvShrinkSlackTokens()
+{
+    return kvEnvInteger("EDGELLM_KV_SHRINK_SLACK_TOKENS", 16384, 0);
+}
+} // namespace
+
+RuntimeMemoryMetrics LLMRankRuntime::getMemoryMetrics() const
+{
+    std::lock_guard<std::mutex> lock(mMemoryMetricsMutex);
+    return mMemoryMetrics;
+}
+
+void LLMRankRuntime::refreshMemoryMetrics() noexcept
+{
+    try
+    {
+        RuntimeMemoryMetrics metrics;
+        KVCacheManager const& kv = mSharedResources->cacheManagers[0]->getKVCacheManager();
+        metrics.valid = true;
+        metrics.kvGrowable = kv.isGrowable();
+        metrics.kvMappedTokens = kv.mappedTokens();
+        metrics.kvCapacityTokens = mDeployment.base.maxKVCacheCapacity;
+        metrics.kvMappedBytes = static_cast<int64_t>(kv.mappedBytes());
+        metrics.kvCapacityBytes = static_cast<int64_t>(kv.capacityBytes());
+        if (mContextCache != nullptr)
+        {
+            ContextCacheMetrics const cache = mContextCache->metrics();
+            int32_t const usable = kv.isGrowable() ? kv.mappedTokens() / kTOKENS_PER_PAGE : cache.baseKvPages.capacity;
+            metrics.kvPagesUsable = usable;
+            metrics.kvPagesFree = cache.baseKvPages.free;
+            metrics.kvPagesHighWater = mContextCache->baseHighWaterPages();
+            metrics.contextRecords = static_cast<int64_t>(cache.currentRecords);
+            metrics.recurrentSnapshotsFree = cache.recurrentSnapshots.free;
+            metrics.recurrentSnapshotsCapacity = cache.recurrentSnapshots.capacity;
+            metrics.partialKvSnapshotsFree = cache.partialKvSnapshots.free;
+            metrics.partialKvSnapshotsCapacity = cache.partialKvSnapshots.capacity;
+        }
+        expertCacheInfo(metrics);
+        std::lock_guard<std::mutex> lock(mMemoryMetricsMutex);
+        mMemoryMetrics = metrics;
+    }
+    catch (std::exception const& e)
+    {
+        LOG_WARNING("Memory metrics unavailable: %s", e.what());
+    }
 }
 
 bool LLMRankRuntime::broadcastInt32(void* gpuBuffer, int32_t count, cudaStream_t stream)
@@ -1719,18 +1840,60 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     cudaStream_t stream, bool outputThinkerEmbeddings, TokenBroadcastFn tokenBroadcast, int32_t parallelRank,
     GenerationBoundaryHook const& boundaryHook)
 {
+    struct MetricsAtExit
+    {
+        LLMRankRuntime& runtime;
+        ~MetricsAtExit()
+        {
+            runtime.refreshMemoryMetrics();
+        }
+    } metricsAtExit{*this};
     std::unique_ptr<SteppedGeneration> generation
         = beginGeneration(request, response, stream, outputThinkerEmbeddings, std::move(tokenBroadcast), parallelRank);
     if (generation == nullptr)
     {
         return false;
     }
+    refreshMemoryMetrics();
     if (!runGenerationLoop(generation->context, *generation->strategy, generation->managedRequest(), request,
             generation->kvHeadroom, stream, boundaryHook))
     {
         return false;
     }
     return finishGeneration(*generation, request, response, stream);
+}
+
+ReasoningBudget LLMRankRuntime::makeReasoningBudget(LLMGenerationRequest const& request)
+{
+    int32_t const startId = reasoningStartMarkers(*mTokenizer)[1];
+    int32_t const endId = reasoningEndMarkers(*mTokenizer)[1];
+    if (startId < 0 || endId < 0)
+    {
+        LOG_ERROR("The tokenizer has no think start/end tokens, so a reasoning budget cannot be applied.");
+        return {};
+    }
+    if (mTokenEndsUtf8.empty())
+    {
+        // A token whose bytes stop inside a multi-byte character decodes to U+FFFD.
+        mTokenEndsUtf8.assign(static_cast<size_t>(mDeployment.base.vocabSize), 1);
+        for (int32_t id = 0; id < mDeployment.base.vocabSize; ++id)
+        {
+            if (mTokenizer->decode({static_cast<tokenizer::Rank>(id)}).find("\xEF\xBF\xBD") != std::string::npos)
+            {
+                mTokenEndsUtf8[static_cast<size_t>(id)] = 0;
+            }
+        }
+    }
+    std::vector<int32_t> forced;
+    if (!request.reasoningBudgetMessage.empty())
+    {
+        for (auto const id : mTokenizer->encode(request.reasoningBudgetMessage))
+        {
+            forced.push_back(static_cast<int32_t>(id));
+        }
+    }
+    forced.push_back(endId);
+    return ReasoningBudget({startId}, {{endId}}, std::move(forced), request.reasoningBudgetTokens, mTokenEndsUtf8);
 }
 
 std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGeneration(LLMGenerationRequest const& request,
@@ -1816,6 +1979,23 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
             "Decoder fallback: reason=non_greedy_eagle_unsupported, selected=vanilla, "
             "temperature=%.3f, topK=%" PRId64 ", topP=%.3f.",
             request.temperature, request.topK, request.topP);
+    }
+
+    if (request.presencePenalty != 0.0f && (enableSpecDecode || activeBatchSize > 1))
+    {
+        LOG_ERROR("presence_penalty needs vanilla decoding of a single request (speculative decoding: %d, batch: %d).",
+            static_cast<int>(enableSpecDecode), activeBatchSize);
+        return nullptr;
+    }
+
+    if (request.reasoningBudgetTokens >= 0
+        && (enableSpecDecode || activeBatchSize > 1 || mDeployment.base.reducedVocabSize > 0))
+    {
+        LOG_ERROR(
+            "A reasoning budget needs vanilla decoding of a single request with the full vocabulary (speculative "
+            "decoding: %d, batch: %d, reduced vocabulary: %d).",
+            static_cast<int>(enableSpecDecode), activeBatchSize, static_cast<int>(mDeployment.base.reducedVocabSize > 0));
+        return nullptr;
     }
 
     int32_t maxGenerateLength = request.maxGenerateLength;
@@ -1926,6 +2106,17 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     context.temperature = forceGreedySpecDecode ? 1.0f : request.temperature;
     context.topP = forceGreedySpecDecode ? 1.0f : request.topP;
     context.topK = forceGreedySpecDecode ? 0 : request.topK;
+    context.presencePenalty = request.presencePenalty;
+    context.presenceFlagsPending = request.presencePenalty != 0.0f;
+    if (request.reasoningBudgetTokens >= 0)
+    {
+        auto budget = makeReasoningBudget(request);
+        if (!budget.enabled())
+        {
+            return nullptr;
+        }
+        context.reasoningBudget = std::move(budget);
+    }
     bool const hasExplicitSamplingSeed = request.samplingSeed.has_value()
         || std::any_of(request.requests.begin(), request.requests.end(),
             [](LLMGenerationRequest::Request const& slot) { return slot.samplingSeed.has_value(); });
@@ -2029,6 +2220,85 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         kvHeadroom.baseExtraTokens > 0 && kvHeadroom.draftExtraTokens >= 0, "Decoder returned invalid KV headroom");
     ELLM_CHECK(!enableSpecDecode || kvHeadroom.draftExtraTokens == 0 || mDeployment.draft.has_value(),
         "Decoder requested draft KV headroom without a draft engine");
+
+    int32_t kvLimit = mDeployment.base.maxKVCacheCapacity;
+    {
+        rt::KVCacheManager& kv = mSharedResources->cacheManagers[0]->getKVCacheManager();
+        int32_t longestInput = 0;
+        for (auto const& tokenIds : context.rawBatchedInputIds)
+        {
+            longestInput = std::max(longestInput, static_cast<int32_t>(tokenIds.size()));
+        }
+        int64_t const wanted = static_cast<int64_t>(longestInput) + std::max<int64_t>(request.maxGenerateLength, 0)
+            + kvHeadroom.baseExtraTokens;
+        int64_t const wantedCapped = std::min<int64_t>(mDeployment.base.maxKVCacheCapacity, wanted);
+        // With the context cache the pages of a request are leased lowest-ID-first below the mapped range. The slack
+        // covers pages the request shares with a retained record, which are counted once in the high-water mark.
+        constexpr int64_t kCacheSlackPages = 128;
+        int64_t const wantedPages
+            = (wantedCapped + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE + (mContextCache != nullptr ? kCacheSlackPages : 0);
+        int32_t needed = static_cast<int32_t>(std::min<int64_t>(mDeployment.base.maxKVCacheCapacity, wantedPages * kTOKENS_PER_PAGE));
+        int32_t const recentPeak = mKvNeedWindow.record(KvNeedWindow::Clock::now(), needed);
+        if (mContextCache != nullptr && kv.isGrowable())
+        {
+            // Records older than the recent-need window go, so their pages do not keep the mapping (and the expert
+            // cache that pays for it) large; the mapping always covers every page still held.
+            int32_t const peakPages = (recentPeak + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE;
+            if (mContextCache->baseHighWaterPages() > peakPages)
+            {
+                size_t const evicted = mContextCache->trimBasePagesTo(peakPages);
+                LOG_INFO("Evicted %zu context-cache records to keep the retained KV within %d pages.", evicted, peakPages);
+            }
+            needed = std::max(needed, std::min(mDeployment.base.maxKVCacheCapacity, mContextCache->baseHighWaterPages() * kTOKENS_PER_PAGE));
+        }
+        bool cacheResized = false;
+        if (!kv.ensureTokens(needed))
+        {
+            size_t const bytesNeeded = kv.bytesToMap(needed);
+            int64_t const released = releaseExpertCacheBytes(static_cast<int64_t>(bytesNeeded));
+            cacheResized = released > 0;
+            if (cacheResized)
+            {
+                LOG_INFO("Released %.1f MiB of expert cache to grow the KV cache to %d tokens.", released / 1048576.0, needed);
+            }
+            else
+            {
+                LOG_WARNING("KV cache needs %.1f MiB more for %d tokens and no expert cache memory could be released (plugin entry point %s).",
+                    bytesNeeded / 1048576.0, needed, moePluginSymbol("edgellmMoeReleaseCacheBytes") != nullptr ? "found" : "not found");
+            }
+            if (!kv.ensureTokens(needed))
+            {
+                kvLimit = kv.mappedTokens();
+                if (longestInput > kvLimit)
+                {
+                    throw std::runtime_error("EDGELLM_INPUT_TOO_LONG: input length " + std::to_string(longestInput)
+                        + " exceeds the KV cache that could be mapped (" + std::to_string(kvLimit) + " tokens)");
+                }
+                LOG_WARNING("KV cache cannot grow to %d tokens (mapped %d); limiting this request.", needed, kvLimit);
+            }
+        }
+        else if (kv.isGrowable()
+            && static_cast<int64_t>(kv.mappedTokens()) > static_cast<int64_t>(std::max(recentPeak, needed)) + kvShrinkSlackTokens())
+        {
+            size_t const freed = kv.shrinkTokens(std::max(recentPeak, needed));
+            int64_t const taken = growExpertCacheBytes(static_cast<int64_t>(freed));
+            cacheResized = taken > 0;
+            LOG_INFO("Trimmed the KV cache to %d tokens, the peak need of the last %zu requests (%.1f MiB freed); the expert cache took %.1f MiB.",
+                kv.mappedTokens(), mKvNeedWindow.size(), freed / 1048576.0, taken / 1048576.0);
+        }
+        if (mContextCache != nullptr && kv.isGrowable())
+        {
+            mContextCache->limitBasePages(kv.mappedTokens() / kTOKENS_PER_PAGE);
+        }
+        if (cacheResized)
+        {
+            mBaseExecutor->dropGraphs();
+            if (!captureDecodingCUDAGraph(context.stream))
+            {
+                LOG_WARNING("Decode graphs were not recaptured after the expert cache changed size; decoding runs without them.");
+            }
+        }
+    }
 
     // In production, the system-prompt KV cache is saved during warm-up.
     // We disable profiling here to make benchmarking closer to production inference result.
@@ -2172,7 +2442,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         residentInputLengths.push_back(static_cast<int32_t>(tokenIds.size()));
     }
     int32_t clampedMaxGenerateLength = clampMaxGenerateLengthForKVCapacity(residentInputLengths,
-        request.maxGenerateLength, mDeployment.base.maxKVCacheCapacity, kvHeadroom.baseExtraTokens);
+        request.maxGenerateLength, kvLimit, kvHeadroom.baseExtraTokens);
     if (kvHeadroom.draftExtraTokens > 0)
     {
         ELLM_CHECK(mDeployment.draft.has_value(), "Draft KV headroom requires a draft engine");
@@ -2211,6 +2481,16 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         }
     }
 
+    // Non-speculative hybrid with context reuse: publish the checkpoint at a stable boundary inside the prefill (EDGELLM_HYBRID_PLAIN_REUSE=0 disables).
+    static bool const plainReuseEnabled = [] {
+        char const* env = std::getenv("EDGELLM_HYBRID_PLAIN_REUSE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    bool const plainHybridContextReuse = plainReuseEnabled && !hybridMtpContextReuse && requestCacheEnabled
+        && decodingStrategy.kind() == DecodingStrategyKind::kVanilla && mDeployment.base.numLinearAttnLayers > 0
+        && context.activeBatchSize == 1 && !context.visualEmbeddings.has_value() && !context.audioEmbeddings.has_value()
+        && request.recurrentCaptureInterval == 0;
+
     // Prefill from the base model; subsequent iterations are delegated to the selected strategy.
     context.prefillLastPassLength = 0;
     bool prefillStatus;
@@ -2219,6 +2499,11 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         context.hybridMtpEndpointReuse = true;
         context.contextCacheReplayTailLength = request.contextCacheReplayTailLength;
         prefillStatus = runHybridMtpPrefill(context, decodingStrategy, *managedRequest);
+    }
+    else if (plainHybridContextReuse)
+    {
+        context.contextCacheReplayTailLength = request.contextCacheReplayTailLength;
+        prefillStatus = runHybridPlainPrefill(context, *managedRequest);
     }
     else if (canChunkPrefill(context, decodingStrategy)
         && context.effectivePrefillLengths[0] > mDeployment.base.maxSupportedInputLength)
@@ -3118,11 +3403,147 @@ bool LLMRankRuntime::runHybridMtpPrefill(
     return true;
 }
 
+bool LLMRankRuntime::runHybridPlainPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest& managedKVCacheRequest)
+{
+    int32_t const reuseLength = managedKVCacheRequest.reuseTokenLength(0);
+    int32_t const inputLength = math::cast<int32_t>(context.rawBatchedInputIds[0].size());
+    int32_t const suffixLenOrig = context.effectivePrefillLengths[0];
+
+    // Stable boundary: the prompt without the volatile generation-prompt tail, or the prefix this input shares with an earlier request when that is
+    // longer than the checkpoint it restored from (divergence checkpoint, as in runHybridMtpPrefill).
+    // A split costs a second prefill pass (which streams the experts of the tail again) and a checkpoint capture, about 1 s on a 3k-token prompt with host-streamed
+    // experts, so it is only made where a later request is likely to reuse it: the prefix this input shares with a recent request (divergence checkpoint,
+    // EDGELLM_HYBRID_DIVERGENCE_CHECKPOINT=<min tokens>, which is how a family of prompts with a common system prompt + tools gets its checkpoint on its
+    // second member), or, with EDGELLM_HYBRID_PLAIN_TAIL_CHECKPOINT=1, always at the end of the prompt without its volatile tail (multi-turn continuations).
+    int32_t replayTailLength = 0;
+    static int32_t const divergenceMinTokens = [] {
+        char const* env = std::getenv("EDGELLM_HYBRID_DIVERGENCE_CHECKPOINT");
+        return env != nullptr ? std::max(0, std::atoi(env)) : 0;
+    }();
+    static bool const tailCheckpoint = [] {
+        char const* env = std::getenv("EDGELLM_HYBRID_PLAIN_TAIL_CHECKPOINT");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (tailCheckpoint)
+    {
+        replayTailLength = context.contextCacheReplayTailLength;
+    }
+    if (divergenceMinTokens > 0)
+    {
+        int32_t const sharedPrefix = managedKVCacheRequest.hybridSharedPrefixLength(0);
+        int32_t const stableEnd = inputLength - std::max(context.contextCacheReplayTailLength, 0);
+        if (sharedPrefix >= reuseLength + divergenceMinTokens && sharedPrefix < stableEnd)
+        {
+            LOG_DEBUG("Hybrid prefill: divergence checkpoint at %d (reuse %d, input %d)", sharedPrefix, reuseLength, inputLength);
+            replayTailLength = inputLength - sharedPrefix;
+        }
+    }
+    bool const hasVolatileTail = replayTailLength > 0 && suffixLenOrig > replayTailLength;
+    if (!hasVolatileTail)
+    {
+        // nothing to split: single pass, the end-of-prompt checkpoint is captured by the prefill itself (serves exact continuations only)
+        return runBoundedBaseModelPrefill(context, &managedKVCacheRequest, /*sampleOutput=*/true);
+    }
+
+    std::vector<int32_t> const completeSuffix = context.tokenIds[0];
+    int32_t const predecessorLength = inputLength - replayTailLength;
+    int32_t const predecessorChunkLength = suffixLenOrig - replayTailLength;
+    auto const replayBegin = completeSuffix.end() - replayTailLength;
+
+    // Chunk 1: the stable predecessor [reuseLength, predecessorLength), no sampling, then publish the checkpoint at its end.
+    context.tokenIds[0].assign(completeSuffix.begin(), replayBegin);
+    context.effectivePrefillLengths[0] = predecessorChunkLength;
+    if (!runBoundedBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/false))
+    {
+        return false;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(context.stream));
+    if (!managedKVCacheRequest.publishHybridEndpoint(0, predecessorLength))
+    {
+        return false;
+    }
+
+    // Chunk 2: replay the volatile tail with sampling, then restore the bookkeeping for the decode loop.
+    context.tokenIds[0].assign(replayBegin, completeSuffix.end());
+    context.effectivePrefillLengths[0] = replayTailLength;
+    if (!runBoundedBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/true))
+    {
+        return false;
+    }
+    int32_t const sampledToken = context.tokenIds[0].back();
+    context.tokenIds[0] = completeSuffix;
+    context.tokenIds[0].push_back(sampledToken);
+    context.effectivePrefillLengths[0] = suffixLenOrig;
+    return true;
+}
+
 bool LLMRankRuntime::canChunkPrefill(
     DecodingInferenceContext const& context, DecodingStrategy const& strategy) const noexcept
 {
+    // Hybrid (gated-delta-net) bases carry their recurrent and convolution state in the request's resident slot, so a
+    // later pass continues from the earlier one exactly like a context-reuse suffix prefill. A prompt that fits one pass
+    // never takes this path, so enabling it only turns a refused prompt into an accepted one (EDGELLM_HYBRID_CHUNKED_PREFILL=0
+    // restores the refusal).
     return strategy.supportsChunkedPrefill() && context.activeBatchSize == 1 && mVisionRunner == nullptr && mAudioRunner == nullptr
-        && mDeployment.base.numLinearAttnLayers == 0 && !mDeployment.base.isDiffusionBackbone;
+        && (mDeployment.base.numLinearAttnLayers == 0 || hybridChunkedPrefillEnabled()) && !mDeployment.base.isDiffusionBackbone;
+}
+
+bool LLMRankRuntime::hybridChunkedPrefillEnabled() noexcept
+{
+    static bool const enabled = [] {
+        char const* value = std::getenv("EDGELLM_HYBRID_CHUNKED_PREFILL");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool LLMRankRuntime::runBoundedBaseModelPrefill(
+    DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest, bool sampleOutput)
+{
+    int32_t const suffixLength = context.effectivePrefillLengths[0];
+    int32_t const maxPassLength = mDeployment.base.maxSupportedInputLength;
+    if (suffixLength <= maxPassLength || !hybridChunkedPrefillEnabled())
+    {
+        return runBaseModelPrefill(context, managedKVCacheRequest, sampleOutput);
+    }
+    // Longer than one pass: passes of at most maxPassLength, each continuing from the recurrent state and the KV the
+    // previous one left in the resident slot. Only the last pass samples and carries the request (its end-of-prompt capture).
+    std::vector<int32_t> const completeSuffix = context.tokenIds[0];
+    ELLM_CHECK(maxPassLength > 0 && suffixLength <= static_cast<int32_t>(completeSuffix.size()),
+        "Chunked hybrid prefill: invalid suffix or max input length");
+    LOG_DEBUG("Chunked hybrid prefill: %d tokens in passes of at most %d", suffixLength, maxPassLength);
+    int32_t lastPassLength = 0;
+    int32_t begin = 0;
+    for (int32_t length = 0; begin < suffixLength; begin += length)
+    {
+        length = std::min(maxPassLength, suffixLength - begin);
+        if (maxPassLength > 2 && suffixLength - begin - length == 1)
+        {
+            --length;
+        }
+        bool const lastPass = begin + length == suffixLength;
+        lastPassLength = length;
+        context.tokenIds[0].assign(completeSuffix.begin() + begin, completeSuffix.begin() + begin + length);
+        context.effectivePrefillLengths[0] = length;
+        if (!runBaseModelPrefill(context, lastPass ? managedKVCacheRequest : nullptr, sampleOutput && lastPass))
+        {
+            return false;
+        }
+        if (!lastPass)
+        {
+            // The next pass restages the shared pinned token buffer.
+            CUDA_CHECK(cudaStreamSynchronize(context.stream));
+        }
+    }
+    int32_t const sampledToken = sampleOutput ? context.tokenIds[0].back() : 0;
+    context.tokenIds[0] = completeSuffix;
+    if (sampleOutput)
+    {
+        context.tokenIds[0].push_back(sampledToken);
+    }
+    context.prefillLastPassLength = lastPassLength;
+    context.effectivePrefillLengths[0] = suffixLength;
+    return true;
 }
 
 bool LLMRankRuntime::runChunkedBaseModelPrefill(

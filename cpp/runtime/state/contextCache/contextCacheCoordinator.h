@@ -211,6 +211,10 @@ public:
     //! base-hidden row, then commits the exact checkpoint. Skipped for bypass, already-published, or empty prefixes.
     ContextCacheCoordinatorStatus publishHybridMtpEndpoint(RequestHandle& request, int32_t slot,
         int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow);
+    //! Publish one recurrent + partial-KV checkpoint of a NON-speculative hybrid at a stable boundary in the middle of a prefill (the prompt
+    //! without its volatile generation-prompt tail, or the prefix shared with an earlier request). Skipped for bypass, already published or
+    //! empty prefixes; a snapshot-pool shortage is a soft skip.
+    ContextCacheCoordinatorStatus publishHybridEndpoint(RequestHandle& request, int32_t slot, int32_t residentStateLength);
     //! Longest page-aligned prefix the slot's input shares with a cached hybrid record (see
     //! ReusePlan::hybridSharedPrefixTokens); 0 for a bypassed lookup.
     int32_t hybridSharedPrefixLength(RequestHandle& request, int32_t slot);
@@ -237,6 +241,13 @@ public:
 
     ContextCacheMetrics metrics() const noexcept;
     ContextCacheManager const& manager() const noexcept;
+
+    //! Bound the base KV pages that may be handed out (see ContextCacheManager::limitBasePages). Call between requests.
+    void limitBasePages(int32_t pages);
+    //! One past the highest base KV page held by an active request or a retained record.
+    int32_t baseHighWaterPages() const noexcept;
+    //! Evict records holding a base page at or above @p pages (least recently used first); returns how many.
+    size_t trimBasePagesTo(int32_t pages);
 
     //! Whether this deployment can lease and bind a new sequence into an executing request.
     bool supportsLiveSequenceAdmission() const noexcept;

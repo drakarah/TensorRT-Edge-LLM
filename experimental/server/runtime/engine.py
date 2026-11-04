@@ -48,6 +48,7 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
                     Optional, Sequence, Tuple, Union)
 
 from ..config import DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig
+from .control_tokens import defang, defang_enabled
 from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
                                     validate_tool_request)
 from .engine_layout import (BundleLayout, EngineType, detect_engine_type,
@@ -92,6 +93,9 @@ class SamplingParams:
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 50
+    presence_penalty: float = 0.0
+    reasoning_budget_tokens: int = -1
+    reasoning_budget_message: str = ""
     seed: Optional[int] = None
     max_tokens: int = 2048
     enable_thinking: bool = False
@@ -845,6 +849,7 @@ def _native_context_cache_config(rt, config: ContextCacheConfig):
     native.max_records = config.max_records
     native.recurrent_snapshot_pool_bytes = config.recurrent_snapshot_pool_bytes
     native.partial_kv_snapshot_pool_bytes = config.partial_kv_snapshot_pool_bytes
+    native.snapshots_in_host_memory = config.snapshots_in_host_memory
     return native
 
 
@@ -1352,12 +1357,15 @@ class LLM:
     def _prepare_messages_for_runtime(
         self,
         messages: List[Dict[str, Any]],
+        apply_chat_template: bool = True,
     ):
         """Preserve structured messages for the model-owned C++ renderer."""
         image_buffers = _load_image_buffers(self._rt, messages,
                                             self._video_model_family,
                                             self._video_frame_limits)
-        return _convert_messages_to_cpp(self._rt, messages), image_buffers
+        return _convert_messages_to_cpp(
+            self._rt, messages,
+            defang_content=apply_chat_template and defang_enabled()), image_buffers
 
     def _make_generation_request(
         self,
@@ -1380,14 +1388,21 @@ class LLM:
         # A negative value asks the native renderer/tokenizer to derive it.
         cache_config = getattr(self, "_context_cache_config", None)
         prefill_state_only = self._hybrid_base and self.has_draft_model
+        # A hybrid base without a draft model needs the tail only for
+        # EDGELLM_HYBRID_PLAIN_TAIL_CHECKPOINT, which publishes the checkpoint
+        # at the end of the prompt without that tail.
+        plain_hybrid_tail = (self._hybrid_base and not self.has_draft_model and
+                             os.environ.get("EDGELLM_HYBRID_PLAIN_TAIL_CHECKPOINT",
+                                            "0") not in ("", "0"))
         derive_replay_tail = (cache_config is not None and cache_config.enabled
-                              and (prefill_state_only
-                                   or not params.cache_generated_tokens)
-                              and self.has_draft_model and apply_chat_template
-                              and add_generation_prompt)
+                              and ((self.has_draft_model and
+                                    (prefill_state_only
+                                     or not params.cache_generated_tokens))
+                                   or plain_hybrid_tail)
+                              and apply_chat_template and add_generation_prompt)
         replay_tail_length = -1 if derive_replay_tail else 0
         cpp_messages, image_buffers = self._prepare_messages_for_runtime(
-            messages)
+            messages, apply_chat_template)
 
         audio_buffers = _load_audio_buffers(self._rt, messages)
 
@@ -1408,6 +1423,9 @@ class LLM:
         request.temperature = params.temperature
         request.top_p = params.top_p
         request.top_k = params.top_k
+        request.presence_penalty = params.presence_penalty
+        request.reasoning_budget_tokens = params.reasoning_budget_tokens
+        request.reasoning_budget_message = params.reasoning_budget_message
         request.max_generate_length = params.max_tokens
         request.apply_chat_template = apply_chat_template
         request.add_generation_prompt = add_generation_prompt
@@ -2330,8 +2348,11 @@ def finish_reason_name(rt_module, reason) -> Optional[str]:
     }.get(reason, "stop")
 
 
-def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
+def _convert_messages_to_cpp(rt_module,
+                             messages: List[Dict[str, Any]],
+                             defang_content: bool = False):
     """Convert Python message dicts to C++ Message objects."""
+    sanitize = defang if defang_content else (lambda text: text)
     cpp_messages = []
     for msg in messages:
         cpp_msg = rt_module.Message()
@@ -2339,7 +2360,7 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
         reasoning_key = ("reasoning_content" if "reasoning_content" in msg else
                          "reasoning" if "reasoning" in msg else None)
         cpp_msg.has_reasoning_content = reasoning_key is not None
-        cpp_msg.reasoning_content = (str(msg.get(reasoning_key) or "")
+        cpp_msg.reasoning_content = (sanitize(str(msg.get(reasoning_key) or ""))
                                      if reasoning_key else "")
         cpp_msg.tool_call_id = str(msg.get("tool_call_id") or "")
         cpp_msg.name = str(msg.get("name") or "")
@@ -2375,30 +2396,31 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
                         f"Invalid JSON in assistant tool-call arguments: "
                         f"{error.msg}") from error
             call.arguments_is_string = False
-            call.arguments = json.dumps(arguments, ensure_ascii=False,
-                                        separators=(",", ":"))
+            call.arguments = sanitize(
+                json.dumps(arguments, ensure_ascii=False, separators=(",", ":")))
             cpp_tool_calls.append(call)
         cpp_msg.tool_calls = cpp_tool_calls
 
         content = msg.get("content")
         contents_list = []
         if isinstance(content, str):
-            contents_list.append(rt_module.MessageContent("text", content))
+            contents_list.append(
+                rt_module.MessageContent("text", sanitize(content)))
         elif content is not None and not isinstance(content, list):
             raise ValueError(
                 "Message content must be a string, an array, or null")
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, str):
-                    contents_list.append(rt_module.MessageContent(
-                        "text", item))
+                    contents_list.append(
+                        rt_module.MessageContent("text", sanitize(item)))
                 elif isinstance(item, dict):
                     ct = item.get("type", "text")
                     if ct in ("text", "input_text"):
                         contents_list.append(
                             rt_module.MessageContent(
                                 "text",
-                                item.get("text", ""),
+                                sanitize(item.get("text", "")),
                             ))
                     elif ct in ("image", "image_url"):
                         contents_list.append(

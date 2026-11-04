@@ -25,10 +25,13 @@
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include "runtime/config/deploymentConfig.h"
+#include "runtime/kvNeedWindow.h"
+#include "runtime/memoryMetrics.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
+#include "runtime/decoding/reasoningBudget.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/features/deepstackBinding.h"
@@ -50,6 +53,7 @@
 #include "runtime/state/systemPromptKVCache.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
+#include <mutex>
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -366,6 +370,9 @@ public:
     //! the context-cache admit, prefill-execution setup, streaming setup, and the founding prefill
     //! itself. Returns null on any refusal (the same conditions that returned false), and throws
     //! where handleRequest threw. @p request must outlive the returned object.
+    //! Budget for the request, disabled (and logged) when the tokenizer has no think tokens.
+    ReasoningBudget makeReasoningBudget(LLMGenerationRequest const& request);
+
     std::unique_ptr<SteppedGeneration> beginGeneration(LLMGenerationRequest const& request,
         LLMGenerationResponse& response, cudaStream_t stream, bool outputThinkerEmbeddings,
         TokenBroadcastFn tokenBroadcast, int32_t parallelRank, RequestId founderRequestId = 0);
@@ -420,6 +427,10 @@ public:
 
     //! Get context-cache metrics, or nullopt when the runtime cache is disabled.
     std::optional<ContextCacheMetrics> getContextCacheMetrics() const noexcept;
+
+    //! Memory the runtime manages (KV mapping, context-cache pools, expert cache) as of the last request boundary;
+    //! `valid` is false before the first request.
+    RuntimeMemoryMetrics getMemoryMetrics() const;
 
     //! Get multimodal metrics (returns empty metrics if no multimodal runner)
     metrics::MultimodalMetrics getMultimodalMetrics() const noexcept
@@ -615,6 +626,8 @@ private:
     rt::Tensor mSamplingIndices;
     rt::Tensor mSamplingScores;
     rt::Tensor mSamplingUniforms;
+    std::vector<uint8_t> mTokenEndsUtf8; //!< Per token: its bytes leave no unfinished UTF-8 character (built on the first reasoning budget)
+    rt::Tensor mPresenceSeen; //!< [maxBatch, outputVocab] flags of the tokens a request has generated (presence penalty)
     rt::Tensor mBaseVocabMappingTable; // Vocab mapping table for base model reduced vocab (empty if not used)
 
     // [3] Batch eviction support tensors.
@@ -652,6 +665,10 @@ private:
     std::unordered_map<int32_t, rt::Tensor const*> mHiddenStatesRegistry; //!< Per-request layer→buffer map
     int32_t mLastPrefillLength{0};                                        //!< Valid prefill length in buffers
     std::vector<std::vector<int32_t>> mLastInputTokenIds;                 //!< Per-batch input token IDs
+    KvNeedWindow mKvNeedWindow{makeKvNeedWindowFromEnv()};               //!< Recent KV needs; the trim target
+    void refreshMemoryMetrics() noexcept;
+    mutable std::mutex mMemoryMetricsMutex;
+    RuntimeMemoryMetrics mMemoryMetrics;                                //!< Taken at request boundaries
 
     ParallelMapping mMapping{};         //!< Fully-resolved parallel coordinates for this rank.
     TokenBroadcastFn mTokenBroadcast{}; //!< Optional sampled-token synchronization callback.
@@ -676,6 +693,10 @@ private:
     //! equals one prefill over the whole suffix. Restores tokenIds/effectivePrefillLengths to the whole suffix.
     //! @throws std::runtime_error if a CUDA error occurs
     bool runChunkedBaseModelPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest);
+    //! Single pass when the suffix fits maxSupportedInputLength, otherwise passes of at most that length (hybrid bases).
+    bool runBoundedBaseModelPrefill(
+        DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest, bool sampleOutput);
+    static bool hybridChunkedPrefillEnabled() noexcept;
 
     //! Hybrid+MTP endpoint-reuse prefill. Mirrors the reference llmInferenceRuntime.cpp::runHybridMtpPrefill: a
     //! two-chunk base prefill publishing at the stable predecessor boundary, folding the reused checkpoint's boundary
@@ -684,6 +705,12 @@ private:
     //! request, so lookup and publication are both enabled here by construction.
     bool runHybridMtpPrefill(
         DecodingInferenceContext& context, DecodingStrategy& strategy, ManagedKVCacheRequest& managedKVCacheRequest);
+
+    //! Non-speculative hybrid (e.g. Qwen3.5/3.6 GDN + attention) prefill with prefix reuse (rtx4060/hybrid-prefix-reuse): the checkpoint of the plain
+    //! hybrid path was only taken at the end of the prompt, including the volatile generation-prompt tail, so it never matched a later request.
+    //! Here the prefill is split at the stable boundary (the prompt without the replay tail, or the prefix shared with an earlier request, see
+    //! EDGELLM_HYBRID_DIVERGENCE_CHECKPOINT) and the recurrent + partial-KV checkpoint is published there, as runHybridMtpPrefill does for MTP.
+    bool runHybridPlainPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest& managedKVCacheRequest);
 
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);

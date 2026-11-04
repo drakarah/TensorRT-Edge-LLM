@@ -491,6 +491,65 @@ def _remove_externalized_initializers(onnx_model,
     onnx_model.graph.initializer.extend(retained_initializers)
 
 
+def compact_external_data(onnx_path: str, onnx_model=None) -> int:
+    """Rewrite ``<model>.onnx.data`` so that it holds only the initializers the model still references.
+
+    Externalizing initializers (or appending converted tensors) only updates the ONNX metadata, so their old bytes stay
+    in the data file as unreferenced garbage: for a 35B MoE export that is 16 GB of expert weights that also live in the
+    external weight file. Returns the bytes reclaimed (0 when the file is already compact). The data file and the model
+    are replaced only after both new files are fully written.
+    """
+    import onnx
+
+    base_dir = os.path.dirname(os.path.abspath(onnx_path))
+    data_file = os.path.basename(onnx_path) + ".data"
+    data_path = os.path.join(base_dir, data_file)
+    if not os.path.isfile(data_path):
+        return 0
+    model = (onnx_model if onnx_model is not None else onnx.load(
+        onnx_path, load_external_data=False))
+    refs = []
+    for init in model.graph.initializer:
+        if init.raw_data or not init.external_data:
+            continue
+        ref = _external_data_ref(init, base_dir)
+        if ref is None or ref[0] != data_path:
+            continue
+        refs.append((init, ref[1], ref[2]))
+    live = sum(length for _, _, length in refs)
+    old_size = os.path.getsize(data_path)
+    if old_size - live < (64 << 20):
+        return 0
+    refs.sort(key=lambda item: item[1])
+    tmp_data = data_path + ".compact"
+    tmp_model = onnx_path + ".compact"
+    chunk_size = 64 * 1024 * 1024
+    with open(data_path, "rb") as src, open(tmp_data, "wb") as dst:
+        for init, offset, length in refs:
+            dst.write(b"\0" * ((-dst.tell()) % 4096))
+            new_offset = dst.tell()
+            src.seek(offset)
+            remaining = length
+            while remaining:
+                chunk = src.read(min(chunk_size, remaining))
+                if not chunk:
+                    raise IOError(f"Unexpected EOF in {data_path}")
+                dst.write(chunk)
+                remaining -= len(chunk)
+            for entry in init.external_data:
+                if entry.key == "offset":
+                    entry.value = str(new_offset)
+        dst.flush()
+        os.fsync(dst.fileno())
+    onnx.save_model(model, tmp_model)
+    new_size = os.path.getsize(tmp_data)
+    os.replace(tmp_data, data_path)
+    os.replace(tmp_model, onnx_path)
+    logger.info("Compacted %s: %.2f GB -> %.2f GB", data_file, old_size / 1e9,
+                new_size / 1e9)
+    return old_size - new_size
+
+
 def _save_externalized_onnx_model(onnx_path: str, onnx_model) -> None:
     """Save ONNX after all requested externalization passes are complete."""
     import onnx
@@ -501,6 +560,7 @@ def _save_externalized_onnx_model(onnx_path: str, onnx_model) -> None:
         logger.info(
             "Saved ONNX metadata update while preserving existing external "
             "data file")
+        compact_external_data(onnx_path)
         return
 
     out_dir = os.path.dirname(os.path.abspath(onnx_path))
