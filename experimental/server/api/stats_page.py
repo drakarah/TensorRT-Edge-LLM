@@ -109,7 +109,7 @@ td.bad { color: var(--bad); }
     </section>
     <section class="card" style="margin-top:12px">
       <h2>Latest requests</h2><p class="n">Newest first, up to 40.</p>
-      <div class="tablewrap"><table id="tbl"><thead><tr><th>#</th><th>status</th><th>prompt</th><th>reused</th><th>new</th><th>generated</th><th>first token</th><th>decode</th><th>prefill</th><th>total</th></tr></thead><tbody></tbody></table></div>
+      <div class="tablewrap"><table id="tbl"><thead><tr><th>#</th><th>started</th><th>status</th><th>prompt</th><th>reused</th><th>new</th><th>generated</th><th>first token</th><th>decode</th><th>prefill</th><th>total</th></tr></thead><tbody></tbody></table></div>
     </section>
     <p class="n" style="margin-top:12px">Decode is generated tokens after the first divided by the time after the first token. Prefill is only given for 256+ uncached prompt tokens; the time to first token also includes work that grows with the context size, so the rate understates the speed on small turns. Time to first token and the rates exist for streamed requests only. Reuse comes from the context-cache counters.</p>
   </div>
@@ -180,7 +180,8 @@ function plot(el, rows, o) {
   el.replaceChildren(svg, tip);
 }
 
-const base = (r) => [["Request", "#" + r.id], ["Context", f0(r.prompt_tokens) + " tokens"], ["New", f0(r.prompt_tokens - (r.reused_tokens || 0)) + " tokens"]];
+const clock = (t) => (t == null ? "—" : new Date(t * 1000).toLocaleTimeString([], { hour12: false }));
+const base = (r) => [["Request", "#" + r.id], ["Started", clock(r.started_at)], ["Context", f0(r.prompt_tokens) + " tokens"], ["New", f0(r.prompt_tokens - (r.reused_tokens || 0)) + " tokens"]];
 const newTokens = (r) => (r.prompt_tokens == null ? null : r.prompt_tokens - (r.reused_tokens || 0));
 
 const mib = (v) => (v >= 1024 ? (v / 1024).toFixed(2) + " GiB" : Math.round(v) + " MiB");
@@ -306,7 +307,7 @@ function render() {
   const body = $("#tbl tbody"); body.replaceChildren();
   for (const r of rows.slice(-40).reverse()) {
     const tr = document.createElement("tr");
-    [["#" + r.id], [r.status, r.status === "ok" ? "" : "bad"], [f0(r.prompt_tokens)], [f0(r.reused_tokens)], [f0(newTokens(r))], [f0(r.completion_tokens)], [fs(r.ttft_ms)], [r.decode_tok_s == null ? "—" : f1(r.decode_tok_s)], [r.prefill_tok_s == null ? "—" : f0(r.prefill_tok_s)], [fs(r.total_ms)]].forEach(([text, cls]) => { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); });
+    [["#" + r.id], [clock(r.started_at)], [r.status, r.status === "ok" ? "" : "bad"], [f0(r.prompt_tokens)], [f0(r.reused_tokens)], [f0(newTokens(r))], [f0(r.completion_tokens)], [fs(r.ttft_ms)], [r.decode_tok_s == null ? "—" : f1(r.decode_tok_s)], [r.prefill_tok_s == null ? "—" : f0(r.prefill_tok_s)], [fs(r.total_ms)]].forEach(([text, cls]) => { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); });
     body.appendChild(tr);
   }
 }
