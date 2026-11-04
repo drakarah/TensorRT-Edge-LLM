@@ -2282,7 +2282,8 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         {
             size_t const freed = kv.shrinkTokens(std::max(recentPeak, needed));
             int64_t const taken = growExpertCacheBytes(static_cast<int64_t>(freed));
-            cacheResized = taken > 0;
+            // A grow that does not fit still reallocates the old block at a new address, so the graphs must go either way.
+            cacheResized = freed > 0;
             LOG_INFO("Trimmed the KV cache to %d tokens, the peak need of the last %zu requests (%.1f MiB freed); the expert cache took %.1f MiB.",
                 kv.mappedTokens(), mKvNeedWindow.size(), freed / 1048576.0, taken / 1048576.0);
         }

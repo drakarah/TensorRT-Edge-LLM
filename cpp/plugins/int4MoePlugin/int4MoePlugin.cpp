@@ -2644,9 +2644,10 @@ int64_t growLiveCacheBytes(int64_t bytes)
     int64_t taken = 0;
     for (Int4MoePlugin* plugin : plugins)
     {
-        if (plugin->cacheSlots() > 0)
+        int32_t const wanted = std::min(target, plugin->maxCacheSlots());
+        if (plugin->cacheSlots() > 0 && wanted > plugin->cacheSlots())
         {
-            taken -= plugin->resizeExpertCache(std::min(target, plugin->maxCacheSlots()));
+            taken -= plugin->resizeExpertCache(wanted);
         }
     }
     return taken;
