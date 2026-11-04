@@ -2508,6 +2508,41 @@ TEST(RopeWriteKvVInt4Packed, PackedToSplitMatchesReference)
     runVInt4PackedCase(EmuWriter::kPackedToSplit);
 }
 
+TEST(RopeWriteKvVInt4Packed, ScopedModeSelectsPackedWithoutTheEnvironment)
+{
+    EmuSetup const cfg;
+    std::mt19937 gen(31337U);
+    std::uniform_real_distribution<float> uniform(-3.0F, 3.0F);
+    size_t const rows = static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numKVHeads * cfg.headDim;
+    std::vector<half> qHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numQHeads * cfg.headDim);
+    std::vector<half> kHost(rows);
+    std::vector<half> vHost(rows);
+    for (auto& x : qHost) x = __float2half(uniform(gen));
+    for (auto& x : kHost) x = __float2half(uniform(gen));
+    for (auto& x : vHost) x = __float2half(uniform(gen));
+    auto const viaEnv = runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, "packed", nvinfer1::DataType::kINT8);
+    auto const plain = runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8);
+    ASSERT_NE(viaEnv, plain);
+    {
+        ScopedVInt4WriteMode const guard(true);
+        EXPECT_EQ(runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8), viaEnv);
+        {
+            // A nested guard that does not ask for packed rows leaves the outer one in force.
+            ScopedVInt4WriteMode const inner(false);
+            EXPECT_EQ(
+                runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8), viaEnv);
+        }
+        // The guard wins over a conflicting environment value.
+        EXPECT_EQ(runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, "token", nvinfer1::DataType::kINT8), viaEnv);
+    }
+    // After the guard the writers follow the environment again.
+    EXPECT_EQ(runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8), plain);
+    {
+        ScopedVInt4WriteMode const off(false);
+        EXPECT_EQ(runEmuWriter(EmuWriter::kWriteKV, cfg, qHost, kHost, vHost, "packed", nvinfer1::DataType::kINT8), viaEnv);
+    }
+}
+
 TEST(RopeWriteKvVInt4Packed, FullyOverwrittenRowsKeepTheLastBytes)
 {
     // Writing the same tokens twice (second time with different values) must replace the first 160 bytes and still not touch

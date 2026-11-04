@@ -41,6 +41,30 @@ TEST(XQAJitCapabilityTest, SupportsSm90Qwen25)
     EXPECT_TRUE(canCompileXQAKernel(14, 2, 64, 90, nvinfer1::DataType::kHALF, nvinfer1::DataType::kFP8));
 }
 
+TEST(XQAJitCapabilityTest, PackedK8V4NeedsHeadDim256)
+{
+    EXPECT_TRUE(canCompileXQAKernel(16, 2, 256, 89, nvinfer1::DataType::kHALF, nvinfer1::DataType::kINT4));
+    EXPECT_TRUE(canCompileXQAKernel(8, 2, 256, 80, nvinfer1::DataType::kHALF, nvinfer1::DataType::kINT4));
+    EXPECT_FALSE(canCompileXQAKernel(16, 2, 128, 89, nvinfer1::DataType::kHALF, nvinfer1::DataType::kINT4));
+    EXPECT_FALSE(canCompileXQAKernel(16, 2, 512, 89, nvinfer1::DataType::kHALF, nvinfer1::DataType::kINT4));
+    EXPECT_FALSE(canCompileXQAKernel(16, 2, 64, 89, nvinfer1::DataType::kHALF, nvinfer1::DataType::kINT4));
+    // Other KV formats keep their rules.
+    EXPECT_TRUE(canCompileXQAKernel(16, 2, 128, 89, nvinfer1::DataType::kHALF, nvinfer1::DataType::kINT8));
+    EXPECT_FALSE(canCompileXQAKernel(16, 2, 256, 89, nvinfer1::DataType::kHALF, nvinfer1::DataType::kINT32));
+}
+
+TEST(XQAJitCapabilityTest, PackedK8V4KeyRejectedForOtherHeadDims)
+{
+    XQAJitKey key{};
+    key.sm = 89;
+    key.dataType = nvinfer1::DataType::kHALF;
+    key.kvDataType = nvinfer1::DataType::kINT4;
+    key.headSize = 128;
+    key.qHeadsPerKv = 4;
+    key.tokensPerPage = 128;
+    EXPECT_THROW(compileXQAKernel(key), std::runtime_error);
+}
+
 XQAJitKey makeKey(bool specDecode, bool contiguousQuerySwa = false)
 {
     XQAJitKey key{};
@@ -116,6 +140,27 @@ TEST(XQAJitSerializationTest, RoundTripsDistinctContiguousQuerySwaVariants)
         EXPECT_TRUE(restored[i].key == kernels[i].key) << "entry " << i;
         EXPECT_EQ(restored[i].cubin, kernels[i].cubin) << "entry " << i;
     }
+}
+
+TEST(XQAJitSerializationTest, PackedK8V4KeyRoundTripsAndDiffersFromInt8)
+{
+    XQAJitKey int8Key = makeKey(false);
+    int8Key.sm = 89;
+    int8Key.kvDataType = nvinfer1::DataType::kINT8;
+    int8Key.headSize = 256;
+    XQAJitKey packedKey = int8Key;
+    packedKey.kvDataType = nvinfer1::DataType::kINT4;
+    EXPECT_FALSE(int8Key == packedKey);
+
+    std::vector<XQAJitKernel> const kernels{{int8Key, makeCubin(1, 16)}, {packedKey, makeCubin(2, 24)}};
+    auto const blob = serializeXQAJitKernels(kernels);
+    auto const restored = deserializeXQAJitKernels(blob.data(), blob.size());
+    ASSERT_EQ(restored.size(), 2U);
+    EXPECT_TRUE(restored[0].key == int8Key);
+    EXPECT_TRUE(restored[1].key == packedKey);
+    EXPECT_EQ(restored[1].key.kvDataType, nvinfer1::DataType::kINT4);
+    EXPECT_EQ(restored[0].cubin, kernels[0].cubin);
+    EXPECT_EQ(restored[1].cubin, kernels[1].cubin);
 }
 
 TEST(XQAJitSerializationTest, EmptyKernelListRoundTrips)
