@@ -57,6 +57,12 @@ struct ContextCacheConfig
     //! Hold the recurrent and partial-KV checkpoints in pinned host memory: the two budgets above then count host bytes,
     //! capture is a D2H and restore an H2D copy, and no device memory is spent on snapshots.
     bool snapshotsInHostMemory{false};
+    //! Pinned host memory that keeps the KV pages of evicted hybrid records so a returning session is restored by a copy
+    //! instead of a prefill. Zero disables the tier. A demoted record still holds its snapshot slots, so the snapshot
+    //! pools bound how many sessions the tier can keep.
+    int64_t hostKvPoolBytes{};
+    //! Records shorter than this are dropped instead of demoted (recomputing them is cheaper than the bookkeeping).
+    int32_t hostKvMinTokens{4096};
     //! Device-memory budget for encoder embedding cache (ViT/audio). Zero disables.
     int64_t encoderEmbeddingCacheBudgetBytes{256LL * 1024 * 1024};
 };

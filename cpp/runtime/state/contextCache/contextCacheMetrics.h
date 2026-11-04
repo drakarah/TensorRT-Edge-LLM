@@ -69,6 +69,13 @@ struct ContextCacheMetrics
     uint64_t reclaimedDraftKvPages{};
     uint64_t reclaimedRecurrentSnapshots{};
     uint64_t reclaimedPartialKvSnapshots{};
+    //! Host KV tier: records moved to host slots, restored on a hit, dropped to make host room, and pages copied back.
+    uint64_t demotedRecords{};
+    uint64_t promotedRecords{};
+    uint64_t hostEvictedRecords{};
+    uint64_t restoredPages{};
+    //! Host slots in use out of the pool (capacity 0 when the tier is off).
+    ContextCachePoolMetrics hostKvSlots;
 };
 
 } // namespace rt

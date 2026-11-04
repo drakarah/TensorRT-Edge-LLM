@@ -404,7 +404,7 @@ AcquireResult ContextCacheManager::acquireHybrid(std::vector<HybridCheckpointCan
 {
     if (mHost.has_value() && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
     {
-        promoteMatching(candidates, inputFullBlockHashes, inputTokenCount);
+        restoreForRequest(candidates, inputFullBlockHashes, inputTokenCount);
     }
     return acquire(makeHybridReusePlan(
         candidates, inputFullBlockHashes, inputTokenCount, mPageSize, hasAttention, mRecords, lookupPolicy));
@@ -1135,7 +1135,7 @@ bool ContextCacheManager::tryDemoteRecord(RecordId id)
     return true;
 }
 
-void ContextCacheManager::promoteMatching(std::vector<HybridCheckpointCandidate> const& candidates,
+void ContextCacheManager::restoreForRequest(std::vector<HybridCheckpointCandidate> const& candidates,
     std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount)
 {
     std::vector<HybridCheckpointCandidate> ordered = candidates;

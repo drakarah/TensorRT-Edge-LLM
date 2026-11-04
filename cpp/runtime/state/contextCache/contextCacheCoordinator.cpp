@@ -22,6 +22,7 @@
 #include "common/pagedKvTypes.h"
 #include "common/tensor.h"
 #include "runtime/hybridCacheManager.h"
+#include "runtime/state/contextCache/hostKvPageStore.h"
 #include "runtime/state/contextCache/hybridSnapshotStorage.h"
 #include "runtime/state/contextCache/reusePlan.h"
 #include "runtime/state/contextCache/specStatePlan.h"
@@ -1017,6 +1018,10 @@ ContextCacheCoordinator::ContextCacheCoordinator(ContextCacheConfig const& confi
     {
         mSynchronizer = [](cudaStream_t requestStream) { return cudaStreamSynchronize(requestStream); };
     }
+    if (config.hostKvPoolBytes > 0)
+    {
+        enableHostKvTier(config);
+    }
     mHostReuseLengths = std::make_unique<Tensor>(Coords{deployment.base.maxSupportedBatchSize}, DeviceType::kCPU,
         nvinfer1::DataType::kINT32, "ContextCacheCoordinator::hostReuseLengths");
 }
@@ -1102,6 +1107,10 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
         return makeVanillaReusePlan(hashes, inputTokenCount, kTOKENS_PER_PAGE, mManager.baseIndex(), policy);
     };
 
+    if (mHostKv != nullptr && !speculativeRequest && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
+    {
+        mManager.restoreForRequest(hybridCandidates, hashes, inputTokenCount);
+    }
     ReusePlan plan = makePlan(lookupPolicy);
     if (usesCheckpointReuse())
     {
@@ -1142,6 +1151,7 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
         acquired = mManager.acquire(std::move(coldPlan));
         forcedCold = true;
     }
+    flushHostTransfers(/*synchronize=*/false);
 
     auto const planningEnd = std::chrono::steady_clock::now();
     mMetrics.planningNanoseconds += static_cast<uint64_t>(
@@ -2089,6 +2099,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(
             bool const grewPages = requiredPages <= currentPages
                 || (isSpecRequest(impl) ? mManager.growSpecPages(sequence.lease, requiredPages - currentPages, 0)
                                         : mManager.growBasePages(sequence.lease, requiredPages - currentPages));
+            flushHostTransfers(/*synchronize=*/false);
             if (!grewPages)
             {
                 impl.markFinishing();
@@ -2366,6 +2377,14 @@ ContextCacheMetrics ContextCacheCoordinator::metrics() const noexcept
     result.reclaimedDraftKvPages = managerMetrics.reclaimedDraftKvPages;
     result.reclaimedRecurrentSnapshots = managerMetrics.reclaimedRecurrentSnapshots;
     result.reclaimedPartialKvSnapshots = managerMetrics.reclaimedPartialKvSnapshots;
+    result.demotedRecords = managerMetrics.demotedRecords;
+    result.promotedRecords = managerMetrics.promotedRecords;
+    result.hostEvictedRecords = managerMetrics.hostEvictedRecords;
+    result.restoredPages = managerMetrics.restoredPages;
+    if (HostKvIndex const* host = mManager.hostIndex(); host != nullptr)
+    {
+        result.hostKvSlots = ContextCachePoolMetrics{host->freeSlots(), host->slotCount()};
+    }
     return result;
 }
 
@@ -2431,7 +2450,89 @@ int32_t ContextCacheCoordinator::baseHighWaterPages() const noexcept
 
 size_t ContextCacheCoordinator::trimBasePagesTo(int32_t pages, size_t protectMostRecent)
 {
-    return mManager.evictToBaseHighWater(pages, protectMostRecent);
+    size_t const evicted = mManager.evictToBaseHighWater(pages, protectMostRecent);
+    // The caller unmaps the freed pages next; the copies out of them have to be complete first.
+    flushHostTransfers(/*synchronize=*/true);
+    return evicted;
+}
+
+void ContextCacheCoordinator::enableHostKvTier(ContextCacheConfig const& config)
+{
+    if (!usesCheckpointReuse() || !mProfile.isHybrid() || isSpecDeployment() || !deploymentHasAttention())
+    {
+        LOG_WARNING("Host KV tier ignored: it needs a non-speculative hybrid model with attention layers.");
+        return;
+    }
+    KVCacheManager const& baseKv = mBaseCache.getKVCacheManager();
+    size_t const bytesPerSlot = HostKvPageStore::bytesPerSlot(baseKv.getConfig());
+    int64_t const slots = config.hostKvPoolBytes / static_cast<int64_t>(bytesPerSlot);
+    if (slots <= 0 || slots > std::numeric_limits<int32_t>::max())
+    {
+        LOG_WARNING("Host KV tier ignored: %lld bytes hold %lld pages of %zu bytes.",
+            static_cast<long long>(config.hostKvPoolBytes), static_cast<long long>(slots), bytesPerSlot);
+        return;
+    }
+    try
+    {
+        mHostKv = std::make_unique<HostKvPageStore>(baseKv, static_cast<int32_t>(slots));
+    }
+    catch (std::exception const& error)
+    {
+        LOG_WARNING("Host KV tier disabled: pinned allocation of %lld bytes failed (%s).",
+            static_cast<long long>(slots) * static_cast<long long>(bytesPerSlot), error.what());
+        return;
+    }
+    int32_t const minBlocks
+        = std::max<int32_t>(1, (std::max<int32_t>(config.hostKvMinTokens, 0) + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE);
+    mManager.enableHostTier(static_cast<int32_t>(slots), minBlocks);
+    LOG_INFO("Host KV tier enabled: %lld pages of %zu bytes (%.2f GiB pinned), records of at least %d blocks.",
+        static_cast<long long>(slots), bytesPerSlot,
+        static_cast<double>(slots) * static_cast<double>(bytesPerSlot) / (1024.0 * 1024.0 * 1024.0), minBlocks);
+}
+
+void ContextCacheCoordinator::flushHostTransfers(bool synchronize)
+{
+    if (mHostKv == nullptr)
+    {
+        return;
+    }
+    std::vector<HostKvTransfer> const transfers = mManager.takeHostTransfers();
+    if (transfers.empty())
+    {
+        return;
+    }
+    size_t toHostPages = 0;
+    size_t toDevicePages = 0;
+    size_t begin = 0;
+    while (begin < transfers.size())
+    {
+        bool const toHost = transfers[begin].toHost;
+        std::vector<HostKvPageCopy> batch;
+        size_t end = begin;
+        while (end < transfers.size() && transfers[end].toHost == toHost)
+        {
+            batch.push_back(HostKvPageCopy{transfers[end].page, transfers[end].slot});
+            ++end;
+        }
+        if (toHost)
+        {
+            mHostKv->capture(batch, mStream);
+            toHostPages += batch.size();
+        }
+        else
+        {
+            mHostKv->restore(batch, mStream);
+            toDevicePages += batch.size();
+        }
+        begin = end;
+    }
+    if (synchronize)
+    {
+        cudaError_t const status = mSynchronizer(mStream);
+        ELLM_CHECK(status == cudaSuccess, "Host KV tier copies failed to complete");
+    }
+    LOG_INFO("Host KV tier: %zu page(s) copied to host, %zu page(s) restored to the device.", toHostPages,
+        toDevicePages);
 }
 
 } // namespace rt

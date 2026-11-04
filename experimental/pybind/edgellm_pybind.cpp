@@ -769,7 +769,12 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("reclaimed_base_kv_pages", &ContextCacheMetrics::reclaimedBaseKvPages)
         .def_readonly("reclaimed_draft_kv_pages", &ContextCacheMetrics::reclaimedDraftKvPages)
         .def_readonly("reclaimed_recurrent_snapshots", &ContextCacheMetrics::reclaimedRecurrentSnapshots)
-        .def_readonly("reclaimed_partial_kv_snapshots", &ContextCacheMetrics::reclaimedPartialKvSnapshots);
+        .def_readonly("reclaimed_partial_kv_snapshots", &ContextCacheMetrics::reclaimedPartialKvSnapshots)
+        .def_readonly("demoted_records", &ContextCacheMetrics::demotedRecords)
+        .def_readonly("promoted_records", &ContextCacheMetrics::promotedRecords)
+        .def_readonly("host_evicted_records", &ContextCacheMetrics::hostEvictedRecords)
+        .def_readonly("restored_pages", &ContextCacheMetrics::restoredPages)
+        .def_readonly("host_kv_slots", &ContextCacheMetrics::hostKvSlots);
 
     py::class_<RuntimeMemoryMetrics>(m, "RuntimeMemoryMetrics")
         .def_readonly("valid", &RuntimeMemoryMetrics::valid)
@@ -799,7 +804,9 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("max_records", &ContextCacheConfig::maxRecords)
         .def_readwrite("recurrent_snapshot_pool_bytes", &ContextCacheConfig::recurrentSnapshotPoolBytes)
         .def_readwrite("partial_kv_snapshot_pool_bytes", &ContextCacheConfig::partialKvSnapshotPoolBytes)
-        .def_readwrite("snapshots_in_host_memory", &ContextCacheConfig::snapshotsInHostMemory);
+        .def_readwrite("snapshots_in_host_memory", &ContextCacheConfig::snapshotsInHostMemory)
+        .def_readwrite("host_kv_pool_bytes", &ContextCacheConfig::hostKvPoolBytes)
+        .def_readwrite("host_kv_min_tokens", &ContextCacheConfig::hostKvMinTokens);
 
     // ========================================================================
     // Image utilities

@@ -231,6 +231,11 @@ public:
     //! its snapshot slots. Off until called. Must be called at most once.
     void enableHostTier(int32_t slotCount, int32_t minBlocks);
     bool hostTierEnabled() const noexcept;
+    //! Restore the demoted record that the longest matching checkpoint candidate of a request names, queueing the
+    //! host-to-device copies (see takeHostTransfers). Does nothing when that candidate is resident or no candidate
+    //! names a record, and leaves the record demoted when no pages can be freed for it.
+    void restoreForRequest(std::vector<HybridCheckpointCandidate> const& candidates,
+        std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount);
     //! Copies the host tier needs since the last call, in the order they must run: demotions copy a page out before its
     //! slot or page is reused, restores copy a page back before the request reads it. The runtime must enqueue them in
     //! order on the stream that writes the KV pool, before any kernel that may touch those pages.
@@ -255,10 +260,6 @@ private:
     void evictRecord(RecordId id, bool allowDemote = true);
     void dropRecord(RecordId id);
     bool tryDemoteRecord(RecordId id);
-    //! Copy a demoted record's pages back when a candidate checkpoint of the request names it. Stops at the first
-    //! candidate (longest first) that is resident or promoted.
-    void promoteMatching(std::vector<HybridCheckpointCandidate> const& candidates,
-        std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount);
     bool promoteRecord(RecordId id);
     void releaseBasePages(std::vector<PageId> const& pages);
     void releaseHostUser(CacheRecordKey const& hostKey, RecordId id);

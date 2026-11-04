@@ -111,6 +111,8 @@ class ContextCacheConfig:
     recurrent_snapshot_pool_bytes: int = 0
     partial_kv_snapshot_pool_bytes: int = 0
     snapshots_in_host_memory: bool = False
+    host_kv_pool_bytes: int = 0
+    host_kv_min_tokens: int = 4096
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -122,6 +124,8 @@ class ContextCacheConfig:
                 "max_records",
                 "recurrent_snapshot_pool_bytes",
                 "partial_kv_snapshot_pool_bytes",
+                "host_kv_pool_bytes",
+                "host_kv_min_tokens",
         ):
             value = getattr(self, name)
             if isinstance(value,
@@ -131,15 +135,20 @@ class ContextCacheConfig:
         if self.max_records > _INT32_MAX:
             raise ServerConfigError(
                 "context_cache.max_records must fit a signed 32-bit integer")
+        if self.host_kv_min_tokens > _INT32_MAX:
+            raise ServerConfigError(
+                "context_cache.host_kv_min_tokens must fit a signed 32-bit integer"
+            )
         for name in ("recurrent_snapshot_pool_bytes",
-                     "partial_kv_snapshot_pool_bytes"):
+                     "partial_kv_snapshot_pool_bytes", "host_kv_pool_bytes"):
             if getattr(self, name) > _INT64_MAX:
                 raise ServerConfigError(
                     f"context_cache.{name} must fit a signed 64-bit integer")
         if (not self.enabled and
             (self.max_records != 1024 or self.recurrent_snapshot_pool_bytes
              or self.partial_kv_snapshot_pool_bytes
-             or self.snapshots_in_host_memory)):
+             or self.snapshots_in_host_memory or self.host_kv_pool_bytes
+             or self.host_kv_min_tokens != 4096)):
             raise ServerConfigError(
                 "context-cache tuning requires context reuse to be enabled")
 
@@ -163,6 +172,8 @@ class ContextCacheConfig:
             "recurrent_snapshot_pool_bytes",
             "partial_kv_snapshot_pool_bytes",
             "snapshots_in_host_memory",
+            "host_kv_pool_bytes",
+            "host_kv_min_tokens",
         }
         unsupported = sorted(set(raw) - supported)
         if unsupported:
@@ -377,6 +388,23 @@ def create_argument_parser() -> argparse.ArgumentParser:
                        type=_non_negative_int,
                        default=0)
     model.add_argument(
+        "--context-cache-host-kv-bytes",
+        type=_non_negative_int,
+        default=0,
+        help="Pinned host memory (bytes) that keeps the KV pages of evicted "
+        "hybrid-model sessions so a returning session is restored by a copy "
+        "instead of a prefill. Zero (the default) disables the tier. Each "
+        "kept session also holds its recurrent and partial-KV snapshot "
+        "slots, so the snapshot pools bound how many sessions fit.",
+    )
+    model.add_argument(
+        "--context-cache-host-kv-min-tokens",
+        type=_non_negative_int,
+        default=4096,
+        help="Sessions shorter than this many tokens are dropped, not kept "
+        "in the host KV tier.",
+    )
+    model.add_argument(
         "--context-cache-snapshots-in-host-memory",
         action="store_true",
         help="Keep the recurrent and partial-KV checkpoints of a hybrid "
@@ -408,6 +436,8 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         partial_kv_snapshot_pool_bytes=(
             args.context_cache_partial_kv_snapshot_pool_bytes),
         snapshots_in_host_memory=args.context_cache_snapshots_in_host_memory,
+        host_kv_pool_bytes=args.context_cache_host_kv_bytes,
+        host_kv_min_tokens=args.context_cache_host_kv_min_tokens,
     )
     model = ModelConfig(
         model=args.model,

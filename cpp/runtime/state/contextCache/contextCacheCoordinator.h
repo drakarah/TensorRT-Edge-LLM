@@ -39,6 +39,7 @@ namespace rt
 
 class HybridCacheManager;
 class HybridSnapshotStorage;
+class HostKvPageStore;
 class KVPageTable;
 class Tensor;
 
@@ -295,6 +296,10 @@ private:
     //! Shared post-advance validation invoked by the policies, so the committed-plus-lookahead invariant math and
     //! the completed-slot dedup live in exactly one place regardless of publication flavor. Each policy calls the
     //! variant matching its decode flavor; PublicationPolicy::validateDecodeAdvances routes to the right one.
+    //! Enqueue the copies the host KV tier has queued, in order, on the coordinator stream. With @p synchronize the
+    //! call also waits for them, for callers that unmap the pages straight afterwards.
+    void flushHostTransfers(bool synchronize);
+    void enableHostKvTier(ContextCacheConfig const& config);
     void validateEagleDecodeAdvances(RequestHandle::Impl const& request,
         std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const;
     void validateVanillaDecodeAdvances(RequestHandle::Impl const& request,
@@ -347,6 +352,7 @@ private:
     ContextCacheDeploymentProfile mProfile;
     ContextCacheManager mManager;
     std::unique_ptr<HybridSnapshotStorage> mHybridSnapshots;
+    std::unique_ptr<HostKvPageStore> mHostKv;
     HybridCacheManager& mBaseCache;
     KVPageTable& mBasePageTable;
     HybridCacheManager* mDraftCache{};

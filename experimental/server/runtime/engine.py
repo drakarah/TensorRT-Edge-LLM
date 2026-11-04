@@ -850,6 +850,8 @@ def _native_context_cache_config(rt, config: ContextCacheConfig):
     native.recurrent_snapshot_pool_bytes = config.recurrent_snapshot_pool_bytes
     native.partial_kv_snapshot_pool_bytes = config.partial_kv_snapshot_pool_bytes
     native.snapshots_in_host_memory = config.snapshots_in_host_memory
+    native.host_kv_pool_bytes = config.host_kv_pool_bytes
+    native.host_kv_min_tokens = config.host_kv_min_tokens
     return native
 
 
