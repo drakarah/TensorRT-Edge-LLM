@@ -719,9 +719,9 @@ TEST(GatherPagedKVToHeadMajorTest, OneByteKvPreservesFp8StorageLayout)
 //=============================================================================
 namespace
 {
-//! Random packed rows: random nibbles, metadata from finite fp16 with the awkward cases mixed in (zero scale, the smallest
-//! subnormal, the largest finite value, negative zero), and random bytes in the unused tail 160..255, which must be ignored.
-void fillPackedPool(std::vector<int8_t>& pool, std::mt19937& gen)
+//! Random bytes everywhere, then the compact V plane (160-byte rows starting at @p vPlaneStart) gets metadata from finite fp16
+//! with the awkward cases mixed in (zero scale, the smallest subnormal, the largest finite value, negative zero).
+void fillPackedPool(std::vector<int8_t>& pool, std::mt19937& gen, size_t vPlaneStart)
 {
     std::uniform_int_distribution<int32_t> byteDist(-128, 127);
     std::uniform_real_distribution<float> metaDist(-8.F, 8.F);
@@ -729,10 +729,10 @@ void fillPackedPool(std::vector<int8_t>& pool, std::mt19937& gen)
     {
         b = static_cast<int8_t>(byteDist(gen));
     }
-    size_t const rows = pool.size() / 256;
+    size_t const rows = (pool.size() - vPlaneStart) / kernel::kVInt4PackedUsedBytes;
     for (size_t r = 0; r < rows; ++r)
     {
-        uint8_t* row = reinterpret_cast<uint8_t*>(pool.data()) + r * 256;
+        uint8_t* row = reinterpret_cast<uint8_t*>(pool.data()) + vPlaneStart + r * kernel::kVInt4PackedUsedBytes;
         for (int32_t g = 0; g < 8; ++g)
         {
             float scale = std::fabs(metaDist(gen)) * 0.1F;
@@ -763,9 +763,11 @@ void runPackedGather(bool rawInt8K, int32_t zeroFillTail)
     int32_t const numPhysicalPages = 10;
     float const kScale = 0.0371f, vScale = 99.0f; // vScale must be ignored for packed V rows
     size_t const pageElems = (size_t) rt::kTOKENS_PER_PAGE * H * D;
-    std::vector<int8_t> poolHost(static_cast<size_t>(2) * numPhysicalPages * pageElems);
+    size_t const vPageBytes = (size_t) rt::kTOKENS_PER_PAGE * H * kernel::kVInt4PackedUsedBytes;
+    size_t const vPlaneStart = (size_t) numPhysicalPages * pageElems;
+    std::vector<int8_t> poolHost(vPlaneStart + (size_t) numPhysicalPages * vPageBytes);
     std::mt19937 gen(777U);
-    fillPackedPool(poolHost, gen);
+    fillPackedPool(poolHost, gen, vPlaneStart);
 
     rt::KVPageTable pageTable(B, maxPagesPerSeq, numPhysicalPages);
     std::vector<int32_t> const slot0KIds = {9, 3, 6, 5};
@@ -784,7 +786,8 @@ void runPackedGather(bool rawInt8K, int32_t zeroFillTail)
         {
             for (int32_t h = 0; h < H; ++h)
             {
-                uint8_t* row = reinterpret_cast<uint8_t*>(&poolHost[(size_t) vPage * pageElems + ((size_t) token * H + h) * D]);
+                uint8_t* row = reinterpret_cast<uint8_t*>(&poolHost[vPlaneStart + (size_t) (vPage - numPhysicalPages) * vPageBytes
+                    + ((size_t) token * H + h) * kernel::kVInt4PackedUsedBytes]);
                 for (int32_t g = 0; g < 8; ++g)
                 {
                     uint32_t const nanPair = 0x7E007E00U;
@@ -825,7 +828,9 @@ void runPackedGather(bool rawInt8K, int32_t zeroFillTail)
                     {
                         std::vector<float> decoded(D);
                         kernel::vInt4UnpackRowHost(
-                            reinterpret_cast<uint8_t const*>(&poolHost[(size_t) vPage * pageElems + srcRow]), decoded.data());
+                            reinterpret_cast<uint8_t const*>(&poolHost[vPlaneStart + (size_t) (vPage - numPhysicalPages) * vPageBytes
+                                + ((size_t) t * H + h) * kernel::kVInt4PackedUsedBytes]),
+                            decoded.data());
                         for (int32_t d = 0; d < D; ++d)
                         {
                             expectedV[dstRow + d] = __float2half(decoded[d]);
@@ -853,7 +858,8 @@ void runPackedGather(bool rawInt8K, int32_t zeroFillTail)
     rt::Tensor kvSeqLens = makeKvSeqLens(lens);
     kernel::gatherPagedKVToSplit(poolTensor.rawPointer(), kDstTensor.rawPointer(), vDstTensor.rawPointer(),
         pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), maxPagesPerSeq, B, S, H, D,
-        sizeof(int8_t), kernel::KVPoolQuant::kINT8PackedV, kScale, vScale, stream, zeroFillTail, -1, rawInt8K);
+        sizeof(int8_t), kernel::KVPoolQuant::kINT8PackedV, kScale, vScale, stream, zeroFillTail, -1, rawInt8K,
+        numPhysicalPages);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<half> const vOut = copyDeviceToHost<half>(vDstTensor);
     int32_t bad = 0;
@@ -941,5 +947,12 @@ TEST(GatherPagedKVToSplitTest, PackedVRejectsOtherHeadDimsAndElementSizes)
     EXPECT_THROW(kernel::gatherPagedKVToSplit(pool.rawPointer(), kDst.rawPointer(), vDst.rawPointer(),
                      pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), 1, 1, 128, 1, 256,
                      sizeof(half), kernel::KVPoolQuant::kINT8PackedV, 1.F, 1.F, stream),
+        std::exception);
+    // A compact pool needs its plane size.
+    rt::Tensor kDst256({1, 128, 1, 256}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vDst256({1, 128, 1, 256}, rt::DeviceType::kGPU, DataType::kHALF);
+    EXPECT_THROW(kernel::gatherPagedKVToSplit(pool.rawPointer(), kDst256.rawPointer(), vDst256.rawPointer(),
+                     pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), 1, 1, 128, 1, 256,
+                     sizeof(int8_t), kernel::KVPoolQuant::kINT8PackedV, 1.F, 1.F, stream),
         std::exception);
 }

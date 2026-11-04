@@ -2415,8 +2415,8 @@ TEST(RopeWriteKvVInt4Emulation, PackedToSplitMatchesReference)
 
 namespace
 {
-//! The packed K8V4 row: every writer must produce the bytes of the host reference in the first 160 bytes of each V row and leave
-//! the other 96 bytes, the K plane and unwritten slots alone.
+//! The packed K8V4 row: every writer must produce the bytes of the host reference in the compact V plane (160-byte rows) and
+//! leave the K plane and unwritten slots alone.
 void runVInt4PackedCase(EmuWriter const writer)
 {
     SCOPED_TRACE(std::string(emuWriterName(writer)) + " packed");
@@ -2449,8 +2449,10 @@ void runVInt4PackedCase(EmuWriter const writer)
     ASSERT_EQ(off.size(), packed.size());
     EXPECT_EQ(packed, packedAgain) << "the packed writer must be deterministic";
 
-    // Expected: the int8 pool, with every written V row replaced by [160 reference bytes | 96 sentinel bytes].
+    // Expected: the K plane of the int8 pool, and a V plane that is all sentinel except the 160-byte rows written compactly.
     std::vector<int8_t> expected = off;
+    size_t const kPlaneElems = static_cast<size_t>(numPages) * kPageSize * cfg.numKVHeads * cfg.headDim;
+    std::fill(expected.begin() + kPlaneElems, expected.end(), kINT8_SENTINEL);
     std::vector<int32_t> const pageTable = makeReversedPageTable(cfg.batchSize, maxPagesPerSeq);
     for (int32_t b = 0; b < cfg.batchSize; ++b)
     {
@@ -2463,10 +2465,11 @@ void runVInt4PackedCase(EmuWriter const writer)
                 for (int32_t d = 0; d < cfg.headDim; ++d) row[d] = __half2float(src[d]);
                 std::vector<uint8_t> bytes(cfg.headDim, static_cast<uint8_t>(kINT8_SENTINEL));
                 vInt4PackRowHost(row.data(), bytes.data());
-                for (int32_t d = 0; d < cfg.headDim; ++d)
+                size_t const rowStart = static_cast<size_t>(vPackedCompactRowOffset(
+                    vPage, t % kPageSize, cfg.numKVHeads, h, numPages, cfg.headDim, kPageSize));
+                for (int32_t d = 0; d < kVInt4PackedUsedBytes; ++d)
                 {
-                    expected[pagedKvIndex(0, vPage, t % kPageSize, h, d, numPages, cfg.numKVHeads, cfg.headDim)]
-                        = static_cast<int8_t>(bytes[d]);
+                    expected[rowStart + d] = static_cast<int8_t>(bytes[d]);
                 }
                 // Decoding the packed row must stay within half a step of the input (the step is the group scale).
                 std::vector<float> decoded(cfg.headDim);
@@ -2583,13 +2586,19 @@ TEST(RopeWriteKvVInt4Packed, UnmappedVPageIsSkippedAndNothingElseChanges)
         {
             unmappedPages.push_back(table[(b * 2 + 1) * maxPagesPerSeq + 1]);
         }
-        size_t const pageElems = static_cast<size_t>(kPageSize) * cfg.numKVHeads * cfg.headDim;
+        size_t const kPlaneElems = static_cast<size_t>(numPages) * kPageSize * cfg.numKVHeads * cfg.headDim;
+        size_t const vPageBytes = static_cast<size_t>(kPageSize) * cfg.numKVHeads * kVInt4PackedUsedBytes;
         int32_t differing = 0;
         for (size_t i = 0; i < intact.size(); ++i)
         {
-            size_t const page = i / pageElems;
-            bool const inUnmappedVPage
-                = std::find(unmappedPages.begin(), unmappedPages.end(), static_cast<int32_t>(page)) != unmappedPages.end();
+            bool inUnmappedVPage = false;
+            if (i >= kPlaneElems)
+            {
+                size_t const vPageIdx = (i - kPlaneElems) / vPageBytes;
+                inUnmappedVPage = std::find(unmappedPages.begin(), unmappedPages.end(),
+                                      static_cast<int32_t>(vPageIdx) + numPages)
+                    != unmappedPages.end();
+            }
             if (inUnmappedVPage)
             {
                 EXPECT_EQ(unmapped[i], kINT8_SENTINEL) << "byte " << i;
@@ -2600,7 +2609,6 @@ TEST(RopeWriteKvVInt4Packed, UnmappedVPageIsSkippedAndNothingElseChanges)
             }
         }
         EXPECT_EQ(differing, 0);
-        static_cast<void>(numPages);
     }
 }
 

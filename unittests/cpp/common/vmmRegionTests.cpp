@@ -162,3 +162,56 @@ TEST(VmmRegionTest, FailedGrowthLeavesTheMappingUnchanged)
     EXPECT_EQ(read(region.base(), 1)[0], 0x77);
     EXPECT_TRUE(region.growTo(2 * g));
 }
+
+TEST(VmmRegionTest, SecondHalfCanBeSmallerAndMapsIndependently)
+{
+    size_t const g = granule();
+    rt::VmmRegion region(4 * g, 2 * g + 1, 0);
+    EXPECT_EQ(region.halfBytes(), 4 * g);
+    EXPECT_EQ(region.secondHalfBytes(), 3 * g) << "rounded up to the granularity";
+    uint8_t* const k = static_cast<uint8_t*>(region.base());
+    uint8_t* const v = k + region.halfBytes();
+
+    ASSERT_TRUE(region.growTo(g, 2 * g));
+    EXPECT_EQ(region.mappedBytes(0), g);
+    EXPECT_EQ(region.mappedBytes(1), 2 * g);
+    EXPECT_EQ(region.mappedTotal(), 3 * g);
+    fill(k, 0x11, g);
+    fill(v, 0x22, 2 * g);
+    EXPECT_EQ(read(k + g - 1, 1)[0], 0x11);
+    EXPECT_EQ(read(v + 2 * g - 1, 1)[0], 0x22);
+
+    // Targets above a half's size are clamped to it; a smaller target never unmaps.
+    ASSERT_TRUE(region.growTo(100 * g, 100 * g));
+    EXPECT_EQ(region.mappedBytes(0), 4 * g);
+    EXPECT_EQ(region.mappedBytes(1), 3 * g);
+    ASSERT_TRUE(region.growTo(g, g));
+    EXPECT_EQ(region.mappedTotal(), 7 * g);
+    EXPECT_EQ(read(k, 1)[0], 0x11) << "contents survive growth";
+    EXPECT_EQ(read(v, 1)[0], 0x22);
+
+    region.shrinkTo(2 * g, 0);
+    EXPECT_EQ(region.mappedBytes(0), 2 * g);
+    EXPECT_EQ(region.mappedBytes(1), 0u);
+    EXPECT_EQ(region.mappedPerHalf(), 2 * g);
+    ASSERT_TRUE(region.growTo(0, g));
+    EXPECT_EQ(region.mappedBytes(1), g);
+}
+
+TEST(VmmRegionTest, TwoSizeConstructorRejectsBadSizes)
+{
+    size_t const g = granule();
+    EXPECT_THROW(rt::VmmRegion(g, 0, 0), std::runtime_error);
+    EXPECT_THROW(rt::VmmRegion(0, g, 0), std::runtime_error);
+    EXPECT_THROW(rt::VmmRegion(g + 1, g, 0), std::runtime_error);
+}
+
+TEST(VmmRegionTest, SingleSizeConstructorKeepsEqualHalves)
+{
+    size_t const g = granule();
+    rt::VmmRegion region(2 * g, 0);
+    EXPECT_EQ(region.secondHalfBytes(), region.halfBytes());
+    ASSERT_TRUE(region.growTo(g));
+    EXPECT_EQ(region.mappedBytes(0), g);
+    EXPECT_EQ(region.mappedBytes(1), g);
+}

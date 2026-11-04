@@ -196,6 +196,9 @@ void runPackedDecode(PackedCase const& tc)
     // Device cache image, filled with garbage first. Rows past a sequence's length and the unused tail of every V row keep it.
     std::vector<int8_t> cache;
     std::vector<int32_t> pageList;
+    size_t kPlaneBytes = 0;
+    size_t vPageBytes = 0;
+    int32_t totalPagesPaged = 0;
     auto putRow = [&](size_t headSlot, bool isV, size_t src) {
         // headSlot indexes 256-byte rows of the cache image.
         if (isV)
@@ -225,10 +228,14 @@ void runPackedDecode(PackedCase const& tc)
     {
         // K pages 0..P-1 and V pages P..2P-1 of one pool, scrambled; a page is [tokens][heads] rows.
         int32_t const totalPages = batch * maxPages;
+        totalPagesPaged = totalPages;
         std::vector<int32_t> perm(totalPages);
         for (int32_t i = 0; i < totalPages; ++i) perm[i] = i;
         std::shuffle(perm.begin(), perm.end(), gen);
-        cache.assign(static_cast<size_t>(2) * totalPages * kTOKENS_PER_PAGE * H * kHEAD, 0);
+        // The V plane follows the K plane and holds 160-byte rows.
+        kPlaneBytes = static_cast<size_t>(totalPages) * kTOKENS_PER_PAGE * H * kHEAD;
+        vPageBytes = static_cast<size_t>(kTOKENS_PER_PAGE) * H * kVInt4PackedUsedBytes;
+        cache.assign(kPlaneBytes + static_cast<size_t>(totalPages) * vPageBytes, 0);
         fillGarbage(cache, gen);
         pageList.assign(static_cast<size_t>(batch) * 2 * maxPages, -1);
         for (int32_t b = 0; b < batch; ++b)
@@ -249,7 +256,9 @@ void runPackedDecode(PackedCase const& tc)
                     int32_t const kPage = pageList[(static_cast<size_t>(b) * 2 + 0) * maxPages + p];
                     int32_t const vPage = pageList[(static_cast<size_t>(b) * 2 + 1) * maxPages + p];
                     putRow((static_cast<size_t>(kPage) * kTOKENS_PER_PAGE + t) * H + h, false, src);
-                    putRow((static_cast<size_t>(vPage) * kTOKENS_PER_PAGE + t) * H + h, true, src);
+                    std::memcpy(&cache[kPlaneBytes + static_cast<size_t>(vPage - totalPages) * vPageBytes
+                                    + (static_cast<size_t>(t) * H + h) * kVInt4PackedUsedBytes],
+                        &vRows[src], kVInt4PackedUsedBytes);
                 }
         }
     }
@@ -306,6 +315,8 @@ void runPackedDecode(PackedCase const& tc)
     {
         params.kvCache.pageList = thrust::raw_pointer_cast(pageListDevice.data());
         params.kvCache.tokensPerPage = kTOKENS_PER_PAGE;
+        params.kvCache.vData = thrust::raw_pointer_cast(cacheDevice.data()) + kPlaneBytes
+            - static_cast<size_t>(totalPagesPaged) * vPageBytes;
     }
     params.output = thrust::raw_pointer_cast(outDevice.data());
     params.attentionScale = attentionScale;
@@ -488,9 +499,13 @@ TEST(XQAPackedVDecodingTest, WriterOutputIsReadByTheDecoder)
         }
     rt::Tensor pageTable(rt::Coords{kBATCH, 2, kPAGES}, rt::DeviceType::kGPU, DataType::kINT32);
     copyHostToDevice(pageTable, pageTableHost);
-    rt::Tensor pool(
-        rt::Coords{2, kNUM_PAGES, kTOKENS_PER_PAGE, kKV_HEADS, kHEAD}, rt::DeviceType::kGPU, DataType::kINT8);
-    copyHostToDevice(pool, std::vector<int8_t>(pool.getShape().volume(), static_cast<int8_t>(-128)));
+    // Compact pool: the full-size K plane, then the V plane of 160-byte rows. The nominal binding shape is kept for the writer.
+    size_t const kPlaneBytes = static_cast<size_t>(kNUM_PAGES) * kTOKENS_PER_PAGE * kKV_HEADS * kHEAD;
+    size_t const vPageBytes = static_cast<size_t>(kTOKENS_PER_PAGE) * kKV_HEADS * kVInt4PackedUsedBytes;
+    rt::Tensor storage({static_cast<int64_t>(kPlaneBytes + kNUM_PAGES * vPageBytes)}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor pool(storage.rawPointer(), rt::Coords{2, kNUM_PAGES, kTOKENS_PER_PAGE, kKV_HEADS, kHEAD},
+        rt::DeviceType::kGPU, DataType::kINT8);
+    copyHostToDevice(storage, std::vector<int8_t>(kPlaneBytes + kNUM_PAGES * vPageBytes, static_cast<int8_t>(-128)));
     float const kScale = 1.0F / 20.0F;
     {
         ScopedVInt4WriteMode const packedRows(true);
@@ -498,12 +513,18 @@ TEST(XQAPackedVDecodingTest, WriterOutputIsReadByTheDecoder)
             pageTable.dataPointer<int32_t>(), kPAGES);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::vector<int8_t> const poolHost = copyDeviceToHost<int8_t>(pool);
+    std::vector<int8_t> const poolHost = copyDeviceToHost<int8_t>(storage);
 
     // Reference from the bytes the writer produced.
     auto rowAt = [&](int32_t plane, int32_t b, int32_t s, int32_t h) {
         int32_t const page = pageTableHost[(b * 2 + plane) * kPAGES + s / kTOKENS_PER_PAGE];
-        return &poolHost[((static_cast<size_t>(page) * kTOKENS_PER_PAGE + s % kTOKENS_PER_PAGE) * kKV_HEADS + h) * kHEAD];
+        size_t const inPage = static_cast<size_t>(s % kTOKENS_PER_PAGE) * kKV_HEADS + h;
+        if (plane == 0)
+        {
+            return &poolHost[static_cast<size_t>(page) * kTOKENS_PER_PAGE * kKV_HEADS * kHEAD + inPage * kHEAD];
+        }
+        return &poolHost[kPlaneBytes + static_cast<size_t>(page - kNUM_PAGES) * vPageBytes
+            + inPage * kVInt4PackedUsedBytes];
     };
     std::vector<half> q(static_cast<size_t>(kBATCH) * kQ_HEADS * kHEAD);
     for (auto& x : q) x = __float2half(uni(gen));
@@ -548,6 +569,7 @@ TEST(XQAPackedVDecodingTest, WriterOutputIsReadByTheDecoder)
     thrust::device_vector<half> outDevice(ref.size(), __float2half(0.0F));
     params.qInputPtr = thrust::raw_pointer_cast(qDevice.data());
     params.kvCache.data = pool.rawPointer();
+    params.kvCache.vData = static_cast<int8_t*>(storage.rawPointer()) + kPlaneBytes - kNUM_PAGES * vPageBytes;
     params.kvCache.pageList = pageTable.dataPointer<int32_t>();
     params.kvCache.tokensPerPage = kTOKENS_PER_PAGE;
     params.kvCache.sequence_lengths = thrust::raw_pointer_cast(lengthsDevice.data());
