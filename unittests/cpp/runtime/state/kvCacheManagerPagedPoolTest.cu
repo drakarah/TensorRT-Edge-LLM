@@ -320,7 +320,7 @@ TEST(KvCacheManagerPagedPoolTest, MixedReducedWindowsAreRejected)
     EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception);
 }
 
-TEST(KvCacheManagerPagedPoolTest, ReducedFp8PoolIsRejected)
+TEST(KvCacheManagerPagedPoolTest, ReducedFp8PoolRequiresExplicitSwaPageBudget)
 {
     cudaStream_t stream{nullptr};
     std::vector<rt::KVLayerConfig> layers{
@@ -330,10 +330,11 @@ TEST(KvCacheManagerPagedPoolTest, ReducedFp8PoolIsRejected)
         /*maxSequenceLength=*/512, layers, DataType::kFP8};
     EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception);
 
+    // With a page budget the quantized reduced pool is supported (bounded SWA with a quantized KV cache).
     config.numSwaPages
         = static_cast<int32_t>(rt::computeMinimumSwaPoolPages(/*maxBatchSize=*/1, /*slidingWindowCapacity=*/64));
     config.useBoundedSwaKVCache = false;
-    EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception);
+    EXPECT_NO_THROW(rt::KVCacheManager mgr(config, stream));
 }
 
 TEST(KvCacheManagerPagedPoolTest, ReducedPoolRequiresExplicitSwaPageBudget)
