@@ -19,6 +19,7 @@
 
 #include "common/cudaMacros.h"
 #include "runtime/hybridCacheManager.h"
+#include "runtime/kvCacheManager.h"
 
 #include <cuda_fp16.h>
 #include <gtest/gtest.h>
@@ -205,4 +206,43 @@ TEST(HostKvPageStoreTests, EmptyCopyListsDoNothingAndAZeroSlotStoreRefusesCopies
     EXPECT_NO_THROW(empty.restore({}, stream));
     EXPECT_THROW(empty.capture({{0, 0}}, stream), std::runtime_error);
     EXPECT_THROW(HostKvPageStore(kv, -1), std::runtime_error);
+}
+
+TEST(HostKvPageStoreTests, PackedVPagesUseTheirOwnStride)
+{
+    cudaStream_t stream{};
+    std::vector<KVLayerConfig> layers{KVLayerConfig{2, 256}};
+    KVCacheManager::Config config{/*.numAttentionLayers=*/1, /*.maxBatchSize=*/1, /*.maxSequenceLength=*/1024, layers,
+        DataType::kINT8};
+    config.packedV = true;
+    KVCacheManager kv(config, stream);
+    size_t const kBytes = kv.kPageBytes(0);
+    size_t const vBytes = kv.vPageBytes(0);
+    ASSERT_EQ(vBytes, static_cast<size_t>(kTOKENS_PER_PAGE) * 2 * 160);
+    EXPECT_EQ(HostKvPageStore::bytesPerSlot(config), kBytes + vBytes);
+
+    auto* keys = static_cast<uint8_t*>(kv.kPoolPtr(0));
+    auto* values = static_cast<uint8_t*>(kv.vPoolPtr(0));
+    for (int32_t page = 0; page < 4; ++page)
+    {
+        CUDA_CHECK(cudaMemsetAsync(keys + page * kBytes, 0x10 + page, kBytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(values + page * vBytes, 0x50 + page, vBytes, stream));
+    }
+    HostKvPageStore store(kv, 3);
+    store.capture({{1, 0}, {2, 1}}, stream);
+    for (int32_t page = 1; page <= 2; ++page)
+    {
+        CUDA_CHECK(cudaMemsetAsync(keys + page * kBytes, 0, kBytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(values + page * vBytes, 0, vBytes, stream));
+    }
+    store.restore({{1, 0}, {2, 1}}, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    for (int32_t page = 0; page < 4; ++page)
+    {
+        std::vector<uint8_t> k(kBytes), v(vBytes);
+        ASSERT_EQ(cudaMemcpy(k.data(), keys + page * kBytes, kBytes, cudaMemcpyDeviceToHost), cudaSuccess);
+        ASSERT_EQ(cudaMemcpy(v.data(), values + page * vBytes, vBytes, cudaMemcpyDeviceToHost), cudaSuccess);
+        EXPECT_TRUE(std::all_of(k.begin(), k.end(), [&](uint8_t b) { return b == 0x10 + page; })) << "K page " << page;
+        EXPECT_TRUE(std::all_of(v.begin(), v.end(), [&](uint8_t b) { return b == 0x50 + page; })) << "V page " << page;
+    }
 }
