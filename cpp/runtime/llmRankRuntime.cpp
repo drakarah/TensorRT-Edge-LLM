@@ -941,6 +941,10 @@ bool expertCacheInfo(RuntimeMemoryMetrics& metrics)
     return true;
 }
 
+//! Expert cache bytes freed per further attempt when the first release did not let the KV pool grow, and the attempts allowed.
+constexpr int64_t kKvGrowExtraReleaseBytes = 64LL << 20;
+constexpr int32_t kKvGrowExtraReleases = 4;
+
 //! Tokens by which the mapped KV may exceed the recent peak need before it is trimmed back (EDGELLM_KV_SHRINK_SLACK_TOKENS).
 int64_t kvShrinkSlackTokens()
 {
@@ -2255,20 +2259,29 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         if (!kv.ensureTokens(needed))
         {
             size_t const bytesNeeded = kv.bytesToMap(needed);
-            int64_t const released = releaseExpertCacheBytes(static_cast<int64_t>(bytesNeeded));
-            cacheResized = released > 0;
+            int32_t const mappedBefore = kv.mappedTokens();
+            KvGrowResult const grown = growKvWithRelease([&kv](int32_t tokens) { return kv.ensureTokens(tokens); },
+                [&kv](int32_t tokens) { return kv.bytesToMap(tokens); }, releaseExpertCacheBytes, needed,
+                static_cast<int32_t>(std::min<int64_t>(needed, wantedCapped)), kKvGrowExtraReleaseBytes, kKvGrowExtraReleases);
+            cacheResized = grown.releases > 0 && grown.released > 0;
             if (cacheResized)
             {
-                LOG_INFO("Released %.1f MiB of expert cache to grow the KV cache to %d tokens.", released / 1048576.0, needed);
+                LOG_INFO("Released %.1f MiB of expert cache in %d step(s) to grow the KV cache to %d tokens.", grown.released / 1048576.0,
+                    grown.releases, needed);
             }
             else
             {
                 LOG_WARNING("KV cache needs %.1f MiB more for %d tokens and no expert cache memory could be released (plugin entry point %s).",
                     bytesNeeded / 1048576.0, needed, moePluginSymbol("edgellmMoeReleaseCacheBytes") != nullptr ? "found" : "not found");
             }
-            if (!kv.ensureTokens(needed))
+            if (grown.outcome != KvGrowOutcome::kFull)
             {
+                size_t freeBytes = 0;
+                size_t totalBytes = 0;
+                cudaMemGetInfo(&freeBytes, &totalBytes);
                 kvLimit = kv.mappedTokens();
+                LOG_WARNING("KV cache needed %d tokens (%.1f MiB more), mapped %d before and %d after releasing %.1f MiB of expert cache; %.1f MiB of device memory free.",
+                    needed, bytesNeeded / 1048576.0, mappedBefore, kvLimit, grown.released / 1048576.0, freeBytes / 1048576.0);
                 if (longestInput > kvLimit)
                 {
                     throw std::runtime_error("EDGELLM_INPUT_TOO_LONG: input length " + std::to_string(longestInput)

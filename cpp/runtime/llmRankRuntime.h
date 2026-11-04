@@ -25,6 +25,7 @@
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include "runtime/config/deploymentConfig.h"
+#include "runtime/kvGrow.h"
 #include "runtime/kvNeedWindow.h"
 #include "runtime/memoryMetrics.h"
 #include "runtime/config/llmEngineConfig.h"
