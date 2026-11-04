@@ -18,6 +18,7 @@
 #include "runtime/state/contextCache/contextCacheManager.h"
 
 #include "common/checkMacros.h"
+#include "common/logger.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -670,6 +671,7 @@ PublishResult ContextCacheManager::commitPreparedPublication(PreparedPublication
     }
     else if (publication.recordLimitVictim.has_value())
     {
+        LOG_INFO("Context cache: record limit of %d reached, evicting the least recently used record.", mRecords.maxRecords());
         evictRecord(*publication.recordLimitVictim);
     }
     ELLM_CHECK(mRecords.size() <= static_cast<size_t>(mRecords.maxRecords()),
@@ -1065,6 +1067,12 @@ void ContextCacheManager::evictRecord(RecordId id)
 
 void ContextCacheManager::applyEviction(EvictionPlan const& plan)
 {
+    if (!plan.victims.empty())
+    {
+        LOG_INFO("Context cache: %zu record(s) evicted under pressure, freeing %d base pages, %d recurrent snapshots, %d partial KV snapshots (%zu records kept).",
+            plan.victims.size(), plan.reclaimed.baseKvPages, plan.reclaimed.recurrentSnapshotSlots, plan.reclaimed.partialKvSnapshotSlots,
+            mRecords.size() - plan.victims.size());
+    }
     for (RecordId const id : plan.victims)
     {
         evictRecord(id);
