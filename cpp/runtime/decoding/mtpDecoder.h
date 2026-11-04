@@ -70,6 +70,15 @@ public:
     //! decode-round-0 draft prefill: this override is a no-op unless context.hybridMtpEndpointReuse is set.
     bool initializeForGeneration(DecodingInferenceContext& context) override;
 
+    //! Chain drafting only. The draft layer's KV cache needs the base hidden state of every prompt position, so a
+    //! prompt longer than one engine pass runs the draft prefill after each base pass (draftPrefillPerPass, or the
+    //! per-pass loop of LLMRankRuntime::runHybridMtpPrefill) instead of once at the end. The tree variant keeps the
+    //! single-pass contract.
+    bool supportsChunkedPrefill() const noexcept override
+    {
+        return !mUseTree;
+    }
+
     int64_t getRequiredContextMemorySize() const noexcept override;
     void setContextMemory(Tensor& memory) override;
 
