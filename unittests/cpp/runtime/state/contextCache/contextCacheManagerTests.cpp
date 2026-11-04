@@ -1309,6 +1309,33 @@ TEST(ContextCacheManagerTests, TheLimitCannotDropBelowASparedRecord)
     EXPECT_NO_THROW(manager.limitBasePages(manager.baseHighWater()));
 }
 
+TEST(ContextCacheManagerTests, PressureStillEvictsRecordsTheTrimSpared)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{3, 0, 0, 0}, 3);
+    manager.limitBasePages(3);
+    publishPrivateRecord(manager, {kHASH_A});
+    publishPrivateRecord(manager, {kHASH_B});
+    publishPrivateRecord(manager, {kHASH_C});
+    ASSERT_EQ(manager.evictToBaseHighWater(1, 2), 0u) << "the two newest hold the high pages and are spared";
+    ASSERT_EQ(manager.records().lruToMru().size(), 3u);
+
+    CacheRequestLease lease = acquirePrivatePages(manager, 3);
+    EXPECT_EQ(lease.basePages(), std::vector<PageId>({0, 1, 2}));
+    EXPECT_TRUE(manager.records().lruToMru().empty()) << "capacity pressure ignores the trim's protection";
+}
+
+TEST(ContextCacheManagerTests, ARequestLargerThanThePoolIsRefusedAndKeepsTheSparedRecords)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{3, 0, 0, 0}, 3);
+    manager.limitBasePages(3);
+    publishPrivateRecord(manager, {kHASH_A});
+    publishPrivateRecord(manager, {kHASH_B});
+    ASSERT_EQ(manager.evictToBaseHighWater(0, 2), 0u);
+
+    EXPECT_EQ(manager.acquireVanilla({}, 4 * kPAGE_SIZE).status, AcquireStatus::kInsufficientCapacity);
+    EXPECT_EQ(manager.records().lruToMru().size(), 2u);
+}
+
 TEST(ContextCacheManagerTests, EvictingToAHighWaterOnAnEmptyStoreDoesNothing)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
