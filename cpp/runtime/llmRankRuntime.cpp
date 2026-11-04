@@ -941,6 +941,12 @@ bool expertCacheInfo(RuntimeMemoryMetrics& metrics)
     return true;
 }
 
+//! Most recently used context-cache records the KV trim never evicts (EDGELLM_KV_TRIM_PROTECT_RECORDS).
+size_t kvTrimProtectedRecords()
+{
+    return static_cast<size_t>(kvEnvInteger("EDGELLM_KV_TRIM_PROTECT_RECORDS", 2, 0));
+}
+
 //! Expert cache bytes freed per further attempt when the first release did not let the KV pool grow, and the attempts allowed.
 constexpr int64_t kKvGrowExtraReleaseBytes = 64LL << 20;
 constexpr int32_t kKvGrowExtraReleases = 4;
@@ -2250,8 +2256,11 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
             int32_t const peakPages = (recentPeak + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE;
             if (mContextCache->baseHighWaterPages() > peakPages)
             {
-                size_t const evicted = mContextCache->trimBasePagesTo(peakPages);
-                LOG_INFO("Evicted %zu context-cache records to keep the retained KV within %d pages.", evicted, peakPages);
+                size_t const evicted = mContextCache->trimBasePagesTo(peakPages, kvTrimProtectedRecords());
+                if (evicted > 0)
+                {
+                    LOG_INFO("Evicted %zu context-cache records to keep the retained KV within %d pages.", evicted, peakPages);
+                }
             }
             needed = std::max(needed, std::min(mDeployment.base.maxKVCacheCapacity, mContextCache->baseHighWaterPages() * kTOKENS_PER_PAGE));
         }

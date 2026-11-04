@@ -213,8 +213,9 @@ public:
     //! One past the highest base page held by an active request or a retained record.
     int32_t baseHighWater() const noexcept;
     //! Evict records that hold a base page at or above @p pages, least recently used first, until none is held. Records
-    //! below the target are kept. Between requests only. Returns the number of evicted records.
-    size_t evictToBaseHighWater(int32_t pages);
+    //! below the target and the @p protectMostRecent most recently used records are kept, so the high water can stay above
+    //! the target. Between requests only. Returns the number of evicted records.
+    size_t evictToBaseHighWater(int32_t pages, size_t protectMostRecent = 0);
 
     ResourcePools const& pools() const noexcept;
     BaseBlockIndex const& baseIndex() const noexcept;

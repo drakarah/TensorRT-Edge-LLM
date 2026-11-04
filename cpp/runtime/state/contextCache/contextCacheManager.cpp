@@ -952,15 +952,18 @@ int32_t ContextCacheManager::baseHighWater() const noexcept
     return mPools.highWater(ResourceType::kBaseKvPage);
 }
 
-size_t ContextCacheManager::evictToBaseHighWater(int32_t pages)
+size_t ContextCacheManager::evictToBaseHighWater(int32_t pages, size_t protectMostRecent)
 {
     size_t evicted = 0;
-    for (RecordId const id : mRecords.lruToMru())
+    std::vector<RecordId> const order = mRecords.lruToMru();
+    size_t const evictable = order.size() > protectMostRecent ? order.size() - protectMostRecent : 0;
+    for (size_t i = 0; i < evictable; ++i)
     {
         if (baseHighWater() <= pages)
         {
             break;
         }
+        RecordId const id = order[i];
         CacheRecord const& record = mRecords.get(id);
         bool const holdsHighPage = std::any_of(record.basePagePath.begin(), record.basePagePath.end(),
             [pages](PageId page) { return page >= pages; });

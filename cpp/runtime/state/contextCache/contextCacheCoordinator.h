@@ -246,8 +246,9 @@ public:
     void limitBasePages(int32_t pages);
     //! One past the highest base KV page held by an active request or a retained record.
     int32_t baseHighWaterPages() const noexcept;
-    //! Evict records holding a base page at or above @p pages (least recently used first); returns how many.
-    size_t trimBasePagesTo(int32_t pages);
+    //! Evict records holding a base page at or above @p pages (least recently used first), sparing the
+    //! @p protectMostRecent most recently used; returns how many.
+    size_t trimBasePagesTo(int32_t pages, size_t protectMostRecent = 0);
 
     //! Whether this deployment can lease and bind a new sequence into an executing request.
     bool supportsLiveSequenceAdmission() const noexcept;
