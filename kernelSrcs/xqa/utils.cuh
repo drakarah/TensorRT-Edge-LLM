@@ -921,6 +921,28 @@ __device__ inline Vec<uint32_t, 2> convertVCacheWordToF16(uint32_t i8data)
     return ret;
 }
 
+//! Packed K8V4 V: one 32-bit word of an ldmatrix.trans-loaded V matrix holds the 16-bit unit u of two tokens (low half: token
+//! 2q, high half: token 2q + 1), each unit being the 4-bit codes of channels 4u..4u+3 (channel 4u + e in nibble e).
+//! Returns, for e = 0..3, the half2 {value(token 2q, channel 4u + e), value(token 2q + 1, channel 4u + e)} where
+//! value = fp16 fma(code, scale, zero) with the {scale, zero} half2 pairs of the two tokens' group (@p scale2, @p zero2).
+//! The code is made exact in fp16 as 1024 + code (the 0x6400 exponent trick) and 1024 is subtracted exactly, so the result is
+//! the single-rounding fp16 FMA the host reference defines. Explicit .rn instructions keep --use_fast_math from changing them.
+__device__ inline void convertVPackedWordToF16(uint32_t word, uint32_t scale2, uint32_t zero2, uint32_t (&dst)[4])
+{
+#pragma unroll
+    for (uint32_t e = 0; e < 4; e++)
+    {
+        uint32_t const biased = ((word >> (4 * e)) & 0x000F000FU) | 0x64006400U;
+        asm("{\n"
+            ".reg .b32 code;\n"
+            "sub.rn.f16x2 code, %1, %2;\n"
+            "fma.rn.f16x2 %0, code, %3, %4;\n"
+            "}"
+            : "=r"(dst[e])
+            : "r"(biased), "r"(0x64006400U), "r"(scale2), "r"(zero2));
+    }
+}
+
 struct PermuteOrder
 {
     uint16_t x0 : 4;

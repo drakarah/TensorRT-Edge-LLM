@@ -67,6 +67,8 @@ XQADataType trtToXqaDataType(nvinfer1::DataType type)
     case nvinfer1::DataType::kBF16: xqaType = XQADataType::DATA_TYPE_BF16; break;
     case nvinfer1::DataType::kFP8: xqaType = XQADataType::DATA_TYPE_E4M3; break;
     case nvinfer1::DataType::kINT8: xqaType = XQADataType::DATA_TYPE_INT8; break;
+    // kINT4 names the packed K8V4 cache: an INT8 K plane and V rows packed to 4 bits (see kvInt4Quant.h).
+    case nvinfer1::DataType::kINT4: xqaType = XQADataType::DATA_TYPE_INT4; break;
     default: throw std::runtime_error("Unsupported datatype for XQA.");
     }
     return xqaType;

@@ -67,6 +67,10 @@ struct XQAJitKeyHasher
 
 void validateXQAJitKey(XQAJitKey const& key)
 {
+    if (key.kvDataType == nvinfer1::DataType::kINT4 && key.headSize != 256)
+    {
+        throw std::runtime_error("The packed K8V4 XQA kernel is implemented for head_dim 256 only.");
+    }
     if (key.contiguousQuerySwa && (!key.specDecode || !key.slidingWindow))
     {
         throw std::runtime_error("Contiguous-query XQA SWA requires spec-decode and sliding-window attention.");
@@ -83,11 +87,12 @@ int32_t getKVCacheEnum(nvinfer1::DataType kvDataType)
     {
         return xqa::kernels::kKV_CACHE_ELEM_FP8_E4M3;
     }
-    if (kvDataType == nvinfer1::DataType::kINT8)
+    if (kvDataType == nvinfer1::DataType::kINT8 || kvDataType == nvinfer1::DataType::kINT4)
     {
+        // kINT4: INT8 K cache with packed 4-bit V rows; the kernel source takes the V format from XQA_V_INT4_PACKED.
         return xqa::kernels::kKV_CACHE_ELEM_INT8;
     }
-    throw std::runtime_error("XQA NVRTC JIT supports only FP16, FP8 and INT8 KV cache.");
+    throw std::runtime_error("XQA NVRTC JIT supports only FP16, FP8, INT8 and packed K8V4 KV cache.");
 }
 
 std::string getGpuArchitectureOption(int32_t sm)
@@ -130,6 +135,7 @@ std::vector<std::string> buildNvrtcOptions(XQAJitKey const& key)
     options.emplace_back("-DTOKENS_PER_PAGE=" + std::to_string(key.tokensPerPage));
     options.emplace_back("-DHEAD_ELEMS=" + std::to_string(key.headSize));
     options.emplace_back("-DCACHE_ELEM_ENUM=" + std::to_string(getKVCacheEnum(key.kvDataType)));
+    options.emplace_back("-DXQA_V_INT4_PACKED=" + std::to_string(key.kvDataType == nvinfer1::DataType::kINT4 ? 1 : 0));
     options.emplace_back("-DSLIDING_WINDOW=" + std::to_string(key.slidingWindow ? 1 : 0));
     options.emplace_back("-DSPEC_DEC=" + std::to_string(key.specDecode ? 1 : 0));
     options.emplace_back("-DCONTIGUOUS_QUERY_SWA=" + std::to_string(key.contiguousQuerySwa ? 1 : 0));
@@ -301,6 +307,7 @@ bool canCompileXQAKernel(int32_t numQHeads, int32_t numKVHeads, int32_t headSize
     // out ~3.6x larger and correspondingly slow, with no diagnostic.
     // INT8 converts are native on every SM listed above (SM80+), so INT8 KV needs no extra gate.
     bool const checkKVType = kvDataType == nvinfer1::DataType::kHALF || kvDataType == nvinfer1::DataType::kINT8
+        || (kvDataType == nvinfer1::DataType::kINT4 && headSize == 256)
         || (kvDataType == nvinfer1::DataType::kFP8 && contains(kFP8_CAPABLE_SM_VERSIONS, smVersion));
     bool const checkSMVersion = contains(kALLOWED_SM_VERSIONS, smVersion);
 

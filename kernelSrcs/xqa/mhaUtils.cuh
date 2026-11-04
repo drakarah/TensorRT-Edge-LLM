@@ -355,7 +355,7 @@ template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, boo
 __device__ inline void copyPartialHeadsAsync(
     Warp const& warp, Array2D<LdGrain, dstNbHeads, exactDiv(exactDiv(sizeof(Head), nbPartsPerHead), grainBytes)>& dst,
     uint32_t dstHeadOffset, SrcHeadPtr const& src, uint32_t idxPart, uint32_t nbAvailHeads = maxNbCopiedHeads,
-    LocalHeadIdxMap&& localHeadIdxMap = [](uint32_t x) { return x; })
+    LocalHeadIdxMap&& localHeadIdxMap = [](uint32_t x) { return x; }, uint32_t maxValidGrains = ~0U)
 {
     static_assert(maxNbCopiedHeads <= dstNbHeads);
     assert(idxPart < nbPartsPerHead);
@@ -390,7 +390,9 @@ __device__ inline void copyPartialHeadsAsync(
         using SrcHead = mha::decay_t<decltype(src[0])>;
         constexpr uint32_t nbValidGrains = exactDiv(sizeof(SrcHead), grainBytes);
         uint32_t const idxGrainInsideHead = grainsPerPart * idxPart + segLane;
-        bool const isGrainInBound = (!isHeadPadded || idxGrainInsideHead < nbValidGrains);
+        // maxValidGrains < the head's grains: only the first grains of every head are fetched (a packed 4-bit V row is 160 of
+        // 256 bytes); the others are zero-filled in shared memory without touching global memory.
+        bool const isGrainInBound = (!isHeadPadded || idxGrainInsideHead < nbValidGrains) && idxGrainInsideHead < maxValidGrains;
         SrcHead const* const pSrcHead = src + localHeadIdxMap(idxHeadLocal);
         bool const isValidPage
             = SrcHeadPtrNeverNull<mha::decay_t<SrcHeadPtr>>::value || (pSrcHead != nullptr);
@@ -406,7 +408,8 @@ template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbWarps, bool swizz
     typename SrcHeadPtr, typename LocalHeadIdxMap = uint32_t (*)(uint32_t)>
 __device__ inline void copyHeadsAsync(
     uint32_t idxWarp, Array2D<LdGrain, dstNbHeads, exactDiv(sizeof(Head), grainBytes)>& dst, SrcHeadPtr const& src,
-    uint32_t nbAvailHeads = maxNbCopiedHeads, LocalHeadIdxMap&& localHeadIdxMap = [](uint32_t x) { return x; })
+    uint32_t nbAvailHeads = maxNbCopiedHeads, LocalHeadIdxMap&& localHeadIdxMap = [](uint32_t x) { return x; },
+    uint32_t maxValidGrains = ~0U)
 {
     assert(idxWarp < nbWarps);
     Warp const& warp = this_warp();
@@ -415,7 +418,7 @@ __device__ inline void copyHeadsAsync(
     uint32_t const warpNbAvailHeads = (dstHeadOffset < nbAvailHeads ? nbAvailHeads - dstHeadOffset : 0);
     constexpr uint32_t idxPart = 0;
     copyPartialHeadsAsync<Head, maxNbHeadsPerWarp, 1, swizzle, isFull, dstNbHeads>(warp, dst, dstHeadOffset, src,
-        idxPart, warpNbAvailHeads, [&](uint32_t x) { return localHeadIdxMap(dstHeadOffset + x); });
+        idxPart, warpNbAvailHeads, [&](uint32_t x) { return localHeadIdxMap(dstHeadOffset + x); }, maxValidGrains);
 }
 
 //! Variant of copyHeadsAsync that stripes a single wide head across all x-warps.

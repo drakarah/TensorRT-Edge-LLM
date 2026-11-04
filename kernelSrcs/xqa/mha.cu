@@ -100,6 +100,23 @@ constexpr uint2 ctaTile = {warpTile.x * ctaShapeInWarps.x, // if .x is greater t
     warpTile.y* ctaShapeInWarps.y};
 
 constexpr uint32_t cvtExpansion = exactDiv(inputElemSize, cacheElemSize);
+
+// Packed K8V4: K stays INT8 and V rows are packed 4-bit rows (see cpp/kernels/posEncoding/kvInt4Quant.h): bytes 0..127 hold 256
+// nibbles, bytes 128..159 hold eight {fp16 scale, fp16 zero} pairs, one per 32 channels; bytes 160..255 are not read.
+#ifndef XQA_V_INT4_PACKED
+#define XQA_V_INT4_PACKED 0
+#endif
+constexpr bool vPacked = XQA_V_INT4_PACKED;
+#if XQA_V_INT4_PACKED
+static_assert(CACHE_ELEM_ENUM == TRT_EDGELLM_XQA_CACHE_ELEM_INT8, "Packed V needs an INT8 K cache.");
+static_assert(HEAD_ELEMS == 256, "Packed V is implemented for head_dim 256 only.");
+static_assert(BEAM_WIDTH == 1, "Packed V is not implemented for beam search.");
+#endif
+// Channels held by one 16-bit unit of an ldmatrix-loaded V word: 2 for INT8, 4 for packed nibbles. It is also the number of
+// fp16 mma column tiles one ldmatrix matrix expands to.
+constexpr uint32_t vCvtExpansion = vPacked ? 4U : cvtExpansion;
+constexpr uint32_t vPackedNibbleGrains = 8U; // 128 bytes
+constexpr uint32_t vPackedUsedGrains = 10U;  // + 32 bytes of metadata
 constexpr uint32_t tiledQKVStagingHeadDim512VTileSeqLen = 16U;
 
 #ifndef __CUDA_ARCH__
@@ -835,31 +852,31 @@ __device__ inline void reorderAndStoreGemmOutTile(
     for (uint32_t m = 0; m < exactDiv(dst.rows, 8); m++)
     {
 #pragma unroll
-        for (uint32_t n = 0; n < exactDiv(dst.cols * grainBytes / inputElemSize, 8 * 2); n++)
+        for (uint32_t n = 0; n < exactDiv(dst.cols * grainBytes / inputElemSize, 8 * vCvtExpansion); n++)
         {
             uint32_t const idxRowLocal = laneId() / 4;
             uint32_t const idxSegLocal = laneId() % 4;
-            Vec<InputElem2, cvtExpansion> seg;
+            Vec<InputElem2, vCvtExpansion> seg;
 #pragma unroll
-            for (uint32_t e = 0; e < cvtExpansion; e++)
+            for (uint32_t e = 0; e < vCvtExpansion; e++)
             {
-                seg[e] = src(m, n * cvtExpansion + e);
+                seg[e] = src(m, n * vCvtExpansion + e);
             }
             // reorder
             // Ideally compiler should be able to fuse this into toFp16() and just reorder input registers of F2FP
             // instructions.
-            Vec<InputElem, cvtExpansion * 2> reorderedSeg;
+            Vec<InputElem, vCvtExpansion * 2> reorderedSeg;
 #pragma unroll
-            for (uint32_t e = 0; e < cvtExpansion; e++)
+            for (uint32_t e = 0; e < vCvtExpansion; e++)
             {
                 reorderedSeg[e] = seg[e].x;
-                reorderedSeg[cvtExpansion + e] = seg[e].y;
+                reorderedSeg[vCvtExpansion + e] = seg[e].y;
             }
-            static_assert(cvtExpansion <= LdGrain::size);
+            static_assert(vCvtExpansion <= LdGrain::size);
             constexpr uint32_t nbSegPerGrain = exactDiv(grainBytes, sizeof(seg));
-            reinterpret_cast<Vec<uint32_t, cvtExpansion>&>(dst.template at<true>(8 * m + idxRowLocal,
-                n * cvtExpansion + idxSegLocal / nbSegPerGrain)[idxSegLocal % nbSegPerGrain * cvtExpansion])
-                = reinterpret_cast<Vec<uint32_t, cvtExpansion>&>(reorderedSeg);
+            reinterpret_cast<Vec<uint32_t, vCvtExpansion>&>(dst.template at<true>(8 * m + idxRowLocal,
+                n * vCvtExpansion + idxSegLocal / nbSegPerGrain)[idxSegLocal % nbSegPerGrain * vCvtExpansion])
+                = reinterpret_cast<Vec<uint32_t, vCvtExpansion>&>(reorderedSeg);
         }
     }
 }
@@ -1415,7 +1432,7 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
             }
         }
         // load v slice. rows and cols here are before transpose
-        constexpr uint32_t mnExV = mnEx * cvtExpansion;
+        constexpr uint32_t mnExV = mnEx * vCvtExpansion;
         constexpr uint32_t vSliceCols = exactDiv(warpTile.x, 8 * mnExV); // in InstInMat
         constexpr uint32_t vSliceRows = nbInstInMatPerSliceInGemmKDim;
         uint32_t const rowBeg = 8 * kEx * nbInstInMatPerSliceInGemmKDim * s;
@@ -1431,7 +1448,42 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
 #if CACHE_ELEM_ENUM == TRT_EDGELLM_XQA_CACHE_ELEM_INPUT
             ret = vSliceOrig;
 #else
-            if constexpr (isLowPrecCacheElem<VElemType>)
+            if constexpr (vPacked && mha::is_same_v<VElemType, int8_t>)
+            {
+                static_assert(mha::is_same_v<InputElem, half>);
+                static_assert(vSliceRows == 1 && mnEx == 2 && kEx == 2);
+                // vSliceOrig(m, 0).data[i][j]: grain (32 channels = one scale group) 2 * (vSliceCols * idxNSplit + m) + i of
+                // the row, token block j (8 tokens); lane (q, u) holds nibble-units u of tokens 8j + 2q and 8j + 2q + 1.
+                uint32_t const quad = laneId() % 4;
+#pragma unroll
+                for (uint32_t m = 0; m < ret.rows; m++)
+                {
+#pragma unroll
+                    for (uint32_t i = 0; i < mnEx; i++)
+                    {
+                        uint32_t const grain = mnEx * (vSliceCols * idxNSplit + m) + i;
+                        static_assert(vPackedUsedGrains - vPackedNibbleGrains == 2);
+#pragma unroll
+                        for (uint32_t j = 0; j < kEx; j++)
+                        {
+                            uint32_t const row = rowBeg + 8 * j + 2 * quad;
+                            // {scale, zero} words of the two tokens of this lane's k pair
+                            uint32_t const metaA = vt.template at<true>(row, vPackedNibbleGrains + grain / 4)[grain % 4];
+                            uint32_t const metaB = vt.template at<true>(row + 1, vPackedNibbleGrains + grain / 4)[grain % 4];
+                            uint32_t const scale2 = prmt(metaA, metaB, PermuteOrder{0, 1, 4, 5});
+                            uint32_t const zero2 = prmt(metaA, metaB, PermuteOrder{2, 3, 6, 7});
+                            uint32_t dstWords[4];
+                            convertVPackedWordToF16(vSliceOrig(m, 0).data[i][j], scale2, zero2, dstWords);
+#pragma unroll
+                            for (uint32_t e = 0; e < 4; e++)
+                            {
+                                ret(m, 0).data[i * 4 + e][j] = dstWords[e];
+                            }
+                        }
+                    }
+                }
+            }
+            else if constexpr (isLowPrecCacheElem<VElemType>)
             {
 #pragma unroll
                 for (uint32_t m = 0; m < ret.rows; m++)
@@ -2749,8 +2801,8 @@ CUBIN_EXPORT __global__
                       ? cacheVTileSeqLen
                       : (seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset
                                                  : 0U); // may also be full but it can be handled correctly anyway
-                  copyHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false>(
-                      warpIdxInGrp, dst, src, nbHeadsAvail);
+                  copyHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false>(warpIdxInGrp, dst,
+                      src, nbHeadsAvail, [](uint32_t x) { return x; }, vPacked ? vPackedUsedGrains : ~0U);
 #else
                   bool const isFullTile = (seqIter + 1 < nbSeqIters);
                   if (isFullTile)
