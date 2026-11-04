@@ -473,13 +473,61 @@ __device__ __forceinline__ void storeVecVInt4Emulated(
     out.store(dst + base);
 }
 
+//! Stores V as the packed K8V4 row (see kvInt4Quant.h). One warp is one (token, kv head) row, eight channels per lane; a
+//! group of 32 channels is four consecutive lanes. @p base is the element offset of this lane's first channel in the row.
+//! Bytes 160..255 of the row are not touched.
+__device__ __forceinline__ void storeVecVPacked(int8_t* dst, int64_t base, DVec<half> const& vec)
+{
+    constexpr uint32_t kVec = DVec<half>::vec_size;
+    static_assert(kVec == 8, "The packed row needs eight channels per lane");
+    uint32_t const lane = threadIdx.x & 31u;
+    float x[kVec];
+    float groupMin = INFINITY;
+    float groupMax = -INFINITY;
+#pragma unroll
+    for (uint32_t i = 0; i < kVec; ++i)
+    {
+        x[i] = __half2float(vec[i]);
+        groupMin = fminf(groupMin, x[i]);
+        groupMax = fmaxf(groupMax, x[i]);
+    }
+#pragma unroll
+    for (uint32_t offset = 1; offset < kVInt4GroupSize / kVec; offset <<= 1)
+    {
+        groupMin = fminf(groupMin, __shfl_xor_sync(0xffffffffu, groupMin, offset));
+        groupMax = fmaxf(groupMax, __shfl_xor_sync(0xffffffffu, groupMax, offset));
+    }
+    VInt4Asym const params = vInt4AsymParams(groupMin, groupMax);
+    uint32_t word = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kVec; ++i)
+    {
+        word |= static_cast<uint32_t>(vInt4AsymCode(x[i], params)) << (4u * i);
+    }
+    int8_t* const rowStart = dst + base - static_cast<int64_t>(lane) * kVec;
+    *reinterpret_cast<uint32_t*>(rowStart + lane * 4u) = word;
+    if ((lane & 3u) == 0)
+    {
+        uint32_t const group = lane >> 2;
+        *reinterpret_cast<__half*>(rowStart + kVInt4PackedScaleOffset + 2u * group) = __float2half_rn(params.scale);
+        *reinterpret_cast<__half*>(rowStart + kVInt4PackedZeroOffset + 2u * group) = __float2half_rn(params.zero);
+    }
+}
+
 template <typename TCache, int32_t kVInt4Mode>
 __device__ __forceinline__ void storeVecV(TCache* dst, int64_t base, DVec<half> const& vec, float vScaleQuantOrig)
 {
     if constexpr (kVInt4Mode != 0)
     {
         static_assert(std::is_same_v<TCache, int8_t>, "The K8V4 emulation needs an int8 pool");
-        storeVecVInt4Emulated<kVInt4Mode>(dst, base, vec, vScaleQuantOrig);
+        if constexpr (kVInt4Mode == static_cast<int32_t>(VInt4Mode::kPackedGroup32Asym))
+        {
+            storeVecVPacked(dst, base, vec);
+        }
+        else
+        {
+            storeVecVInt4Emulated<kVInt4Mode>(dst, base, vec, vScaleQuantOrig);
+        }
     }
     else
     {
@@ -518,7 +566,12 @@ static VInt4Mode vInt4ModeFromEnvironment()
     {
         return VInt4Mode::kHadamard128Asym;
     }
-    check::check(false, "EDGELLM_KV_V_INT4_EMULATION must be off, static, token, group32, group32asym, had128 or had128asym.");
+    if (std::strcmp(env, "packed") == 0)
+    {
+        return VInt4Mode::kPackedGroup32Asym;
+    }
+    check::check(false,
+        "EDGELLM_KV_V_INT4_EMULATION must be off, static, token, group32, group32asym, had128, had128asym or packed.");
     return VInt4Mode::kOff;
 }
 
@@ -542,6 +595,7 @@ static void dispatchVInt4Mode(VInt4Mode mode, Fn&& launch)
     case VInt4Mode::kGroup32Asym: launch(std::integral_constant<int32_t, 4>{}); break;
     case VInt4Mode::kHadamard128: launch(std::integral_constant<int32_t, 5>{}); break;
     case VInt4Mode::kHadamard128Asym: launch(std::integral_constant<int32_t, 6>{}); break;
+    case VInt4Mode::kPackedGroup32Asym: launch(std::integral_constant<int32_t, 7>{}); break;
     case VInt4Mode::kOff:
     default: launch(std::integral_constant<int32_t, 0>{}); break;
     }

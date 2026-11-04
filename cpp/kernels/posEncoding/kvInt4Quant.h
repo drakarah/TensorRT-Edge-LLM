@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -39,7 +40,22 @@ enum class VInt4Mode : int32_t
     kGroup32Asym = 4,     //!< Scale and zero point per 32 channels: 16 levels between the group minimum and maximum.
     kHadamard128 = 5,     //!< Rotate blocks of 128 channels with a Hadamard transform, one symmetric scale per block.
     kHadamard128Asym = 6, //!< Rotate blocks of 128 channels, scale and zero point per block.
+    kPackedGroup32Asym = 7, //!< The packed K8V4 row: 4-bit codes and fp16 scale + zero point per 32 channels, see below.
 };
+
+//! Packed V row of 256 channels inside a 256-byte int8 row (the pool keeps its geometry; only the first 160 bytes are used):
+//!   bytes   0..127  nibble i (low nibble of byte i/2 for even i) is the code 0..15 of channel i;
+//!   bytes 128..143  eight fp16 scales, one per group of 32 channels;
+//!   bytes 144..159  eight fp16 zero points;
+//!   bytes 160..255  never written or read.
+//! Channel value = code * scale + zero. Groups are those of VInt4Mode::kGroup32Asym; this is the same arithmetic, so the packed
+//! cache holds exactly the values the emulation stored (up to the int8 grid of the emulation).
+constexpr int32_t kVInt4PackedChannels = 256;
+constexpr int32_t kVInt4PackedNibbleBytes = 128;
+constexpr int32_t kVInt4PackedScaleOffset = 128;
+constexpr int32_t kVInt4PackedZeroOffset = 144;
+constexpr int32_t kVInt4PackedUsedBytes = 160;
+constexpr int32_t kVInt4PackedGroups = 8;
 
 //! Largest code magnitude. Codes lie in [-7, 7]; the code -8 is never produced so that negation stays exact.
 constexpr int32_t kVInt4MaxCode = 7;
@@ -224,6 +240,52 @@ inline void vInt4Hadamard128Host(float* x)
     for (int32_t i = 0; i < kVInt4HadamardBlock; ++i)
     {
         x[i] = x[i] * kVInt4HadamardScale;
+    }
+}
+
+//! Host reference of the packed row writer: packs 256 channel values (as the kernel sees them, already fp16-exact floats) into
+//! the first 160 bytes of @p row; the other bytes are left alone.
+inline void vInt4PackRowHost(float const* values, uint8_t* row)
+{
+    for (int32_t g = 0; g < kVInt4PackedGroups; ++g)
+    {
+        float groupMin = INFINITY;
+        float groupMax = -INFINITY;
+        for (int32_t i = 0; i < kVInt4GroupSize; ++i)
+        {
+            float const x = values[g * kVInt4GroupSize + i];
+            groupMin = fminf(groupMin, x);
+            groupMax = fmaxf(groupMax, x);
+        }
+        VInt4Asym const params = vInt4AsymParams(groupMin, groupMax);
+        for (int32_t i = 0; i < kVInt4GroupSize; ++i)
+        {
+            int32_t const channel = g * kVInt4GroupSize + i;
+            uint32_t const code = static_cast<uint32_t>(vInt4AsymCode(values[channel], params));
+            uint8_t& byte = row[channel / 2];
+            byte = (channel % 2 == 0) ? static_cast<uint8_t>((byte & 0xF0U) | code) : static_cast<uint8_t>((byte & 0x0FU) | (code << 4));
+        }
+        __half const scale = __float2half_rn(params.scale);
+        __half const zero = __float2half_rn(params.zero);
+        std::memcpy(row + kVInt4PackedScaleOffset + 2 * g, &scale, 2);
+        std::memcpy(row + kVInt4PackedZeroOffset + 2 * g, &zero, 2);
+    }
+}
+
+//! Host reference of the unpack: channel values of a packed row, code * scale + zero, with the same float arithmetic as the
+//! emulation.
+inline void vInt4UnpackRowHost(uint8_t const* row, float* values)
+{
+    for (int32_t channel = 0; channel < kVInt4PackedChannels; ++channel)
+    {
+        int32_t const g = channel / kVInt4GroupSize;
+        uint8_t const byte = row[channel / 2];
+        int32_t const code = (channel % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+        __half scale;
+        __half zero;
+        std::memcpy(&scale, row + kVInt4PackedScaleOffset + 2 * g, 2);
+        std::memcpy(&zero, row + kVInt4PackedZeroOffset + 2 * g, 2);
+        values[channel] = vInt4AsymDequant(code, VInt4Asym{__half2float(scale), __half2float(zero)});
     }
 }
 
