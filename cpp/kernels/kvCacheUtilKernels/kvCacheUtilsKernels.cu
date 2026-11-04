@@ -19,6 +19,7 @@
 #include "common/pagedKvTypes.h"
 #include "common/stringUtils.h"
 #include "kernels/common/vectorizedTypes.cuh"
+#include "kernels/posEncoding/kvInt4Quant.h"
 #include "kvCacheUtilsKernels.h"
 #include <cuda_fp16.h>
 #include <stdexcept>
@@ -319,7 +320,9 @@ __global__ void gatherPagedKVToSplitKernel(uint8_t const* __restrict__ pool, uin
 //! One-byte pool -> FP16 dequant gather (FP8 e4m3 or INT8). Same page addressing as the byte-copy kernel,
 //! but each element is dequantized (value * scale) into the FP16 destination, so the downstream
 //! `dataPointer<half>()` consumers see real FP16 rather than reinterpreted one-byte values.
-template <typename TCache, bool kRawK = false>
+//! kPackedV (INT8 pool only, head_dim 256): the V rows are packed K8V4 rows (see kvInt4Quant.h) and are decoded to FP16 as
+//! code * scale + zero; vScale is not used for V.
+template <typename TCache, bool kRawK = false, bool kPackedV = false>
 __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ pool, void* __restrict__ kDstRaw,
     half* __restrict__ vDst, int32_t const* __restrict__ pageTable, int32_t const* __restrict__ kvSeqLens,
     int32_t maxPagesPerSeq, int32_t seqLen, int32_t tokenElems, float kScale, float vScale, int32_t zeroFillTailTokens, int32_t keepTrailingTokens)
@@ -372,6 +375,34 @@ __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ poo
     TCache const* vSrc = pool + static_cast<size_t>(vPage) * pageElems;
     constexpr size_t kVEC = 8;
     bool const vectorizable = (elemsToCopy % kVEC == 0) && (dstOffset % kVEC == 0) && (pageElems % kVEC == 0);
+    if constexpr (kPackedV)
+    {
+        // K as below; V: one thread decodes eight channels of one (token, head) row.
+        static_assert(sizeof(TCache) == 1, "packed V needs a one-byte pool");
+        for (size_t i = threadIdx.x; i < elemsToCopy; i += blockDim.x)
+        {
+            storeK(dstOffset + i, kSrc[i]);
+        }
+        size_t const chunks = elemsToCopy / kVEC; // elemsToCopy is a multiple of 256 (head_dim 256)
+        for (size_t v = threadIdx.x; v < chunks; v += blockDim.x)
+        {
+            size_t const row = v / 32;
+            uint32_t const lane = static_cast<uint32_t>(v % 32);
+            uint8_t const* const rowBytes = reinterpret_cast<uint8_t const*>(vSrc) + row * 256;
+            uint32_t const word = *reinterpret_cast<uint32_t const*>(rowBytes + 4 * lane);
+            uint32_t const group = lane >> 2;
+            float const scale = __half2float(*reinterpret_cast<__half const*>(rowBytes + kVInt4PackedScaleOffset + 2 * group));
+            float const zero = __half2float(*reinterpret_cast<__half const*>(rowBytes + kVInt4PackedZeroOffset + 2 * group));
+            __align__(16) half vOut[kVEC];
+#pragma unroll
+            for (uint32_t j = 0; j < kVEC; ++j)
+            {
+                vOut[j] = __float2half(vInt4AsymDequant(static_cast<int32_t>((word >> (4 * j)) & 0xFu), VInt4Asym{scale, zero}));
+            }
+            reinterpret_cast<uint4*>(vDst + dstOffset)[v] = *reinterpret_cast<uint4 const*>(vOut);
+        }
+        return;
+    }
     if (vectorizable)
     {
         // 8 one-byte elements in, 8 halves (16 B) out per thread and iteration.
@@ -416,7 +447,8 @@ void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t cons
     KVPoolQuant poolQuant, float kScale, float vScale, cudaStream_t stream, int32_t zeroFillTailTokens, int32_t keepTrailingTokens,
     bool rawInt8K)
 {
-    check::check(!rawInt8K || poolQuant == KVPoolQuant::kINT8, "gatherPagedKVToSplit: rawInt8K needs an INT8 pool.");
+    check::check(!rawInt8K || poolQuant == KVPoolQuant::kINT8 || poolQuant == KVPoolQuant::kINT8PackedV,
+        "gatherPagedKVToSplit: rawInt8K needs an INT8 pool.");
     check::check(batchSize > 0 && seqLen > 0 && numKVHeads > 0 && headDim > 0 && elemSize > 0,
         "gatherPagedKVToSplit: batchSize, seqLen, numKVHeads, headDim, and elemSize must all be positive.");
     check::check(
@@ -441,6 +473,23 @@ void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t cons
 #else
         throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
 #endif
+    }
+    else if (poolQuant == KVPoolQuant::kINT8PackedV)
+    {
+        check::check(headDim == kVInt4PackedChannels && elemSize == 1,
+            "gatherPagedKVToSplit: a packed-V pool needs head_dim 256 and one-byte elements.");
+        if (rawInt8K)
+        {
+            gatherDequantPagedKVToSplitKernel<int8_t, true, true><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
+                static_cast<int8_t const*>(pool), kDst, static_cast<half*>(vDst), pageTable, kvSeqLens, maxPagesPerSeq,
+                seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens);
+        }
+        else
+        {
+            gatherDequantPagedKVToSplitKernel<int8_t, false, true><<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(
+                static_cast<int8_t const*>(pool), kDst, static_cast<half*>(vDst), pageTable, kvSeqLens, maxPagesPerSeq,
+                seqLen, tokenElems, kScale, vScale, zeroFillTailTokens, keepTrailingTokens);
+        }
     }
     else if (poolQuant == KVPoolQuant::kINT8 && rawInt8K)
     {

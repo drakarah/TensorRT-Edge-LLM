@@ -84,6 +84,7 @@ enum class KVPoolQuant
     kNONE, //!< FP16 pool: bytes are copied
     kFP8,  //!< FP8 e4m3 pool: dequantized to FP16
     kINT8, //!< INT8 pool: dequantized to FP16
+    kINT8PackedV, //!< INT8 pool whose V rows are packed K8V4 rows (head_dim 256, see kvInt4Quant.h); K as kINT8
 };
 
 //! \brief Gathers logical pages 0..ceil(seqLen/128) of every slot from a paged K/V page pool into dense
