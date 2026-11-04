@@ -853,6 +853,74 @@ _int4_groupwise_gemm_v2_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::Int4AffineGroupwiseGemmPlugin (MLX affine INT4, fragment-layout weights)
+# ---------------------------------------------------------------------------
+
+_int4_affine_gemm_schema = OpSchema(
+    name="Int4AffineGroupwiseGemmPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TensorRT affine Int4 groupwise GEMM plugin (MLX affine, group 64, "
+    "cuteDSL fragment-layout weights).",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="input",
+            description="Input tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="qweight",
+            description="Quantized weights, cuteDSL fragment layout (int8)",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="scales",
+            description="Scales (float16) [K/64, N]",
+            type_str="tensor(float16)",
+        ),
+        OpSchema.FormalParameter(
+            name="bias_prime",
+            description="Shifted bias fp16(bias + 8 * scale) (float16) [K/64, N]",
+            type_str="tensor(float16)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="Output tensor",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
+            "Input and output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="gemm_n",
+            type=OpSchema.AttrType.INT,
+            description="Output feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="gemm_k",
+            type=OpSchema.AttrType.INT,
+            description="Input feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="group_size",
+            type=OpSchema.AttrType.INT,
+            description="Group size (64)",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::Nvfp4A16GemmPlugin (dense FP16-A / NVFP4-W4 Marlin GEMM)
 # ---------------------------------------------------------------------------
 
@@ -1659,6 +1727,129 @@ _int4_moe_plugin_schema = OpSchema(
             name="quantization_group_size",
             type=OpSchema.AttrType.INT,
             description="Quantization group size G",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::Int4MoeAffinePlugin (Flint routed experts)
+# ---------------------------------------------------------------------------
+
+_int4_moe_affine_plugin_schema = OpSchema(
+    name="Int4MoeAffinePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("Flint routed experts: sigmoid top-k routing (plain, renormalised), "
+         "affine INT4 (MLX, group 64, w = (q-8)*scale + b') Marlin expert "
+         "GEMMs, SwiGLU scaled by 2^-act_scale_log2 with the inverse folded "
+         "into the routing weights, weighted combine. Mirrors "
+         "trt_edgellm::Int4MoeAffinePlugin."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="router_logits",
+            description="Router logits [T, E] FP32",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="hidden_states",
+            description="Input hidden states [T, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_gate_up_qweights",
+            description="Marlin packed gate|up weights int8",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_gate_up_scales",
+            description="gate|up scales [E, D/64, 2I]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_gate_up_bias_prime",
+            description="gate|up b' [E, D/64, 2I]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_down_qweights",
+            description="Marlin packed down weights int8",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_down_scales",
+            description="down scales [E, I/64, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_down_bias_prime",
+            description="down b' [E, I/64, D]",
+            type_str="T",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="Output tensor [T, D]",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        ("T", ["tensor(float16)"], "FP16 data type."),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="num_experts",
+            type=OpSchema.AttrType.INT,
+            description="Number of experts",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="top_k",
+            type=OpSchema.AttrType.INT,
+            description="Top K experts per token",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="hidden_size",
+            type=OpSchema.AttrType.INT,
+            description="Hidden size D",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="moe_inter_size",
+            type=OpSchema.AttrType.INT,
+            description="MoE intermediate size I",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="activation_type",
+            type=OpSchema.AttrType.INT,
+            description="Activation (0=SiLU)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="quantization_group_size",
+            type=OpSchema.AttrType.INT,
+            description="Quantization group size (64)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="act_scale_log2",
+            type=OpSchema.AttrType.INT,
+            description="SwiGLU output scale exponent",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="norm_topk_prob",
+            type=OpSchema.AttrType.INT,
+            description="Renormalise top-k scores",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="routed_scaling_factor",
+            type=OpSchema.AttrType.FLOAT,
+            description="Routing weight factor",
             required=True,
         ),
     ],
@@ -2472,6 +2663,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _qkv_concat_schema,
     _gelu_tanh_mul_schema,
     _int4_groupwise_gemm_v2_schema,
+    _int4_affine_gemm_schema,
     _nvfp4_a16_gemm_schema,
     _nvfp4_a16_blackwell_gemm_schema,
     _causal_conv1d_schema,
@@ -2482,6 +2674,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _trt_ragged_attention_schema,
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
+    _int4_moe_affine_plugin_schema,
     _nvfp4_moe_plugin_schema,
     _nvfp4_a16_moe_plugin_schema,
     _nvfp4_a16_blackwell_moe_plugin_schema,

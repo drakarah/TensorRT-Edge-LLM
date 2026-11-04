@@ -24,6 +24,8 @@ Kernel groups:
   int4_fp16_gemm   — W4A16 INT4-weight FP16 GEMM (Ampere; 60-config sweep, bN=128) +
                      the decode GEMV (small-M, shares the GEMM's weight layout;
                      one exported function per M in 1..8) — built together
+  int4_affine_gemm — affine (MLX-style, group 64) INT4-weight FP16 GEMM (16 variants) +
+                     decode GEMV (M 1..8) for Flint; second per-group tensor (bias)
   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere / Blackwell / SM12x)
   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
   nvfp4_a16_blackwell_gemm — SM110 dense NVFP4-weight FP16/BF16 GEMM
@@ -996,6 +998,33 @@ KERNEL_VARIANTS = [
             "--m_block_size", "32", "--n_block_size", "32", "--num_threads", "64",
             "--dtype", "Float16", "--is_causal", "--paged_kv", "--window_size_left", "4096",
             "--skip_rescale", "--export_only",
+        ],
+    ),
+    # Learned attention-sink prefill (Flint, head_dim 128): same kernels as fmha_v2_d128_paged /
+    # fmha_v2_d128_sw_paged plus a per-query-head FP32 sink logit in the softmax denominator. Separate
+    # variants (and a separate ABI with one extra tensor) so the sink-free kernels stay untouched.
+    KernelVariant(
+        name="fmha_v2_d128_sink_paged",
+        group="fmha",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "128",
+            "--m_block_size", "64", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--paged_kv", "--attention_sink",
+            "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_d128_sw_sink_paged",
+        group="fmha",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "128",
+            "--m_block_size", "64", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--paged_kv", "--attention_sink",
+            "--window_size_left", "4096", "--skip_rescale", "--export_only",
         ],
     ),
     KernelVariant(
@@ -2169,6 +2198,60 @@ for _m in range(1, _INT4_FP16_GEMV_MAX_M + 1):
             script_args=[
                 "--mnk", f"{_m},512,1024",
                 "--group_size", str(_INT4_FP16_GEMV_GROUP_SIZE),
+                "--export_only",
+            ],
+        )
+    )
+
+# ---------------------------------------------------------------------------
+# int4_affine_gemm group — affine (MLX-style) INT4-weight FP16 GEMM + decode GEMV
+# for the Flint model: w = scale * q + bias with q in 0..15 and per-group (64)
+# fp16 scale / bias (bias pre-shifted by 8 * scale at repack time).  Same Ampere
+# instruction floor and same 16-variant tile / stage / split-K set as the
+# symmetric int4_fp16_gemm group (a baked split_k=N is correct only when N
+# divides K/64), plus one GEMV per M in [1, 8].  The group is independent: the
+# symmetric kernels and their artifacts are untouched.  group_size is fixed at
+# 64; the exported ABI takes a second per-group tensor (bias) after the scales.
+# Variant names carry the int4_affine_ prefix so the C++ side can key them apart.
+# ---------------------------------------------------------------------------
+_INT4_AFFINE_GEMM_CONFIGS = [
+    (16, 3, 1), (16, 4, 1), (16, 4, 2), (16, 4, 4),
+    (32, 2, 1), (32, 3, 2), (32, 3, 4), (32, 4, 1),
+    (64, 2, 1), (64, 3, 1), (64, 3, 4), (64, 4, 2), (64, 4, 4),
+    (128, 2, 1), (128, 2, 4), (128, 4, 1),
+]
+_INT4_AFFINE_MAX_GEMV_M = 8
+
+for _bm, _stages, _sk in _INT4_AFFINE_GEMM_CONFIGS:
+    KERNEL_VARIANTS.append(
+        KernelVariant(
+            name=f"int4_affine_gemm_{_bm}x128x64_s{_stages}_sk{_sk}",
+            group="int4_affine_gemm",
+            supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+            script="int4_affine_cutedsl/int4_affine_gemm_ampere.py",
+            script_args=[
+                # export-only trace shape: K is a runtime argument; split_k must divide K/64 (16 here)
+                "--mnk", "256,512,1024",
+                "--cta_tiler_mnk", f"{_bm},128,64",
+                "--atom_layout_mnk", "1,4,1",
+                "--num_stages", str(_stages),
+                "--split_k", str(_sk),
+                "--group_size", "64",
+                "--export_only",
+            ],
+        )
+    )
+
+for _m in range(1, _INT4_AFFINE_MAX_GEMV_M + 1):
+    KERNEL_VARIANTS.append(
+        KernelVariant(
+            name=f"int4_affine_gemv_m{_m}",
+            group="int4_affine_gemm",
+            supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+            script="int4_affine_cutedsl/int4_affine_gemv_ampere.py",
+            script_args=[
+                "--mnk", f"{_m},512,1024",
+                "--group_size", "64",
                 "--export_only",
             ],
         )

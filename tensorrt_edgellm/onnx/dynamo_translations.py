@@ -478,6 +478,27 @@ def _int4_groupwise_gemm_v2_translation(
     )
 
 
+@script()
+def _int4_affine_gemm_translation(
+    hidden_states: onnxscript.FLOAT16,
+    qweight: onnxscript.INT8,
+    scales: onnxscript.FLOAT16,
+    bias_prime: onnxscript.FLOAT16,
+    gemm_n: int,
+    gemm_k: int,
+    group_size: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Int4AffineGroupwiseGemmPlugin(
+        hidden_states,
+        qweight,
+        scales,
+        bias_prime,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        group_size=group_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # QKV packing op
 # ---------------------------------------------------------------------------
@@ -1347,6 +1368,47 @@ def _int4_moe_plugin_translation(
     )
 
 
+@script()
+def _int4_moe_affine_plugin_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc_gate_up_qweights: onnxscript.INT8,
+    fc_gate_up_scales: onnxscript.FLOAT16,
+    fc_gate_up_bias_prime: onnxscript.FLOAT16,
+    fc_down_qweights: onnxscript.INT8,
+    fc_down_scales: onnxscript.FLOAT16,
+    fc_down_bias_prime: onnxscript.FLOAT16,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    quantization_group_size: int,
+    act_scale_log2: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Int4MoeAffinePlugin(
+        router_logits,
+        hidden_states,
+        fc_gate_up_qweights,
+        fc_gate_up_scales,
+        fc_gate_up_bias_prime,
+        fc_down_qweights,
+        fc_down_scales,
+        fc_down_bias_prime,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        quantization_group_size=quantization_group_size,
+        act_scale_log2=act_scale_log2,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1805,6 +1867,8 @@ def build_custom_translation_table() -> dict:
         _int4_groupwise_gemm_translation,
         torch.ops.trt.int4_groupwise_gemm_v2.default:
         _int4_groupwise_gemm_v2_translation,
+        torch.ops.trt.int4_affine_gemm_plugin.default:
+        _int4_affine_gemm_translation,
         torch.ops.trt.qkv_concat.default:
         _qkv_concat_translation,
         torch.ops.trt.gelu_tanh_mul.default:
@@ -1837,6 +1901,8 @@ def build_custom_translation_table() -> dict:
         _gather_nd_translation,
         torch.ops.trt_edgellm.int4_moe_plugin.default:
         _int4_moe_plugin_translation,
+        torch.ops.trt_edgellm.int4_moe_affine_plugin.default:
+        _int4_moe_affine_plugin_translation,
         torch.ops.trt_edgellm.Nvfp4MoePlugin.default:
         _nvfp4_moe_plugin_translation,
         torch.ops.trt_edgellm.Nvfp4A16MoePlugin.default:

@@ -77,6 +77,10 @@ QUANT_NVFP4_A16 = "nvfp4_a16"
 QUANT_INT4_AWQ = "int4_awq"
 QUANT_INT4_AWQ_MODELOPT = "int4_awq_modelopt"
 QUANT_INT4_GPTQ = "int4_gptq"
+# MLX affine INT4 (``w = scale * q + bias``, q in 0..15, group 64; ``weight`` uint8
+# [N, K/2], BF16 ``scales`` / ``biases`` [N, K/64]). Served by the
+# Int4AffineGroupwiseGemmPlugin; see ``checkpoint/mlx_affine_repack.py``.
+QUANT_INT4_MLX_AFFINE = "int4_mlx_affine"
 QUANT_INT8_SQ = "int8_sq"
 # ``quant_algo`` value in hf_quant_config for MIXED_PRECISION only.
 # After parsing, :attr:`QuantConfig.quant_type` is always a concrete type
@@ -152,6 +156,11 @@ def _is_gemma4_assistant_model_type(model_type: str) -> bool:
 def _is_muse_glimmer_model_type(model_type: str) -> bool:
     """Return whether a model type belongs to Muse-Glimmer."""
     return str(model_type) in ("muse_glimmer", "muse_glimmer_text")
+
+
+def _is_flint_model_type(model_type: str) -> bool:
+    """Return whether a model type is Flint (hybrid sliding/NoPE MoE)."""
+    return str(model_type) == "flint"
 
 
 def _check_num_attention_heads(num_attn_heads: int) -> None:
@@ -264,7 +273,8 @@ def _parse_attention_layer_types(config: dict, num_hidden_layers: int,
     """Preserve per-layer sliding/full attention labels when required."""
     raw = config.get("layer_types")
     if not (_is_gemma4_model_type(model_type)
-            or _is_muse_glimmer_model_type(model_type)):
+            or _is_muse_glimmer_model_type(model_type)
+            or _is_flint_model_type(model_type)):
         return []
 
     if not isinstance(raw, list):
@@ -1141,7 +1151,8 @@ class ModelConfig:
                                      layer_types,
                                      model_dir=model_dir)
         gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
-        has_qk_norm = _detect_has_qk_norm(model_dir, model_type)
+        has_qk_norm = (True if _is_flint_model_type(model_type) else
+                       _detect_has_qk_norm(model_dir, model_type))
         has_value_norm = _get_has_value_norm(llm_dict, model_type)
         default_attention_scale_value = float(
             default_attention_scale(head_dim))
@@ -1156,6 +1167,35 @@ class ModelConfig:
                 attention_scaling = float(qk_scale_factor) / math.sqrt(
                     head_dim)
             # Full-attention layers use NoPE; sliding layers use regular RoPE.
+            if not dual_rope_configs:
+                _mp = int(llm_dict.get("max_position_embeddings", 4096))
+                _sliding = {
+                    "rope_theta": _get_rope_theta(llm_dict),
+                    "rope_scaling": None,
+                    "partial_rotary_factor": 1.0,
+                    "max_position_embeddings": _mp,
+                }
+                _full = dict(_sliding)
+                _full["rope_scaling"] = {"rope_type": "nope", "type": "nope"}
+                dual_rope_configs = {
+                    "sliding_rope_config": _sliding,
+                    "full_rope_config": _full,
+                }
+
+        if _is_flint_model_type(model_type):
+            # Full-attention layers are exactly the NoPE layers; sliding layers
+            # use plain RoPE (theta from config).
+            full_layers = {
+                i
+                for i, t in enumerate(attention_layer_types)
+                if t == "full_attention"
+            }
+            no_rope_layers = set(llm_dict.get("no_rope_layer_indices") or [])
+            if full_layers != no_rope_layers:
+                raise ValueError(
+                    "flint expects no_rope_layer_indices to equal the "
+                    f"full_attention layers: {sorted(no_rope_layers)} vs "
+                    f"{sorted(full_layers)}")
             if not dual_rope_configs:
                 _mp = int(llm_dict.get("max_position_embeddings", 4096))
                 _sliding = {
@@ -2562,6 +2602,11 @@ def _parse_checkpoint_quant(model_dir: str,
             excluded=excluded,
         )
 
+    # ---- MLX affine INT4 (config.json "quantization" + MLX sidecar) ----------
+    mlx_affine = _parse_mlx_affine_int4(model_dir, config)
+    if mlx_affine is not None:
+        return mlx_affine
+
     # ---- Embedded quantization_config in config.json ------------------------
     qc = config.get("quantization_config")
     if qc is None:
@@ -2643,6 +2688,44 @@ def _parse_checkpoint_quant(model_dir: str,
         )
 
     return QuantConfig()
+
+
+def _parse_mlx_affine_int4(model_dir: str,
+                           config: dict) -> Optional[QuantConfig]:
+    """Recognise an MLX affine INT4 checkpoint (Flint), or return None.
+
+    Requires the MLX ``quantization: {bits: 4, group_size: G}`` block in
+    ``config.json`` together with either the ``weight_format: mlx-affine-int4``
+    marker of the sidecar json shipped with the checkpoint (``flint-int4.json``)
+    or a model type known to ship in this format (``flint``). The dense kernels
+    only support group size 64.
+    """
+    qm = config.get("quantization")
+    if not isinstance(qm, dict) or int(qm.get("bits", 0)) != 4:
+        return None
+    marked = str(config.get("model_type", "")) == "flint"
+    if not marked:
+        for name in sorted(os.listdir(model_dir)):
+            if not name.endswith(".json") or name in ("config.json", ):
+                continue
+            try:
+                with open(os.path.join(model_dir, name)) as f:
+                    side = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if (isinstance(side, dict)
+                    and side.get("weight_format") == "mlx-affine-int4"):
+                marked = True
+                break
+    if not marked:
+        return None
+    group_size = int(qm.get("group_size", 64))
+    if group_size != 64:
+        raise ValueError(
+            f"MLX affine INT4 checkpoints are supported with group_size 64 only, got {group_size}"
+        )
+    return QuantConfig(quant_type=QUANT_INT4_MLX_AFFINE,
+                       group_size=group_size)
 
 
 def _detect_gptq_zero_point_offset(model_dir: str, qc: dict) -> int:
