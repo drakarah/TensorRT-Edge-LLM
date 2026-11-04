@@ -332,7 +332,6 @@ KVCacheManager& KVCacheManager::operator=(KVCacheManager&& other) noexcept
         mConfig = std::move(other.mConfig);
         mLayerCaches = std::move(other.mLayerCaches);
         mPackedStorage = std::move(other.mPackedStorage);
-    mPackedStorage = std::move(other.mPackedStorage);
         mLayerCapPadded = std::move(other.mLayerCapPadded);
         mLayerNumPages = std::move(other.mLayerNumPages);
         mReducedKVCacheCapacity = other.mReducedKVCacheCapacity;

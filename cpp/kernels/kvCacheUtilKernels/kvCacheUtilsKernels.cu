@@ -383,6 +383,15 @@ __global__ void gatherDequantPagedKVToSplitKernel(TCache const* __restrict__ poo
             storeK(dstOffset + i, kSrc[i]);
         }
         size_t const chunks = elemsToCopy / kVEC; // head_dim 256: a whole number of rows
+        if (vPage < numPagesPerPlane || vPage >= 2 * numPagesPerPlane)
+        {
+            for (size_t i = threadIdx.x; i < elemsToCopy; i += blockDim.x)
+            {
+                storeK(dstOffset + i, kSrc[i]);
+                vDst[dstOffset + i] = __float2half(0.f);
+            }
+            return;
+        }
         // V rows are 160 bytes in a plane that follows the full-size K plane; page ids >= numPagesPerPlane are V pages.
         size_t const vPageBytes
             = static_cast<size_t>(rt::kTOKENS_PER_PAGE) * (static_cast<size_t>(tokenElems) / 256) * kVInt4PackedUsedBytes;
