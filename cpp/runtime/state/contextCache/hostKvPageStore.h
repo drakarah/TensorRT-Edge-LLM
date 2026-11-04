@@ -69,6 +69,7 @@ private:
     KVCacheManager const& mKvCache;
     int32_t mSlotCount{};
     std::vector<size_t> mPageBytes;
+    std::vector<size_t> mValuePageBytes;
     std::vector<Tensor> mKeys;
     std::vector<Tensor> mValues;
     HostMemoryReservation mHostReservation;
