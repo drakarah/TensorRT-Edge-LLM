@@ -17,6 +17,16 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <optional>
+#include <random>
+#include <string>
+#include <stdexcept>
+
 #include "common/cudaUtils.h"
 #include "common/pagedKvTypes.h"
 #include "common/tensor.h"
@@ -1967,4 +1977,448 @@ TEST(RopeWriteKvPrefill, Benchmark)
     // QheadNum = 32, kvHeadNum = 8, headSize = 128, rotaryDim = 128, qLen = 512, cosSinCacheBatchSize = 2
     // Same benchmark shapes as FP16 benchmark, but FP8 KV-cache path is enabled.
     BenchmarkRopeWriteKv(2, {32, 8, 128, 128}, 512, 2);
+}
+
+
+// =============================================================================
+// K8V4 emulation: V reduced to 4-bit codes and stored dequantised on the int8 grid
+// =============================================================================
+
+namespace
+{
+
+//! Sets or clears an environment variable for the lifetime of the object.
+class ScopedEnv
+{
+public:
+    ScopedEnv(char const* name, char const* value)
+        : mName(name)
+    {
+        char const* const old = std::getenv(name);
+        if (old != nullptr)
+        {
+            mHadOld = true;
+            mOld = old;
+        }
+        if (value != nullptr)
+        {
+            setenv(name, value, 1);
+        }
+        else
+        {
+            unsetenv(name);
+        }
+    }
+
+    ~ScopedEnv()
+    {
+        if (mHadOld)
+        {
+            setenv(mName.c_str(), mOld.c_str(), 1);
+        }
+        else
+        {
+            unsetenv(mName.c_str());
+        }
+    }
+
+    ScopedEnv(ScopedEnv const&) = delete;
+    ScopedEnv& operator=(ScopedEnv const&) = delete;
+
+private:
+    std::string mName;
+    std::string mOld;
+    bool mHadOld{false};
+};
+
+constexpr char const* kVInt4EnvName = "EDGELLM_KV_V_INT4_EMULATION";
+constexpr int32_t kEmuHeadDim = 256;
+constexpr int32_t kNumRowPatterns = 10;
+
+//! Rows that exercise the quantiser: random, zero, an outlier, tiny, saturating, constant, ramp, only the last group,
+//! an infinity and a NaN.
+void fillEmulationRow(std::mt19937& gen, int32_t const pattern, int32_t const salt, std::vector<float>& row)
+{
+    std::uniform_real_distribution<float> uniform(-5.0F, 5.0F);
+    std::uniform_real_distribution<float> small(-0.01F, 0.01F);
+    int32_t const n = static_cast<int32_t>(row.size());
+    switch (pattern)
+    {
+    case 0:
+        for (auto& x : row) x = uniform(gen);
+        break;
+    case 1: std::fill(row.begin(), row.end(), 0.0F); break;
+    case 2:
+        for (auto& x : row) x = small(gen);
+        row[(salt * 13) % n] = (salt % 2 == 0) ? 15.0F : -15.0F;
+        break;
+    case 3:
+        for (auto& x : row) x = 1.0e-6F * uniform(gen);
+        break;
+    case 4:
+        for (auto& x : row) x = (gen() & 1U) ? 6.0F : -6.0F;
+        break;
+    case 5: std::fill(row.begin(), row.end(), 2.5F); break;
+    case 6:
+        for (int32_t i = 0; i < n; ++i) row[i] = -5.0F + 10.0F * static_cast<float>(i) / static_cast<float>(n - 1);
+        break;
+    case 7:
+        std::fill(row.begin(), row.end(), 0.0F);
+        for (int32_t i = n - 32; i < n; ++i) row[i] = uniform(gen);
+        break;
+    case 8:
+        for (auto& x : row) x = uniform(gen);
+        row[37] = std::numeric_limits<float>::infinity();
+        break;
+    default:
+        for (auto& x : row) x = uniform(gen);
+        row[70] = std::numeric_limits<float>::quiet_NaN();
+        break;
+    }
+}
+
+//! Float32 reference of the emulation for one (token, kv head) row of 256 channels; mode is static, token or group32.
+//! Written from the specification, not from the header under test.
+std::vector<int8_t> referenceEmulatedVRow(std::vector<float> const& row, float const vScale, std::string const& mode)
+{
+    size_t const groupSize = (mode == "group32") ? 32 : row.size();
+    std::vector<int8_t> out(row.size());
+    for (size_t first = 0; first < row.size(); first += groupSize)
+    {
+        float scale4 = vScale * (127.0F / 7.0F);
+        if (mode != "static")
+        {
+            float absMax = 0.0F;
+            for (size_t i = first; i < first + groupSize; ++i)
+            {
+                absMax = std::fmax(absMax, std::fabs(row[i]));
+            }
+            float const stored = __half2float(__float2half_ru(absMax / 7.0F));
+            scale4 = (stored > 0.0F && stored <= 65504.0F) ? stored : 0.0F;
+        }
+        for (size_t i = first; i < first + groupSize; ++i)
+        {
+            float dequant = 0.0F;
+            if (scale4 > 0.0F)
+            {
+                float const code = std::nearbyint(std::fmin(std::fmax(row[i] * (1.0F / scale4), -7.0F), 7.0F));
+                dequant = code * scale4;
+            }
+            float const q = std::nearbyint(std::fmin(std::fmax(dequant * (1.0F / vScale), -127.0F), 127.0F));
+            out[i] = static_cast<int8_t>(q);
+        }
+    }
+    return out;
+}
+
+enum class EmuWriter
+{
+    kWriteKV,
+    kSplitQKV,
+    kPackedToSplit,
+};
+
+char const* emuWriterName(EmuWriter const writer)
+{
+    switch (writer)
+    {
+    case EmuWriter::kWriteKV: return "WriteKV";
+    case EmuWriter::kSplitQKV: return "SplitQKV";
+    case EmuWriter::kPackedToSplit: return "PackedToSplit";
+    }
+    return "?";
+}
+
+struct EmuSetup
+{
+    int32_t batchSize{2};
+    int32_t qSeqLen{130};
+    int32_t numQHeads{4};
+    int32_t numKVHeads{2};
+    int32_t headDim{kEmuHeadDim};
+    int32_t capacity{256};
+    float kScale{0.07F};
+    float vScale{0.045F};
+};
+
+//! Runs one writer against an int8 pool and returns the pool, starting from the sentinel.
+std::vector<int8_t> runEmuWriter(EmuWriter const writer, EmuSetup const& cfg, std::vector<half> const& qHost,
+    std::vector<half> const& kHost, std::vector<half> const& vHost, char const* envValue, nvinfer1::DataType poolType,
+    std::vector<half>* fp16PoolOut = nullptr)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const maxPagesPerSeq = getMaxPagesPerSeq(cfg.capacity);
+    int32_t const numPages = cfg.batchSize * maxPagesPerSeq;
+    int32_t const combinedHeads = cfg.numQHeads + 2 * cfg.numKVHeads;
+
+    rt::Tensor cosSin(rt::Coords{1, cfg.capacity, cfg.headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(cosSin.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, cfg.headDim, cfg.capacity, stream);
+
+    rt::Tensor qT(rt::Coords{cfg.batchSize, cfg.qSeqLen, cfg.numQHeads, cfg.headDim}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF);
+    rt::Tensor kT(rt::Coords{cfg.batchSize, cfg.qSeqLen, cfg.numKVHeads, cfg.headDim}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF);
+    rt::Tensor vT(rt::Coords{cfg.batchSize, cfg.qSeqLen, cfg.numKVHeads, cfg.headDim}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF);
+    copyHostToDevice(qT, qHost);
+    copyHostToDevice(kT, kHost);
+    copyHostToDevice(vT, vHost);
+    rt::Tensor endLens(rt::Coords{cfg.batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(endLens, std::vector<int32_t>(cfg.batchSize, cfg.qSeqLen));
+
+    std::vector<int32_t> const pageTableHost = makeReversedPageTable(cfg.batchSize, maxPagesPerSeq);
+    rt::Tensor pageTableT(
+        rt::Coords{cfg.batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(pageTableT, pageTableHost);
+
+    rt::Coords const poolShape{2, numPages, kPageSize, cfg.numKVHeads, cfg.headDim};
+    rt::Tensor pool(poolShape, rt::DeviceType::kGPU, poolType);
+    if (poolType == nvinfer1::DataType::kINT8)
+    {
+        copyHostToDevice(pool, std::vector<int8_t>(poolShape.volume(), kINT8_SENTINEL));
+    }
+    else
+    {
+        copyHostToDevice(pool, std::vector<half>(poolShape.volume(), __float2half(-1234.0F)));
+    }
+
+    ScopedEnv const env(kVInt4EnvName, envValue);
+    int32_t const* pageTablePtr = pageTableT.dataPointer<int32_t>();
+    switch (writer)
+    {
+    case EmuWriter::kWriteKV:
+        launchApplyRopeWriteKV(cosSin, endLens, qT, kT, vT, pool, cfg.kScale, cfg.vScale, stream, false, pageTablePtr,
+            maxPagesPerSeq);
+        break;
+    case EmuWriter::kSplitQKV:
+        launchApplyRopeWriteKVSplitQKV(
+            cosSin, endLens, qT, kT, vT, pool, cfg.kScale, cfg.vScale, stream, pageTablePtr, maxPagesPerSeq);
+        break;
+    case EmuWriter::kPackedToSplit:
+    {
+        std::vector<half> packed(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * combinedHeads * cfg.headDim);
+        for (int32_t tok = 0; tok < cfg.batchSize * cfg.qSeqLen; ++tok)
+        {
+            for (int32_t h = 0; h < combinedHeads; ++h)
+            {
+                half const* src = h < cfg.numQHeads
+                    ? &qHost[(static_cast<size_t>(tok) * cfg.numQHeads + h) * cfg.headDim]
+                    : (h < cfg.numQHeads + cfg.numKVHeads
+                            ? &kHost[(static_cast<size_t>(tok) * cfg.numKVHeads + (h - cfg.numQHeads)) * cfg.headDim]
+                            : &vHost[(static_cast<size_t>(tok) * cfg.numKVHeads
+                                         + (h - cfg.numQHeads - cfg.numKVHeads))
+                                  * cfg.headDim]);
+                std::copy(src, src + cfg.headDim, &packed[(static_cast<size_t>(tok) * combinedHeads + h) * cfg.headDim]);
+            }
+        }
+        rt::Tensor packedT(rt::Coords{cfg.batchSize, cfg.qSeqLen, combinedHeads, cfg.headDim}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kHALF);
+        copyHostToDevice(packedT, packed);
+        rt::Tensor qScratch(rt::Coords{cfg.batchSize, cfg.qSeqLen, cfg.numQHeads, cfg.headDim}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kHALF);
+        launchApplyRopeFromPackedToSplit(cosSin, endLens, std::nullopt, packedT, qScratch, pool, cfg.kScale, cfg.vScale,
+            stream, pageTablePtr, maxPagesPerSeq);
+        break;
+    }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (poolType == nvinfer1::DataType::kINT8)
+    {
+        return copyDeviceToHost<int8_t>(pool);
+    }
+    if (fp16PoolOut != nullptr)
+    {
+        *fp16PoolOut = copyDeviceToHost<half>(pool);
+    }
+    return {};
+}
+
+void runVInt4EmulationCase(EmuWriter const writer, std::string const& mode)
+{
+    SCOPED_TRACE(std::string(emuWriterName(writer)) + " mode=" + mode);
+    EmuSetup const cfg;
+    int32_t const maxPagesPerSeq = getMaxPagesPerSeq(cfg.capacity);
+    int32_t const numPages = cfg.batchSize * maxPagesPerSeq;
+    std::mt19937 gen(4242U + static_cast<uint32_t>(writer));
+    std::uniform_real_distribution<float> uniform(-5.0F, 5.0F);
+
+    std::vector<half> qHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numQHeads * cfg.headDim);
+    std::vector<half> kHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numKVHeads * cfg.headDim);
+    std::vector<half> vHost(kHost.size());
+    for (auto& x : qHost) x = __float2half(uniform(gen));
+    for (auto& x : kHost) x = __float2half(uniform(gen));
+    std::vector<float> row(cfg.headDim);
+    for (int32_t b = 0; b < cfg.batchSize; ++b)
+    {
+        for (int32_t t = 0; t < cfg.qSeqLen; ++t)
+        {
+            for (int32_t h = 0; h < cfg.numKVHeads; ++h)
+            {
+                int32_t const pattern = (b * 7 + t * 3 + h) % kNumRowPatterns;
+                fillEmulationRow(gen, pattern, b * 1000 + t * 10 + h, row);
+                half* dst = &vHost[((static_cast<size_t>(b) * cfg.qSeqLen + t) * cfg.numKVHeads + h) * cfg.headDim];
+                for (int32_t d = 0; d < cfg.headDim; ++d) dst[d] = __float2half(row[d]);
+            }
+        }
+    }
+
+    auto const off = runEmuWriter(writer, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8);
+    auto const emulated = runEmuWriter(writer, cfg, qHost, kHost, vHost, mode.c_str(), nvinfer1::DataType::kINT8);
+    auto const emulatedAgain = runEmuWriter(writer, cfg, qHost, kHost, vHost, mode.c_str(), nvinfer1::DataType::kINT8);
+    ASSERT_EQ(off.size(), emulated.size());
+    EXPECT_EQ(emulated, emulatedAgain) << "the emulation must be deterministic";
+
+    // Expected pool: the plain int8 pool (K plane, sentinels, untouched pages) with the V rows replaced by the reference.
+    std::vector<int8_t> expected = off;
+    std::vector<int32_t> const pageTable = makeReversedPageTable(cfg.batchSize, maxPagesPerSeq);
+    for (int32_t b = 0; b < cfg.batchSize; ++b)
+    {
+        for (int32_t t = 0; t < cfg.qSeqLen; ++t)
+        {
+            int32_t const vPage = pageTable[(b * 2 + 1) * maxPagesPerSeq + t / kPageSize];
+            for (int32_t h = 0; h < cfg.numKVHeads; ++h)
+            {
+                half const* src = &vHost[((static_cast<size_t>(b) * cfg.qSeqLen + t) * cfg.numKVHeads + h) * cfg.headDim];
+                for (int32_t d = 0; d < cfg.headDim; ++d) row[d] = __half2float(src[d]);
+                auto const ref = referenceEmulatedVRow(row, cfg.vScale, mode);
+                for (int32_t d = 0; d < cfg.headDim; ++d)
+                {
+                    expected[pagedKvIndex(
+                        0, vPage, t % kPageSize, h, d, numPages, cfg.numKVHeads, cfg.headDim)]
+                        = ref[d];
+                }
+            }
+        }
+    }
+    int32_t mismatches = 0;
+    for (size_t i = 0; i < expected.size() && mismatches < 10; ++i)
+    {
+        if (expected[i] != emulated[i])
+        {
+            ++mismatches;
+            ADD_FAILURE() << "pool byte " << i << " expected " << static_cast<int32_t>(expected[i]) << " got "
+                          << static_cast<int32_t>(emulated[i]);
+        }
+    }
+    EXPECT_EQ(mismatches, 0);
+}
+
+} // namespace
+
+TEST(RopeWriteKvVInt4Emulation, WriteKVMatchesReference)
+{
+    for (char const* mode : {"static", "token", "group32"})
+    {
+        runVInt4EmulationCase(EmuWriter::kWriteKV, mode);
+    }
+}
+
+TEST(RopeWriteKvVInt4Emulation, SplitQKVMatchesReference)
+{
+    for (char const* mode : {"static", "token", "group32"})
+    {
+        runVInt4EmulationCase(EmuWriter::kSplitQKV, mode);
+    }
+}
+
+TEST(RopeWriteKvVInt4Emulation, PackedToSplitMatchesReference)
+{
+    for (char const* mode : {"static", "token", "group32"})
+    {
+        runVInt4EmulationCase(EmuWriter::kPackedToSplit, mode);
+    }
+}
+
+TEST(RopeWriteKvVInt4Emulation, ExplicitOffEqualsUnset)
+{
+    EmuSetup const cfg;
+    std::mt19937 gen(7U);
+    std::uniform_real_distribution<float> uniform(-5.0F, 5.0F);
+    std::vector<half> qHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numQHeads * cfg.headDim);
+    std::vector<half> kHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numKVHeads * cfg.headDim);
+    std::vector<half> vHost(kHost.size());
+    for (auto& x : qHost) x = __float2half(uniform(gen));
+    for (auto& x : kHost) x = __float2half(uniform(gen));
+    for (auto& x : vHost) x = __float2half(uniform(gen));
+    for (auto const writer : {EmuWriter::kWriteKV, EmuWriter::kSplitQKV, EmuWriter::kPackedToSplit})
+    {
+        auto const unset = runEmuWriter(writer, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8);
+        auto const off = runEmuWriter(writer, cfg, qHost, kHost, vHost, "off", nvinfer1::DataType::kINT8);
+        auto const empty = runEmuWriter(writer, cfg, qHost, kHost, vHost, "", nvinfer1::DataType::kINT8);
+        EXPECT_EQ(unset, off) << emuWriterName(writer);
+        EXPECT_EQ(unset, empty) << emuWriterName(writer);
+    }
+}
+
+TEST(RopeWriteKvVInt4Emulation, KPlaneIsNeverChanged)
+{
+    EmuSetup const cfg;
+    int32_t const maxPagesPerSeq = getMaxPagesPerSeq(cfg.capacity);
+    int32_t const numPages = cfg.batchSize * maxPagesPerSeq;
+    std::mt19937 gen(99U);
+    std::uniform_real_distribution<float> uniform(-5.0F, 5.0F);
+    std::vector<half> qHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numQHeads * cfg.headDim);
+    std::vector<half> kHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numKVHeads * cfg.headDim);
+    std::vector<half> vHost(kHost.size());
+    for (auto& x : qHost) x = __float2half(uniform(gen));
+    for (auto& x : kHost) x = __float2half(uniform(gen));
+    for (auto& x : vHost) x = __float2half(uniform(gen));
+    size_t const planeElems = static_cast<size_t>(numPages) * kPageSize * cfg.numKVHeads * cfg.headDim;
+    for (auto const writer : {EmuWriter::kWriteKV, EmuWriter::kSplitQKV, EmuWriter::kPackedToSplit})
+    {
+        auto const off = runEmuWriter(writer, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8);
+        for (char const* mode : {"static", "token", "group32"})
+        {
+            auto const emu = runEmuWriter(writer, cfg, qHost, kHost, vHost, mode, nvinfer1::DataType::kINT8);
+            // The V plane is the second half of the pool; V ids are stored as page + numPages.
+            EXPECT_TRUE(std::equal(off.begin(), off.begin() + planeElems, emu.begin()))
+                << emuWriterName(writer) << " " << mode << ": K plane changed";
+        }
+    }
+}
+
+TEST(RopeWriteKvVInt4Emulation, Fp16PoolIsNotAffected)
+{
+    EmuSetup const cfg;
+    std::mt19937 gen(3U);
+    std::uniform_real_distribution<float> uniform(-5.0F, 5.0F);
+    std::vector<half> qHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numQHeads * cfg.headDim);
+    std::vector<half> kHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numKVHeads * cfg.headDim);
+    std::vector<half> vHost(kHost.size());
+    for (auto& x : qHost) x = __float2half(uniform(gen));
+    for (auto& x : kHost) x = __float2half(uniform(gen));
+    for (auto& x : vHost) x = __float2half(uniform(gen));
+    for (auto const writer : {EmuWriter::kWriteKV, EmuWriter::kSplitQKV, EmuWriter::kPackedToSplit})
+    {
+        std::vector<half> poolOff;
+        std::vector<half> poolOn;
+        runEmuWriter(writer, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kHALF, &poolOff);
+        runEmuWriter(writer, cfg, qHost, kHost, vHost, "token", nvinfer1::DataType::kHALF, &poolOn);
+        ASSERT_EQ(poolOff.size(), poolOn.size());
+        EXPECT_EQ(0, std::memcmp(poolOff.data(), poolOn.data(), poolOff.size() * sizeof(half))) << emuWriterName(writer);
+    }
+}
+
+TEST(RopeWriteKvVInt4Emulation, RejectsUnknownModeAndUnsupportedShape)
+{
+    EmuSetup cfg;
+    std::vector<half> qHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numQHeads * cfg.headDim);
+    std::vector<half> kHost(static_cast<size_t>(cfg.batchSize) * cfg.qSeqLen * cfg.numKVHeads * cfg.headDim);
+    std::vector<half> vHost(kHost.size());
+    for (auto const writer : {EmuWriter::kWriteKV, EmuWriter::kSplitQKV, EmuWriter::kPackedToSplit})
+    {
+        EXPECT_THROW(runEmuWriter(writer, cfg, qHost, kHost, vHost, "bogus", nvinfer1::DataType::kINT8),
+            std::runtime_error)
+            << emuWriterName(writer);
+        EmuSetup narrow = cfg;
+        narrow.headDim = 64;
+        std::vector<half> q64(static_cast<size_t>(narrow.batchSize) * narrow.qSeqLen * narrow.numQHeads * narrow.headDim);
+        std::vector<half> k64(static_cast<size_t>(narrow.batchSize) * narrow.qSeqLen * narrow.numKVHeads * narrow.headDim);
+        std::vector<half> v64(k64.size());
+        EXPECT_THROW(runEmuWriter(writer, narrow, q64, k64, v64, "token", nvinfer1::DataType::kINT8), std::runtime_error)
+            << emuWriterName(writer);
+        // The same shape runs when the emulation is off.
+        EXPECT_NO_THROW(runEmuWriter(writer, narrow, q64, k64, v64, nullptr, nvinfer1::DataType::kINT8))
+            << emuWriterName(writer);
+    }
 }
