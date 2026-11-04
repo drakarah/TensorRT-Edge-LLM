@@ -21,6 +21,7 @@
 #include "common/cudaMacros.h"
 #include "common/pagedKvTypes.h"
 #include "runtime/hybridCacheManager.h"
+#include "runtime/state/contextCache/hostKvPageStore.h"
 #include "runtime/state/contextCache/hybridSnapshotStorage.h"
 #include "runtime/state/kvPageTable.h"
 
@@ -45,10 +46,10 @@ namespace
 constexpr int32_t kMAX_BATCH{2};
 constexpr int32_t kMAX_SEQUENCE_LENGTH{512};
 
-std::vector<int32_t> makeTokens(int32_t count)
+std::vector<int32_t> makeTokens(int32_t count, int32_t first = 1)
 {
     std::vector<int32_t> tokens(static_cast<size_t>(count));
-    std::iota(tokens.begin(), tokens.end(), 1);
+    std::iota(tokens.begin(), tokens.end(), first);
     return tokens;
 }
 
@@ -136,7 +137,8 @@ protected:
         EXPECT_EQ(cudaStreamDestroy(mStream), cudaSuccess);
     }
 
-    void createCoordinator(ContextCacheCoordinator::StreamSynchronizer synchronizer = {}, int32_t snapshotSlots = 4)
+    void createCoordinator(ContextCacheCoordinator::StreamSynchronizer synchronizer = {}, int32_t snapshotSlots = 4,
+        int64_t hostKvPoolBytes = 0)
     {
         ASSERT_GT(snapshotSlots, 0);
         ContextCachePhysicalResources resources{*mCache, *mPageTable, nullptr, nullptr};
@@ -146,7 +148,8 @@ protected:
                 * HybridSnapshotStorage::recurrentBytesPerSlot(mCache->getMambaCacheManager().getConfig())),
             /*.partialKvSnapshotPoolBytes=*/
             static_cast<int64_t>(static_cast<size_t>(snapshotSlots)
-                * HybridSnapshotStorage::partialKvBytesPerSlot(mCache->getKVCacheManager().getConfig()))};
+                * HybridSnapshotStorage::partialKvBytesPerSlot(mCache->getKVCacheManager().getConfig())),
+            /*.snapshotsInHostMemory=*/false, hostKvPoolBytes, /*.hostKvMinTokens=*/1};
         mCoordinator = std::make_unique<ContextCacheCoordinator>(config, mDeployment,
             validateContextCacheDeployment(mDeployment), resources, mStream, std::move(synchronizer));
     }
@@ -408,3 +411,115 @@ TEST_F(ContextCacheHybridCoordinatorTests, PureRecurrentCheckpointNeedsNoKvPage)
 }
 
 } // namespace
+
+TEST_F(ContextCacheHybridCoordinatorTests, EvictedSessionIsRestoredFromHostMemory)
+{
+    ASSERT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
+    mCoordinator.reset();
+    int64_t const hostBytes
+        = 16 * static_cast<int64_t>(HostKvPageStore::bytesPerSlot(mCache->getKVCacheManager().getConfig()));
+    createCoordinator({}, 4, hostBytes);
+
+    constexpr int32_t kSESSION_A_TOKENS{3 * kTOKENS_PER_PAGE + 1};
+    constexpr int32_t kOTHER_TOKENS{4 * kTOKENS_PER_PAGE - 12};
+    std::vector<PageId> sessionAPages;
+
+    auto producerA = begin(makeTokens(kSESSION_A_TOKENS));
+    ASSERT_EQ(mCoordinator->preparePrefill(producerA.request), ContextCacheCoordinatorStatus::kOk);
+    for (int32_t block = 0; block < 4; ++block)
+    {
+        sessionAPages.push_back(mPageTable->hostRow(0)[static_cast<size_t>(block)]);
+    }
+    seedRecurrent(0x31, 0x61);
+    for (int32_t block = 0; block < 3; ++block)
+    {
+        seedKvPage(sessionAPages[static_cast<size_t>(block)], static_cast<uint8_t>(0x10 + block),
+            static_cast<uint8_t>(0x50 + block));
+    }
+    seedKvPage(sessionAPages[3], 0x21, 0x71);
+    publishPrefill(producerA, kSESSION_A_TOKENS, 9001);
+    ASSERT_EQ(mCoordinator->finish(producerA.request), ContextCacheCoordinatorStatus::kOk);
+
+    for (int32_t other = 0; other < 2; ++other)
+    {
+        auto producer = begin(makeTokens(kOTHER_TOKENS, 10000 * (other + 1)));
+        ASSERT_EQ(mCoordinator->preparePrefill(producer.request), ContextCacheCoordinatorStatus::kOk);
+        for (size_t block = 0; block < 4; ++block)
+        {
+            // Whatever the session overwrites must not be needed any more: A's pages are in host memory by now.
+            seedKvPage(mPageTable->hostRow(0)[block], 0xEE, 0xEE);
+        }
+        seedRecurrent(0x44, 0x55);
+        publishPrefill(producer, kOTHER_TOKENS, 9002 + other);
+        ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+    }
+    ContextCacheMetrics const demoted = mCoordinator->metrics();
+    ASSERT_GE(demoted.demotedRecords, 1U) << "the second other session must have forced session A out of the device";
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+
+    auto returning = begin(makeTokens(kSESSION_A_TOKENS + 1));
+    EXPECT_EQ(returning.prefillStarts, std::vector<int32_t>{kSESSION_A_TOKENS});
+    ContextCacheMetrics const restored = mCoordinator->metrics();
+    EXPECT_EQ(restored.promotedRecords, 1U);
+    EXPECT_EQ(restored.restoredPages, 3U);
+    ASSERT_EQ(mCoordinator->preparePrefill(returning.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    expectRecurrent(0x31, 0x61);
+    for (int32_t block = 0; block < 3; ++block)
+    {
+        expectKvPrefix(mPageTable->hostRow(0)[static_cast<size_t>(block)], kTOKENS_PER_PAGE,
+            static_cast<uint8_t>(0x10 + block), static_cast<uint8_t>(0x50 + block));
+    }
+    expectKvPrefix(mPageTable->hostRow(0)[3], 1, 0x21, 0x71);
+    EXPECT_EQ(mCoordinator->finish(returning.request), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheHybridCoordinatorTests, HostTierIsIgnoredWhenThePoolIsTooSmallForOnePage)
+{
+    ASSERT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
+    mCoordinator.reset();
+    createCoordinator({}, 4, 1);
+    EXPECT_EQ(mCoordinator->metrics().hostKvSlots.capacity, 0);
+    EXPECT_FALSE(mCoordinator->manager().hostTierEnabled());
+}
+
+TEST_F(ContextCacheHybridCoordinatorTests, HostTierIsOffByDefaultAndReportsItsSlotsWhenOn)
+{
+    EXPECT_FALSE(mCoordinator->manager().hostTierEnabled());
+    ASSERT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
+    mCoordinator.reset();
+    int64_t const hostBytes
+        = 5 * static_cast<int64_t>(HostKvPageStore::bytesPerSlot(mCache->getKVCacheManager().getConfig()));
+    createCoordinator({}, 4, hostBytes);
+    EXPECT_TRUE(mCoordinator->manager().hostTierEnabled());
+    EXPECT_EQ(mCoordinator->metrics().hostKvSlots.capacity, 5);
+    EXPECT_EQ(mCoordinator->metrics().hostKvSlots.free, 5);
+}
+
+TEST_F(ContextCacheHybridCoordinatorTests, TrimmingWaitsForTheCopiesOutOfThePagesItFrees)
+{
+    ASSERT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
+    mCoordinator.reset();
+    int64_t const hostBytes
+        = 16 * static_cast<int64_t>(HostKvPageStore::bytesPerSlot(mCache->getKVCacheManager().getConfig()));
+    int32_t synchronizations = 0;
+    createCoordinator(
+        [&synchronizations](cudaStream_t stream)
+        {
+            ++synchronizations;
+            return cudaStreamSynchronize(stream);
+        },
+        4, hostBytes);
+    mCoordinator->limitBasePages(8);
+
+    constexpr int32_t kTOKENS{2 * kTOKENS_PER_PAGE + 1};
+    auto producer = begin(makeTokens(kTOKENS));
+    ASSERT_EQ(mCoordinator->preparePrefill(producer.request), ContextCacheCoordinatorStatus::kOk);
+    publishPrefill(producer, kTOKENS, 9001);
+    ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+
+    int32_t const before = synchronizations;
+    EXPECT_EQ(mCoordinator->trimBasePagesTo(0), 1U);
+    EXPECT_EQ(mCoordinator->metrics().demotedRecords, 1U);
+    EXPECT_GT(synchronizations, before) << "the trim must wait for the device-to-host copies";
+}

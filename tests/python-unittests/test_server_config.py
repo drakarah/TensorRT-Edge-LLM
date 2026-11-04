@@ -152,6 +152,43 @@ def test_context_cache_config_rejects_ignored_or_invalid_options():
         ContextCacheConfig(enabled=True, recurrent_snapshot_pool_bytes=2**63)
 
 
+def test_host_kv_tier_flags_reach_the_context_cache_config():
+    config = parse_server_config([
+        "Qwen/Qwen3-0.6B",
+        "--enable-context-reuse",
+        "--context-cache-host-kv-bytes",
+        "4294967296",
+        "--context-cache-host-kv-min-tokens",
+        "8192",
+    ])
+    assert config.model.context_cache_config == ContextCacheConfig(
+        enabled=True, host_kv_pool_bytes=4294967296, host_kv_min_tokens=8192)
+
+
+def test_host_kv_tier_is_off_by_default():
+    config = parse_server_config(["Qwen/Qwen3-0.6B", "--enable-context-reuse"])
+    cache = config.model.context_cache_config
+    assert cache.host_kv_pool_bytes == 0
+    assert cache.host_kv_min_tokens == 4096
+
+
+def test_host_kv_tier_options_are_validated():
+    with pytest.raises(ServerConfigError, match="tuning requires"):
+        ContextCacheConfig(host_kv_pool_bytes=1)
+    with pytest.raises(ServerConfigError, match="tuning requires"):
+        ContextCacheConfig(host_kv_min_tokens=1)
+    with pytest.raises(ServerConfigError, match="non-negative"):
+        ContextCacheConfig(enabled=True, host_kv_pool_bytes=-1)
+    with pytest.raises(ServerConfigError, match="signed 64-bit"):
+        ContextCacheConfig(enabled=True, host_kv_pool_bytes=2**63)
+    with pytest.raises(ServerConfigError, match="signed 32-bit"):
+        ContextCacheConfig(enabled=True, host_kv_min_tokens=2**31)
+    assert ContextCacheConfig.parse({
+        "enabled": True,
+        "host_kv_pool_bytes": 1
+    }).host_kv_pool_bytes == 1
+
+
 def test_allowed_local_media_path_survives_cli_parsing(tmp_path):
     config = parse_server_config([
         "Qwen/Qwen3.5-0.8B",
