@@ -110,6 +110,34 @@ PublishedRecord publishPrivateRecord(ContextCacheManager& manager, std::vector<B
     return PublishedRecord{status, producerPages, lru.back()};
 }
 
+struct PublishedHybridRecord
+{
+    RecordId id{};
+    std::vector<PageId> pages;
+};
+
+//! Publish a hybrid record that covers exactly @p hashes (no partial page) and keep its snapshot slot.
+PublishedHybridRecord publishHybridRecord(ContextCacheManager& manager, BlockHash digest, std::vector<BlockHash> hashes)
+{
+    int32_t const tokens = static_cast<int32_t>(hashes.size()) * kPAGE_SIZE;
+    AcquireResult result = manager.acquireHybrid({}, hashes, tokens, /*hasAttention=*/true);
+    CacheRequestLease lease = takeLease(result);
+    std::optional<HybridSnapshotReservation> const snapshots = manager.reserveHybridSnapshots(lease, false);
+    if (!snapshots.has_value())
+    {
+        throw std::runtime_error("Test hybrid snapshot reservation failed");
+    }
+    PublishResult const published
+        = manager.publishHybrid(lease, HybridPublishRequest{hashes, HybridCheckpointKey{digest, tokens}, *snapshots});
+    manager.retireHybridSnapshotReservation(lease, *snapshots);
+    lease.release();
+    if (!published.record.has_value())
+    {
+        throw std::runtime_error("Test hybrid publication did not retain a record");
+    }
+    return PublishedHybridRecord{*published.record, manager.records().get(*published.record).basePagePath};
+}
+
 PublishedSpecRecord publishPrivateSpecRecord(ContextCacheManager& manager, std::vector<BlockHash> hashes)
 {
     AcquireResult result = manager.acquireSpec(hashes, static_cast<int32_t>(hashes.size()) * kPAGE_SIZE);
@@ -1378,4 +1406,257 @@ TEST(ContextCacheManagerTests, LeasePagesStayBelowTheLimitAcrossManyRequests)
         lease.release();
         ASSERT_LE(manager.baseHighWater(), 5) << "round " << round;
     }
+}
+
+constexpr BlockHash kDIGEST_1{0x6161616161616161ULL, 0x1616161616161616ULL};
+constexpr BlockHash kDIGEST_2{0x6262626262626262ULL, 0x2626262626262626ULL};
+constexpr BlockHash kDIGEST_3{0x6363636363636363ULL, 0x3636363636363636ULL};
+
+TEST(ContextCacheManagerHostTierTests, TheTierIsOffByDefaultAndPressureDrops)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 2, 0}, 4);
+    EXPECT_FALSE(manager.hostTierEnabled());
+    EXPECT_EQ(manager.hostIndex(), nullptr);
+    publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_C, kHASH_D});
+
+    CacheRequestLease lease = acquirePrivatePages(manager, 2);
+    EXPECT_EQ(manager.records().size(), 1u);
+    EXPECT_EQ(manager.metrics().demotedRecords, 0u);
+    EXPECT_TRUE(manager.takeHostDemotions().empty());
+}
+
+TEST(ContextCacheManagerHostTierTests, EnablingValidatesItsArguments)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 2, 0}, 4);
+    EXPECT_THROW(manager.enableHostTier(0, 1), std::runtime_error);
+    EXPECT_THROW(manager.enableHostTier(-3, 1), std::runtime_error);
+    EXPECT_THROW(manager.enableHostTier(4, 0), std::runtime_error);
+    EXPECT_FALSE(manager.hostTierEnabled());
+    manager.enableHostTier(4, 1);
+    EXPECT_TRUE(manager.hostTierEnabled());
+    ASSERT_NE(manager.hostIndex(), nullptr);
+    EXPECT_EQ(manager.hostIndex()->slotCount(), 4);
+    EXPECT_THROW(manager.enableHostTier(4, 1), std::runtime_error);
+}
+
+TEST(ContextCacheManagerHostTierTests, PressureOnPagesDemotesTheLeastRecentRecord)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 2, 0}, 4);
+    manager.enableHostTier(8, 1);
+    PublishedHybridRecord const a = publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_C, kHASH_D});
+    ASSERT_EQ(a.pages.size(), 2u);
+
+    CacheRequestLease lease = acquirePrivatePages(manager, 2);
+    CacheRecord const& record = manager.records().get(a.id);
+    EXPECT_TRUE(record.demoted());
+    EXPECT_TRUE(record.basePagePath.empty());
+    EXPECT_EQ(record.hostSlots, std::vector<int32_t>({0, 1}));
+    EXPECT_TRUE(record.recurrentSnapshotSlot.has_value()) << "the snapshot stays with the record";
+    EXPECT_EQ(manager.pools().freeCount(ResourceType::kRecurrentSnapshot), 0);
+    EXPECT_FALSE(manager.baseIndex().lookup(kHASH_A).has_value());
+    EXPECT_EQ(manager.metrics().demotedRecords, 1u);
+    EXPECT_EQ(manager.metrics().evictedRecords, 0u);
+    EXPECT_EQ(manager.metrics().reclaimedBaseKvPages, 2u);
+    EXPECT_EQ(manager.hostIndex()->usedSlots(), 2);
+
+    std::vector<HostKvTransfer> const transfers = manager.takeHostDemotions();
+    ASSERT_EQ(transfers.size(), 2u);
+    EXPECT_EQ(transfers[0].page, a.pages[0]);
+    EXPECT_EQ(transfers[0].slot, 0);
+    EXPECT_EQ(transfers[1].page, a.pages[1]);
+    EXPECT_EQ(transfers[1].slot, 1);
+    EXPECT_TRUE(manager.takeHostDemotions().empty()) << "taking clears the list";
+}
+
+TEST(ContextCacheManagerHostTierTests, ADemotedRecordIsNotReusedAsAHit)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 2, 0}, 4);
+    manager.enableHostTier(8, 1);
+    publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_C, kHASH_D});
+    CacheRequestLease lease = acquirePrivatePages(manager, 2);
+    lease.release();
+
+    AcquireResult result = manager.acquireHybrid(
+        {{2 * kPAGE_SIZE, kDIGEST_1}}, {kHASH_A, kHASH_B, kHASH_E}, 3 * kPAGE_SIZE, /*hasAttention=*/true);
+    EXPECT_EQ(result.plan.reuseTokenLength, 0);
+    EXPECT_EQ(result.status, AcquireStatus::kAcquired);
+}
+
+TEST(ContextCacheManagerHostTierTests, PlanningSkipsDemotedRecordsWhenOnlyPagesAreNeeded)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 2, 0}, 4);
+    manager.enableHostTier(8, 1);
+    PublishedHybridRecord const a = publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    PublishedHybridRecord const b = publishHybridRecord(manager, kDIGEST_2, {kHASH_C, kHASH_D});
+    CacheRequestLease first = acquirePrivatePages(manager, 2);
+    ASSERT_TRUE(manager.records().get(a.id).demoted());
+
+    CacheRequestLease second = acquirePrivatePages(manager, 2);
+    EXPECT_TRUE(manager.records().contains(a.id)) << "the demoted record was not evicted for pages it does not hold";
+    EXPECT_TRUE(manager.records().get(b.id).demoted());
+    EXPECT_EQ(manager.metrics().demotedRecords, 2u);
+    EXPECT_EQ(manager.metrics().evictedRecords, 0u);
+    EXPECT_EQ(manager.hostIndex()->usedSlots(), 4);
+}
+
+TEST(ContextCacheManagerHostTierTests, ARequestForSnapshotSlotsDropsRecordsInsteadOfDemotingThem)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 2, 0}, 4);
+    manager.enableHostTier(8, 1);
+    PublishedHybridRecord const a = publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_C, kHASH_D});
+
+    AcquireResult result = manager.acquireHybrid({}, {kHASH_E}, kPAGE_SIZE, /*hasAttention=*/true);
+    CacheRequestLease lease = takeLease(result);
+    std::optional<HybridSnapshotReservation> const snapshots = manager.reserveHybridSnapshots(lease, false);
+    ASSERT_TRUE(snapshots.has_value());
+    EXPECT_FALSE(manager.records().contains(a.id));
+    EXPECT_EQ(manager.metrics().demotedRecords, 0u);
+    EXPECT_EQ(manager.hostIndex()->usedSlots(), 0);
+    EXPECT_TRUE(manager.takeHostDemotions().empty());
+}
+
+TEST(ContextCacheManagerHostTierTests, DroppingADemotedRecordFreesItsSnapshotAndHostSlots)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 2, 0}, 4);
+    manager.enableHostTier(8, 1);
+    PublishedHybridRecord const a = publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_C, kHASH_D});
+    CacheRequestLease pressure = acquirePrivatePages(manager, 2);
+    ASSERT_TRUE(manager.records().get(a.id).demoted());
+    pressure.release();
+
+    AcquireResult result = manager.acquireHybrid({}, {kHASH_E}, kPAGE_SIZE, /*hasAttention=*/true);
+    CacheRequestLease lease = takeLease(result);
+    ASSERT_TRUE(manager.reserveHybridSnapshots(lease, false).has_value());
+    EXPECT_FALSE(manager.records().contains(a.id));
+    EXPECT_EQ(manager.hostIndex()->usedSlots(), 0);
+    EXPECT_EQ(manager.hostIndex()->entryCount(), 0u);
+    EXPECT_EQ(manager.metrics().evictedRecords, 1u);
+}
+
+TEST(ContextCacheManagerHostTierTests, ShortRecordsBelowTheMinimumAreDropped)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 2, 0}, 4);
+    manager.enableHostTier(8, 3);
+    PublishedHybridRecord const a = publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_C, kHASH_D});
+    CacheRequestLease lease = acquirePrivatePages(manager, 2);
+    EXPECT_FALSE(manager.records().contains(a.id));
+    EXPECT_EQ(manager.metrics().demotedRecords, 0u);
+    EXPECT_EQ(manager.hostIndex()->usedSlots(), 0);
+}
+
+TEST(ContextCacheManagerHostTierTests, ANewerDemotionEvictsTheOldestWhenTheHostIsFull)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 2, 0}, 4);
+    manager.enableHostTier(2, 1);
+    PublishedHybridRecord const a = publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    PublishedHybridRecord const b = publishHybridRecord(manager, kDIGEST_2, {kHASH_C, kHASH_D});
+    CacheRequestLease first = acquirePrivatePages(manager, 2);
+    ASSERT_TRUE(manager.records().get(a.id).demoted());
+    first.release();
+
+    CacheRequestLease second = acquirePrivatePages(manager, 4);
+    EXPECT_FALSE(manager.records().contains(a.id)) << "the older demoted record made room";
+    ASSERT_TRUE(manager.records().contains(b.id));
+    EXPECT_TRUE(manager.records().get(b.id).demoted());
+    EXPECT_EQ(manager.records().get(b.id).hostSlots, std::vector<int32_t>({0, 1}));
+    EXPECT_EQ(manager.metrics().hostEvictedRecords, 1u);
+    EXPECT_EQ(manager.metrics().demotedRecords, 2u);
+    EXPECT_EQ(manager.pools().freeCount(ResourceType::kRecurrentSnapshot), 1);
+}
+
+TEST(ContextCacheManagerHostTierTests, ARecordLargerThanTheHostIsDropped)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 2, 0}, 4);
+    manager.enableHostTier(1, 1);
+    PublishedHybridRecord const a = publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_C, kHASH_D});
+    CacheRequestLease lease = acquirePrivatePages(manager, 2);
+    EXPECT_FALSE(manager.records().contains(a.id));
+    EXPECT_EQ(manager.metrics().demotedRecords, 0u);
+}
+
+TEST(ContextCacheManagerHostTierTests, SharedAncestorBlocksAreCopiedOnce)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 2, 0}, 4);
+    manager.enableHostTier(8, 1);
+    PublishedHybridRecord const a = publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    PublishedHybridRecord const b = publishHybridRecord(manager, kDIGEST_2, {kHASH_A, kHASH_B, kHASH_C});
+    ASSERT_EQ(b.pages.size(), 3u);
+    ASSERT_EQ(b.pages[0], a.pages[0]) << "the descendant shares the ancestor's pages";
+
+    CacheRequestLease lease = acquirePrivatePages(manager, 6);
+    EXPECT_TRUE(manager.records().get(a.id).demoted());
+    EXPECT_TRUE(manager.records().get(b.id).demoted());
+    std::vector<HostKvTransfer> const transfers = manager.takeHostDemotions();
+    EXPECT_EQ(transfers.size(), 3u) << "two ancestor blocks and one private block";
+    EXPECT_EQ(manager.hostIndex()->usedSlots(), 3);
+    EXPECT_EQ(manager.hostIndex()->entryCount(), 2u);
+    EXPECT_EQ(manager.records().get(b.id).hostSlots[0], manager.records().get(a.id).hostSlots[0]);
+}
+
+TEST(ContextCacheManagerHostTierTests, RecordsWithTheSameBlocksShareOneHostEntry)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 2, 0}, 4);
+    manager.enableHostTier(8, 1);
+    PublishedHybridRecord const a = publishHybridRecord(manager, kDIGEST_1, {kHASH_A, kHASH_B});
+    PublishedHybridRecord const b = publishHybridRecord(manager, kDIGEST_2, {kHASH_A, kHASH_B});
+    ASSERT_NE(a.id, b.id);
+
+    CacheRequestLease lease = acquirePrivatePages(manager, 6);
+    EXPECT_TRUE(manager.records().get(a.id).demoted());
+    EXPECT_TRUE(manager.records().get(b.id).demoted());
+    EXPECT_EQ(manager.takeHostDemotions().size(), 2u) << "the second demotion needs no copy";
+    EXPECT_EQ(manager.hostIndex()->entryCount(), 1u);
+    lease.release();
+
+    // Dropping one user keeps the entry for the other; dropping the last one frees it.
+    AcquireResult first = manager.acquireHybrid({}, {kHASH_E}, kPAGE_SIZE, /*hasAttention=*/true);
+    CacheRequestLease firstLease = takeLease(first);
+    ASSERT_TRUE(manager.reserveHybridSnapshots(firstLease, false).has_value());
+    EXPECT_FALSE(manager.records().contains(a.id));
+    EXPECT_EQ(manager.hostIndex()->entryCount(), 1u);
+    EXPECT_EQ(manager.hostIndex()->usedSlots(), 2);
+
+    AcquireResult second = manager.acquireHybrid({}, {kHASH_E}, kPAGE_SIZE, /*hasAttention=*/true);
+    CacheRequestLease secondLease = takeLease(second);
+    ASSERT_TRUE(manager.reserveHybridSnapshots(secondLease, false).has_value());
+    EXPECT_FALSE(manager.records().contains(b.id));
+    EXPECT_EQ(manager.hostIndex()->entryCount(), 0u);
+    EXPECT_EQ(manager.hostIndex()->usedSlots(), 0);
+}
+
+TEST(ContextCacheManagerHostTierTests, TrimmingToAHighWaterDemotes)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 3, 0}, 6);
+    manager.limitBasePages(6);
+    manager.enableHostTier(8, 1);
+    publishHybridRecord(manager, kDIGEST_1, {kHASH_A});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_B});
+    PublishedHybridRecord const c = publishHybridRecord(manager, kDIGEST_3, {kHASH_C});
+    ASSERT_EQ(manager.baseHighWater(), 3);
+
+    EXPECT_EQ(manager.evictToBaseHighWater(2), 1u);
+    EXPECT_EQ(manager.baseHighWater(), 2);
+    EXPECT_TRUE(manager.records().get(c.id).demoted());
+    EXPECT_EQ(manager.records().size(), 3u);
+    ASSERT_EQ(manager.takeHostDemotions().size(), 1u);
+}
+
+TEST(ContextCacheManagerHostTierTests, TheRecordLimitDropsInsteadOfDemoting)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 3, 0}, 2);
+    manager.enableHostTier(8, 1);
+    PublishedHybridRecord const a = publishHybridRecord(manager, kDIGEST_1, {kHASH_A});
+    publishHybridRecord(manager, kDIGEST_2, {kHASH_B});
+    publishHybridRecord(manager, kDIGEST_3, {kHASH_C});
+    EXPECT_EQ(manager.records().size(), 2u);
+    EXPECT_FALSE(manager.records().contains(a.id));
+    EXPECT_EQ(manager.metrics().demotedRecords, 0u);
+    EXPECT_EQ(manager.hostIndex()->usedSlots(), 0);
 }

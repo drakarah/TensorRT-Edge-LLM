@@ -493,7 +493,7 @@ TEST(HostKvIndexTest, RandomOperationsKeepTheInvariants)
         for (auto const& hashes : known)
         {
             auto const hit = index.lookupPrefix(hashes);
-            if (!hit.has_value() || hit->key != keyOf(hashes))
+            if (!hit.has_value() || !(hit->key == keyOf(hashes)))
             {
                 continue;
             }
