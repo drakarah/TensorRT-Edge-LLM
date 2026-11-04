@@ -146,14 +146,12 @@ Tensor copyKVCacheAsHND(HybridCacheManager& cacheManager, KVPageTable const& ful
     size_t const poolBytes = static_cast<size_t>(storage.physicalPages) * pageBytes;
     ELLM_CHECK(static_cast<int32_t>(residents.size()) >= activeBatchSize,
         "LayerDebugger: resident mapping is smaller than the active batch");
-    Tensor staging(
-        {static_cast<int64_t>(2 * poolBytes)}, DeviceType::kCPU, nvinfer1::DataType::kINT8, name + ".staging");
+    // Copy only the pages a resident sequence maps: the pool may be a growable reservation whose unused pages are not
+    // backed by memory, so a whole-pool copy can fail.
+    Tensor staging({static_cast<int64_t>(2 * pageBytes)}, DeviceType::kCPU, nvinfer1::DataType::kINT8, name + ".staging");
     std::byte* const kStage = static_cast<std::byte*>(staging.rawPointer());
-    std::byte* const vStage = kStage + poolBytes;
+    std::byte* const vStage = kStage + pageBytes;
     auto const* poolBase = static_cast<std::byte const*>(pool.rawPointer());
-    CUDA_CHECK(cudaMemcpyAsync(kStage, poolBase, poolBytes, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(vStage, poolBase + poolBytes, poolBytes, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     Tensor host({activeBatchSize, 2, heads, cap, dim}, DeviceType::kCPU, dtype, name);
     std::byte* const out = static_cast<std::byte*>(host.rawPointer());
@@ -173,9 +171,14 @@ Tensor copyKVCacheAsHND(HybridCacheManager& cacheManager, KVPageTable const& ful
             ELLM_CHECK(page >= 0 && page < storage.physicalPages, "LayerDebugger: KV page exceeds the physical pool");
             ELLM_CHECK(static_cast<int64_t>(lp + 1) * kTOKENS_PER_PAGE <= cap,
                 "LayerDebugger: logical KV page exceeds the dump shape");
+            CUDA_CHECK(cudaMemcpyAsync(
+                kStage, poolBase + static_cast<size_t>(page) * pageBytes, pageBytes, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(vStage, poolBase + poolBytes + static_cast<size_t>(page) * pageBytes, pageBytes,
+                cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
             for (int64_t kv = 0; kv < 2; ++kv)
             {
-                std::byte const* const src = (kv == 0 ? kStage : vStage) + static_cast<size_t>(page) * pageBytes;
+                std::byte const* const src = (kv == 0 ? kStage : vStage);
                 std::byte* const slotDst = out + (b * 2 + kv) * slotBytes;
                 for (int64_t t = 0; t < kTOKENS_PER_PAGE; ++t)
                 {
