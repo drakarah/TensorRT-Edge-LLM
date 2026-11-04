@@ -121,15 +121,15 @@ def _write_fake_archive(path: Path, machine: int) -> Path:
 
 
 def test_cutlass_dsl_version_accepts_pinned_dev_and_local_versions():
-    assert build_cutedsl._cutlass_dsl_version_matches("4.7.0")
-    assert build_cutedsl._cutlass_dsl_version_matches("4.7.0+local")
-    assert build_cutedsl._cutlass_dsl_version_matches("4.7.0.dev0")
+    assert build_cutedsl._cutlass_dsl_version_matches("4.8.0")
+    assert build_cutedsl._cutlass_dsl_version_matches("4.8.0+local")
+    assert build_cutedsl._cutlass_dsl_version_matches("4.8.0.dev0")
     assert build_cutedsl._cutlass_dsl_version_matches(
-        "4.7.0.dev20260630+local")
+        "4.8.0.dev20260630+local")
 
     assert not build_cutedsl._cutlass_dsl_version_matches("4.5.2")
     assert not build_cutedsl._cutlass_dsl_version_matches("4.6.1")
-    assert not build_cutedsl._cutlass_dsl_version_matches("4.7.0rc1")
+    assert not build_cutedsl._cutlass_dsl_version_matches("4.8.0rc1")
 
 
 def test_find_static_runtime_archive_prefers_cuda_variant_layout(tmp_path):
@@ -173,7 +173,7 @@ def test_resolve_static_runtime_archive_uses_installed_matching_archive(
         "x86_64",
         pkg_dir,
         "13.0",
-        "4.7.0",
+        "4.8.0",
         tmp_path / "staging",
     )
     assert resolved == archive
@@ -187,7 +187,7 @@ def test_resolve_static_runtime_archive_cross_downloads_target_wheel(
         build_cutedsl._ELF_MACHINE["x86_64"],
     )
 
-    wheel = tmp_path / "nvidia_cutlass_dsl_libs_cu13-4.7.0-cp312-cp312-manylinux_2_28_aarch64.whl"
+    wheel = tmp_path / "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp312-cp312-manylinux_2_28_aarch64.whl"
     archive_in_wheel = tmp_path / "wheel_src" / "nvidia_cutlass_dsl" / "cu13" / "lib" / "libcuda_dialect_runtime_static.a"
     _write_fake_archive(archive_in_wheel,
                         build_cutedsl._ELF_MACHINE["aarch64"])
@@ -205,7 +205,7 @@ def test_resolve_static_runtime_archive_cross_downloads_target_wheel(
         "x86_64",
         pkg_dir,
         "13.0",
-        "4.7.0",
+        "4.8.0",
         tmp_path / "staging",
     )
     assert resolved.name == "libcuda_dialect_runtime_static.a"
@@ -226,7 +226,7 @@ def test_download_runtime_libs_wheel_uses_configured_wheelhouse(
         destination = Path(cmd[cmd.index("-d") + 1])
         destination.mkdir(parents=True, exist_ok=True)
         wheel = destination / (
-            "nvidia_cutlass_dsl_libs_cu12-4.7.0-cp312-cp312-"
+            "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp312-cp312-"
             "manylinux_2_28_aarch64.whl")
         wheel.write_bytes(b"wheel")
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -234,8 +234,8 @@ def test_download_runtime_libs_wheel_uses_configured_wheelhouse(
     monkeypatch.setattr(build_cutedsl.subprocess, "run", fake_run)
 
     wheel = build_cutedsl._download_runtime_libs_wheel("aarch64", "12",
-                                                       "4.7.0", download_dir)
-    assert wheel.name.startswith("nvidia_cutlass_dsl_libs_cu12-4.7.0")
+                                                       "4.8.0", download_dir)
+    assert wheel.name.startswith("nvidia_cutlass_dsl_libs_cu12-4.8.0")
 
 
 def test_tarball_builder_lists_mixed_cuda_matrix():
@@ -818,7 +818,7 @@ _BASE_METADATA = {
     "compile_gpu_arch": "sm_100a",
     "host_target": "",
     "cuda_package_variant": "cu12",
-    "cutlass_dsl_version": "4.7.0",
+    "cutlass_dsl_version": "4.8.0",
     "groups": ["gdn"],
     "variants": ["gdn_decode", "gdn_prefill"],
 }
