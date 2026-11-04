@@ -319,6 +319,45 @@ __device__ __forceinline__ void storeVec(TCache* dst, int64_t base, DVec<half> c
 #endif
 }
 
+//! In-place Hadamard transform of the 128 channels held by 16 consecutive lanes (8 channels per lane), orthonormal:
+//! applying it twice restores the input up to float rounding. Stage order is the same as the host reference of the tests:
+//! the three in-register index bits first, then the four lane bits; the lower element of a pair gets a + b, the upper a - b.
+__device__ __forceinline__ void hadamard128InPlace(float (&x)[8])
+{
+#pragma unroll
+    for (uint32_t bit = 0; bit < 3; ++bit)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            if (((i >> bit) & 1u) == 0u)
+            {
+                float const a = x[i];
+                float const b = x[i | (1u << bit)];
+                x[i] = vInt4Add(a, b);
+                x[i | (1u << bit)] = vInt4Sub(a, b);
+            }
+        }
+    }
+    uint32_t const lane = threadIdx.x & 31u;
+#pragma unroll
+    for (uint32_t bit = 0; bit < 4; ++bit)
+    {
+        bool const upper = ((lane >> bit) & 1u) != 0u;
+#pragma unroll
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            float const partner = __shfl_xor_sync(0xffffffffu, x[i], 1u << bit);
+            x[i] = upper ? vInt4Sub(partner, x[i]) : vInt4Add(x[i], partner);
+        }
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i)
+    {
+        x[i] = vInt4Mul(x[i], kVInt4HadamardScale);
+    }
+}
+
 //! Stores V into the int8 pool as the K8V4 emulation: 4-bit codes, dequantised and re-expressed on the int8 grid.
 //! Group and row scales come from a warp-shuffle reduction, so every lane of a (token, kv head) row must reach this
 //! call together; the launchers only enable it when a warp is exactly one row of 256 channels.
@@ -326,39 +365,110 @@ template <int32_t kMode>
 __device__ __forceinline__ void storeVecVInt4Emulated(
     int8_t* dst, int64_t base, DVec<half> const& vec, float vScaleQuantOrig)
 {
-    static_assert(kMode == static_cast<int32_t>(VInt4Mode::kStatic) || kMode == static_cast<int32_t>(VInt4Mode::kPerToken)
-        || kMode == static_cast<int32_t>(VInt4Mode::kGroup32));
     constexpr uint32_t kVec = DVec<half>::vec_size;
+    constexpr bool kAsym = kMode == static_cast<int32_t>(VInt4Mode::kGroup32Asym)
+        || kMode == static_cast<int32_t>(VInt4Mode::kHadamard128Asym);
+    constexpr bool kRotate = kMode == static_cast<int32_t>(VInt4Mode::kHadamard128)
+        || kMode == static_cast<int32_t>(VInt4Mode::kHadamard128Asym);
+    static_assert(kMode >= static_cast<int32_t>(VInt4Mode::kStatic) && kMode <= static_cast<int32_t>(VInt4Mode::kHadamard128Asym));
     assert(vScaleQuantOrig > 0.0f);
     float x[kVec];
-    float absMax = 0.0f;
 #pragma unroll
     for (uint32_t i = 0; i < kVec; ++i)
     {
         x[i] = __half2float(vec[i]);
-        absMax = fmaxf(absMax, fabsf(x[i]));
     }
-    float scale4;
-    if constexpr (kMode == static_cast<int32_t>(VInt4Mode::kStatic))
+    DVec<int8_t> out;
+    if constexpr (kMode <= static_cast<int32_t>(VInt4Mode::kGroup32))
     {
-        scale4 = vInt4StaticScale(vScaleQuantOrig);
+        float absMax = 0.0f;
+#pragma unroll
+        for (uint32_t i = 0; i < kVec; ++i)
+        {
+            absMax = fmaxf(absMax, fabsf(x[i]));
+        }
+        float scale4;
+        if constexpr (kMode == static_cast<int32_t>(VInt4Mode::kStatic))
+        {
+            scale4 = vInt4StaticScale(vScaleQuantOrig);
+        }
+        else
+        {
+            constexpr uint32_t kLanes
+                = kMode == static_cast<int32_t>(VInt4Mode::kPerToken) ? 32u : kVInt4GroupSize / kVec;
+#pragma unroll
+            for (uint32_t offset = 1; offset < kLanes; offset <<= 1)
+            {
+                absMax = fmaxf(absMax, __shfl_xor_sync(0xffffffffu, absMax, offset));
+            }
+            scale4 = vInt4ScaleFromAbsMax(absMax);
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < kVec; ++i)
+        {
+            out[i] = vInt4EmulatedInt8(x[i], scale4, vScaleQuantOrig);
+        }
     }
     else
     {
-        constexpr uint32_t kLanes
-            = kMode == static_cast<int32_t>(VInt4Mode::kPerToken) ? 32u : kVInt4GroupSize / kVec;
-#pragma unroll
-        for (uint32_t offset = 1; offset < kLanes; offset <<= 1)
+        if constexpr (kRotate)
         {
-            absMax = fmaxf(absMax, __shfl_xor_sync(0xffffffffu, absMax, offset));
+            hadamard128InPlace(x);
         }
-        scale4 = vInt4ScaleFromAbsMax(absMax);
-    }
-    DVec<int8_t> out;
+        constexpr uint32_t kLanes = kRotate ? kVInt4HadamardBlock / kVec : kVInt4GroupSize / kVec;
+        float y[kVec];
+        if constexpr (kAsym)
+        {
+            float groupMin = INFINITY;
+            float groupMax = -INFINITY;
 #pragma unroll
-    for (uint32_t i = 0; i < kVec; ++i)
-    {
-        out[i] = vInt4EmulatedInt8(x[i], scale4, vScaleQuantOrig);
+            for (uint32_t i = 0; i < kVec; ++i)
+            {
+                groupMin = fminf(groupMin, x[i]);
+                groupMax = fmaxf(groupMax, x[i]);
+            }
+#pragma unroll
+            for (uint32_t offset = 1; offset < kLanes; offset <<= 1)
+            {
+                groupMin = fminf(groupMin, __shfl_xor_sync(0xffffffffu, groupMin, offset));
+                groupMax = fmaxf(groupMax, __shfl_xor_sync(0xffffffffu, groupMax, offset));
+            }
+            VInt4Asym const params = vInt4AsymParams(groupMin, groupMax);
+#pragma unroll
+            for (uint32_t i = 0; i < kVec; ++i)
+            {
+                y[i] = vInt4AsymDequant(vInt4AsymCode(x[i], params), params);
+            }
+        }
+        else
+        {
+            float absMax = 0.0f;
+#pragma unroll
+            for (uint32_t i = 0; i < kVec; ++i)
+            {
+                absMax = fmaxf(absMax, fabsf(x[i]));
+            }
+#pragma unroll
+            for (uint32_t offset = 1; offset < kLanes; offset <<= 1)
+            {
+                absMax = fmaxf(absMax, __shfl_xor_sync(0xffffffffu, absMax, offset));
+            }
+            float const scale4 = vInt4ScaleFromAbsMax(absMax);
+#pragma unroll
+            for (uint32_t i = 0; i < kVec; ++i)
+            {
+                y[i] = scale4 > 0.0f ? vInt4SymDequant(vInt4Code(x[i], scale4), scale4) : 0.0f;
+            }
+        }
+        if constexpr (kRotate)
+        {
+            hadamard128InPlace(y);
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < kVec; ++i)
+        {
+            out[i] = vInt4Int8FromValue(y[i], vScaleQuantOrig);
+        }
     }
     out.store(dst + base);
 }
@@ -396,7 +506,19 @@ static VInt4Mode vInt4ModeFromEnvironment()
     {
         return VInt4Mode::kGroup32;
     }
-    check::check(false, "EDGELLM_KV_V_INT4_EMULATION must be off, static, token or group32.");
+    if (std::strcmp(env, "group32asym") == 0)
+    {
+        return VInt4Mode::kGroup32Asym;
+    }
+    if (std::strcmp(env, "had128") == 0)
+    {
+        return VInt4Mode::kHadamard128;
+    }
+    if (std::strcmp(env, "had128asym") == 0)
+    {
+        return VInt4Mode::kHadamard128Asym;
+    }
+    check::check(false, "EDGELLM_KV_V_INT4_EMULATION must be off, static, token, group32, group32asym, had128 or had128asym.");
     return VInt4Mode::kOff;
 }
 
@@ -417,6 +539,9 @@ static void dispatchVInt4Mode(VInt4Mode mode, Fn&& launch)
     case VInt4Mode::kStatic: launch(std::integral_constant<int32_t, 1>{}); break;
     case VInt4Mode::kPerToken: launch(std::integral_constant<int32_t, 2>{}); break;
     case VInt4Mode::kGroup32: launch(std::integral_constant<int32_t, 3>{}); break;
+    case VInt4Mode::kGroup32Asym: launch(std::integral_constant<int32_t, 4>{}); break;
+    case VInt4Mode::kHadamard128: launch(std::integral_constant<int32_t, 5>{}); break;
+    case VInt4Mode::kHadamard128Asym: launch(std::integral_constant<int32_t, 6>{}); break;
     case VInt4Mode::kOff:
     default: launch(std::integral_constant<int32_t, 0>{}); break;
     }

@@ -32,6 +32,7 @@
 #include "common/tensor.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
+#include "kernels/posEncoding/kvInt4Quant.h"
 #include "references.h"
 #include "testUtils.h"
 
@@ -2077,36 +2078,102 @@ void fillEmulationRow(std::mt19937& gen, int32_t const pattern, int32_t const sa
     }
 }
 
-//! Float32 reference of the emulation for one (token, kv head) row of 256 channels; mode is static, token or group32.
-//! Written from the specification, not from the header under test.
+//! Float32 reference of the emulation for one (token, kv head) row of 256 channels. mode is static, token, group32,
+//! group32asym, had128 or had128asym. Written from the specification, not from the device code under test.
 std::vector<int8_t> referenceEmulatedVRow(std::vector<float> const& row, float const vScale, std::string const& mode)
 {
-    size_t const groupSize = (mode == "group32") ? 32 : row.size();
-    std::vector<int8_t> out(row.size());
-    for (size_t first = 0; first < row.size(); first += groupSize)
+    bool const rotate = (mode == "had128" || mode == "had128asym");
+    bool const asym = (mode == "group32asym" || mode == "had128asym");
+    size_t const groupSize = (mode == "group32" || mode == "group32asym") ? 32 : (rotate ? 128 : row.size());
+    std::vector<float> work = row;
+    if (rotate)
     {
-        float scale4 = vScale * (127.0F / 7.0F);
-        if (mode != "static")
+        for (size_t first = 0; first < work.size(); first += 128)
+        {
+            vInt4Hadamard128Host(&work[first]);
+        }
+    }
+    std::vector<float> value(work.size());
+    for (size_t first = 0; first < work.size(); first += groupSize)
+    {
+        if (mode == "static")
+        {
+            float const scale4 = vScale * (127.0F / 7.0F);
+            for (size_t i = first; i < first + groupSize; ++i)
+            {
+                float const code = std::nearbyint(std::fmin(std::fmax(work[i] * (1.0F / scale4), -7.0F), 7.0F));
+                value[i] = code * scale4;
+            }
+        }
+        else if (asym)
+        {
+            float lo = std::numeric_limits<float>::infinity();
+            float hi = -std::numeric_limits<float>::infinity();
+            for (size_t i = first; i < first + groupSize; ++i)
+            {
+                lo = std::fmin(lo, work[i]);
+                hi = std::fmax(hi, work[i]);
+            }
+            float scale = 0.0F;
+            float zero = 0.0F;
+            bool const finite = (lo <= hi) && std::isfinite(lo) && std::isfinite(hi);
+            if (finite)
+            {
+                float const zeroHalf = __half2float(__float2half_rd(lo));
+                float const topHalf = __half2float(__float2half_rn(hi));
+                if (std::fabs(zeroHalf) <= 65504.0F && std::fabs(topHalf) <= 65504.0F)
+                {
+                    zero = zeroHalf;
+                    float const s = __half2float(__float2half_ru((hi - zero) / 15.0F));
+                    scale = (s > 0.0F && s <= 65504.0F) ? s : 0.0F;
+                }
+            }
+            for (size_t i = first; i < first + groupSize; ++i)
+            {
+                float code = 0.0F;
+                if (scale > 0.0F)
+                {
+                    code = std::nearbyint(std::fmin(std::fmax((work[i] - zero) * (1.0F / scale), 0.0F), 15.0F));
+                }
+                value[i] = code * scale + zero;
+            }
+        }
+        else
         {
             float absMax = 0.0F;
             for (size_t i = first; i < first + groupSize; ++i)
             {
-                absMax = std::fmax(absMax, std::fabs(row[i]));
+                absMax = std::fmax(absMax, std::fabs(work[i]));
             }
             float const stored = __half2float(__float2half_ru(absMax / 7.0F));
-            scale4 = (stored > 0.0F && stored <= 65504.0F) ? stored : 0.0F;
-        }
-        for (size_t i = first; i < first + groupSize; ++i)
-        {
-            float dequant = 0.0F;
-            if (scale4 > 0.0F)
+            float const scale = (stored > 0.0F && stored <= 65504.0F) ? stored : 0.0F;
+            for (size_t i = first; i < first + groupSize; ++i)
             {
-                float const code = std::nearbyint(std::fmin(std::fmax(row[i] * (1.0F / scale4), -7.0F), 7.0F));
-                dequant = code * scale4;
+                float code = 0.0F;
+                if (scale > 0.0F)
+                {
+                    code = std::nearbyint(std::fmin(std::fmax(work[i] * (1.0F / scale), -7.0F), 7.0F));
+                    value[i] = code * scale;
+                }
+                else
+                {
+                    value[i] = 0.0F;
+                }
             }
-            float const q = std::nearbyint(std::fmin(std::fmax(dequant * (1.0F / vScale), -127.0F), 127.0F));
-            out[i] = static_cast<int8_t>(q);
         }
+    }
+    if (rotate)
+    {
+        for (size_t first = 0; first < value.size(); first += 128)
+        {
+            vInt4Hadamard128Host(&value[first]);
+        }
+    }
+    std::vector<int8_t> out(row.size());
+    for (size_t i = 0; i < row.size(); ++i)
+    {
+        float const q = std::nearbyint(std::fmin(std::fmax(value[i] * (1.0F / vScale), -127.0F), 127.0F));
+        out[i] = static_cast<int8_t>(q);
     }
     return out;
 }
@@ -2307,7 +2374,7 @@ void runVInt4EmulationCase(EmuWriter const writer, std::string const& mode)
 
 TEST(RopeWriteKvVInt4Emulation, WriteKVMatchesReference)
 {
-    for (char const* mode : {"static", "token", "group32"})
+    for (char const* mode : {"static", "token", "group32", "group32asym", "had128", "had128asym"})
     {
         runVInt4EmulationCase(EmuWriter::kWriteKV, mode);
     }
@@ -2315,7 +2382,7 @@ TEST(RopeWriteKvVInt4Emulation, WriteKVMatchesReference)
 
 TEST(RopeWriteKvVInt4Emulation, SplitQKVMatchesReference)
 {
-    for (char const* mode : {"static", "token", "group32"})
+    for (char const* mode : {"static", "token", "group32", "group32asym", "had128", "had128asym"})
     {
         runVInt4EmulationCase(EmuWriter::kSplitQKV, mode);
     }
@@ -2323,7 +2390,7 @@ TEST(RopeWriteKvVInt4Emulation, SplitQKVMatchesReference)
 
 TEST(RopeWriteKvVInt4Emulation, PackedToSplitMatchesReference)
 {
-    for (char const* mode : {"static", "token", "group32"})
+    for (char const* mode : {"static", "token", "group32", "group32asym", "had128", "had128asym"})
     {
         runVInt4EmulationCase(EmuWriter::kPackedToSplit, mode);
     }
@@ -2367,7 +2434,7 @@ TEST(RopeWriteKvVInt4Emulation, KPlaneIsNeverChanged)
     for (auto const writer : {EmuWriter::kWriteKV, EmuWriter::kSplitQKV, EmuWriter::kPackedToSplit})
     {
         auto const off = runEmuWriter(writer, cfg, qHost, kHost, vHost, nullptr, nvinfer1::DataType::kINT8);
-        for (char const* mode : {"static", "token", "group32"})
+        for (char const* mode : {"static", "token", "group32", "group32asym", "had128", "had128asym"})
         {
             auto const emu = runEmuWriter(writer, cfg, qHost, kHost, vHost, mode, nvinfer1::DataType::kINT8);
             // The V plane is the second half of the pool; V ids are stored as page + numPages.

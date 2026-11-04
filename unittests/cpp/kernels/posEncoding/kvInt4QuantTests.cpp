@@ -254,3 +254,166 @@ TEST(KvInt4Quant, GroupSizeDividesTheHeadDimension)
     EXPECT_EQ(256 % kVInt4GroupSize, 0);
     EXPECT_EQ(kVInt4GroupSize % 8, 0);
 }
+
+TEST(KvInt4Asym, DegenerateRangesGiveZeroGroups)
+{
+    float const inf = std::numeric_limits<float>::infinity();
+    // No finite element at all (min stays +inf, max stays -inf), or an infinity in the group.
+    for (auto const& [lo, hi] : std::vector<std::pair<float, float>>{{inf, -inf}, {-inf, 1.0F}, {0.0F, inf}, {-inf, inf},
+             {-70000.0F, 1.0F}, {0.0F, 70000.0F}})
+    {
+        VInt4Asym const p = vInt4AsymParams(lo, hi);
+        EXPECT_EQ(p.scale, 0.0F) << lo << " " << hi;
+        EXPECT_EQ(p.zero, 0.0F) << lo << " " << hi;
+        EXPECT_EQ(vInt4AsymCode(0.5F, p), 0);
+        EXPECT_EQ(vInt4AsymDequant(0, p), 0.0F);
+    }
+    // An inverted range (min above max) is not a group.
+    EXPECT_EQ(vInt4AsymParams(2.0F, 1.0F).scale, 0.0F);
+}
+
+TEST(KvInt4Asym, ConstantGroupReconstructsTheValue)
+{
+    for (float const v : {0.0F, 3.0F, -2.5F, 65504.0F, -65504.0F, 1.0e-7F})
+    {
+        VInt4Asym const p = vInt4AsymParams(v, v);
+        int32_t const code = vInt4AsymCode(v, p);
+        EXPECT_NEAR(vInt4AsymDequant(code, p), v, std::fabs(v) * 1.0e-3F + 1.0e-7F) << v;
+    }
+    // Values exactly representable in fp16 are reconstructed exactly.
+    for (float const v : {0.0F, 3.0F, -2.5F, 65504.0F})
+    {
+        VInt4Asym const p = vInt4AsymParams(v, v);
+        EXPECT_EQ(vInt4AsymDequant(vInt4AsymCode(v, p), p), v) << v;
+    }
+}
+
+TEST(KvInt4Asym, NeitherEndOfTheRangeIsClippedAndTheErrorIsHalfAStep)
+{
+    // Deterministic pseudo-random ranges over the whole fp16 range, including subnormal and near-maximum values.
+    uint64_t state = 0x9E3779B97F4A7C15ULL;
+    auto next = [&state]() {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<uint32_t>(state >> 33);
+    };
+    auto randomHalf = [&]() {
+        float f;
+        do
+        {
+            f = halfBitsToFloat(next() & 0xFFFFu);
+        } while (!std::isfinite(f));
+        return f;
+    };
+    int32_t checked = 0;
+    for (int32_t trial = 0; trial < 200000; ++trial)
+    {
+        float lo = randomHalf();
+        float hi = randomHalf();
+        if (lo > hi)
+        {
+            std::swap(lo, hi);
+        }
+        VInt4Asym const p = vInt4AsymParams(lo, hi);
+        if (!(p.scale > 0.0F))
+        {
+            continue;
+        }
+        ++checked;
+        ASSERT_LE(p.zero, lo) << lo << " " << hi;
+        ASSERT_LE((hi - p.zero) / p.scale, static_cast<float>(kVInt4AsymMaxCode) * (1.0F + 1.0e-6F)) << lo << " " << hi;
+        for (float const x : {lo, hi, 0.5F * (lo + hi), lo + 0.25F * (hi - lo)})
+        {
+            int32_t const code = vInt4AsymCode(x, p);
+            ASSERT_GE(code, 0);
+            ASSERT_LE(code, kVInt4AsymMaxCode);
+            float const err = std::fabs(vInt4AsymDequant(code, p) - x);
+            ASSERT_LE(err, 0.5F * p.scale * (1.0F + 1.0e-5F) + 2.0e-7F * std::max(std::fabs(x), std::fabs(p.zero)) + 1.0e-12F)
+                << "x=" << x << " lo=" << lo << " hi=" << hi << " scale=" << p.scale;
+        }
+    }
+    EXPECT_GT(checked, 100000);
+}
+
+TEST(KvInt4Asym, CodesAreMonotoneInTheValue)
+{
+    VInt4Asym const p = vInt4AsymParams(-3.0F, 5.0F);
+    int32_t previous = -1;
+    for (float x = -4.0F; x <= 6.0F; x += 0.0173F)
+    {
+        int32_t const code = vInt4AsymCode(x, p);
+        ASSERT_GE(code, previous) << x;
+        previous = code;
+    }
+    EXPECT_EQ(vInt4AsymCode(-100.0F, p), 0);
+    EXPECT_EQ(vInt4AsymCode(100.0F, p), kVInt4AsymMaxCode);
+}
+
+TEST(KvInt4Hadamard, MatchesTheNaiveMatrixAndIsOrthonormal)
+{
+    uint64_t state = 12345;
+    auto uniform = [&state]() {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<float>(static_cast<int32_t>(state >> 40) - (1 << 23)) / static_cast<float>(1 << 23) * 5.0F;
+    };
+    for (int32_t trial = 0; trial < 50; ++trial)
+    {
+        std::vector<float> x(128);
+        for (auto& v : x)
+        {
+            v = uniform();
+        }
+        std::vector<float> fast = x;
+        vInt4Hadamard128Host(fast.data());
+        double normIn = 0.0;
+        double normOut = 0.0;
+        for (int32_t i = 0; i < 128; ++i)
+        {
+            double naive = 0.0;
+            for (int32_t j = 0; j < 128; ++j)
+            {
+                naive += ((__builtin_popcount(static_cast<unsigned>(i & j)) & 1) ? -1.0 : 1.0) * x[j];
+            }
+            naive /= std::sqrt(128.0);
+            ASSERT_NEAR(fast[i], naive, 2.0e-5) << "i=" << i;
+            normIn += static_cast<double>(x[i]) * x[i];
+            normOut += static_cast<double>(fast[i]) * fast[i];
+        }
+        EXPECT_NEAR(normOut, normIn, 1.0e-4 * normIn);
+        vInt4Hadamard128Host(fast.data());
+        for (int32_t i = 0; i < 128; ++i)
+        {
+            ASSERT_NEAR(fast[i], x[i], 2.0e-5) << "round trip i=" << i;
+        }
+    }
+}
+
+TEST(KvInt4Hadamard, KnownVectors)
+{
+    std::vector<float> unit(128, 0.0F);
+    unit[0] = 1.0F;
+    vInt4Hadamard128Host(unit.data());
+    for (float const v : unit)
+    {
+        EXPECT_NEAR(v, kVInt4HadamardScale, 1.0e-7F);
+    }
+    std::vector<float> ones(128, 1.0F);
+    vInt4Hadamard128Host(ones.data());
+    EXPECT_NEAR(ones[0], std::sqrt(128.0F), 1.0e-4F);
+    for (int32_t i = 1; i < 128; ++i)
+    {
+        EXPECT_NEAR(ones[i], 0.0F, 1.0e-5F);
+    }
+    // An outlier is spread over the whole block: every output has the same magnitude.
+    std::vector<float> spike(128, 0.0F);
+    spike[77] = 50.0F;
+    vInt4Hadamard128Host(spike.data());
+    for (float const v : spike)
+    {
+        EXPECT_NEAR(std::fabs(v), 50.0F * kVInt4HadamardScale, 1.0e-4F);
+    }
+}
+
+TEST(KvInt4Hadamard, ScaleConstantIsOneOverSqrtOf128)
+{
+    EXPECT_EQ(kVInt4HadamardScale, static_cast<float>(1.0 / std::sqrt(128.0)));
+}

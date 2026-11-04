@@ -36,12 +36,20 @@ enum class VInt4Mode : int32_t
     kStatic = 1,   //!< One static scale for the whole layer: codes cover the same range as int8.
     kPerToken = 2, //!< One scale per (token, kv head) row, from the row's absolute maximum.
     kGroup32 = 3,  //!< One scale per 32 channels of a (token, kv head) row.
+    kGroup32Asym = 4,     //!< Scale and zero point per 32 channels: 16 levels between the group minimum and maximum.
+    kHadamard128 = 5,     //!< Rotate blocks of 128 channels with a Hadamard transform, one symmetric scale per block.
+    kHadamard128Asym = 6, //!< Rotate blocks of 128 channels, scale and zero point per block.
 };
 
 //! Largest code magnitude. Codes lie in [-7, 7]; the code -8 is never produced so that negation stays exact.
 constexpr int32_t kVInt4MaxCode = 7;
 //! Channels that share a scale in VInt4Mode::kGroup32.
 constexpr int32_t kVInt4GroupSize = 32;
+//! Asymmetric codes lie in [0, 15].
+constexpr int32_t kVInt4AsymMaxCode = 15;
+//! Channels per Hadamard block and the factor that makes the transform orthonormal (1 / sqrt(128)).
+constexpr int32_t kVInt4HadamardBlock = 128;
+constexpr float kVInt4HadamardScale = 0.08838834764831845F;
 //! Largest finite fp16 value; scales above it are not representable and quantise the group to zero.
 constexpr float kVInt4MaxFp16 = 65504.0F;
 
@@ -105,6 +113,118 @@ __host__ __device__ inline int8_t vInt4EmulatedInt8(float x, float scale4, float
     float const scaled = dequant * vInt4Reciprocal(vScaleQuantOrig);
     float const clamped = fminf(fmaxf(scaled, -127.0F), 127.0F);
     return static_cast<int8_t>(vInt4RoundToInt(clamped));
+}
+
+//! Explicit IEEE add, subtract and multiply: they cannot be contracted into fused multiply-adds, so the device result
+//! stays bit-identical to the host.
+__host__ __device__ inline float vInt4Add(float a, float b)
+{
+#ifdef __CUDA_ARCH__
+    return __fadd_rn(a, b);
+#else
+    return a + b;
+#endif
+}
+
+__host__ __device__ inline float vInt4Sub(float a, float b)
+{
+#ifdef __CUDA_ARCH__
+    return __fsub_rn(a, b);
+#else
+    return a - b;
+#endif
+}
+
+__host__ __device__ inline float vInt4Mul(float a, float b)
+{
+#ifdef __CUDA_ARCH__
+    return __fmul_rn(a, b);
+#else
+    return a * b;
+#endif
+}
+
+//! Asymmetric 4-bit parameters of a group: value = code * scale + zero, code in [0, 15]. zero is the group minimum
+//! rounded down to fp16 and scale is (max - zero) / 15 rounded up to fp16, so neither end of the group is clipped.
+//! A zero scale means every code is 0 and the group is reconstructed as zero (the fp16-rounded minimum for a constant
+//! group; exactly 0 when the group holds a non-finite value or a magnitude beyond fp16).
+struct VInt4Asym
+{
+    float scale;
+    float zero;
+};
+
+__host__ __device__ inline VInt4Asym vInt4AsymParams(float groupMin, float groupMax)
+{
+    if (!(groupMin <= groupMax))
+    {
+        return {0.0F, 0.0F};
+    }
+    float const zero = __half2float(__float2half_rd(groupMin));
+    float const top = __half2float(__float2half_rn(groupMax));
+    if (!(zero >= -kVInt4MaxFp16 && zero <= kVInt4MaxFp16 && top >= -kVInt4MaxFp16 && top <= kVInt4MaxFp16))
+    {
+        return {0.0F, 0.0F};
+    }
+    float const range = vInt4Sub(groupMax, zero);
+    float const raw = vInt4Divide(range, static_cast<float>(kVInt4AsymMaxCode));
+    float const scale = __half2float(__float2half_ru(raw));
+    return {(scale > 0.0F && scale <= kVInt4MaxFp16) ? scale : 0.0F, zero};
+}
+
+//! Asymmetric code of @p x: round((x - zero) / scale) clamped to [0, 15]; 0 for a zero scale.
+__host__ __device__ inline int32_t vInt4AsymCode(float x, VInt4Asym params)
+{
+    if (!(params.scale > 0.0F))
+    {
+        return 0;
+    }
+    float const scaled = vInt4Mul(vInt4Sub(x, params.zero), vInt4Reciprocal(params.scale));
+    float const clamped = fminf(fmaxf(scaled, 0.0F), static_cast<float>(kVInt4AsymMaxCode));
+    return vInt4RoundToInt(clamped);
+}
+
+__host__ __device__ inline float vInt4AsymDequant(int32_t code, VInt4Asym params)
+{
+    return vInt4Add(vInt4Mul(static_cast<float>(code), params.scale), params.zero);
+}
+
+//! Symmetric dequantisation with the same explicit multiply.
+__host__ __device__ inline float vInt4SymDequant(int32_t code, float scale)
+{
+    return vInt4Mul(static_cast<float>(code), scale);
+}
+
+//! The int8 value stored for a dequantised V value @p value under the layer's int8 scale.
+__host__ __device__ inline int8_t vInt4Int8FromValue(float value, float vScaleQuantOrig)
+{
+    float const scaled = vInt4Mul(value, vInt4Reciprocal(vScaleQuantOrig));
+    float const clamped = fminf(fmaxf(scaled, -127.0F), 127.0F);
+    return static_cast<int8_t>(vInt4RoundToInt(clamped));
+}
+
+//! Host reference of the orthonormal 128-point Hadamard transform used by the rotated modes, in place on 128 values.
+//! Stage order is fixed because float addition is not associative and the device kernel must match it bit for bit: index
+//! bits 0 to 6 in turn, the lower element of each pair gets a + b and the upper a - b, then one multiply by 1 / sqrt(128).
+inline void vInt4Hadamard128Host(float* x)
+{
+    for (int32_t bit = 0; bit < 7; ++bit)
+    {
+        for (int32_t i = 0; i < kVInt4HadamardBlock; ++i)
+        {
+            if (((i >> bit) & 1) == 0)
+            {
+                float const a = x[i];
+                float const b = x[i | (1 << bit)];
+                x[i] = a + b;
+                x[i | (1 << bit)] = a - b;
+            }
+        }
+    }
+    for (int32_t i = 0; i < kVInt4HadamardBlock; ++i)
+    {
+        x[i] = x[i] * kVInt4HadamardScale;
+    }
 }
 
 //! Scale used by VInt4Mode::kStatic: the 4-bit step that spans the same range as the int8 scale.
