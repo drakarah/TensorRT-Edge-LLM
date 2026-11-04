@@ -1246,6 +1246,69 @@ TEST(ContextCacheManagerTests, EvictingToAHighWaterKeepsRecordsBelowTheTarget)
     EXPECT_TRUE(manager.records().lruToMru().empty());
 }
 
+TEST(ContextCacheManagerTests, TheMostRecentRecordIsSparedEvenOnAHighPage)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 0, 0}, 6);
+    manager.limitBasePages(6);
+    PublishedRecord const a = publishPrivateRecord(manager, {kHASH_A});
+    PublishedRecord const b = publishPrivateRecord(manager, {kHASH_B});
+    PublishedRecord const c = publishPrivateRecord(manager, {kHASH_C});
+    ASSERT_EQ(manager.baseHighWater(), 3);
+
+    EXPECT_EQ(manager.evictToBaseHighWater(2, 1), 0u) << "the only record on the high page is the most recent";
+    EXPECT_EQ(manager.baseHighWater(), 3);
+    EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>({a.id, b.id, c.id}));
+}
+
+TEST(ContextCacheManagerTests, SparedRecordsLeaveOlderOnesToBeEvicted)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 0, 0, 0}, 6);
+    manager.limitBasePages(6);
+    PublishedRecord const a = publishPrivateRecord(manager, {kHASH_A});
+    PublishedRecord const b = publishPrivateRecord(manager, {kHASH_B});
+    PublishedRecord const c = publishPrivateRecord(manager, {kHASH_C});
+
+    EXPECT_EQ(manager.evictToBaseHighWater(0, 1), 2u);
+    EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>({c.id}));
+    EXPECT_EQ(manager.baseHighWater(), 3);
+    static_cast<void>(a);
+    static_cast<void>(b);
+}
+
+TEST(ContextCacheManagerTests, ProtectingMoreRecordsThanExistEvictsNothing)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
+    manager.limitBasePages(4);
+    publishPrivateRecord(manager, {kHASH_A});
+    publishPrivateRecord(manager, {kHASH_B});
+
+    EXPECT_EQ(manager.evictToBaseHighWater(0, 5), 0u);
+    EXPECT_EQ(manager.records().lruToMru().size(), 2u);
+}
+
+TEST(ContextCacheManagerTests, ProtectingNoRecordsEvictsLikeBefore)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
+    manager.limitBasePages(4);
+    publishPrivateRecord(manager, {kHASH_A});
+    publishPrivateRecord(manager, {kHASH_B});
+
+    EXPECT_EQ(manager.evictToBaseHighWater(0, 0), 2u);
+    EXPECT_TRUE(manager.records().lruToMru().empty());
+}
+
+TEST(ContextCacheManagerTests, TheLimitCannotDropBelowASparedRecord)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
+    manager.limitBasePages(4);
+    publishPrivateRecord(manager, {kHASH_A});
+    publishPrivateRecord(manager, {kHASH_B});
+
+    EXPECT_EQ(manager.evictToBaseHighWater(1, 1), 0u);
+    EXPECT_THROW(manager.limitBasePages(1), std::runtime_error);
+    EXPECT_NO_THROW(manager.limitBasePages(manager.baseHighWater()));
+}
+
 TEST(ContextCacheManagerTests, EvictingToAHighWaterOnAnEmptyStoreDoesNothing)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
