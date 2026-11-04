@@ -124,6 +124,9 @@ TEST(ChatTemplateTest, NormalizesContentToProviderTemplateContract)
     TemporaryTemplate structured{{"chat_template.jinja",
         "{% for item in messages[0].content %}{{ item.text }}{% if not loop.last %}|{% endif %}{% endfor %}"}};
     rt::Message text{"user", {{"text", "plain string"}}};
+    // Text-only messages that are not marked as arrays are handed to the template as plain strings (Gemma 4 branches
+    // on `content is string`); a block-iterating template needs the array form.
+    text.contentIsArray = true;
     chat_template::ChatTemplate renderer;
     ASSERT_TRUE(renderer.load(structured.path));
     rt::LLMGenerationRequest::FormattedRequest formatted;
@@ -220,6 +223,7 @@ TEST(ChatTemplateTest, FlattensToolResultsForStructuredProviderTemplates)
         "{% for message in messages %}{% if message.role == 'tool' %}{{ message.content }}{% else %}"
         "{% for item in message.content %}{{ item.text }}{% endfor %}{% endif %}{% endfor %}"}};
     rt::Message user{"user", {{"text", "question"}}};
+    user.contentIsArray = true; // text-only non-array messages are rendered as strings; this template iterates blocks
     rt::Message tool{"tool", {{"text", "line one"}, {"text", "line two"}}};
     tool.contentIsArray = true;
 
