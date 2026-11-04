@@ -20,8 +20,11 @@
 #include "common/cudaMacros.h"
 #include "common/pagedKvTypes.h"
 #include "kernels/common/vectorizedTypes.cuh"
+#include "kvInt4Quant.h"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <type_traits>
 
@@ -316,7 +319,110 @@ __device__ __forceinline__ void storeVec(TCache* dst, int64_t base, DVec<half> c
 #endif
 }
 
-template <typename T, typename TCache>
+//! Stores V into the int8 pool as the K8V4 emulation: 4-bit codes, dequantised and re-expressed on the int8 grid.
+//! Group and row scales come from a warp-shuffle reduction, so every lane of a (token, kv head) row must reach this
+//! call together; the launchers only enable it when a warp is exactly one row of 256 channels.
+template <int32_t kMode>
+__device__ __forceinline__ void storeVecVInt4Emulated(
+    int8_t* dst, int64_t base, DVec<half> const& vec, float vScaleQuantOrig)
+{
+    static_assert(kMode == static_cast<int32_t>(VInt4Mode::kStatic) || kMode == static_cast<int32_t>(VInt4Mode::kPerToken)
+        || kMode == static_cast<int32_t>(VInt4Mode::kGroup32));
+    constexpr uint32_t kVec = DVec<half>::vec_size;
+    assert(vScaleQuantOrig > 0.0f);
+    float x[kVec];
+    float absMax = 0.0f;
+#pragma unroll
+    for (uint32_t i = 0; i < kVec; ++i)
+    {
+        x[i] = __half2float(vec[i]);
+        absMax = fmaxf(absMax, fabsf(x[i]));
+    }
+    float scale4;
+    if constexpr (kMode == static_cast<int32_t>(VInt4Mode::kStatic))
+    {
+        scale4 = vInt4StaticScale(vScaleQuantOrig);
+    }
+    else
+    {
+        constexpr uint32_t kLanes
+            = kMode == static_cast<int32_t>(VInt4Mode::kPerToken) ? 32u : kVInt4GroupSize / kVec;
+#pragma unroll
+        for (uint32_t offset = 1; offset < kLanes; offset <<= 1)
+        {
+            absMax = fmaxf(absMax, __shfl_xor_sync(0xffffffffu, absMax, offset));
+        }
+        scale4 = vInt4ScaleFromAbsMax(absMax);
+    }
+    DVec<int8_t> out;
+#pragma unroll
+    for (uint32_t i = 0; i < kVec; ++i)
+    {
+        out[i] = vInt4EmulatedInt8(x[i], scale4, vScaleQuantOrig);
+    }
+    out.store(dst + base);
+}
+
+template <typename TCache, int32_t kVInt4Mode>
+__device__ __forceinline__ void storeVecV(TCache* dst, int64_t base, DVec<half> const& vec, float vScaleQuantOrig)
+{
+    if constexpr (kVInt4Mode != 0)
+    {
+        static_assert(std::is_same_v<TCache, int8_t>, "The K8V4 emulation needs an int8 pool");
+        storeVecVInt4Emulated<kVInt4Mode>(dst, base, vec, vScaleQuantOrig);
+    }
+    else
+    {
+        storeVec(dst, base, vec, vScaleQuantOrig);
+    }
+}
+
+static VInt4Mode vInt4ModeFromEnvironment()
+{
+    char const* const env = std::getenv("EDGELLM_KV_V_INT4_EMULATION");
+    if (env == nullptr || *env == '\0' || std::strcmp(env, "off") == 0)
+    {
+        return VInt4Mode::kOff;
+    }
+    if (std::strcmp(env, "static") == 0)
+    {
+        return VInt4Mode::kStatic;
+    }
+    if (std::strcmp(env, "token") == 0)
+    {
+        return VInt4Mode::kPerToken;
+    }
+    if (std::strcmp(env, "group32") == 0)
+    {
+        return VInt4Mode::kGroup32;
+    }
+    check::check(false, "EDGELLM_KV_V_INT4_EMULATION must be off, static, token or group32.");
+    return VInt4Mode::kOff;
+}
+
+static void checkVInt4EmulationShape(VInt4Mode mode, uint32_t headDim, uint32_t threadsPerRow)
+{
+    if (mode != VInt4Mode::kOff)
+    {
+        check::check(headDim == 256 && threadsPerRow == 32,
+            "The K8V4 emulation needs head_dim 256 with one warp per (token, kv head) row.");
+    }
+}
+
+template <typename Fn>
+static void dispatchVInt4Mode(VInt4Mode mode, Fn&& launch)
+{
+    switch (mode)
+    {
+    case VInt4Mode::kStatic: launch(std::integral_constant<int32_t, 1>{}); break;
+    case VInt4Mode::kPerToken: launch(std::integral_constant<int32_t, 2>{}); break;
+    case VInt4Mode::kGroup32: launch(std::integral_constant<int32_t, 3>{}); break;
+    case VInt4Mode::kOff:
+    default: launch(std::integral_constant<int32_t, 0>{}); break;
+    }
+}
+
+template <typename T, typename TCache, int32_t kVInt4Mode = 0>
 __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float const* cosSinCache,
     int32_t const* kvCacheEndLens, int32_t const* tokenPosIds, float kScaleQuantOrig, float vScaleQuantOrig,
     int32_t qSeqLen, int32_t totalNumTokens, int32_t numPages, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim,
@@ -460,7 +566,7 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
                 int64_t const vOffset
                     = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
                     + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
-                storeVec(kvCache, vOffset, vSrc, vScaleQuantOrig);
+                storeVecV<TCache, kVInt4Mode>(kvCache, vOffset, vSrc, vScaleQuantOrig);
             }
         }
     }
@@ -517,10 +623,16 @@ static void launchApplyRopeWriteKVKernel(rt::Tensor& q, rt::Tensor& k, rt::Tenso
     else if (dt == nvinfer1::DataType::kINT8)
     {
         int8_t* kvCachePtr = kvCache.dataPointer<int8_t>();
-        applyRopeWriteKV<half, int8_t><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr, cosSinCachePtr,
-            kvCacheEndLensPtr, tokenPosIdsPtr, kScale, vScale, runtimeSeqLen, totalNumTokens, numPages, numQHeads,
-            numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, writeKInPlace, pageTable,
-            maxPagesPerSeq);
+        VInt4Mode const vInt4Mode = vInt4ModeFromEnvironment();
+        checkVInt4EmulationShape(vInt4Mode, headDim, bDimX);
+        dispatchVInt4Mode(vInt4Mode,
+            [&](auto modeTag)
+            {
+                applyRopeWriteKV<half, int8_t, decltype(modeTag)::value><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr,
+                    kvCachePtr, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr, kScale, vScale, runtimeSeqLen,
+                    totalNumTokens, numPages, numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize,
+                    cosSinCacheSeqLen, writeKInPlace, pageTable, maxPagesPerSeq);
+            });
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
@@ -619,7 +731,7 @@ void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tenso
 // Optimized kernel for CuTe DSL FMHA path: RoPE Q in-place + write K/V to cache
 // =============================================================================
 
-template <typename T, typename TCache>
+template <typename T, typename TCache, int32_t kVInt4Mode = 0>
 __global__ void applyRopeWriteKVSplitQKVKernel(T* __restrict__ q, T const* __restrict__ k, T const* __restrict__ v,
     TCache* __restrict__ kvCache, void* __restrict__ fp8QOut, float const* __restrict__ cosSinCache,
     int32_t const* __restrict__ kvCacheEndLens, float qScaleQuantOrig, float kScaleQuantOrig, float vScaleQuantOrig,
@@ -709,7 +821,7 @@ __global__ void applyRopeWriteKVSplitQKVKernel(T* __restrict__ q, T const* __res
         {
             int64_t const vOffset = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
                 + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
-            storeVec(kvCache, vOffset, vSrc, vScaleQuantOrig);
+            storeVecV<TCache, kVInt4Mode>(kvCache, vOffset, vSrc, vScaleQuantOrig);
         }
     }
 }
@@ -771,10 +883,16 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
         // INT8 KV keeps Q in FP16: the FP8-Q buffer belongs to the FP8 FMHA route only.
         check::check(fp8QOut == nullptr, "INT8 KV cache does not support an FP8 Q output.");
         int8_t* kvCachePtr = kvCache.dataPointer<int8_t>();
-        applyRopeWriteKVSplitQKVKernel<half, int8_t><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr,
-            fp8QOut, cosSinCachePtr, kvCacheEndLensPtr, qScale, kScale, vScale, runtimeSeqLen, totalNumTokens, numPages,
-            numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, pageTable,
-            maxPagesPerSeq);
+        VInt4Mode const vInt4Mode = vInt4ModeFromEnvironment();
+        checkVInt4EmulationShape(vInt4Mode, headDim, bDimX);
+        dispatchVInt4Mode(vInt4Mode,
+            [&](auto modeTag)
+            {
+                applyRopeWriteKVSplitQKVKernel<half, int8_t, decltype(modeTag)::value><<<grid, block, 0, stream>>>(qPtr,
+                    kPtr, vPtr, kvCachePtr, fp8QOut, cosSinCachePtr, kvCacheEndLensPtr, qScale, kScale, vScale,
+                    runtimeSeqLen, totalNumTokens, numPages, numQHeads, numKVHeads, headDim, rotaryDim,
+                    cosSinCacheBatchSize, cosSinCacheSeqLen, pageTable, maxPagesPerSeq);
+            });
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
@@ -800,7 +918,7 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
 // Tree decoding via optional tokenPosIds (-1 = padding token).
 // =============================================================================
 
-template <typename T, typename TCache, bool kEnablePdl>
+template <typename T, typename TCache, bool kEnablePdl, int32_t kVInt4Mode = 0>
 __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV, T* __restrict__ qScratch,
     T* __restrict__ kScratch, T* __restrict__ vScratch, TCache* __restrict__ kvCache, void* __restrict__ fp8QOut,
     float const* __restrict__ cosSinCache, int32_t const* __restrict__ kvCacheEndLens,
@@ -1021,7 +1139,7 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
                     int64_t const vOffset
                         = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * poolHeadDim
                         + static_cast<int64_t>(kvHeadIdx) * poolHeadDim + vecBase;
-                    storeVec(kvCache, vOffset, vSrc, vScaleQuantOrig);
+                    storeVecV<TCache, kVInt4Mode>(kvCache, vOffset, vSrc, vScaleQuantOrig);
                 }
             }
         }
@@ -1124,9 +1242,11 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     dim3 grid(gDimX, gDimY);
     dim3 block(bDimX, bDimY);
 
-    auto const launchKernel = [&](auto* kvCachePtr, void* fp8QOutput, float qScaleOrig, auto pdlTag) {
+    auto const launchKernel = [&](auto* kvCachePtr, void* fp8QOutput, float qScaleOrig, auto pdlTag,
+                                  auto vModeTag) {
         using TCache = std::remove_pointer_t<decltype(kvCachePtr)>;
         constexpr bool kEnablePdl = decltype(pdlTag)::value;
+        constexpr int32_t kVMode = decltype(vModeTag)::value;
 #if SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
         cudaLaunchAttribute pdlAttribute{};
         cudaLaunchConfig_t launchConfig{};
@@ -1143,7 +1263,7 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
             pdlAttribute.val.programmaticStreamSerializationAllowed = 1;
         }
 
-        CUDA_CHECK(cudaLaunchKernelEx(&launchConfig, applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl>,
+        CUDA_CHECK(cudaLaunchKernelEx(&launchConfig, applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl, kVMode>,
             packedPtr, qScratchPtr, kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr,
             tokenPosIdsPtr, cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qkNormPostRope, qScaleOrig, kScale,
             vScale, static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens),
@@ -1152,7 +1272,7 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
             static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
             maxPagesPerSeq, writeKVCache, tokenAlignedRope));
 #else
-        applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr,
+        applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl, kVMode><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr,
             kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
             cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qkNormPostRope, qScaleOrig, kScale, vScale,
             static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
@@ -1168,11 +1288,11 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
         half* kvCachePtr = kvCache.dataPointer<half>();
         if (enablePdl)
         {
-            launchKernel(kvCachePtr, nullptr /* fp8QOut */, 1.0f /* qScaleQuantOrig */, std::true_type{});
+            launchKernel(kvCachePtr, nullptr /* fp8QOut */, 1.0f /* qScaleQuantOrig */, std::true_type{}, std::integral_constant<int32_t, 0>{});
         }
         else
         {
-            launchKernel(kvCachePtr, nullptr /* fp8QOut */, 1.0f /* qScaleQuantOrig */, std::false_type{});
+            launchKernel(kvCachePtr, nullptr /* fp8QOut */, 1.0f /* qScaleQuantOrig */, std::false_type{}, std::integral_constant<int32_t, 0>{});
         }
     }
     else if (dt == nvinfer1::DataType::kINT8)
@@ -1180,14 +1300,20 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
         // INT8 KV keeps Q in FP16: the FP8-Q buffer belongs to the FP8 FMHA route only.
         check::check(fp8QOut == nullptr, "INT8 KV cache does not support an FP8 Q output.");
         int8_t* kvCachePtr = kvCache.dataPointer<int8_t>();
-        if (enablePdl)
-        {
-            launchKernel(kvCachePtr, fp8QOut, qScale, std::true_type{});
-        }
-        else
-        {
-            launchKernel(kvCachePtr, fp8QOut, qScale, std::false_type{});
-        }
+        VInt4Mode const vInt4Mode = vInt4ModeFromEnvironment();
+        checkVInt4EmulationShape(vInt4Mode, headDim, bDimX);
+        dispatchVInt4Mode(vInt4Mode,
+            [&](auto modeTag)
+            {
+                if (enablePdl)
+                {
+                    launchKernel(kvCachePtr, fp8QOut, qScale, std::true_type{}, modeTag);
+                }
+                else
+                {
+                    launchKernel(kvCachePtr, fp8QOut, qScale, std::false_type{}, modeTag);
+                }
+            });
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
@@ -1195,11 +1321,11 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
         __nv_fp8_e4m3* kvCachePtr = kvCache.dataPointer<__nv_fp8_e4m3>();
         if (enablePdl)
         {
-            launchKernel(kvCachePtr, fp8QOut, qScale, std::true_type{});
+            launchKernel(kvCachePtr, fp8QOut, qScale, std::true_type{}, std::integral_constant<int32_t, 0>{});
         }
         else
         {
-            launchKernel(kvCachePtr, fp8QOut, qScale, std::false_type{});
+            launchKernel(kvCachePtr, fp8QOut, qScale, std::false_type{}, std::integral_constant<int32_t, 0>{});
         }
     }
 #endif
