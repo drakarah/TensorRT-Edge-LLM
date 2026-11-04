@@ -36,6 +36,20 @@ namespace kernel
 //! tables cover every slot by construction, and reuse-mode table builders enforce coverage on the
 //! host at build time.
 
+//! While alive, the KV writers launched from this thread store V as packed 4-bit rows (see kvInt4Quant.h). Otherwise they
+//! follow EDGELLM_KV_V_INT4_EMULATION. The guard is per thread, so engines with different V formats can share a process.
+class ScopedVInt4WriteMode
+{
+public:
+    explicit ScopedVInt4WriteMode(bool packed);
+    ~ScopedVInt4WriteMode();
+    ScopedVInt4WriteMode(ScopedVInt4WriteMode const&) = delete;
+    ScopedVInt4WriteMode& operator=(ScopedVInt4WriteMode const&) = delete;
+
+private:
+    int32_t mPrevious;
+};
+
 //! @brief Launch kernel to apply RoPE positional encoding to Q/K and write K/V to KVCache.
 //! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
 //! @param[in] kvCacheEndLens Optional INT32 type tensor with layout of [batchSize], the end position of KVCache after

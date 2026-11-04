@@ -146,7 +146,7 @@ private:
         int32_t const* kvSeqLens, int32_t maxPagesPerSeq, std::byte*& workspacePtr, int32_t batchSize,
         int32_t numKVHeads, int32_t capPadded, int32_t headSize, int32_t seqLen, float kScale, float vScale,
         cudaStream_t stream, int32_t consumerTailTokens = -1,
-        int32_t consumerKeepTrailingTokens = -1, bool rawInt8K = false);
+        int32_t consumerKeepTrailingTokens = -1, bool rawInt8K = false, bool packedV = false);
 
     //! enqueue() body. enqueue() wraps it in a try/catch so a thrown error
     //! fails the call instead of terminating the process (enqueue is noexcept).
@@ -217,6 +217,18 @@ protected:
     bool quantizedKVCache() const noexcept
     {
         return mEnableFp8KVCache != 0 || mEnableInt8KVCache != 0;
+    }
+
+    //! INT8 K with V rows packed to 4 bits (enable_int8_kv_cache == 2); the pool dtype is INT8.
+    bool packedV4KVCache() const noexcept
+    {
+        return mEnableInt8KVCache == 2;
+    }
+
+    //! KV dtype as the XQA kernels see it: kINT4 stands for INT8 K with packed 4-bit V rows.
+    nvinfer1::DataType xqaKVDataType() const noexcept
+    {
+        return packedV4KVCache() ? nvinfer1::DataType::kINT4 : kvCacheDataType();
     }
 
     //! Storage dtype of the paged KV pool.

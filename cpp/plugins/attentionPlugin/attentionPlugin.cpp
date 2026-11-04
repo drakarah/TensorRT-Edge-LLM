@@ -546,7 +546,7 @@ REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::splitPagedKV(rt::Tensor const& poolTensor, int32_t const* pageTable,
     int32_t const* kvSeqLens, int32_t maxPagesPerSeq, std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads,
     int32_t capPadded, int32_t headSize, int32_t seqLen, float kScale, float vScale, cudaStream_t stream,
-    int32_t consumerTailTokens, int32_t consumerKeepTrailingTokens, bool rawInt8K)
+    int32_t consumerTailTokens, int32_t consumerKeepTrailingTokens, bool rawInt8K, bool packedV)
 {
     // The pool binding is [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
     check::check(isPagedPoolShape(poolTensor.getShape(), numKVHeads, headSize),
@@ -558,9 +558,10 @@ std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::splitPagedKV(rt::Tensor const
     check::check(dtype == DataType::kHALF || dtype == DataType::kFP8 || dtype == DataType::kINT8,
         "splitPagedKV: separate K/V consumers require an FP16, FP8 or INT8 KV pool; other dtypes would be "
         "reinterpreted as FP16 by the split-KV consumers.");
+    check::check(!packedV || dtype == DataType::kINT8, "splitPagedKV: packed 4-bit V rows need an INT8 pool.");
     kernel::KVPoolQuant const poolQuant = dtype == DataType::kFP8 ? kernel::KVPoolQuant::kFP8
-        : dtype == DataType::kINT8                              ? kernel::KVPoolQuant::kINT8
-                                                                : kernel::KVPoolQuant::kNONE;
+        : dtype == DataType::kINT8 ? (packedV ? kernel::KVPoolQuant::kINT8PackedV : kernel::KVPoolQuant::kINT8)
+                                   : kernel::KVPoolQuant::kNONE;
     size_t const elemSize = rt::utils::getTypeSize(dtype);
 
     // seqLen == 0 gathers full capacity; seqLen > 0 gathers only the first seqLen tokens (compact),
@@ -652,6 +653,12 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
 
     mSMVersion = getSMVersion();
     ELLM_CHECK(!mEnableInt8KVCache || mSMVersion >= 80, "INT8 KV cache requires SM80 or newer.");
+    ELLM_CHECK(mEnableInt8KVCache >= 0 && mEnableInt8KVCache <= 2, "enable_int8_kv_cache must be 0, 1 or 2.");
+    ELLM_CHECK(!packedV4KVCache()
+            || (mHeadSize == 256 && mSlidingWindowSize <= 0 && !mEnableTreeAttention && !mEnableVisionBlockAttention
+                && !mSupportsBoundedKVCache),
+        "Packed 4-bit V (enable_int8_kv_cache = 2) is implemented for head_dim 256 full attention without tree "
+        "attention, vision blocks or a bounded KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || isFp8KVCacheSupportedSM(mSMVersion),
         "FP8 KV cache is supported only on SM89, SM90, SM100, SM101, SM110, SM120, and SM121; got SM"
             + std::to_string(mSMVersion) + ".");
@@ -799,6 +806,12 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
 
     mSMVersion = getSMVersion();
     ELLM_CHECK(!mEnableInt8KVCache || mSMVersion >= 80, "INT8 KV cache requires SM80 or newer.");
+    ELLM_CHECK(mEnableInt8KVCache >= 0 && mEnableInt8KVCache <= 2, "enable_int8_kv_cache must be 0, 1 or 2.");
+    ELLM_CHECK(!packedV4KVCache()
+            || (mHeadSize == 256 && mSlidingWindowSize <= 0 && !mEnableTreeAttention && !mEnableVisionBlockAttention
+                && !mSupportsBoundedKVCache),
+        "Packed 4-bit V (enable_int8_kv_cache = 2) is implemented for head_dim 256 full attention without tree "
+        "attention, vision blocks or a bounded KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || isFp8KVCacheSupportedSM(mSMVersion),
         "FP8 KV cache is supported only on SM89, SM90, SM100, SM101, SM110, SM120, and SM121; got SM"
             + std::to_string(mSMVersion) + ".");
@@ -845,7 +858,7 @@ XQAJitKey AttentionPlugin::getXQAJitKey() const noexcept
     XQAJitKey key{};
     key.sm = mSMVersion;
     key.dataType = mDataType;
-    key.kvDataType = kvCacheDataType();
+    key.kvDataType = xqaKVDataType();
     key.headSize = mHeadSize;
     key.qHeadsPerKv = mNumKVHeads > 0 ? mNumQHeads / mNumKVHeads : 0;
     key.tokensPerPage = rt::kTOKENS_PER_PAGE;
@@ -858,7 +871,7 @@ XQAJitKey AttentionPlugin::getXQAJitKey() const noexcept
 bool AttentionPlugin::canCompileXQAJitKernel() const noexcept
 {
     return canCompileXQAKernel(
-        mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, kvCacheDataType());
+        mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, xqaKVDataType());
 }
 
 void AttentionPlugin::compileXQAJitKernelForBuild()
@@ -1380,6 +1393,7 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
     // enqueue instead.
     try
     {
+        kernel::ScopedVInt4WriteMode const vWriteMode(packedV4KVCache());
         return enqueueImpl(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
     catch (std::exception const& e)
@@ -2069,7 +2083,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
                         runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,
-                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen), int8K);
+                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen), int8K, packedV4KVCache());
                     CuteDslFMHAV2Runner runner(mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen,
                         physicalLenForFallback(), splitSeqLen > 0);
                     bool const ranKernel = int8K
@@ -2110,7 +2124,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
                         runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,
-                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen));
+                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen), false, packedV4KVCache());
                     int32_t const kvExtent = physicalLenForFallback();
                     CuteDslFMHAV2Runner runner(
                         mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvExtent);
@@ -2311,7 +2325,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
                         runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,
-                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen), int8K);
+                        consumerTailForFallback(splitSeqLen), consumerWindowForFallback(splitSeqLen), int8K, packedV4KVCache());
                     CuteDslFMHAV2Runner runner(mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen,
                         physicalLenForFallback(), splitSeqLen > 0);
                     bool const ranKernel = int8K
@@ -2428,14 +2442,15 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         // the cache state it would see without vision.
 
         // XQA decode kernel dispatch.
-        auto xqaRunner = DecoderXQARunner(mDataType, kvCacheDataType(), runtimeBatchSize,
+        auto xqaRunner = DecoderXQARunner(mDataType, xqaKVDataType(), runtimeBatchSize,
             mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion);
         XQALaunchParams params = xqaRunner.initXQAParams();
         params.attentionScale = mAttentionScale;
         if (quantizedKVCache())
         {
             params.kScale = kScale;
-            params.vScale = vScale;
+            // Packed V rows carry their own scales, so the kernel must not rescale the output.
+            params.vScale = packedV4KVCache() ? 1.0F : vScale;
         }
         params.output = attentionOutputTensor.dataPointer<half>();
         params.qInputPtr = qInputTensor.dataPointer<half>();

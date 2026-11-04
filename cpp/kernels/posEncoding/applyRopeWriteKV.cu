@@ -537,8 +537,31 @@ __device__ __forceinline__ void storeVecV(TCache* dst, int64_t base, DVec<half> 
     }
 }
 
+namespace
+{
+thread_local int32_t sForcedVInt4Mode = -1;
+} // namespace
+
+ScopedVInt4WriteMode::ScopedVInt4WriteMode(bool packed)
+    : mPrevious(sForcedVInt4Mode)
+{
+    if (packed)
+    {
+        sForcedVInt4Mode = static_cast<int32_t>(VInt4Mode::kPackedGroup32Asym);
+    }
+}
+
+ScopedVInt4WriteMode::~ScopedVInt4WriteMode()
+{
+    sForcedVInt4Mode = mPrevious;
+}
+
 static VInt4Mode vInt4ModeFromEnvironment()
 {
+    if (sForcedVInt4Mode >= 0)
+    {
+        return static_cast<VInt4Mode>(sForcedVInt4Mode);
+    }
     char const* const env = std::getenv("EDGELLM_KV_V_INT4_EMULATION");
     if (env == nullptr || *env == '\0' || std::strcmp(env, "off") == 0)
     {
