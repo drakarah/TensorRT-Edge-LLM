@@ -46,6 +46,7 @@ _FMHA_V2_DENSE_VARIANTS = {
     "fmha_v2_d128_sw",
     "fmha_v2_d256_sw",
     "fmha_v2_d512",
+    "fmha_v2_d512_i8",
     "fmha_v2_d512_sw",
 }
 _FMHA_V2_PAGED_VARIANTS = {
@@ -507,6 +508,7 @@ def test_fmha_v2_d512_registry_uses_32x32_tiles_and_two_warps():
     assert {variant.name
             for variant in d512_variants} == {
                 "fmha_v2_d512",
+                "fmha_v2_d512_i8",
                 "fmha_v2_d512_sw",
                 "fmha_v2_d512_bidirectional",
                 "fmha_v2_d512_paged",
