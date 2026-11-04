@@ -133,6 +133,29 @@ def test_runtime_memory_converts_bytes_to_mib_and_keeps_counts():
     assert not any(name.endswith("_bytes") for name in out)
 
 
+def test_runtime_memory_reports_the_host_reservations_in_mib():
+    out = memory_stats.runtime_memory(
+        _llm(
+            _metrics(host_expert_weights_bytes=16 * _MIB,
+                     host_embedding_bytes=2 * _MIB,
+                     host_snapshot_bytes=3 * _MIB,
+                     host_kv_tier_bytes=4 * _MIB,
+                     host_kv_tier_used_bytes=_MIB)))
+    assert out["host_expert_weights_mib"] == 16.0
+    assert out["host_embedding_mib"] == 2.0
+    assert out["host_snapshot_mib"] == 3.0
+    assert out["host_kv_tier_mib"] == 4.0
+    assert out["host_kv_tier_used_mib"] == 1.0
+    assert not any(name.endswith("_bytes") for name in out)
+
+
+def test_runtime_memory_without_host_fields_keeps_the_rest():
+    # A binding older than the server has no host_* fields: the coarse host bar is drawn instead.
+    out = memory_stats.runtime_memory(_llm(_metrics()))
+    assert "host_expert_weights_mib" not in out
+    assert out["kv_mapped_mib"] == 2.0
+
+
 @pytest.mark.parametrize("llm", [
     types.SimpleNamespace(),
     types.SimpleNamespace(_runtime=None),
@@ -188,5 +211,7 @@ def test_api_stats_carries_memory_with_or_without_request_stats(
 def test_stats_page_draws_the_memory_bars(tmp_path, monkeypatch):
     page = _client(tmp_path, monkeypatch, enabled=True).get("/stats").text
     for needle in ("renderMemory", 'id="gpu"', 'id="kv"', 'id="experts"',
-                   'id="host"', 'id="snaps"'):
+                   'id="host"', 'id="snaps"', "Expert weights",
+                   "Embedding table", "Reuse snapshots",
+                   "Host KV tier, holding sessions", "--s5", "--s6"):
         assert needle in page
