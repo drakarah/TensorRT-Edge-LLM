@@ -113,6 +113,7 @@ class ContextCacheConfig:
     snapshots_in_host_memory: bool = False
     host_kv_pool_bytes: int = 0
     host_kv_min_tokens: int = 4096
+    superseded_records_kept: int = -1
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -135,6 +136,13 @@ class ContextCacheConfig:
         if self.max_records > _INT32_MAX:
             raise ServerConfigError(
                 "context_cache.max_records must fit a signed 32-bit integer")
+        if (isinstance(self.superseded_records_kept, bool)
+                or not isinstance(self.superseded_records_kept, int)
+                or self.superseded_records_kept < -1
+                or self.superseded_records_kept > _INT32_MAX):
+            raise ServerConfigError(
+                "context_cache.superseded_records_kept must be -1 (keep all) or a "
+                "non-negative 32-bit integer")
         if self.host_kv_min_tokens > _INT32_MAX:
             raise ServerConfigError(
                 "context_cache.host_kv_min_tokens must fit a signed 32-bit integer"
@@ -148,7 +156,8 @@ class ContextCacheConfig:
             (self.max_records != 1024 or self.recurrent_snapshot_pool_bytes
              or self.partial_kv_snapshot_pool_bytes
              or self.snapshots_in_host_memory or self.host_kv_pool_bytes
-             or self.host_kv_min_tokens != 4096)):
+             or self.host_kv_min_tokens != 4096
+             or self.superseded_records_kept != -1)):
             raise ServerConfigError(
                 "context-cache tuning requires context reuse to be enabled")
 
@@ -174,6 +183,7 @@ class ContextCacheConfig:
             "snapshots_in_host_memory",
             "host_kv_pool_bytes",
             "host_kv_min_tokens",
+            "superseded_records_kept",
         }
         unsupported = sorted(set(raw) - supported)
         if unsupported:
@@ -405,6 +415,14 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "in the host KV tier.",
     )
     model.add_argument(
+        "--context-cache-keep-superseded-records",
+        type=int,
+        default=-1,
+        help="When a session publishes a new checkpoint, keep this many of "
+        "its older checkpoints (the longest ones) and drop the rest, which "
+        "frees their snapshot slots. -1 (the default) keeps all of them.",
+    )
+    model.add_argument(
         "--context-cache-snapshots-in-host-memory",
         action="store_true",
         help="Keep the recurrent and partial-KV checkpoints of a hybrid "
@@ -438,6 +456,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         snapshots_in_host_memory=args.context_cache_snapshots_in_host_memory,
         host_kv_pool_bytes=args.context_cache_host_kv_bytes,
         host_kv_min_tokens=args.context_cache_host_kv_min_tokens,
+        superseded_records_kept=args.context_cache_keep_superseded_records,
     )
     model = ModelConfig(
         model=args.model,

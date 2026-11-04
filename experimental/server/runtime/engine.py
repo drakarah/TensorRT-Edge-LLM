@@ -852,6 +852,7 @@ def _native_context_cache_config(rt, config: ContextCacheConfig):
     native.snapshots_in_host_memory = config.snapshots_in_host_memory
     native.host_kv_pool_bytes = config.host_kv_pool_bytes
     native.host_kv_min_tokens = config.host_kv_min_tokens
+    native.superseded_records_kept = config.superseded_records_kept
     return native
 
 

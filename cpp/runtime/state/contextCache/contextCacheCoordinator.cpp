@@ -1022,6 +1022,7 @@ ContextCacheCoordinator::ContextCacheCoordinator(ContextCacheConfig const& confi
     {
         enableHostKvTier(config);
     }
+    mManager.setSupersededRecordsKept(config.supersededRecordsKept);
     mHostReuseLengths = std::make_unique<Tensor>(Coords{deployment.base.maxSupportedBatchSize}, DeviceType::kCPU,
         nvinfer1::DataType::kINT32, "ContextCacheCoordinator::hostReuseLengths");
 }
@@ -2381,6 +2382,7 @@ ContextCacheMetrics ContextCacheCoordinator::metrics() const noexcept
     result.promotedRecords = managerMetrics.promotedRecords;
     result.hostEvictedRecords = managerMetrics.hostEvictedRecords;
     result.restoredPages = managerMetrics.restoredPages;
+    result.supersededRecords = managerMetrics.supersededRecords;
     if (HostKvIndex const* host = mManager.hostIndex(); host != nullptr)
     {
         result.hostKvSlots = ContextCachePoolMetrics{host->freeSlots(), host->slotCount()};

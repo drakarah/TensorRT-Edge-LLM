@@ -685,6 +685,7 @@ PublishResult ContextCacheManager::commitPreparedPublication(PreparedPublication
     if (mRecords.contains(inserted.id))
     {
         retainedRecord = inserted.id;
+        dropSupersededRecords(inserted.id);
     }
     return PublishResult{PublishStatus::kPublished, retainedRecord, std::move(publication.canonicalBasePages),
         publication.publishedBaseFullBlockCount};
@@ -1322,6 +1323,45 @@ void ContextCacheManager::applyEviction(EvictionPlan const& plan, ResourceDemand
     for (RecordId const id : plan.victims)
     {
         evictRecord(id, allowDemote);
+    }
+}
+
+void ContextCacheManager::setSupersededRecordsKept(int32_t keep)
+{
+    mSupersededKept = keep;
+}
+
+void ContextCacheManager::dropSupersededRecords(RecordId published)
+{
+    if (mSupersededKept < 0)
+    {
+        return;
+    }
+    CacheRecord const& fresh = mRecords.get(published);
+    if (!fresh.recurrentSnapshotSlot.has_value() || fresh.specState.has_value()
+        || !fresh.exactCheckpointLength.has_value())
+    {
+        return;
+    }
+    std::vector<std::pair<int32_t, RecordId>> older;
+    for (RecordId const id : mRecords.lruToMru())
+    {
+        CacheRecord const& record = mRecords.get(id);
+        if (id == published || !record.recurrentSnapshotSlot.has_value() || record.specState.has_value()
+            || !record.exactCheckpointLength.has_value() || *record.exactCheckpointLength >= *fresh.exactCheckpointLength
+            || record.logicalBlockHashes.size() > fresh.logicalBlockHashes.size()
+            || !std::equal(record.logicalBlockHashes.begin(), record.logicalBlockHashes.end(),
+                fresh.logicalBlockHashes.begin()))
+        {
+            continue;
+        }
+        older.emplace_back(*record.exactCheckpointLength, id);
+    }
+    std::sort(older.begin(), older.end(), [](auto const& a, auto const& b) { return a.first > b.first; });
+    for (size_t i = static_cast<size_t>(mSupersededKept); i < older.size(); ++i)
+    {
+        dropRecord(older[i].second);
+        ++mMetrics.supersededRecords;
     }
 }
 

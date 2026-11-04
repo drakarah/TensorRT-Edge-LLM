@@ -158,6 +158,8 @@ struct ContextCacheManagerMetrics
     //! Demoted records whose pages were copied back because a request matched them, and the pages that needed a copy.
     uint64_t promotedRecords{};
     uint64_t restoredPages{};
+    //! Records dropped because a newer record of the same block chain made them redundant.
+    uint64_t supersededRecords{};
 };
 
 //! Host orchestrator for the complete context-cache lifecycle under an externally serialized single-writer contract.
@@ -242,6 +244,10 @@ public:
     std::vector<HostKvTransfer> takeHostTransfers();
     HostKvIndex const* hostIndex() const noexcept;
 
+    //! Keep only the @p keep longest older hybrid records whose blocks are a prefix of a newly published record; drop the
+    //! rest, which frees their snapshot slots. Negative (the default) keeps every record. Applies to later publications.
+    void setSupersededRecordsKept(int32_t keep);
+
     ResourcePools const& pools() const noexcept;
     BaseBlockIndex const& baseIndex() const noexcept;
     SpecStateIndex const& specIndex() const noexcept;
@@ -264,6 +270,7 @@ private:
     void releaseBasePages(std::vector<PageId> const& pages);
     void releaseHostUser(CacheRecordKey const& hostKey, RecordId id);
     void applyEviction(EvictionPlan const& plan, ResourceDemand const& demand);
+    void dropSupersededRecords(RecordId published);
     void releaseLeaseResource(CacheRequestLease& lease, ResourceId resource);
 
     int32_t mPageSize{};
@@ -280,6 +287,7 @@ private:
     //! Demoted records per host entry; records with the same block chain and different tails share one entry.
     std::unordered_map<CacheRecordKey, std::vector<RecordId>> mHostUsers;
     std::vector<HostKvTransfer> mPendingTransfers;
+    int32_t mSupersededKept{-1};
 };
 
 } // namespace rt

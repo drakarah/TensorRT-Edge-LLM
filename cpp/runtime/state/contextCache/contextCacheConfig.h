@@ -63,6 +63,9 @@ struct ContextCacheConfig
     int64_t hostKvPoolBytes{};
     //! Records shorter than this are dropped instead of demoted (recomputing them is cheaper than the bookkeeping).
     int32_t hostKvMinTokens{4096};
+    //! Negative keeps every record. Otherwise a newly published hybrid record keeps at most this many older records whose
+    //! blocks are a prefix of its own (the longest ones) and drops the rest, which frees their snapshot slots.
+    int32_t supersededRecordsKept{-1};
     //! Device-memory budget for encoder embedding cache (ViT/audio). Zero disables.
     int64_t encoderEmbeddingCacheBudgetBytes{256LL * 1024 * 1024};
 };

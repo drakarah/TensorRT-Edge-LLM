@@ -74,6 +74,7 @@ struct ContextCacheMetrics
     uint64_t promotedRecords{};
     uint64_t hostEvictedRecords{};
     uint64_t restoredPages{};
+    uint64_t supersededRecords{};
     //! Host slots in use out of the pool (capacity 0 when the tier is off).
     ContextCachePoolMetrics hostKvSlots;
 };

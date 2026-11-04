@@ -774,6 +774,7 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("promoted_records", &ContextCacheMetrics::promotedRecords)
         .def_readonly("host_evicted_records", &ContextCacheMetrics::hostEvictedRecords)
         .def_readonly("restored_pages", &ContextCacheMetrics::restoredPages)
+        .def_readonly("superseded_records", &ContextCacheMetrics::supersededRecords)
         .def_readonly("host_kv_slots", &ContextCacheMetrics::hostKvSlots);
 
     py::class_<RuntimeMemoryMetrics>(m, "RuntimeMemoryMetrics")
@@ -811,7 +812,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("partial_kv_snapshot_pool_bytes", &ContextCacheConfig::partialKvSnapshotPoolBytes)
         .def_readwrite("snapshots_in_host_memory", &ContextCacheConfig::snapshotsInHostMemory)
         .def_readwrite("host_kv_pool_bytes", &ContextCacheConfig::hostKvPoolBytes)
-        .def_readwrite("host_kv_min_tokens", &ContextCacheConfig::hostKvMinTokens);
+        .def_readwrite("host_kv_min_tokens", &ContextCacheConfig::hostKvMinTokens)
+        .def_readwrite("superseded_records_kept", &ContextCacheConfig::supersededRecordsKept);
 
     // ========================================================================
     // Image utilities
