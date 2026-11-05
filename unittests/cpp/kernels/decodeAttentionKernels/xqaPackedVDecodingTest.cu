@@ -610,6 +610,23 @@ TEST(XQAPackedVSpecDecodeTest, VariablePerSequenceVerifyRows)
     }
 }
 
+TEST(XQAPackedVSpecDecodeTest, KvHeadCounts)
+{
+    for (int32_t kvHeads : {1, 2, 4})
+    {
+        for (int32_t ratio : {4, 8})
+        {
+            SCOPED_TRACE("kvHeads=" + std::to_string(kvHeads) + " ratio=" + std::to_string(ratio));
+            PackedCase tc = specCase({300, 129}, 5, 1, 800 + kvHeads);
+            tc.numKVHeads = kvHeads;
+            tc.numQHeads = kvHeads * ratio;
+            tc.useQSeqLens = true;
+            tc.multiBlockSplits = kXQA_MULTI_BLOCK_AUTO;
+            runPackedDecode(tc);
+        }
+    }
+}
+
 TEST(XQAPackedVSpecDecodeTest, ExtremeValueRangesPerPattern)
 {
     for (int32_t pattern = 0; pattern < kNUM_PATTERNS; ++pattern)

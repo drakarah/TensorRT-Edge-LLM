@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include "runtime/decoding/decoderUtils.h"
 #include "runtime/state/sharedResources.h"
 
 #include "common/checkMacros.h"
@@ -264,12 +263,10 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
     // writes per-token recurrent/conv snapshots; after accept, the decoder
     // scatters only the accepted prefix into the persistent state pools.
     {
-        ELLM_CHECK(!bundle.base.kvCacheVPacked
-                || decoder_utils::packedVSpecDecodeSupported(
-                    bundle.specDecodeMode(), bundle.specConfig->draftingTopK, bundle.specConfig->maxVerifySize),
+        ELLM_CHECK(packedVSpeculationSupported(bundle),
             "Packed V rows support speculative decoding only in MTP chain mode (draftingTopK = 1) with at most "
-            + std::to_string(decoder_utils::kPackedVMaxVerifyRows)
-                + " verify rows: the tree commit copies KV rows at the unpacked stride.");
+            + std::to_string(kPackedVMaxSpecRows)
+                + " verify rows and an unpacked draft pool: the tree commit copies KV rows at the unpacked stride.");
         int32_t const baseMaxIntermediateSeqLen = baseVerifyIntermediateSeqLen(bundle);
         rt::KVCacheManager::Config kvCfg{
             /*.numAttentionLayers=*/static_cast<int32_t>(bundle.base.kvLayerConfigs.size()),

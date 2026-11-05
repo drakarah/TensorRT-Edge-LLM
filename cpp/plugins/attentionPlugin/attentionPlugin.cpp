@@ -18,6 +18,7 @@
 #include "attentionPlugin.h"
 
 #include "common/checkMacros.h"
+#include "common/kvFormatLimits.h"
 #include "common/cudaUtils.h"
 #include "common/executionPhase.h"
 #include "common/logger.h"
@@ -2494,6 +2495,12 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             params.qSeqLen = runtimeSeqLen;
             params.qSeqLens = static_cast<int32_t const*>(inputs[kIN_QUERY_LENGTH_IDX]);
             params.contiguousQuerySwa = mEnableContiguousQuerySwa && params.slidingWinSize > 0;
+            if (packedV4KVCache() && runtimeSeqLen > kPackedVMaxSpecRows)
+            {
+                LOG_ERROR("AttentionPlugin: packed-V tree decoding is tested for at most %d query rows per sequence, got %d.",
+                    kPackedVMaxSpecRows, static_cast<int32_t>(runtimeSeqLen));
+                return -1;
+            }
             xqaRunner.dispatchSpecDecodeXQAKernel(params, stream);
         }
         else
