@@ -692,8 +692,11 @@ private:
     //! Base prefill in passes of at most the engine's max input length. Each pass appends to the KV cache written
     //! by the previous ones (as a context-reuse suffix prefill does); only the last pass samples, so the result
     //! equals one prefill over the whole suffix. Restores tokenIds/effectivePrefillLengths to the whole suffix.
+    //! MTP (chain) runs its draft prefill after every pass, on that pass's hidden states, because the draft layer's KV
+    //! cache needs the base hidden state of every prompt position (context.draftPrefillPerPass).
     //! @throws std::runtime_error if a CUDA error occurs
-    bool runChunkedBaseModelPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest);
+    bool runChunkedBaseModelPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest,
+        DecodingStrategy& strategy);
     //! Single pass when the suffix fits maxSupportedInputLength, otherwise passes of at most that length (hybrid bases).
     bool runBoundedBaseModelPrefill(
         DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest, bool sampleOutput);

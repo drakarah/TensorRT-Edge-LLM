@@ -243,6 +243,10 @@ struct DecodingInferenceContext
     //! prefill so MTPDecoder::initializeForGeneration runs the draft prefill pre-publication (default MTP keeps its
     //! decode-round-0 draft prefill when this is false).
     bool hybridMtpEndpointReuse{false};
+    //! The draft prefill runs once per base prefill pass (a prompt longer than the engine's max input length, see
+    //! LLMRankRuntime::runChunkedBaseModelPrefill) instead of once after the whole prefill, so
+    //! MTPDecoder::initializeForGeneration runs it for every pass, as it does for hybridMtpEndpointReuse.
+    bool draftPrefillPerPass{false};
     //! Guards the speculative draft prefill so it runs exactly once, whether triggered pre-publication (Hybrid+MTP
     //! endpoint reuse) or in decode round 0 (default speculative path).
     bool speculativeDraftPrefillComplete{false};

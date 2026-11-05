@@ -2542,7 +2542,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     else if (canChunkPrefill(context, decodingStrategy)
         && context.effectivePrefillLengths[0] > mDeployment.base.maxSupportedInputLength)
     {
-        prefillStatus = runChunkedBaseModelPrefill(context, managedRequest);
+        prefillStatus = runChunkedBaseModelPrefill(context, managedRequest, decodingStrategy);
     }
     else
     {
@@ -3272,6 +3272,125 @@ bool LLMRankRuntime::runHybridMtpPrefill(
     // a replayed tail. The shared native chat-template renderer computes the tail before dispatching to ranks.
     bool const hasVolatileTail = replayTailLength > 0 && suffixLenOrig > replayTailLength;
 
+    // A suffix longer than one engine pass (speculative bases are built with a max input length below the context
+    // window): the base prefill runs in passes of at most that length and the draft prefill runs after every pass on that
+    // pass's hidden states, since the shared hidden-state buffer holds only the current pass and the draft layer's KV
+    // cache needs every prompt position. Draft slot k pairs hidden k with token k + 1, so a pass over positions
+    // [b, b + L) uses the tokens [b + 1, b + L], the last of which is the next pass's first token (or the sampled token,
+    // or, for a non-sampling predecessor segment, the first token of the replayed tail). Only the first pass of a cache
+    // hit folds the reused checkpoint's boundary hidden state in (draft slot reuseLength - 1), as the single-pass code
+    // below does. Suffixes that fit one pass keep the code below unchanged.
+    int32_t const maxPassLength = mDeployment.base.maxSupportedInputLength;
+    if (suffixLenOrig > maxPassLength)
+    {
+        ELLM_CHECK(maxPassLength > 2, "Chunked Hybrid+MTP prefill needs a max input length above 2");
+        std::vector<int32_t> const completeSuffix = context.tokenIds[0];
+        int32_t sampledToken = 0;
+        int32_t publishRow = 0; // last hidden row of the last draft pass: what the endpoint checkpoint captures
+
+        auto runSegment = [&](std::vector<int32_t> const& segment, bool sampleOutput, int32_t successorToken,
+                              bool foldBoundary) -> bool {
+            int32_t const segmentLength = static_cast<int32_t>(segment.size());
+            int32_t begin = 0;
+            for (int32_t length = 0; begin < segmentLength; begin += length)
+            {
+                bool const foldPass = foldBoundary && begin == 0;
+                // The fold writes one row beyond its pass into baseHiddenStates.
+                int32_t const passCap = foldPass ? std::min(maxPassLength, mBoundaryFoldMaxRows - 1) : maxPassLength;
+                ELLM_CHECK(passCap > 2, "Hybrid+MTP boundary fold leaves no room for a prefill pass");
+                length = std::min(passCap, segmentLength - begin);
+                if (segmentLength - begin - length == 1)
+                {
+                    --length; // a one-token last pass would be a decode-shaped prefill
+                }
+                bool const lastPass = begin + length == segmentLength;
+                context.tokenIds[0].assign(segment.begin() + begin, segment.begin() + begin + length);
+                context.effectivePrefillLengths[0] = length;
+                if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/sampleOutput && lastPass))
+                {
+                    return false;
+                }
+                int32_t successor = 0;
+                if (!lastPass)
+                {
+                    successor = segment[begin + length];
+                }
+                else if (sampleOutput)
+                {
+                    successor = context.tokenIds[0].back();
+                    sampledToken = successor;
+                }
+                else
+                {
+                    successor = successorToken;
+                }
+                // The draft prefill restages the shared pinned token buffer.
+                CUDA_CHECK(cudaStreamSynchronize(context.stream));
+                std::vector<int32_t> draftTokens(segment.begin() + begin, segment.begin() + begin + length);
+                draftTokens.push_back(successor);
+                int32_t draftLength = length;
+                if (foldPass)
+                {
+                    if (!foldBoundaryHiddenIntoRow0(length))
+                    {
+                        return false;
+                    }
+                    draftTokens.insert(
+                        draftTokens.begin(), context.rawBatchedInputIds[0][static_cast<size_t>(reuseLength - 1)]);
+                    draftLength = length + 1;
+                    context.prefillStartLengths[0] = reuseLength - 1;
+                }
+                context.tokenIds[0] = std::move(draftTokens);
+                context.effectivePrefillLengths[0] = draftLength;
+                if (!runFoldedDraftPrefill())
+                {
+                    return false;
+                }
+                publishRow = draftLength - 1;
+            }
+            return true;
+        };
+
+        LOG_DEBUG("Hybrid+MTP chunked prefill: %d tokens in passes of at most %d (reuse %d)", suffixLenOrig,
+            maxPassLength, reuseLength);
+        if (hasVolatileTail)
+        {
+            int32_t const predecessorLength = inputLength - replayTailLength;
+            int32_t const predecessorChunkLength = suffixLenOrig - replayTailLength;
+            std::vector<int32_t> const predecessor(completeSuffix.begin(), completeSuffix.begin() + predecessorChunkLength);
+            std::vector<int32_t> const tail(completeSuffix.begin() + predecessorChunkLength, completeSuffix.end());
+            if (!runSegment(predecessor, /*sampleOutput=*/false, tail.front(), /*foldBoundary=*/reuseLength > 0))
+            {
+                return false;
+            }
+            if (!managedKVCacheRequest.publishHybridMtpEndpoint(
+                    0, predecessorLength, mPipelineIO->baseHiddenStates, publishRow))
+            {
+                return false;
+            }
+            if (!runSegment(tail, /*sampleOutput=*/true, /*successorToken=*/0, /*foldBoundary=*/false))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            if (!runSegment(completeSuffix, /*sampleOutput=*/true, /*successorToken=*/0, /*foldBoundary=*/reuseLength > 0))
+            {
+                return false;
+            }
+            if (!managedKVCacheRequest.publishHybridMtpEndpoint(
+                    0, inputLength, mPipelineIO->baseHiddenStates, publishRow))
+            {
+                return false;
+            }
+        }
+        context.tokenIds[0] = completeSuffix;
+        context.tokenIds[0].push_back(sampledToken);
+        context.effectivePrefillLengths[0] = suffixLenOrig;
+        return true;
+    }
+
     // Cold sequence with a volatile generation-prompt tail: publish the checkpoint at the STABLE boundary
     // predecessorLength = inputLength - replayTailLength (two-chunk prefill), not at the full inputLength (ref :2534).
     if (reuseLength == 0 && hasVolatileTail)
@@ -3581,7 +3700,7 @@ bool LLMRankRuntime::runBoundedBaseModelPrefill(
 }
 
 bool LLMRankRuntime::runChunkedBaseModelPrefill(
-    DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest)
+    DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest, DecodingStrategy& strategy)
 {
     std::vector<int32_t> const completeSuffix = context.tokenIds[0];
     int32_t const suffixLength = context.effectivePrefillLengths[0];
@@ -3589,6 +3708,16 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
     ELLM_CHECK(maxPassLength > 0 && suffixLength <= static_cast<int32_t>(completeSuffix.size()),
         "Chunked prefill: invalid suffix or max input length");
     LOG_DEBUG("Chunked prefill: %d tokens in passes of at most %d", suffixLength, maxPassLength);
+    // MTP: the draft layer needs the base hidden state of every prompt position, and the shared hidden-state buffer holds
+    // only the current pass, so the draft prefill runs after each pass (positions [begin, begin + length) with the tokens
+    // [begin + 1, begin + length]; the successor of the last position is the next pass's first token, or the sampled one).
+    bool const perPassDraft = strategy.kind() == DecodingStrategyKind::kMTP && strategy.isSpeculative();
+    if (perPassDraft)
+    {
+        ELLM_CHECK(context.committedLengths[0] == 0,
+            "Chunked MTP prefill after a reused prefix needs the hybrid MTP endpoint-reuse path");
+        context.draftPrefillPerPass = true;
+    }
     int32_t lastPassLength = 0;
     int32_t begin = 0;
     for (int32_t length = 0; begin < suffixLength; begin += length)
@@ -3616,6 +3745,21 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
         if (!passOk)
         {
             return false;
+        }
+        if (perPassDraft)
+        {
+            int32_t const successor = lastPass ? context.tokenIds[0].back() : completeSuffix[begin + length];
+            // The draft prefill restages the shared pinned token buffer.
+            CUDA_CHECK(cudaStreamSynchronize(context.stream));
+            std::vector<int32_t> draftTokens(completeSuffix.begin() + begin, completeSuffix.begin() + begin + length);
+            draftTokens.push_back(successor); // the draft prefill skips the first entry: slot k pairs hidden k with token k + 1
+            context.tokenIds[0] = std::move(draftTokens);
+            context.effectivePrefillLengths[0] = length;
+            context.speculativeDraftPrefillComplete = false;
+            if (!strategy.initializeForGeneration(context))
+            {
+                return false;
+            }
         }
         if (!lastPass)
         {

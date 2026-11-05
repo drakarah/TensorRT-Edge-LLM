@@ -231,7 +231,7 @@ bool MTPDecoder::initializeForGeneration(DecodingInferenceContext& context)
     // prefill here (pre-publication), mirroring EagleDecoder::initializeForGeneration. The runtime folds the reused
     // checkpoint boundary into baseHiddenStates and prepends the boundary token before this call, so the standard
     // runDraftModelPrefill body is reused unchanged.
-    if (!context.hybridMtpEndpointReuse || context.speculativeDraftPrefillComplete)
+    if (!(context.hybridMtpEndpointReuse || context.draftPrefillPerPass) || context.speculativeDraftPrefillComplete)
     {
         return true;
     }
