@@ -68,10 +68,9 @@ struct XQAJitKeyHasher
 void validateXQAJitKey(XQAJitKey const& key)
 {
     if (key.kvDataType == nvinfer1::DataType::kINT4
-        && (key.headSize != 256 || key.specDecode || key.slidingWindow || key.contiguousQuerySwa))
+        && (key.headSize != 256 || key.slidingWindow || key.contiguousQuerySwa))
     {
-        throw std::runtime_error(
-            "The packed K8V4 XQA kernel is implemented for head_dim 256 without spec-decode or sliding window.");
+        throw std::runtime_error("The packed K8V4 XQA kernel is implemented for head_dim 256 without sliding window.");
     }
     if (key.contiguousQuerySwa && (!key.specDecode || !key.slidingWindow))
     {

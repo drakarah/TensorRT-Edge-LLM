@@ -185,3 +185,11 @@ TEST(DecoderUtilsTests, SpecPrefillRejectsPhysicalTokenOverflow)
     context.activeBatchSize = std::numeric_limits<int32_t>::max();
     EXPECT_THROW(rt::decoder_utils::buildSpecPrefillRaggedBatch(context, 2), std::runtime_error);
 }
+
+TEST(DecoderUtilsTests, KvCommitCopyIsSkippedOnlyForChainsOnPackedPools)
+{
+    EXPECT_TRUE(rt::decoder_utils::baseKvCommitCopyNeeded(/*treeMode=*/false, /*packedV=*/false));
+    EXPECT_TRUE(rt::decoder_utils::baseKvCommitCopyNeeded(/*treeMode=*/true, /*packedV=*/false));
+    EXPECT_TRUE(rt::decoder_utils::baseKvCommitCopyNeeded(/*treeMode=*/true, /*packedV=*/true));
+    EXPECT_FALSE(rt::decoder_utils::baseKvCommitCopyNeeded(/*treeMode=*/false, /*packedV=*/true));
+}

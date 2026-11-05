@@ -657,10 +657,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     ELLM_CHECK(!mEnableInt8KVCache || mSMVersion >= 80, "INT8 KV cache requires SM80 or newer.");
     ELLM_CHECK(mEnableInt8KVCache >= 0 && mEnableInt8KVCache <= 2, "enable_int8_kv_cache must be 0, 1 or 2.");
     ELLM_CHECK(!packedV4KVCache()
-            || (mHeadSize == 256 && mSlidingWindowSize <= 0 && !mEnableTreeAttention && !mEnableVisionBlockAttention
-                && !mSupportsBoundedKVCache),
-        "Packed 4-bit V (enable_int8_kv_cache = 2) is implemented for head_dim 256 full attention without tree "
-        "attention, vision blocks or a bounded KV cache.");
+            || (mHeadSize == 256 && mSlidingWindowSize <= 0 && !mEnableVisionBlockAttention && !mSupportsBoundedKVCache),
+        "Packed 4-bit V (enable_int8_kv_cache = 2) is implemented for head_dim 256 full attention without vision "
+        "blocks or a bounded KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || isFp8KVCacheSupportedSM(mSMVersion),
         "FP8 KV cache is supported only on SM89, SM90, SM100, SM101, SM110, SM120, and SM121; got SM"
             + std::to_string(mSMVersion) + ".");
@@ -812,10 +811,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     ELLM_CHECK(!mEnableInt8KVCache || mSMVersion >= 80, "INT8 KV cache requires SM80 or newer.");
     ELLM_CHECK(mEnableInt8KVCache >= 0 && mEnableInt8KVCache <= 2, "enable_int8_kv_cache must be 0, 1 or 2.");
     ELLM_CHECK(!packedV4KVCache()
-            || (mHeadSize == 256 && mSlidingWindowSize <= 0 && !mEnableTreeAttention && !mEnableVisionBlockAttention
-                && !mSupportsBoundedKVCache),
-        "Packed 4-bit V (enable_int8_kv_cache = 2) is implemented for head_dim 256 full attention without tree "
-        "attention, vision blocks or a bounded KV cache.");
+            || (mHeadSize == 256 && mSlidingWindowSize <= 0 && !mEnableVisionBlockAttention && !mSupportsBoundedKVCache),
+        "Packed 4-bit V (enable_int8_kv_cache = 2) is implemented for head_dim 256 full attention without vision "
+        "blocks or a bounded KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || isFp8KVCacheSupportedSM(mSMVersion),
         "FP8 KV cache is supported only on SM89, SM90, SM100, SM101, SM110, SM120, and SM121; got SM"
             + std::to_string(mSMVersion) + ".");

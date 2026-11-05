@@ -921,8 +921,14 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     decoder_utils::applyForcedAcceptance(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, ownTokens, maxAcceptDepth, context.stream);
 
+    bool const commitCopy
+        = decoder_utils::baseKvCommitCopyNeeded(mUseTree, mRuntime.deployment.base.kvCacheVPacked);
     for (auto const& group : kvHeadDimGroups)
     {
+        if (!commitCopy)
+        {
+            break;
+        }
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths,
             mRuntime.base.pipelineIO.stateIndices, group.deviceLayerInfos, group.numLayers, group.headDim,
             group.maxKVHeads, activeBatchSize, mRuntime.deployment.base.recurrentPoolRows, maxAcceptDepth, kvCacheType,

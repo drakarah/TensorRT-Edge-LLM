@@ -211,7 +211,15 @@ TEST_F(AttentionPluginKvFormatTest, PackedValueRejectsUnsupportedConfigurations)
         Attrs attrs;
         attrs.int8KvCache = 2;
         attrs.treeAttention = 1;
-        EXPECT_EQ(create(attrs), nullptr) << "tree attention";
+        attrs.slidingWindow = 1024;
+        EXPECT_EQ(create(attrs), nullptr) << "tree attention with a sliding window";
+    }
+    {
+        Attrs attrs;
+        attrs.int8KvCache = 2;
+        attrs.treeAttention = 1;
+        attrs.visionBlock = 1;
+        EXPECT_EQ(create(attrs), nullptr) << "tree attention with vision blocks";
     }
     {
         Attrs attrs;
@@ -268,4 +276,32 @@ TEST_F(AttentionPluginKvFormatTest, BuildCompilesTheDecodeKernelForTheCacheForma
         delete restored;
         delete plugin;
     }
+}
+
+TEST_F(AttentionPluginKvFormatTest, PackedValueWithTreeAttentionCompilesVanillaAndSpecDecodeKernels)
+{
+    Attrs attrs;
+    attrs.int8KvCache = 2;
+    attrs.treeAttention = 1;
+    IPluginV3* plugin = create(attrs, TensorRTPhase::kBUILD);
+    ASSERT_NE(plugin, nullptr);
+    PluginField const* blob = findField(serializedFields(plugin), "xqa_jit_kernels");
+    ASSERT_NE(blob, nullptr);
+    auto const kernels = deserializeXQAJitKernels(static_cast<uint8_t const*>(blob->data), blob->length);
+    bool sawVanilla = false;
+    bool sawSpecDecode = false;
+    for (auto const& kernel : kernels)
+    {
+        EXPECT_EQ(kernel.key.kvDataType, DataType::kINT4);
+        EXPECT_EQ(kernel.key.headSize, 256);
+        EXPECT_EQ(kernel.key.tokensPerPage, 128);
+        EXPECT_FALSE(kernel.cubin.empty());
+        (kernel.key.specDecode ? sawSpecDecode : sawVanilla) = true;
+    }
+    EXPECT_TRUE(sawVanilla);
+    EXPECT_TRUE(sawSpecDecode);
+    IPluginV3* restored = getCreator()->createPlugin("restored", serializedFields(plugin), TensorRTPhase::kRUNTIME);
+    EXPECT_NE(restored, nullptr);
+    delete restored;
+    delete plugin;
 }
