@@ -41,7 +41,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -83,14 +85,50 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     // itself is consumed as the tree-build candidate fanout (see buildTreeVerifyInputs).
     mUseTree = draftingConfig.draftingTopK > 1;
     int32_t const effectiveDraftTopK = mUseTree ? 1 : draftingConfig.draftingTopK;
-    int32_t const effectiveMaxAcceptDepth = draftingConfig.draftingStep + 1;
+    mServedVerifySize = draftingConfig.verifySize;
+    if (char const* env = std::getenv("EDGELLM_MTP_LOOKUP"); env != nullptr && std::atoi(env) > 0)
+    {
+        // The widest window must fit the engine's verify profile, the accept kernels' path buffers and the policy.
+        int32_t const wanted = std::atoi(env) + 1;
+        int32_t const window = std::min({wanted, static_cast<int32_t>(mRuntime.deployment.base.maxVerifyTreeSize),
+            kernel::kEagleMaxAcceptedPathLength, LookupDraftPolicy::kMaxWindow});
+        if (mUseTree)
+        {
+            LOG_WARNING("MTPDecoder: EDGELLM_MTP_LOOKUP is ignored with tree drafting (draftingTopK > 1).");
+        }
+        else if (window <= mServedVerifySize)
+        {
+            LOG_WARNING(
+                "MTPDecoder: EDGELLM_MTP_LOOKUP ignored: the engine verifies at most %d rows and the drafter's window "
+                "is %d (build the base with a larger --maxVerifyTreeSize and the draft with --maxDraftTreeSize).",
+                window, mServedVerifySize);
+        }
+        else
+        {
+            mLookupMaxLength = window - 1;
+            mLookupPolicy = std::make_unique<LookupDraftPolicy>(window);
+            if (char const* minEnv = std::getenv("EDGELLM_MTP_LOOKUP_MIN"); minEnv != nullptr)
+            {
+                mLookupMinLength = std::max(1, std::atoi(minEnv));
+            }
+            if (char const* promptEnv = std::getenv("EDGELLM_MTP_LOOKUP_PROMPT"); promptEnv != nullptr)
+            {
+                mLookupPromptTokens = std::max(0, std::atoi(promptEnv));
+            }
+            LOG_INFO("MTPDecoder: n-gram lookup windows up to %d rows (proposals of at least %d tokens, prompt index %d).",
+                window, mLookupMinLength, mLookupPromptTokens);
+        }
+    }
+    int32_t const lookupWindow = mLookupMaxLength > 0 ? mLookupMaxLength + 1 : 0;
+    int32_t const effectiveMaxAcceptDepth = std::max(draftingConfig.draftingStep + 1, lookupWindow);
     int32_t const draftFullTableLength
         = 1 + effectiveDraftTopK + (draftingConfig.draftingStep - 1) * effectiveDraftTopK * effectiveDraftTopK;
 
     mDraftProposalSize
         = Tensor({maxRuntimeBatchSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "SpecDecode::draftProposalSize");
-    mDraftAttentionMask = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize, effectiveMaxDraftProposalSize},
-        DeviceType::kGPU, nvinfer1::DataType::kINT8, "SpecDecode::draftAttentionMask");
+    int32_t const maskSize = std::max(effectiveMaxDraftProposalSize, lookupWindow);
+    mDraftAttentionMask = Tensor({maxRuntimeBatchSize, maskSize, maskSize}, DeviceType::kGPU,
+        nvinfer1::DataType::kINT8, "SpecDecode::draftAttentionMask");
 
     buildTensorMapForSpecDecodeDraft(
         mDraftTensorMap, mRuntime.base.pipelineIO, mRuntime.base.sharedResources, *mRuntime.deployment.draft);
@@ -209,7 +247,7 @@ DecodingKvHeadroom MTPDecoder::requiredKvHeadroom() const
 {
     auto const& config = *mRuntime.deployment.specConfig;
     ELLM_CHECK(config.verifySize > 0 && config.draftingStep > 0, "MTP KV headroom must be positive");
-    return {config.verifySize, config.draftingStep};
+    return {std::max(config.verifySize, mLookupMaxLength + 1), config.draftingStep};
 }
 
 int64_t MTPDecoder::getRequiredContextMemorySize() const noexcept
@@ -253,6 +291,32 @@ bool MTPDecoder::decodeStep(DecodingInferenceContext& context)
             "draftingTopK=1.");
         return false;
     }
+    mRoundStart = std::chrono::steady_clock::now();
+    mLookupRound = false;
+    mRoundWindow = mServedVerifySize;
+    mRoundMatch = 0;
+    if (mLookupMaxLength > 0)
+    {
+        // A lookup round widens the verify window; every other round, and every error path, runs at the served size.
+        mRuntime.deployment.specConfig->verifySize = mServedVerifySize;
+        if (context.generationRound == 0)
+        {
+            mLookupIndexed = 0;
+        }
+    }
+    struct VerifySizeGuard
+    {
+        MTPDecoder& self;
+
+        ~VerifySizeGuard()
+        {
+            if (self.mLookupMaxLength > 0)
+            {
+                self.mRuntime.deployment.specConfig->verifySize = self.mServedVerifySize;
+            }
+        }
+    } verifySizeGuard{*this};
+
     // Draft KV for a round's accepted tokens is written lazily, by the *next* round's accept-token pass, so the draft
     // cache trails the base cache by the last accepted span (see ContextCacheCommitPolicy::kPrefillStateOnly).
     if (context.generationRound == 0)
@@ -274,7 +338,9 @@ bool MTPDecoder::decodeStep(DecodingInferenceContext& context)
         return false;
     }
 
-    if (!constructDraftProposal(context))
+    // The lookup replaces the drafter's proposal for this round when the policy expects it to pay.
+    bool const lookupWindow = mLookupMaxLength > 0 && context.generationRound > 0 && prepareLookupWindow(context);
+    if (!lookupWindow && !constructDraftProposal(context))
     {
         LOG_ERROR("Failed to construct draft proposal.");
         return false;
@@ -815,7 +881,8 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
 
     // A tree with fewer verify nodes than the full chain depth caps the acceptable
     // path length at verifySize.
-    int32_t const chainAcceptDepth = mRuntime.deployment.specConfig->draftingStep + 1;
+    int32_t const chainAcceptDepth
+        = mLookupRound ? mRuntime.deployment.specConfig->verifySize : mRuntime.deployment.specConfig->draftingStep + 1;
     int32_t const maxAcceptDepth
         = mUseTree ? std::min(chainAcceptDepth, mRuntime.deployment.specConfig->verifySize) : chainAcceptDepth;
     check::check(mAcceptedTokenIds.reshape({activeBatchSize, maxAcceptDepth}), "Tensor reshape failed");
@@ -932,7 +999,110 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
             mHostAcceptLengths.dataPointer<int32_t>(), context.numLogprobs);
     }
 
+    observeLookupRound(context);
     return true;
+}
+
+void MTPDecoder::indexLookupTokens(DecodingInferenceContext& context)
+{
+    // Outputs of the running request (and, with EDGELLM_MTP_LOOKUP_PROMPT, the tail of its prompt) feed the cache.
+    std::vector<int32_t> const& tokens = context.tokenIds[0];
+    int32_t const generated = std::min<int32_t>(context.currentGenerateLengths[0], static_cast<int32_t>(tokens.size()));
+    mLookupIndexed = std::min(mLookupIndexed, generated);
+    if (mLookupIndexed == 0)
+    {
+        mLookupCache.beginSequence();
+        if (mLookupPromptTokens > 0)
+        {
+            size_t const promptEnd = tokens.size() - generated;
+            size_t const promptBegin
+                = promptEnd > static_cast<size_t>(mLookupPromptTokens) ? promptEnd - mLookupPromptTokens : 0;
+            for (size_t pos = promptBegin; pos < promptEnd; ++pos)
+            {
+                mLookupCache.append(tokens[pos]);
+            }
+        }
+    }
+    for (size_t pos = tokens.size() - generated + mLookupIndexed; pos < tokens.size(); ++pos)
+    {
+        mLookupCache.append(tokens[pos]);
+    }
+    mLookupIndexed = generated;
+}
+
+bool MTPDecoder::prepareLookupWindow(DecodingInferenceContext& context)
+{
+    if (context.activeBatchSize != 1 || context.hasGuidedDecoding || context.numLogprobs > 0)
+    {
+        return false;
+    }
+    indexLookupTokens(context);
+    std::vector<int32_t> const& tokens = context.tokenIds[0];
+    int32_t match = 0;
+    std::vector<int32_t> proposal = mLookupCache.proposeWithMatch(
+        tokens.data(), static_cast<int32_t>(tokens.size()), mLookupMaxLength, match);
+    if (static_cast<int32_t>(proposal.size()) < mLookupMinLength)
+    {
+        return false;
+    }
+    auto const pick = mLookupPolicy->choose(mServedVerifySize, static_cast<int32_t>(proposal.size()), match);
+    if (!pick.lookup)
+    {
+        return false;
+    }
+    int32_t const window = pick.window;
+    proposal.resize(static_cast<size_t>(window - 1));
+
+    // The window is a chain: [last committed token, proposal...], every row attends to itself and the rows before it.
+    std::vector<int32_t> ids(static_cast<size_t>(window));
+    ids[0] = tokens.back();
+    std::copy(proposal.begin(), proposal.end(), ids.begin() + 1);
+    std::vector<int8_t> mask(static_cast<size_t>(window) * window, 0);
+    for (int32_t row = 0; row < window; ++row)
+    {
+        std::fill(mask.begin() + static_cast<size_t>(row) * window, mask.begin() + static_cast<size_t>(row) * window + row + 1, 1);
+    }
+    check::check(mRuntime.preprocess.idsInput.reshape({1, window}), "Tensor reshape failed");
+    check::check(mDraftAttentionMask.reshape({1, window, window}), "Tensor reshape failed");
+    check::check(mRuntime.base.pipelineIO.packedAttentionMask.reshape({1, window, static_cast<int64_t>(divUp(window, 32))}),
+        "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), ids.data(), ids.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice, context.stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        mDraftAttentionMask.rawPointer(), mask.data(), mask.size(), cudaMemcpyHostToDevice, context.stream));
+    // pageable host memory: the copies above are staged before they return, so the vectors may go out of scope
+
+    mRuntime.deployment.specConfig->verifySize = window;
+    mLookupRound = true;
+    mRoundWindow = window;
+    mRoundMatch = match;
+    return true;
+}
+
+void MTPDecoder::observeLookupRound(DecodingInferenceContext& context)
+{
+    if (mLookupMaxLength <= 0 || context.activeBatchSize != 1)
+    {
+        return;
+    }
+    int32_t const accepted = std::max(0, mHostAcceptLengths.dataPointer<int32_t>()[0] - 1);
+    double const roundMs
+        = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mRoundStart).count();
+    mLookupPolicy->observe(mLookupRound, mRoundWindow, accepted, mRoundMatch, roundMs);
+    mStatRounds += 1;
+    mStatTokens += accepted + 1;
+    if (mLookupRound)
+    {
+        mStatLookupRounds += 1;
+        mStatLookupAccepted += accepted;
+    }
+    if (mStatRounds % 256 == 0)
+    {
+        LOG_INFO("MTP lookup: %lld rounds, %lld lookup windows (%.1f accepted per lookup window), %.2f tokens per round",
+            static_cast<long long>(mStatRounds), static_cast<long long>(mStatLookupRounds),
+            mStatLookupRounds > 0 ? static_cast<double>(mStatLookupAccepted) / mStatLookupRounds : 0.0,
+            static_cast<double>(mStatTokens) / mStatRounds);
+    }
 }
 
 bool MTPDecoder::runDraftModelAcceptToken(DecodingInferenceContext& context)

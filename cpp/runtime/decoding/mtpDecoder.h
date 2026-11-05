@@ -19,8 +19,11 @@
 
 #include "common/hashUtils.h"
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/decoding/lookupDraftPolicy.h"
+#include "runtime/decoding/suffixDraftCache.h"
 #include "runtime/state/externalWeightManager.h"
 
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <unordered_map>
@@ -100,6 +103,15 @@ private:
     bool runBaseModelVerification(DecodingInferenceContext& context);
     bool runDraftModelAcceptToken(DecodingInferenceContext& context);
 
+    //! n-gram lookup window (EDGELLM_MTP_LOOKUP=<longest proposal>). Chain mode, batch 1, no guided decoding.
+    //! When the lookup finds a continuation of the context in earlier output (and the prompt, with
+    //! EDGELLM_MTP_LOOKUP_PROMPT) and the policy expects more tokens per millisecond than the drafter's own window,
+    //! the round verifies [last token, lookup tokens...] instead of the draft layer's chain and skips the draft
+    //! proposal. Verification is unchanged, so the output is. Returns true when this round's window was replaced.
+    bool prepareLookupWindow(DecodingInferenceContext& context);
+    void indexLookupTokens(DecodingInferenceContext& context);
+    void observeLookupRound(DecodingInferenceContext& context);
+
     DecodingRuntimeContext& mRuntime;
     HybridCacheManager& mDraftCacheManager;
 
@@ -137,6 +149,23 @@ private:
     Tensor mTreeBuildWorkspace; //!< ddtreeBuild temporary workspace
 
     hash_utils::HashMap<SystemPromptCacheKey, SystemPromptKVCache> mSystemPromptKVCacheDraft;
+
+    // Lookup window state (see prepareLookupWindow). mLookupMaxLength == 0: off.
+    int32_t mLookupMaxLength{0};     //!< Longest lookup proposal; the widest window is mLookupMaxLength + 1 rows.
+    int32_t mLookupMinLength{2};     //!< Shortest proposal worth offering to the policy.
+    int32_t mLookupPromptTokens{0};  //!< Index up to this many prompt tokens too (0 = outputs only).
+    int32_t mServedVerifySize{0};    //!< The drafter's own window (the engine's served verify size).
+    SuffixDraftCache mLookupCache;
+    std::unique_ptr<LookupDraftPolicy> mLookupPolicy;
+    int32_t mLookupIndexed{0};       //!< Generated tokens of the running request already in the cache.
+    bool mLookupRound{false};        //!< This round's window came from the lookup.
+    int32_t mRoundWindow{0};         //!< Rows verified this round.
+    int32_t mRoundMatch{0};          //!< Context tokens matched by this round's lookup proposal.
+    std::chrono::steady_clock::time_point mRoundStart;
+    int64_t mStatRounds{0};
+    int64_t mStatLookupRounds{0};
+    int64_t mStatLookupAccepted{0};
+    int64_t mStatTokens{0};
 };
 
 } // namespace rt
