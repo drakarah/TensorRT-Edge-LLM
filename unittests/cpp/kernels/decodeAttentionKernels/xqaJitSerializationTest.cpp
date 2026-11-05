@@ -76,6 +76,19 @@ TEST(XQAJitCapabilityTest, PackedK8V4KeyRejectedForOtherHeadDims)
     }
 }
 
+TEST(XQAJitCapabilityTest, PackedK8V4SpecDecodeKeyIsAccepted)
+{
+    XQAJitKey key{};
+    key.sm = 89;
+    key.dataType = nvinfer1::DataType::kHALF;
+    key.kvDataType = nvinfer1::DataType::kINT4;
+    key.headSize = 256;
+    key.qHeadsPerKv = 0;
+    key.tokensPerPage = 128;
+    key.specDecode = true;
+    EXPECT_NO_THROW(compileXQAKernel(key));
+}
+
 XQAJitKey makeKey(bool specDecode, bool contiguousQuerySwa = false)
 {
     XQAJitKey key{};

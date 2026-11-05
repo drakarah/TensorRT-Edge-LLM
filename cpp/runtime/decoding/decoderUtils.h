@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/raggedBatchBuilder.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -148,6 +149,16 @@ void collectSpecLogprobsFromHost(DecodingRuntimeContext& runtime, DecodingInfere
 inline bool baseKvCommitCopyNeeded(bool treeMode, bool packedV)
 {
     return treeMode || !packedV;
+}
+
+//! Largest verify window the packed-V XQA spec-decode kernels are tested for.
+constexpr int32_t kPackedVMaxVerifyRows = 8;
+
+//! Packed V supports speculative decoding only for an MTP chain (draftingTopK <= 1, so baseKvCommitCopyNeeded is false)
+//! with an engine verify window the kernels are tested for.
+inline bool packedVSpecDecodeSupported(SpecDecodeMode mode, int32_t draftingTopK, int32_t maxVerifySize)
+{
+    return mode == SpecDecodeMode::kMTP && draftingTopK <= 1 && maxVerifySize <= kPackedVMaxVerifyRows;
 }
 
 } // namespace decoder_utils

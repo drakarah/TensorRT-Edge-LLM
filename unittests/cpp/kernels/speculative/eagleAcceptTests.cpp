@@ -245,6 +245,48 @@ TEST_F(EagleAcceptTest, MultiBatchSimple)
         });
 }
 
+// An MTP chain is a lower-triangular mask over the verified rows. The accepted rows are then the prefix 0..length-1,
+// which is what lets the packed-V path skip the KV commit copy: every accepted row is already in place.
+TEST_F(EagleAcceptTest, ChainAcceptsAPrefixOfTheVerifiedRowsInPlace)
+{
+    constexpr int32_t numTokens = 8;
+    constexpr int32_t batchSize = 3;
+    constexpr int32_t vocabSize = 32;
+    constexpr int32_t maxDepth = numTokens;
+    // Rows 0..matches-1 of each sequence are confirmed by the next row's token; row `matches` is the first mismatch.
+    int32_t const matches[batchSize] = {0, 4, numTokens - 1};
+
+    std::vector<int32_t> tokenIds(batchSize * numTokens);
+    std::vector<int8_t> mask(batchSize * numTokens * numTokens, 0);
+    std::vector<float> logits(batchSize * numTokens * vocabSize, -5.F);
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        for (int32_t i = 0; i < numTokens; ++i)
+        {
+            tokenIds[b * numTokens + i] = 1 + ((7 * b + 3 * i) % (vocabSize - 2));
+            for (int32_t j = 0; j <= i; ++j)
+            {
+                mask[(b * numTokens + i) * numTokens + j] = 1;
+            }
+            int32_t const next = i < matches[b] ? tokenIds[b * numTokens + i + 1] : 0;
+            logits[(b * numTokens + i) * vocabSize + (i + 1 < numTokens && i < matches[b] ? next : 31)] = 5.F;
+        }
+    }
+    runEagleAcceptTest(tokenIds, mask, logits, batchSize, numTokens, vocabSize, maxDepth, "ChainPrefixInPlace",
+        [&](auto const&, auto const& acceptedIndices, auto const& acceptLengths, auto const&) {
+            for (int32_t b = 0; b < batchSize; ++b)
+            {
+                ASSERT_GE(acceptLengths[b], 1);
+                ASSERT_LE(acceptLengths[b], numTokens);
+                for (int32_t i = 0; i < acceptLengths[b]; ++i)
+                {
+                    EXPECT_EQ(acceptedIndices[b * maxDepth + i], i)
+                        << "batch " << b << ": accepted row " << i << " is not in place";
+                }
+            }
+        });
+}
+
 // Test complex multi-batch scenario with varying tree structures and early termination
 TEST_F(EagleAcceptTest, MultiBatchAsymmetricTree)
 {

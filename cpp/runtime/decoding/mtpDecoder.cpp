@@ -926,16 +926,15 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
 
     bool const commitCopy
         = decoder_utils::baseKvCommitCopyNeeded(mUseTree, mRuntime.deployment.base.kvCacheVPacked);
-    for (auto const& group : kvHeadDimGroups)
+    if (commitCopy)
     {
-        if (!commitCopy)
+        for (auto const& group : kvHeadDimGroups)
         {
-            break;
+            kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths,
+                mRuntime.base.pipelineIO.stateIndices, group.deviceLayerInfos, group.numLayers, group.headDim,
+                group.maxKVHeads, activeBatchSize, mRuntime.deployment.base.recurrentPoolRows, maxAcceptDepth,
+                kvCacheType, context.stream, basePageTablePtr, baseNumPages, baseMaxPagesPerSeq);
         }
-        kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths,
-            mRuntime.base.pipelineIO.stateIndices, group.deviceLayerInfos, group.numLayers, group.headDim,
-            group.maxKVHeads, activeBatchSize, mRuntime.deployment.base.recurrentPoolRows, maxAcceptDepth, kvCacheType,
-            context.stream, basePageTablePtr, baseNumPages, baseMaxPagesPerSeq);
     }
     kernel::eagleBaseAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.baseHiddenStates, context.stream);
@@ -1484,9 +1483,46 @@ void MTPDecoder::saveSystemPromptKVCache(SystemPromptCacheKey const& key, std::s
 
 namespace
 {
-//! Calibration aid (EDGELLM_DUMP_DRAFT_KV_AMAX=<json path>): before the draft cache is reset for a new request,
-//! fold the largest |K| and |V| of the finished request's cached rows into a running maximum and write it to
-//! the file as {"k_amax":[..],"v_amax":[..]} (one entry per draft attention layer). INT8 draft-KV scales are amax / 127.
+//! Calibration aid (EDGELLM_DUMP_DRAFT_KV_AMAX=<json path>): before the draft cache is reset for a new request, fold
+//! the largest RoPE pair length of K and the largest magnitude of V of the finished request's cached rows into a
+//! running maximum and write it as {"k_amax":[..],"v_amax":[..]}; INT8 draft-KV scales are amax * margin / 127.
+//! Scans batch slot 0 of a full-capacity FP16 pool only (batch size 1 engines); anything else is reported and skipped.
+//! EDGELLM_DUMP_DRAFT_KV_ROTARY_DIM overrides the rotary width (default headDim / 4, rotate-half pairing).
+class PinnedHalfBuffer
+{
+public:
+    PinnedHalfBuffer() = default;
+    PinnedHalfBuffer(PinnedHalfBuffer const&) = delete;
+    PinnedHalfBuffer& operator=(PinnedHalfBuffer const&) = delete;
+
+    ~PinnedHalfBuffer()
+    {
+        if (mData != nullptr)
+        {
+            static_cast<void>(cudaFreeHost(mData));
+        }
+    }
+
+    __half* reserve(size_t count)
+    {
+        if (count > mCapacity)
+        {
+            if (mData != nullptr)
+            {
+                CUDA_CHECK(cudaFreeHost(mData));
+                mData = nullptr;
+            }
+            CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&mData), count * sizeof(__half)));
+            mCapacity = count;
+        }
+        return mData;
+    }
+
+private:
+    __half* mData{nullptr};
+    size_t mCapacity{0};
+};
+
 void foldDraftKvAmax(HybridCacheManager& cache, cudaStream_t stream)
 {
     char const* path = std::getenv("EDGELLM_DUMP_DRAFT_KV_AMAX");
@@ -1496,8 +1532,30 @@ void foldDraftKvAmax(HybridCacheManager& cache, cudaStream_t stream)
     }
     static std::vector<float> kAmax;
     static std::vector<float> vAmax;
+    static PinnedHalfBuffer staging;
+    static bool warned = false;
+    auto warnOnce = [&](char const* reason)
+    {
+        if (!warned)
+        {
+            LOG_WARNING("EDGELLM_DUMP_DRAFT_KV_AMAX: %s; no amax is recorded", reason);
+            warned = true;
+        }
+    };
+
     auto& kv = cache.getKVCacheManager();
-    int32_t const numLayers = static_cast<int32_t>(kv.getConfig().layerConfigs.size());
+    auto const& kvConfig = kv.getConfig();
+    if (kvConfig.kvCacheType != nvinfer1::DataType::kHALF)
+    {
+        warnOnce("the draft KV cache is not FP16");
+        return;
+    }
+    if (kvConfig.useBoundedSwaKVCache || kvConfig.maxBatchSize != 1)
+    {
+        warnOnce("only a full-capacity draft cache with batch size 1 is supported");
+        return;
+    }
+    int32_t const numLayers = static_cast<int32_t>(kvConfig.layerConfigs.size());
     if (kAmax.empty())
     {
         kAmax.assign(numLayers, 0.F);
@@ -1507,33 +1565,40 @@ void foldDraftKvAmax(HybridCacheManager& cache, cudaStream_t stream)
     CUDA_CHECK(cudaMemcpyAsync(&length, cache.getKVCacheLengths().dataPointer<int32_t>(), sizeof(int32_t),
         cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (length <= 0 || kv.getConfig().kvCacheType != nvinfer1::DataType::kHALF)
+    if (length <= 0)
     {
         return;
     }
+    char const* rotEnv = std::getenv("EDGELLM_DUMP_DRAFT_KV_ROTARY_DIM");
     for (int32_t layer = 0; layer < numLayers; ++layer)
     {
         auto const views = kv.getSeparateKVCache(layer);
-        auto const& lc = kv.getConfig().layerConfigs[layer];
-        size_t const count = static_cast<size_t>(length) * lc.numKVHeads * lc.headDim;
-        std::vector<__half> host(count);
+        auto const& lc = kvConfig.layerConfigs[layer];
+        int32_t const rotary = rotEnv != nullptr ? std::atoi(rotEnv) : lc.headDim / 4;
+        if (rotary <= 0 || rotary > lc.headDim || rotary % 2 != 0)
+        {
+            warnOnce("EDGELLM_DUMP_DRAFT_KV_ROTARY_DIM must be even and within the head dimension");
+            return;
+        }
+        // Slot 0 of the [maxBatch, capacity, H, D] view starts at its first byte and holds `capacity` rows.
+        int64_t const capacityRows = views.first.getShape()[1];
+        int64_t const rows = std::min<int64_t>(length, capacityRows);
+        int64_t const rowElems = static_cast<int64_t>(lc.numKVHeads) * lc.headDim;
+        size_t const count = static_cast<size_t>(rows * rowElems);
+        __half* host = staging.reserve(count);
         for (int32_t which = 0; which < 2; ++which)
         {
             Tensor const& view = which == 0 ? views.first : views.second;
-            CUDA_CHECK(cudaMemcpyAsync(host.data(), view.dataPointer<__half>(), count * sizeof(__half),
+            CUDA_CHECK(cudaMemcpyAsync(host, view.dataPointer<__half>(), count * sizeof(__half),
                 cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            // K: largest RoPE pair length (rotation keeps it, so it bounds the cached K at every position); dims
-            // beyond the rotary part count singly. V: largest magnitude.
             float amax = 0.F;
             if (which == 0)
             {
-                char const* rotEnv = std::getenv("EDGELLM_DUMP_DRAFT_KV_ROTARY_DIM");
-                int32_t const rotary = rotEnv != nullptr ? std::atoi(rotEnv) : lc.headDim / 4;
                 int32_t const half = rotary / 2;
-                for (size_t row = 0; row < count / lc.headDim; ++row)
+                for (int64_t row = 0; row < rows * lc.numKVHeads; ++row)
                 {
-                    __half const* k = host.data() + row * lc.headDim;
+                    __half const* k = host + row * lc.headDim;
                     for (int32_t i = 0; i < half; ++i)
                     {
                         float const a = __half2float(k[i]);
@@ -1548,9 +1613,9 @@ void foldDraftKvAmax(HybridCacheManager& cache, cudaStream_t stream)
             }
             else
             {
-                for (__half const h : host)
+                for (size_t i = 0; i < count; ++i)
                 {
-                    amax = std::max(amax, std::fabs(__half2float(h)));
+                    amax = std::max(amax, std::fabs(__half2float(host[i])));
                 }
             }
             float& slot = which == 0 ? kAmax[layer] : vAmax[layer];
@@ -1558,21 +1623,23 @@ void foldDraftKvAmax(HybridCacheManager& cache, cudaStream_t stream)
         }
     }
     FILE* out = std::fopen(path, "w");
-    if (out != nullptr)
+    if (out == nullptr)
     {
-        std::fprintf(out, "{\"k_amax\": [");
-        for (size_t i = 0; i < kAmax.size(); ++i)
-        {
-            std::fprintf(out, "%s%.6f", i ? ", " : "", kAmax[i]);
-        }
-        std::fprintf(out, "], \"v_amax\": [");
-        for (size_t i = 0; i < vAmax.size(); ++i)
-        {
-            std::fprintf(out, "%s%.6f", i ? ", " : "", vAmax[i]);
-        }
-        std::fprintf(out, "], \"last_length\": %d}\n", length);
-        std::fclose(out);
+        warnOnce("the output file cannot be opened");
+        return;
     }
+    std::fprintf(out, "{\"k_amax\": [");
+    for (size_t i = 0; i < kAmax.size(); ++i)
+    {
+        std::fprintf(out, "%s%.6f", i != 0 ? ", " : "", kAmax[i]);
+    }
+    std::fprintf(out, "], \"v_amax\": [");
+    for (size_t i = 0; i < vAmax.size(); ++i)
+    {
+        std::fprintf(out, "%s%.6f", i != 0 ? ", " : "", vAmax[i]);
+    }
+    std::fprintf(out, "], \"last_length\": %d}\n", length);
+    std::fclose(out);
 }
 } // namespace
 
