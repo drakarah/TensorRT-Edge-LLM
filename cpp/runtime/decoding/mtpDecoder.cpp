@@ -39,10 +39,13 @@
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "sampler/sampling.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
@@ -1479,8 +1482,103 @@ void MTPDecoder::saveSystemPromptKVCache(SystemPromptCacheKey const& key, std::s
     mSystemPromptKVCacheDraft.insert({key, std::move(savedKVCacheDraft)});
 }
 
+namespace
+{
+//! Calibration aid (EDGELLM_DUMP_DRAFT_KV_AMAX=<json path>): before the draft cache is reset for a new request,
+//! fold the largest |K| and |V| of the finished request's cached rows into a running maximum and write it to
+//! the file as {"k_amax":[..],"v_amax":[..]} (one entry per draft attention layer). INT8 draft-KV scales are amax / 127.
+void foldDraftKvAmax(HybridCacheManager& cache, cudaStream_t stream)
+{
+    char const* path = std::getenv("EDGELLM_DUMP_DRAFT_KV_AMAX");
+    if (path == nullptr || path[0] == '\0')
+    {
+        return;
+    }
+    static std::vector<float> kAmax;
+    static std::vector<float> vAmax;
+    auto& kv = cache.getKVCacheManager();
+    int32_t const numLayers = static_cast<int32_t>(kv.getConfig().layerConfigs.size());
+    if (kAmax.empty())
+    {
+        kAmax.assign(numLayers, 0.F);
+        vAmax.assign(numLayers, 0.F);
+    }
+    int32_t length = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&length, cache.getKVCacheLengths().dataPointer<int32_t>(), sizeof(int32_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (length <= 0 || kv.getConfig().kvCacheType != nvinfer1::DataType::kHALF)
+    {
+        return;
+    }
+    for (int32_t layer = 0; layer < numLayers; ++layer)
+    {
+        auto const views = kv.getSeparateKVCache(layer);
+        auto const& lc = kv.getConfig().layerConfigs[layer];
+        size_t const count = static_cast<size_t>(length) * lc.numKVHeads * lc.headDim;
+        std::vector<__half> host(count);
+        for (int32_t which = 0; which < 2; ++which)
+        {
+            Tensor const& view = which == 0 ? views.first : views.second;
+            CUDA_CHECK(cudaMemcpyAsync(host.data(), view.dataPointer<__half>(), count * sizeof(__half),
+                cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // K: largest RoPE pair length (rotation keeps it, so it bounds the cached K at every position); dims
+            // beyond the rotary part count singly. V: largest magnitude.
+            float amax = 0.F;
+            if (which == 0)
+            {
+                char const* rotEnv = std::getenv("EDGELLM_DUMP_DRAFT_KV_ROTARY_DIM");
+                int32_t const rotary = rotEnv != nullptr ? std::atoi(rotEnv) : lc.headDim / 4;
+                int32_t const half = rotary / 2;
+                for (size_t row = 0; row < count / lc.headDim; ++row)
+                {
+                    __half const* k = host.data() + row * lc.headDim;
+                    for (int32_t i = 0; i < half; ++i)
+                    {
+                        float const a = __half2float(k[i]);
+                        float const b = __half2float(k[i + half]);
+                        amax = std::max(amax, std::sqrt(a * a + b * b));
+                    }
+                    for (int32_t i = rotary; i < lc.headDim; ++i)
+                    {
+                        amax = std::max(amax, std::fabs(__half2float(k[i])));
+                    }
+                }
+            }
+            else
+            {
+                for (__half const h : host)
+                {
+                    amax = std::max(amax, std::fabs(__half2float(h)));
+                }
+            }
+            float& slot = which == 0 ? kAmax[layer] : vAmax[layer];
+            slot = std::max(slot, amax);
+        }
+    }
+    FILE* out = std::fopen(path, "w");
+    if (out != nullptr)
+    {
+        std::fprintf(out, "{\"k_amax\": [");
+        for (size_t i = 0; i < kAmax.size(); ++i)
+        {
+            std::fprintf(out, "%s%.6f", i ? ", " : "", kAmax[i]);
+        }
+        std::fprintf(out, "], \"v_amax\": [");
+        for (size_t i = 0; i < vAmax.size(); ++i)
+        {
+            std::fprintf(out, "%s%.6f", i ? ", " : "", vAmax[i]);
+        }
+        std::fprintf(out, "], \"last_length\": %d}\n", length);
+        std::fclose(out);
+    }
+}
+} // namespace
+
 void MTPDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream)
 {
+    foldDraftKvAmax(mDraftCacheManager, stream);
     mDraftCacheManager.resetForNewSequences(reuseLengths, stream);
 }
 
