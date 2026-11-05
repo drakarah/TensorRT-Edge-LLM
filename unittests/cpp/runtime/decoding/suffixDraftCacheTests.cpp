@@ -98,3 +98,70 @@ TEST(SuffixDraftCache, StartsOverWhenFull)
     appendAll(cache, {10, 7});
     EXPECT_EQ(propose(cache, {9, 10}, 2), (std::vector<int32_t>{7}));
 }
+
+TEST(SuffixDraftCache, ReportsHowManyContextTokensMatched)
+{
+    SuffixDraftCache cache;
+    appendAll(cache, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+    cache.beginSequence();
+
+    int32_t match = -1;
+    // The whole 6-token context occurred earlier: the match is extended past the 4-gram index.
+    std::vector<int32_t> const context{3, 4, 5, 6, 7, 8};
+    auto proposal = cache.proposeWithMatch(context.data(), static_cast<int32_t>(context.size()), 3, match);
+    EXPECT_EQ(proposal, (std::vector<int32_t>{9, 10, 11}));
+    EXPECT_EQ(match, 6);
+
+    // Only the last 3 tokens matched (a different token precedes them).
+    std::vector<int32_t> const partial{77, 6, 7, 8};
+    proposal = cache.proposeWithMatch(partial.data(), static_cast<int32_t>(partial.size()), 2, match);
+    EXPECT_EQ(proposal, (std::vector<int32_t>{9, 10}));
+    EXPECT_EQ(match, 3);
+
+    // No proposal: the length is reset to zero.
+    std::vector<int32_t> const unknown{90, 91};
+    proposal = cache.proposeWithMatch(unknown.data(), static_cast<int32_t>(unknown.size()), 2, match);
+    EXPECT_TRUE(proposal.empty());
+    EXPECT_EQ(match, 0);
+}
+
+TEST(SuffixDraftCache, ProposeWithMatchContinuesALoopPastTheContextEnd)
+{
+    SuffixDraftCache cache;
+    cache.beginSequence();
+    // The text repeats with period 2: ... 1 2 1 2 1 2. The most recent earlier occurrence of the context's last
+    // 4-gram is 2 tokens back, so the plain continuation is only 2 tokens long; the cycle goes on.
+    appendAll(cache, {1, 2, 1, 2, 1, 2});
+    std::vector<int32_t> const context{1, 2, 1, 2, 1, 2};
+
+    int32_t match = 0;
+    auto const proposal = cache.proposeWithMatch(context.data(), static_cast<int32_t>(context.size()), 7, match);
+    EXPECT_EQ(proposal, (std::vector<int32_t>{1, 2, 1, 2, 1, 2, 1}));
+    EXPECT_GE(match, 4);
+    // propose() keeps its original behaviour: the continuation stops at the sequence's end.
+    EXPECT_EQ(propose(cache, context, 7), (std::vector<int32_t>{1, 2}));
+}
+
+TEST(SuffixDraftCache, ProposeWithMatchOfAConstantRunRepeatsTheToken)
+{
+    SuffixDraftCache cache;
+    cache.beginSequence();
+    appendAll(cache, {9, 9, 9, 9, 9});
+    std::vector<int32_t> const context{9, 9, 9, 9, 9};
+    int32_t match = 0;
+    auto const proposal = cache.proposeWithMatch(context.data(), static_cast<int32_t>(context.size()), 5, match);
+    EXPECT_EQ(proposal, (std::vector<int32_t>{9, 9, 9, 9, 9}));
+}
+
+TEST(SuffixDraftCache, ProposeWithMatchDoesNotExtendAcrossARequestSeparator)
+{
+    SuffixDraftCache cache;
+    appendAll(cache, {1, 2, 3, 4, 5, 6});
+    cache.beginSequence();
+    appendAll(cache, {2, 3, 4});
+    std::vector<int32_t> const context{2, 3, 4};
+    int32_t match = 0;
+    // The earlier request continues with 5, 6 and then ends at the separator: no cyclic extension of that.
+    auto const proposal = cache.proposeWithMatch(context.data(), static_cast<int32_t>(context.size()), 7, match);
+    EXPECT_EQ(proposal, (std::vector<int32_t>{5, 6}));
+}

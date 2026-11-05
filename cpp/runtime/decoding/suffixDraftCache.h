@@ -120,6 +120,71 @@ public:
         return proposal;
     }
 
+    //! As propose(), and reports how many trailing context tokens actually matched the earlier occurrence (the
+    //! index stops at 4-grams, the match is extended backwards up to maxMatch). A longer match is stronger
+    //! evidence that the continuation repeats, which a draft policy can price. matchLength is 0 without a proposal.
+    //! When the earlier occurrence is close enough that its continuation reaches the context's own end (text that
+    //! loops), the proposal continues that cycle up to maxLen tokens.
+    std::vector<int32_t> proposeWithMatch(
+        int32_t const* context, int32_t contextLen, int32_t maxLen, int32_t& matchLength, int32_t maxMatch = 64) const
+    {
+        matchLength = 0;
+        int64_t const ownEnd = static_cast<int64_t>(mTokens.size());
+        for (int32_t n : kNgrams)
+        {
+            if (contextLen < n)
+            {
+                continue;
+            }
+            uint64_t const key = hashNgram(context + contextLen - n, n);
+            auto const it = mLast.find(key);
+            if (key == kInvalidKey || it == mLast.end())
+            {
+                continue;
+            }
+            int64_t const end = it->second.first == ownEnd ? it->second.second : it->second.first;
+            if (end <= 0 || !matches(end, context + contextLen - n, n))
+            {
+                continue;
+            }
+            std::vector<int32_t> proposal;
+            bool reachedOwnEnd = true;
+            for (int64_t pos = end; pos < ownEnd && static_cast<int32_t>(proposal.size()) < maxLen; ++pos)
+            {
+                if (mTokens[pos] == kSeparator)
+                {
+                    reachedOwnEnd = false;
+                    break;
+                }
+                proposal.push_back(mTokens[pos]);
+            }
+            if (proposal.empty())
+            {
+                continue;
+            }
+            // The earlier occurrence ran into the context's own end: the text repeats with period ownEnd - end
+            // (a loop, a repeated line). The cycle continues; a verification confirms or rejects the extension.
+            if (reachedOwnEnd && end < ownEnd)
+            {
+                int64_t const period = ownEnd - end;
+                for (int64_t i = static_cast<int64_t>(proposal.size()); i < maxLen; ++i)
+                {
+                    proposal.push_back(mTokens[end + (i % period)]);
+                }
+            }
+            int32_t length = n;
+            while (length < maxMatch && length < contextLen && end - length - 1 >= 0
+                && mTokens[end - length - 1] != kSeparator
+                && mTokens[end - length - 1] == context[contextLen - length - 1])
+            {
+                ++length;
+            }
+            matchLength = length;
+            return proposal;
+        }
+        return {};
+    }
+
 private:
     static constexpr int32_t kNgrams[] = {4, 3, 2};
     static constexpr uint64_t kInvalidKey{0};
