@@ -60,8 +60,9 @@ public:
 
     DecodingStrategyCapabilities capabilities() const noexcept override
     {
-        return {/*.ownsBaseVerificationCudaGraphs=*/false, /*.supportsLosslessSampling=*/false,
-            /*.maxSamplingSupport=*/0, /*.fallbackToVanillaForNonGreedySampling=*/mUseTree};
+        return {/*.ownsBaseVerificationCudaGraphs=*/false, /*.supportsLosslessSampling=*/!mUseTree,
+            /*.maxSamplingSupport=*/0, /*.fallbackToVanillaForNonGreedySampling=*/mUseTree,
+            /*.requiresDefaultDecoderCudaGraphs=*/false, /*.supportsPresencePenalty=*/!mUseTree};
     }
 
     DecodingKvHeadroom requiredKvHeadroom() const override;
@@ -134,6 +135,8 @@ private:
     Tensor mAcceptedTokenIds;
     Tensor mAcceptedTokenIndices;
     Tensor mAcceptLength;
+    Tensor mSampledIds;        //!< sampled base token per verify row (sampling requests)
+    uint64_t mSamplingOffset{0};
     Tensor mHostAcceptLengths;
     Tensor mHostAcceptedTokenIds;
 

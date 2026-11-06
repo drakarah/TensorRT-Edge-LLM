@@ -211,6 +211,27 @@ constexpr float kMaskedLogitValue = -1e30F;
 void forceToken(rt::Tensor& logits, int32_t tokenId, cudaStream_t stream);
 
 /*!
+ * \brief Makes row r's argmax token r's entry of `tokens`: that logit is raised above every other one.
+ *
+ * Used by speculative verification to run sampling as "sample the target's token per row, accept a draft token only
+ * if it is the same one": exact (lossless) for drafts that propose one token per position.
+ *
+ * \param[in,out] logits Logits [GPU, Float] with shape [num-rows, vocab-size]
+ * \param[in] tokens Token per row [GPU, Int32] with num-rows entries
+ */
+void forceRowTokens(rt::Tensor& logits, rt::Tensor const& tokens, cudaStream_t stream);
+
+/*!
+ * \brief Presence penalty for the rows of one speculative chain window (batch of one): row r also counts the window
+ * tokens 0..r as generated, because it is only used when the drafts before it were accepted.
+ */
+void applyWindowPresencePenalty(
+    rt::Tensor& logits, rt::Tensor const& windowIds, rt::Tensor const& seenFlags, float penalty, cudaStream_t stream);
+
+//! After a round: flags the first `acceptLength` window tokens (the committed token and the accepted drafts).
+void markWindowSeen(rt::Tensor& seenFlags, rt::Tensor const& windowIds, rt::Tensor const& acceptLength, cudaStream_t stream);
+
+/*!
  * \brief Zero out grammar-forbidden tokens ahead of sampling.
  *
  * The bitmask is dense and bit-packed, one bit per output-vocabulary entry, with a

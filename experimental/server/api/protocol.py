@@ -172,6 +172,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "chat_template_kwargs.reasoning_effort must be a string")
             if effort is not None:
                 self.reasoning_effort = effort
+        # Reasoning level as clients send it (OpenAI: minimal/low/medium/high, pi also xhigh/off): mapped onto the levels
+        # the chat template knows (xhigh, medium, low); "none"/"off" turns thinking off. EDGELLM_DEFAULT_REASONING_EFFORT
+        # applies to requests that carry no level.
+        effort = (self.reasoning_effort or os.environ.get("EDGELLM_DEFAULT_REASONING_EFFORT") or "").strip().lower()
+        if effort in ("none", "off", "disabled", "false"):
+            self.enable_thinking = False
+            self.reasoning_effort = None
+        elif effort:
+            self.reasoning_effort = {
+                "minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh",
+            }.get(effort, "medium")
         wants_audio = bool(self.modalities and "audio" in self.modalities)
         if wants_audio != (self.audio is not None):
             raise ValueError(

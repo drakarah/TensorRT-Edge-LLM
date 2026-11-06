@@ -79,6 +79,8 @@ struct DecodingStrategyCapabilities
     bool fallbackToVanillaForNonGreedySampling{false};
     //! Capture vanilla graphs when request routing may select the default decoder.
     bool requiresDefaultDecoderCudaGraphs{false};
+    //! The decoder applies a presence penalty itself (window rows see the draft tokens before them).
+    bool supportsPresencePenalty{false};
 };
 
 struct SamplingBuffers

@@ -56,6 +56,7 @@ namespace rt
 {
 namespace
 {
+constexpr uint64_t kMtpSamplingSeed{0x4D5450534D504C45ULL};
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
 } // namespace
@@ -162,6 +163,8 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
         nvinfer1::DataType::kINT32, "SpecDecode::acceptedIndices");
     mAcceptLength
         = Tensor({maxRuntimeBatchSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "SpecDecode::acceptLength");
+    mSampledIds = Tensor({static_cast<int64_t>(maxRuntimeBatchSize) * LookupDraftPolicy::kMaxWindow, 1},
+        DeviceType::kGPU, nvinfer1::DataType::kINT32, "SpecDecode::sampledIds");
     mHostAcceptLengths
         = Tensor({maxRuntimeBatchSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "SpecDecode::hostAcceptLengths");
     mHostAcceptedTokenIds = Tensor({maxRuntimeBatchSize, effectiveMaxAcceptDepth}, DeviceType::kCPU,
@@ -893,6 +896,33 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         ? std::optional{std::ref(mRuntime.sampling.baseVocabMappingTable)}
         : std::nullopt;
     Tensor const& acceptTokenIds = mUseTree ? mTreeTokenIds : mRuntime.preprocess.idsInput;
+    bool const presence = !mUseTree && context.presencePenalty != 0.0f && activeBatchSize == 1;
+    if (presence)
+    {
+        if (context.presenceFlagsPending)
+        {
+            CUDA_CHECK(cudaMemsetAsync(mRuntime.sampling.presenceSeen.rawPointer(), 0,
+                mRuntime.sampling.presenceSeen.getMemoryCapacity(), context.stream));
+            context.presenceFlagsPending = false;
+        }
+        applyWindowPresencePenalty(mRuntime.base.pipelineIO.outputLogits, mRuntime.preprocess.idsInput,
+            mRuntime.sampling.presenceSeen, context.presencePenalty, context.stream);
+    }
+    if (!mUseTree && ::trt_edgellm::shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
+    {
+        // Sampling with a chain draft (one proposed token per position, so the draft distribution is a point mass):
+        // sample the base's token for every verify row, then let the greedy accept kernel compare. A draft token is
+        // accepted exactly when the sample equals it, and the first mismatch commits the sample: the output
+        // distribution is the base model's. The chain is cut at the first mismatch, so rows after it are unused.
+        int32_t const rows = activeBatchSize * mRuntime.deployment.specConfig->verifySize;
+        auto const vocab = mRuntime.base.pipelineIO.outputLogits.getShape()[1];
+        check::check(mSampledIds.reshape({rows, 1}), "Tensor reshape failed");
+        SamplingParams params(rows, static_cast<int32_t>(vocab), context.temperature, static_cast<int32_t>(context.topK),
+            context.topP);
+        topKtopPSamplingFromLogits(mRuntime.base.pipelineIO.outputLogits, mSampledIds, params,
+            mRuntime.sampling.workspace, context.stream, kMtpSamplingSeed, mSamplingOffset++);
+        forceRowTokens(mRuntime.base.pipelineIO.outputLogits, mSampledIds, context.stream);
+    }
     kernel::eagleAccept(mRuntime.base.pipelineIO.outputLogits, acceptTokenIds, verifyTreeMask, mAcceptedTokenIds,
         mAcceptedTokenIndices, mAcceptLength, vocabMappingTable, mRuntime.sampling.workspace.rawPointer(),
         mRuntime.sampling.workspace.getMemoryCapacity(), context.stream);
@@ -913,6 +943,10 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
 
     decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mAcceptLength, context.stream);
+    if (presence)
+    {
+        markWindowSeen(mRuntime.sampling.presenceSeen, mRuntime.preprocess.idsInput, mAcceptLength, context.stream);
+    }
 
     // Few-layer-validation teacher forcing (no-op unless EDGELLM_FORCE_TOKENS_FILE is set). Must
     // run before the KV-cache commit below: trimming the acceptance is what keeps a replaced

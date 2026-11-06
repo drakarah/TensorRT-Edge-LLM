@@ -211,17 +211,18 @@ class OpenAIServingChat:
             )
         except PermissionError as exc:
             raise ServerError(str(exc), status_code=403) from exc
+        if request.frequency_penalty != 0 and os.environ.get("EDGELLM_IGNORE_UNSUPPORTED_PENALTIES") == "1":
+            # Agent harnesses cannot be configured: drop the penalty the runtime has no kernel for instead of a 400.
+            request.frequency_penalty = 0
         if request.frequency_penalty != 0:
             raise UnsupportedFeatureError(
                 "frequency_penalty is not supported by the Edge-LLM runtime",
                 param="frequency_penalty")
         if request.presence_penalty != 0:
             capabilities = getattr(self._client, "capabilities", None)
-            if (getattr(capabilities, "speculative_decoding", False)
-                    or (getattr(capabilities, "max_num_seqs", 1) or 1) > 1):
+            if (getattr(capabilities, "max_num_seqs", 1) or 1) > 1:
                 raise UnsupportedFeatureError(
-                    "presence_penalty needs a deployment without speculative "
-                    "decoding and with a single request slot",
+                    "presence_penalty needs a deployment with a single request slot",
                     param="presence_penalty")
         reasoning_budget = request.reasoning_budget_tokens if request.enable_thinking else -1
         if reasoning_budget >= 0:

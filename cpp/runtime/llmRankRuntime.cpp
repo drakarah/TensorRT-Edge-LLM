@@ -503,8 +503,18 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     size_t const logprobsWorkspaceSize = mLogprobsMaxBatchDim > 0
         ? getExtractTopKLogprobsWorkspaceSize(mLogprobsMaxBatchDim, mDeployment.base.outputVocabSize, kMaxLogprobsK)
         : 0U;
+    // MTP chain sampling verifies a window of up to 8 rows (lookup windows) per request: sample every row.
+    int32_t const mtpSamplingRows = (hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kMTP)
+        ? mMaxRuntimeBatchSize * std::max(mDeployment.specConfig->verifySize, 8)
+        : 0;
+    size_t const mtpSamplingWorkspaceSize = mtpSamplingRows > 0
+        ? std::max(getTopKtopPSamplingWorkspaceSize(mtpSamplingRows, mDeployment.base.outputVocabSize,
+                       SamplingParams(mtpSamplingRows, mDeployment.base.outputVocabSize, 1.0f, 0, 0.9f)),
+              getTopKtopPSamplingWorkspaceSize(mtpSamplingRows, mDeployment.base.outputVocabSize,
+                  SamplingParams(mtpSamplingRows, mDeployment.base.outputVocabSize, 1.0f, 20, 0.95f)))
+        : 0U;
     size_t const maxSamplingWorkspaceSize = hasDraft
-        ? std::max({vanillaSamplingWorkspaceSize,
+        ? std::max({vanillaSamplingWorkspaceSize, mtpSamplingWorkspaceSize,
               getSelectAllTopKWorkspaceSize(vanillaSamplingRows, mDeployment.base.outputVocabSize, 1),
               getSelectAllTopKWorkspaceSize(draftSamplingRows, mDeployment.draft->outputVocabSize, draftSamplingTopK),
               dsparkBaseTopKWorkspaceSize, dflash2TopPWorkspaceSize, logprobsWorkspaceSize})
@@ -2002,7 +2012,8 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
             request.temperature, request.topK, request.topP);
     }
 
-    if (request.presencePenalty != 0.0f && (enableSpecDecode || activeBatchSize > 1))
+    if (request.presencePenalty != 0.0f
+        && ((enableSpecDecode && !decodingCapabilities.supportsPresencePenalty) || activeBatchSize > 1))
     {
         LOG_ERROR("presence_penalty needs vanilla decoding of a single request (speculative decoding: %d, batch: %d).",
             static_cast<int>(enableSpecDecode), activeBatchSize);

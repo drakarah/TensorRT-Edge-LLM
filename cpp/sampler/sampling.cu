@@ -959,6 +959,92 @@ void forceToken(rt::Tensor& logits, int32_t tokenId, cudaStream_t stream)
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void applyWindowPresencePenaltyKernel(
+    float* logits, int32_t const* windowIds, int8_t const* seenFlags, int32_t vocabSize, float penalty)
+{
+    int32_t const row = static_cast<int32_t>(blockIdx.y);
+    int32_t const token = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x)
+        + static_cast<int32_t>(threadIdx.x);
+    if (token >= vocabSize)
+    {
+        return;
+    }
+    // Row r predicts the token after window[0..r]: those tokens count as generated for it, besides the flagged ones.
+    bool seen = seenFlags[token] != 0;
+    for (int32_t j = 0; j <= row && !seen; ++j)
+    {
+        seen = windowIds[j] == token;
+    }
+    if (seen)
+    {
+        logits[static_cast<int64_t>(row) * vocabSize + token] -= penalty;
+    }
+}
+
+void applyWindowPresencePenalty(
+    rt::Tensor& logits, rt::Tensor const& windowIds, rt::Tensor const& seenFlags, float penalty, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU && logits.getDataType() == nvinfer1::DataType::kFLOAT
+            && windowIds.getDataType() == nvinfer1::DataType::kINT32 && seenFlags.getDataType() == nvinfer1::DataType::kINT8,
+        "Invalid tensors for the window presence penalty");
+    auto const shape = logits.getShape();
+    check::check(shape.getNumDims() == 2, "Invalid tensor dimensions");
+    int32_t const rows = static_cast<int32_t>(shape[0]);
+    int32_t const vocabSize = static_cast<int32_t>(shape[1]);
+    check::check(windowIds.getShape().volume() >= rows && seenFlags.getShape()[1] == vocabSize,
+        "Window presence penalty shape mismatch");
+    if (rows == 0 || vocabSize == 0)
+    {
+        return;
+    }
+    constexpr int32_t kBLOCK_SIZE = 256;
+    dim3 const grid(static_cast<uint32_t>((vocabSize + kBLOCK_SIZE - 1) / kBLOCK_SIZE), static_cast<uint32_t>(rows));
+    applyWindowPresencePenaltyKernel<<<grid, kBLOCK_SIZE, 0, stream>>>(logits.dataPointer<float>(),
+        windowIds.dataPointer<int32_t>(), seenFlags.dataPointer<int8_t>(), vocabSize, penalty);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void markWindowSeenKernel(int8_t* seenFlags, int32_t const* windowIds, int32_t const* acceptLength, int32_t vocabSize)
+{
+    for (int32_t i = 0; i < acceptLength[0]; ++i)
+    {
+        int32_t const token = windowIds[i];
+        if (token >= 0 && token < vocabSize)
+        {
+            seenFlags[token] = 1;
+        }
+    }
+}
+
+void markWindowSeen(rt::Tensor& seenFlags, rt::Tensor const& windowIds, rt::Tensor const& acceptLength, cudaStream_t stream)
+{
+    markWindowSeenKernel<<<1, 1, 0, stream>>>(seenFlags.dataPointer<int8_t>(), windowIds.dataPointer<int32_t>(),
+        acceptLength.dataPointer<int32_t>(), static_cast<int32_t>(seenFlags.getShape()[1]));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void forceRowTokensKernel(float* logits, int32_t const* tokens, int32_t vocabSize)
+{
+    int32_t const row = static_cast<int32_t>(blockIdx.x);
+    logits[static_cast<int64_t>(row) * vocabSize + tokens[row]] = 1e30F;
+}
+
+void forceRowTokens(rt::Tensor& logits, rt::Tensor const& tokens, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU && logits.getDataType() == nvinfer1::DataType::kFLOAT,
+        "forceRowTokens needs GPU Float logits");
+    auto const shape = logits.getShape();
+    check::check(shape.getNumDims() == 2, "Invalid tensor dimensions");
+    int32_t const rows = static_cast<int32_t>(shape[0]);
+    if (rows == 0)
+    {
+        return;
+    }
+    forceRowTokensKernel<<<rows, 1, 0, stream>>>(
+        logits.dataPointer<float>(), tokens.dataPointer<int32_t>(), static_cast<int32_t>(shape[1]));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 //! Words of the packed mask each warp visits per launch; sizes the grid's x dimension.
 constexpr int32_t kTOKEN_BITMASK_WORDS_PER_WARP = 8;
 
