@@ -1030,8 +1030,9 @@ class LLM:
             bundle = os.path.abspath(model)
             prepared = SimpleNamespace(bundle_dir=bundle, model_dir=bundle,
                                        draft_model_dir="")
-            self._checkpoint_dir = ""
-            self._draft_checkpoint_dir = ""
+            # Engines from the checkpoint-native builder keep their weights in the checkpoint: the operator names it.
+            self._checkpoint_dir = os.environ.get("EDGELLM_CHECKPOINT_DIR", "")
+            self._draft_checkpoint_dir = os.environ.get("EDGELLM_DRAFT_CHECKPOINT_DIR", "")
             if spec_method == "none" and detect_engine_type(
                     bundle) == EngineType.SPEC_DECODE:
                 spec_method = _read_json(
