@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "runtime/config/deploymentConfig.h"
 #include "runtime/decoding/decoderUtils.h"
 
 #include "common/cudaUtils.h"
@@ -184,4 +185,87 @@ TEST(DecoderUtilsTests, SpecPrefillRejectsPhysicalTokenOverflow)
     rt::DecodingInferenceContext context;
     context.activeBatchSize = std::numeric_limits<int32_t>::max();
     EXPECT_THROW(rt::decoder_utils::buildSpecPrefillRaggedBatch(context, 2), std::runtime_error);
+}
+
+TEST(DecoderUtilsTests, KvCommitCopyIsSkippedOnlyForChainsOnPackedPools)
+{
+    EXPECT_TRUE(rt::decoder_utils::baseKvCommitCopyNeeded(/*treeMode=*/false, /*packedV=*/false));
+    EXPECT_TRUE(rt::decoder_utils::baseKvCommitCopyNeeded(/*treeMode=*/true, /*packedV=*/false));
+    EXPECT_TRUE(rt::decoder_utils::baseKvCommitCopyNeeded(/*treeMode=*/true, /*packedV=*/true));
+    EXPECT_FALSE(rt::decoder_utils::baseKvCommitCopyNeeded(/*treeMode=*/false, /*packedV=*/true));
+}
+
+namespace
+{
+rt::DeploymentConfig makeSpecDeployment(rt::SpecDecodeMode mode, int32_t draftingTopK, int32_t maxVerifySize,
+    bool basePacked, bool draftPacked = false)
+{
+    rt::DeploymentConfig deployment;
+    deployment.base.specDecodeType = mode;
+    deployment.base.kvCacheVPacked = basePacked;
+    rt::LLMEngineConfig draft = deployment.base;
+    draft.kvCacheVPacked = draftPacked;
+    deployment.draft = draft;
+    rt::SpecDecodeConfig spec;
+    spec.draftingTopK = draftingTopK;
+    spec.maxVerifySize = maxVerifySize;
+    spec.verifySize = std::min(maxVerifySize, 3);
+    deployment.specConfig = spec;
+    return deployment;
+}
+} // namespace
+
+TEST(DecoderUtilsTests, PackedVSpeculationIsLimitedToMtpChainsWithinTheTestedVerifyWindow)
+{
+    using rt::SpecDecodeMode;
+    constexpr int32_t kRows = kPackedVMaxSpecRows;
+    EXPECT_TRUE(rt::packedVSpeculationSupported(makeSpecDeployment(SpecDecodeMode::kMTP, 1, kRows, true)));
+    EXPECT_TRUE(rt::packedVSpeculationSupported(makeSpecDeployment(SpecDecodeMode::kMTP, 1, 1, true)));
+    EXPECT_TRUE(rt::packedVSpeculationSupported(makeSpecDeployment(SpecDecodeMode::kMTP, 0, kRows, true)));
+    EXPECT_FALSE(rt::packedVSpeculationSupported(makeSpecDeployment(SpecDecodeMode::kMTP, 1, kRows + 1, true)));
+    EXPECT_FALSE(rt::packedVSpeculationSupported(makeSpecDeployment(SpecDecodeMode::kMTP, 2, kRows, true)));
+    // A packed draft pool is never supported.
+    EXPECT_FALSE(rt::packedVSpeculationSupported(
+        makeSpecDeployment(SpecDecodeMode::kMTP, 1, kRows, /*basePacked=*/true, /*draftPacked=*/true)));
+    EXPECT_FALSE(rt::packedVSpeculationSupported(
+        makeSpecDeployment(SpecDecodeMode::kMTP, 1, kRows, /*basePacked=*/false, /*draftPacked=*/true)));
+    for (SpecDecodeMode mode : {SpecDecodeMode::kNONE, SpecDecodeMode::kEAGLE, SpecDecodeMode::kDFlash,
+             SpecDecodeMode::kJetSpec, SpecDecodeMode::kGemma4MTP, SpecDecodeMode::kDSpark})
+    {
+        EXPECT_FALSE(rt::packedVSpeculationSupported(makeSpecDeployment(mode, 1, 2, true)))
+            << "mode " << static_cast<int32_t>(mode);
+    }
+}
+
+TEST(DecoderUtilsTests, UnpackedPoolsAreNeverRestrictedBySpeculationMode)
+{
+    using rt::SpecDecodeMode;
+    for (SpecDecodeMode mode : {SpecDecodeMode::kNONE, SpecDecodeMode::kEAGLE, SpecDecodeMode::kMTP,
+             SpecDecodeMode::kDFlash, SpecDecodeMode::kGemma4MTP, SpecDecodeMode::kDSpark})
+    {
+        for (int32_t topK : {1, 2, 4})
+        {
+            EXPECT_TRUE(rt::packedVSpeculationSupported(makeSpecDeployment(mode, topK, 16, /*basePacked=*/false)));
+        }
+    }
+    rt::DeploymentConfig noSpec;
+    noSpec.base.kvCacheVPacked = true;
+    EXPECT_FALSE(rt::packedVSpeculationSupported(noSpec)) << "packed V without a speculative configuration is not MTP";
+}
+
+TEST(DecoderUtilsTests, EverySupportedPackedVConfigurationSkipsTheUnpackedStrideCommitCopy)
+{
+    using rt::SpecDecodeMode;
+    for (int32_t topK = 0; topK <= 4; ++topK)
+    {
+        for (int32_t rows = 1; rows <= kPackedVMaxSpecRows + 1; ++rows)
+        {
+            if (rt::packedVSpeculationSupported(makeSpecDeployment(SpecDecodeMode::kMTP, topK, rows, true)))
+            {
+                // The decoder's own rule for tree drafting, shared with MTPDecoder.
+                EXPECT_FALSE(rt::decoder_utils::baseKvCommitCopyNeeded(rt::mtpDraftsTree(topK), /*packedV=*/true))
+                    << "topK " << topK << " rows " << rows;
+            }
+        }
+    }
 }

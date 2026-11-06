@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "common/kvFormatLimits.h"
 #include "runtime/config/llmEngineConfig.h"
 
 #include <cstdint>
@@ -146,6 +147,27 @@ struct DeploymentConfig
     //! Exported SWA capability metadata remains unchanged; full storage wins on equal page counts.
     void selectSwaKVCacheMode(bool contextReuseEnabled) noexcept;
 };
+
+//! MTP drafts a tree when more than one candidate per depth is requested; otherwise it drafts a chain.
+inline bool mtpDraftsTree(int32_t draftingTopK)
+{
+    return draftingTopK > 1;
+}
+
+//! A packed-V (K8V4) KV cache supports speculative decoding only for an MTP chain (the accepted rows are a prefix, so the
+//! KV commit copy that moves rows at the unpacked stride is not needed) with a verify window the XQA kernels are tested for.
+//! The draft engine's pool is never packed.
+inline bool packedVSpeculationSupported(DeploymentConfig const& deployment)
+{
+    bool const draftPacked = deployment.draft.has_value() && deployment.draft->kvCacheVPacked;
+    if (!deployment.base.kvCacheVPacked && !draftPacked)
+    {
+        return true;
+    }
+    return !draftPacked && deployment.specDecodeMode() == SpecDecodeMode::kMTP && deployment.specConfig.has_value()
+        && !mtpDraftsTree(deployment.specConfig->draftingTopK)
+        && deployment.specConfig->maxVerifySize <= kPackedVMaxSpecRows;
+}
 
 //! Create a `DeploymentConfig` from engine config paths and optional user-side drafting.
 //!

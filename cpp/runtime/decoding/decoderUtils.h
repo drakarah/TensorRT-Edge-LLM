@@ -143,6 +143,13 @@ void collectLogprobsFromHost(
 void collectSpecLogprobsFromHost(DecodingRuntimeContext& runtime, DecodingInferenceContext& context,
     int32_t activeBatchSize, int32_t rowsPerBatch, int32_t const* hostAcceptLens, int32_t topK);
 
+//! A chain accepts a prefix of the verified rows, so the accepted KV rows are already in place; the commit copy moves
+//! rows at the unpacked stride and must not run on a packed-V pool.
+inline bool baseKvCommitCopyNeeded(bool treeMode, bool packedV)
+{
+    return treeMode || !packedV;
+}
+
 } // namespace decoder_utils
 } // namespace rt
 } // namespace trt_edgellm

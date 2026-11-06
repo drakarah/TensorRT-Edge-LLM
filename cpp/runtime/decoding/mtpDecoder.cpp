@@ -39,14 +39,18 @@
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "sampler/sampling.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -57,6 +61,10 @@ namespace rt
 namespace
 {
 constexpr uint64_t kMtpSamplingSeed{0x4D5450534D504C45ULL};
+
+void checkChainAcceptIsInPlace(
+    Tensor const& acceptedIndices, Tensor const& acceptLength, int32_t batch, int32_t maxAcceptDepth, cudaStream_t stream);
+
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
 } // namespace
@@ -84,7 +92,7 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     // draftingTopK candidates per depth row. The EAGLE draft-table machinery below only
     // drives that chain walk, so it is sized with topK = 1 in tree mode; draftingTopK
     // itself is consumed as the tree-build candidate fanout (see buildTreeVerifyInputs).
-    mUseTree = draftingConfig.draftingTopK > 1;
+    mUseTree = mtpDraftsTree(draftingConfig.draftingTopK);
     int32_t const effectiveDraftTopK = mUseTree ? 1 : draftingConfig.draftingTopK;
     mServedVerifySize = draftingConfig.verifySize;
     if (char const* env = std::getenv("EDGELLM_MTP_LOOKUP"); env != nullptr && std::atoi(env) > 0)
@@ -955,12 +963,22 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     decoder_utils::applyForcedAcceptance(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, ownTokens, maxAcceptDepth, context.stream);
 
-    for (auto const& group : kvHeadDimGroups)
+    static bool const sCheckChainCommit = std::getenv("EDGELLM_MTP_CHECK_CHAIN_COMMIT") != nullptr;
+    if (sCheckChainCommit && !mUseTree)
     {
-        kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths,
-            mRuntime.base.pipelineIO.stateIndices, group.deviceLayerInfos, group.numLayers, group.headDim,
-            group.maxKVHeads, activeBatchSize, mRuntime.deployment.base.recurrentPoolRows, maxAcceptDepth, kvCacheType,
-            context.stream, basePageTablePtr, baseNumPages, baseMaxPagesPerSeq);
+        checkChainAcceptIsInPlace(mAcceptedTokenIndices, mAcceptLength, activeBatchSize, maxAcceptDepth, context.stream);
+    }
+    bool const commitCopy
+        = decoder_utils::baseKvCommitCopyNeeded(mUseTree, mRuntime.deployment.base.kvCacheVPacked);
+    if (commitCopy)
+    {
+        for (auto const& group : kvHeadDimGroups)
+        {
+            kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths,
+                mRuntime.base.pipelineIO.stateIndices, group.deviceLayerInfos, group.numLayers, group.headDim,
+                group.maxKVHeads, activeBatchSize, mRuntime.deployment.base.recurrentPoolRows, maxAcceptDepth,
+                kvCacheType, context.stream, basePageTablePtr, baseNumPages, baseMaxPagesPerSeq);
+        }
     }
     kernel::eagleBaseAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.baseHiddenStates, context.stream);
@@ -1507,8 +1525,215 @@ void MTPDecoder::saveSystemPromptKVCache(SystemPromptCacheKey const& key, std::s
     mSystemPromptKVCacheDraft.insert({key, std::move(savedKVCacheDraft)});
 }
 
+namespace
+{
+//! Pinned host staging for the debug read-backs below; grows on demand and is released with the process.
+template <typename T>
+class PinnedHostBuffer
+{
+public:
+    PinnedHostBuffer() = default;
+    PinnedHostBuffer(PinnedHostBuffer const&) = delete;
+    PinnedHostBuffer& operator=(PinnedHostBuffer const&) = delete;
+
+    ~PinnedHostBuffer()
+    {
+        if (mData != nullptr)
+        {
+            static_cast<void>(cudaFreeHost(mData));
+        }
+    }
+
+    T* reserve(size_t count)
+    {
+        if (count > mCapacity)
+        {
+            if (mData != nullptr)
+            {
+                CUDA_CHECK(cudaFreeHost(mData));
+                mData = nullptr;
+                mCapacity = 0;
+            }
+            CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&mData), count * sizeof(T)));
+            mCapacity = count;
+        }
+        return mData;
+    }
+
+private:
+    T* mData{nullptr};
+    size_t mCapacity{0};
+};
+
+//! Debug check (EDGELLM_MTP_CHECK_CHAIN_COMMIT=1): in chain mode every accepted row must be the verified row of the same
+//! index, because the packed-V path skips the KV commit copy that would otherwise move accepted rows into place.
+void checkChainAcceptIsInPlace(
+    Tensor const& acceptedIndices, Tensor const& acceptLength, int32_t batch, int32_t maxAcceptDepth, cudaStream_t stream)
+{
+    static PinnedHostBuffer<int32_t> sIndices;
+    static PinnedHostBuffer<int32_t> sLengths;
+    int32_t* indices = sIndices.reserve(static_cast<size_t>(batch) * maxAcceptDepth);
+    int32_t* lengths = sLengths.reserve(static_cast<size_t>(batch));
+    CUDA_CHECK(cudaMemcpyAsync(indices, acceptedIndices.dataPointer<int32_t>(),
+        static_cast<size_t>(batch) * maxAcceptDepth * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(lengths, acceptLength.dataPointer<int32_t>(), static_cast<size_t>(batch) * sizeof(int32_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int32_t b = 0; b < batch; ++b)
+    {
+        ELLM_CHECK(lengths[b] >= 1 && lengths[b] <= maxAcceptDepth, "chain accept length out of range");
+        for (int32_t i = 0; i < lengths[b]; ++i)
+        {
+            ELLM_CHECK(indices[b * maxAcceptDepth + i] == i,
+                "MTP chain accepted a row that is not the verified row of the same index: the packed-V path would keep "
+                "the wrong KV rows");
+        }
+    }
+}
+
+//! Calibration aid (EDGELLM_DUMP_DRAFT_KV_AMAX=<json path>): before the draft cache is reset for a new request, fold
+//! the largest RoPE pair length of K and the largest magnitude of V of the finished request's cached rows into a
+//! running maximum and write it as {"k_amax":[..],"v_amax":[..]}; INT8 draft-KV scales are amax * margin / 127. The last
+//! request of a run is folded only at the next reset, so send one more request before reading the file.
+//! Scans batch slot 0 of a full-capacity FP16 pool only (batch size 1 engines); anything else is reported and skipped.
+//! EDGELLM_DUMP_DRAFT_KV_ROTARY_DIM overrides the rotary width (default headDim / 4, rotate-half pairing).
+void foldDraftKvAmax(HybridCacheManager& cache, cudaStream_t stream)
+{
+    char const* path = std::getenv("EDGELLM_DUMP_DRAFT_KV_AMAX");
+    if (path == nullptr || path[0] == '\0')
+    {
+        return;
+    }
+    static std::vector<float> sKAmax;
+    static std::vector<float> sVAmax;
+    static PinnedHostBuffer<__half> sStaging;
+    static std::set<std::string> sReported;
+    auto warnOnce = [&](std::string const& reason)
+    {
+        if (sReported.insert(reason).second)
+        {
+            LOG_WARNING("EDGELLM_DUMP_DRAFT_KV_AMAX: %s; no amax is recorded", reason.c_str());
+        }
+    };
+
+    auto& kv = cache.getKVCacheManager();
+    auto const& kvConfig = kv.getConfig();
+    if (kvConfig.kvCacheType != nvinfer1::DataType::kHALF)
+    {
+        warnOnce("the draft KV cache is not FP16");
+        return;
+    }
+    if (kvConfig.useBoundedSwaKVCache || kvConfig.maxBatchSize != 1)
+    {
+        warnOnce("only a full-capacity draft cache with batch size 1 is supported");
+        return;
+    }
+    int32_t const numLayers = static_cast<int32_t>(kvConfig.layerConfigs.size());
+    // Rotary width: one value for every layer, validated before anything is accumulated.
+    int32_t rotaryOverride = 0;
+    if (char const* rotEnv = std::getenv("EDGELLM_DUMP_DRAFT_KV_ROTARY_DIM"))
+    {
+        char* end = nullptr;
+        long const value = std::strtol(rotEnv, &end, 10);
+        if (end == rotEnv || *end != '\0' || value <= 0 || value > INT32_MAX)
+        {
+            warnOnce("EDGELLM_DUMP_DRAFT_KV_ROTARY_DIM is not a positive integer");
+            return;
+        }
+        rotaryOverride = static_cast<int32_t>(value);
+    }
+    std::vector<int32_t> rotary(numLayers);
+    for (int32_t layer = 0; layer < numLayers; ++layer)
+    {
+        int32_t const headDim = kvConfig.layerConfigs[layer].headDim;
+        rotary[layer] = rotaryOverride > 0 ? rotaryOverride : headDim / 4;
+        if (rotary[layer] > headDim || rotary[layer] % 2 != 0)
+        {
+            warnOnce("the rotary width must be even and within the head dimension");
+            return;
+        }
+    }
+    if (sKAmax.empty())
+    {
+        sKAmax.assign(numLayers, 0.F);
+        sVAmax.assign(numLayers, 0.F);
+    }
+    int32_t length = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&length, cache.getKVCacheLengths().dataPointer<int32_t>(), sizeof(int32_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (length <= 0)
+    {
+        return;
+    }
+    for (int32_t layer = 0; layer < numLayers; ++layer)
+    {
+        auto const views = kv.getSeparateKVCache(layer);
+        auto const& lc = kvConfig.layerConfigs[layer];
+        // Slot 0 of the [maxBatch, capacity, H, D] view starts at its first byte and holds `capacity` rows.
+        int64_t const rows = std::min<int64_t>(length, views.first.getShape()[1]);
+        size_t const count = static_cast<size_t>(rows * lc.numKVHeads * lc.headDim);
+        __half* host = sStaging.reserve(count);
+        for (int32_t which = 0; which < 2; ++which)
+        {
+            Tensor const& view = which == 0 ? views.first : views.second;
+            CUDA_CHECK(cudaMemcpyAsync(host, view.dataPointer<__half>(), count * sizeof(__half),
+                cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            float amax = 0.F;
+            if (which == 0)
+            {
+                int32_t const half = rotary[layer] / 2;
+                for (int64_t row = 0; row < rows * lc.numKVHeads; ++row)
+                {
+                    __half const* k = host + row * lc.headDim;
+                    for (int32_t i = 0; i < half; ++i)
+                    {
+                        float const a = __half2float(k[i]);
+                        float const b = __half2float(k[i + half]);
+                        amax = std::max(amax, std::sqrt(a * a + b * b));
+                    }
+                    for (int32_t i = rotary[layer]; i < lc.headDim; ++i)
+                    {
+                        amax = std::max(amax, std::fabs(__half2float(k[i])));
+                    }
+                }
+            }
+            else
+            {
+                for (size_t i = 0; i < count; ++i)
+                {
+                    amax = std::max(amax, std::fabs(__half2float(host[i])));
+                }
+            }
+            float& slot = which == 0 ? sKAmax[layer] : sVAmax[layer];
+            slot = std::max(slot, amax);
+        }
+    }
+    FILE* out = std::fopen(path, "w");
+    if (out == nullptr)
+    {
+        warnOnce("the output file cannot be opened");
+        return;
+    }
+    std::fprintf(out, "{\"k_amax\": [");
+    for (size_t i = 0; i < sKAmax.size(); ++i)
+    {
+        std::fprintf(out, "%s%.6f", i != 0 ? ", " : "", sKAmax[i]);
+    }
+    std::fprintf(out, "], \"v_amax\": [");
+    for (size_t i = 0; i < sVAmax.size(); ++i)
+    {
+        std::fprintf(out, "%s%.6f", i != 0 ? ", " : "", sVAmax[i]);
+    }
+    std::fprintf(out, "], \"last_length\": %d}\n", length);
+    std::fclose(out);
+}
+} // namespace
+
 void MTPDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream)
 {
+    foldDraftKvAmax(mDraftCacheManager, stream);
     mDraftCacheManager.resetForNewSequences(reuseLengths, stream);
 }
 

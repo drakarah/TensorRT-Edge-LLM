@@ -115,6 +115,10 @@ struct PackedCase
     int32_t fixedPattern{-1};    //!< >= 0: every row uses this pattern
     float largeAmplitude{6.0F}; //!< amplitude of pattern 5
     bool peaked{false};         //!< sequence b attends to token b only (every q head of a sequence is the same vector)
+    int32_t qSeqLen{0};         //!< > 0: speculative-decode verify with this many query rows; lengths include them
+    int32_t maskKind{0};        //!< verify rows: 0 chain (row i sees rows 0..i), 1 random tree (row i sees its ancestors)
+    bool useQSeqLens{false};    //!< pass the per-sequence query lengths as the attention plugin does
+    std::vector<int32_t> validRows; //!< per-sequence valid verify rows (<= qSeqLen); lengths still include the padded width
 };
 
 //! Fills garbage that must never influence the result: fp16 NaN pairs and random bytes.
@@ -152,7 +156,9 @@ void runPackedDecode(PackedCase const& tc)
     std::uniform_real_distribution<float> uni(-1.0F, 1.0F);
 
     // Q, K (int8 with a per-tensor scale) and V rows.
-    std::vector<half> q(static_cast<size_t>(batch) * tc.numQHeads * kHEAD);
+    int32_t const R = std::max(tc.qSeqLen, 1); // query rows per sequence (fixed width)
+    auto rowsOf = [&](int32_t b) { return tc.validRows.empty() ? R : tc.validRows[b]; };
+    std::vector<half> q(static_cast<size_t>(batch) * R * tc.numQHeads * kHEAD);
     for (auto& x : q) x = __float2half(uni(gen));
     float const kScale = (tc.peaked ? 8.0F : 1.0F) / 127.0F;
     std::vector<int8_t> kQuant(static_cast<size_t>(batch) * H * maxLen * kHEAD);
@@ -263,43 +269,76 @@ void runPackedDecode(PackedCase const& tc)
         }
     }
 
-    // Reference in double precision.
-    int32_t const ratio = tc.numQHeads / H;
-    std::vector<double> ref(static_cast<size_t>(batch) * tc.numQHeads * kHEAD, 0.0);
-    for (int32_t b = 0; b < batch; ++b)
-        for (int32_t qh = 0; qh < tc.numQHeads; ++qh)
+    // Verify-row visibility: the first lengths[b] - R positions are fully visible, row i sees verify row j when
+    // mask[b][i * R + j]. A tree row sees its ancestors and itself.
+    std::vector<std::vector<int32_t>> mask(batch, std::vector<int32_t>(static_cast<size_t>(R) * R, 0));
+    if (tc.qSeqLen > 0)
+    {
+        std::mt19937 maskGen(tc.seed * 7919U + 13U);
+        for (int32_t b = 0; b < batch; ++b)
         {
-            int32_t const h = qh / ratio;
-            std::vector<double> score(tc.lengths[b]);
-            double best = -1e300;
-            for (int32_t s = 0; s < tc.lengths[b]; ++s)
+            ASSERT_GE(tc.lengths[b], R);
+            ASSERT_LE(rowsOf(b), R);
+            for (int32_t i = 0; i < rowsOf(b); ++i)
             {
-                size_t const at = ((static_cast<size_t>(b) * H + h) * maxLen + s) * kHEAD;
-                double acc = 0.0;
-                for (int32_t d = 0; d < kHEAD; ++d)
-                {
-                    acc += static_cast<double>(__half2float(q[(static_cast<size_t>(b) * tc.numQHeads + qh) * kHEAD + d]))
-                        * static_cast<double>(kQuant[at + d]) * kScale;
-                }
-                score[s] = acc * attentionScale;
-                best = std::max(best, score[s]);
-            }
-            double sum = 0.0;
-            for (auto& x : score) { x = std::exp(x - best); sum += x; }
-            for (int32_t s = 0; s < tc.lengths[b]; ++s)
-            {
-                size_t const at = ((static_cast<size_t>(b) * H + h) * maxLen + s) * kHEAD;
-                for (int32_t d = 0; d < kHEAD; ++d)
-                {
-                    ref[(static_cast<size_t>(b) * tc.numQHeads + qh) * kHEAD + d] += score[s] / sum * vDecoded[at + d];
-                }
+                int32_t const parent = tc.maskKind == 0 ? i - 1 : (i == 0 ? -1 : static_cast<int32_t>(maskGen() % i));
+                if (parent >= 0)
+                    for (int32_t j = 0; j < R; ++j) mask[b][i * R + j] = mask[b][parent * R + j];
+                mask[b][i * R + i] = 1;
             }
         }
+    }
+    auto visible = [&](int32_t b, int32_t row, int32_t s) {
+        if (tc.qSeqLen == 0) return true;
+        // Fixed-width input keeps the padding rows in KV, so the sequence length counts the full width R.
+        int32_t const past = tc.lengths[b] - R;
+        return s < past || mask[b][row * R + (s - past)] != 0;
+    };
+
+    // Reference in double precision.
+    int32_t const ratio = tc.numQHeads / H;
+    std::vector<double> ref(static_cast<size_t>(batch) * R * tc.numQHeads * kHEAD, 0.0);
+    for (int32_t b = 0; b < batch; ++b)
+        for (int32_t row = 0; row < rowsOf(b); ++row)
+            for (int32_t qh = 0; qh < tc.numQHeads; ++qh)
+            {
+                int32_t const h = qh / ratio;
+                size_t const qAt = ((static_cast<size_t>(b) * R + row) * tc.numQHeads + qh) * kHEAD;
+                std::vector<double> score(tc.lengths[b], 0.0);
+                double best = -1e300;
+                for (int32_t s = 0; s < tc.lengths[b]; ++s)
+                {
+                    if (!visible(b, row, s)) continue;
+                    size_t const at = ((static_cast<size_t>(b) * H + h) * maxLen + s) * kHEAD;
+                    double acc = 0.0;
+                    for (int32_t d = 0; d < kHEAD; ++d)
+                    {
+                        acc += static_cast<double>(__half2float(q[qAt + d])) * static_cast<double>(kQuant[at + d])
+                            * kScale;
+                    }
+                    score[s] = acc * attentionScale;
+                    best = std::max(best, score[s]);
+                }
+                double sum = 0.0;
+                for (int32_t s = 0; s < tc.lengths[b]; ++s)
+                {
+                    score[s] = visible(b, row, s) ? std::exp(score[s] - best) : 0.0;
+                    sum += score[s];
+                }
+                for (int32_t s = 0; s < tc.lengths[b]; ++s)
+                {
+                    size_t const at = ((static_cast<size_t>(b) * H + h) * maxLen + s) * kHEAD;
+                    for (int32_t d = 0; d < kHEAD; ++d)
+                    {
+                        ref[qAt + d] += score[s] / sum * vDecoded[at + d];
+                    }
+                }
+            }
 
     // Launch.
     ASSERT_TRUE(canCompileXQAKernel(tc.numQHeads, H, kHEAD, smVersion, DataType::kHALF, DataType::kINT4));
-    ASSERT_TRUE(loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kINT4, kHEAD, tc.numQHeads, H, false, false,
-        tc.paged ? kTOKENS_PER_PAGE : 0));
+    ASSERT_TRUE(loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kINT4, kHEAD, tc.numQHeads, H, false,
+        tc.qSeqLen > 0, tc.paged ? kTOKENS_PER_PAGE : 0));
     DecoderXQARunner runner(DataType::kHALF, DataType::kINT4, batch, tc.numQHeads, H, kHEAD, smVersion);
     auto params = runner.initXQAParams();
     thrust::device_vector<half> qDevice(q);
@@ -307,6 +346,18 @@ void runPackedDecode(PackedCase const& tc)
     thrust::device_vector<int32_t> lengthsDevice(tc.lengths);
     thrust::device_vector<int32_t> pageListDevice(pageList);
     thrust::device_vector<half> outDevice(ref.size(), __float2half(0.0F));
+    std::vector<int32_t> packedMask;
+    if (tc.qSeqLen > 0)
+    {
+        int32_t const words = (R + 31) / 32;
+        packedMask.assign(static_cast<size_t>(batch) * R * words, 0);
+        for (int32_t b = 0; b < batch; ++b)
+            for (int32_t i = 0; i < R; ++i)
+                for (int32_t j = 0; j < R; ++j)
+                    packedMask[(static_cast<size_t>(b) * R + i) * words + j / 32]
+                        |= static_cast<int32_t>(mask[b][i * R + j]) << (j % 32);
+    }
+    thrust::device_vector<int32_t> maskDevice(packedMask);
     params.qInputPtr = thrust::raw_pointer_cast(qDevice.data());
     params.kvCache.data = thrust::raw_pointer_cast(cacheDevice.data());
     params.kvCache.sequence_lengths = thrust::raw_pointer_cast(lengthsDevice.data());
@@ -322,12 +373,21 @@ void runPackedDecode(PackedCase const& tc)
     params.attentionScale = attentionScale;
     params.kScale = kScale;
     params.vScale = 1.0F; // the scales are inside the packed rows
-    thrust::device_vector<int32_t> semaphores(tc.multiBlockSplits > 1 ? batch * H : 0, 0);
-    size_t const scratchBytes = tc.multiBlockSplits > 1
-        ? xqaMultiBlockScratchUpperBound(kHEAD, static_cast<size_t>(batch) * H * tc.multiBlockSplits)
-        : 0;
+    // Spec-decode grids have up to 8 token blocks per KV head and sequence.
+    // multiBlockSplits 0 is kXQA_MULTI_BLOCK_AUTO: the split count fills the GPU, so the SM count bounds the scratch.
+    int32_t smCount = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, 0));
+    uint32_t const splitsBound = tc.multiBlockSplits == kXQA_MULTI_BLOCK_AUTO ? static_cast<uint32_t>(smCount)
+                                                                              : tc.multiBlockSplits;
+    bool const multiBlock = tc.multiBlockSplits == kXQA_MULTI_BLOCK_AUTO || tc.multiBlockSplits > 1;
+    size_t const multiBlockSeqs = static_cast<size_t>(batch) * H * (tc.qSeqLen > 0 ? 8 : 1);
+    thrust::device_vector<int32_t> semaphores(multiBlock ? multiBlockSeqs : 0, 0);
+    size_t const scratchBytes = multiBlock ? xqaMultiBlockScratchUpperBound(kHEAD, multiBlockSeqs * splitsBound) : 0;
     thrust::device_vector<int8_t> scratch(scratchBytes, 0);
-    if (tc.multiBlockSplits > 1)
+    std::vector<int32_t> qSeqLensHost(batch);
+    for (int32_t b = 0; b < batch; ++b) qSeqLensHost[b] = rowsOf(b);
+    thrust::device_vector<int32_t> qSeqLensDevice(qSeqLensHost);
+    if (multiBlock)
     {
         params.nbSubSeqPerSeq = tc.multiBlockSplits;
         params.semaphores = thrust::raw_pointer_cast(semaphores.data());
@@ -335,7 +395,17 @@ void runPackedDecode(PackedCase const& tc)
         params.scratchBytes = scratchBytes;
     }
     cudaStream_t stream{nullptr};
-    runner.dispatchXQAKernel(params, stream);
+    if (tc.qSeqLen > 0)
+    {
+        params.qSeqLen = tc.qSeqLen;
+        if (tc.useQSeqLens) params.qSeqLens = thrust::raw_pointer_cast(qSeqLensDevice.data());
+        params.treeAttnMask = thrust::raw_pointer_cast(maskDevice.data());
+        runner.dispatchSpecDecodeXQAKernel(params, stream);
+    }
+    else
+    {
+        runner.dispatchXQAKernel(params, stream);
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -351,22 +421,30 @@ void runPackedDecode(PackedCase const& tc)
                         static_cast<double>(std::fabs(vDecoded[((static_cast<size_t>(b) * H + h) * maxLen + s) * kHEAD + d])));
     double worst = 0.0;
     double meanRatio = 0.0;
+    size_t compared = 0;
     for (size_t i = 0; i < out.size(); ++i)
     {
+        size_t const b = i / (static_cast<size_t>(R) * tc.numQHeads * kHEAD);
+        size_t const row = (i / (static_cast<size_t>(tc.numQHeads) * kHEAD)) % R;
+        if (static_cast<int32_t>(row) >= rowsOf(static_cast<int32_t>(b))) continue; // padding rows are not defined
         float const got = __half2float(out[i]);
         ASSERT_TRUE(std::isfinite(got)) << "non-finite output at " << i;
-        size_t const b = i / (static_cast<size_t>(tc.numQHeads) * kHEAD);
         size_t const qh = (i / kHEAD) % tc.numQHeads;
         double const err = std::fabs(got - ref[i]);
         double const tol = 1e-7 + 2e-3 * vMax[b * H + qh / ratio] + 1e-2 * std::fabs(ref[i]);
         worst = std::max(worst, err / tol);
         meanRatio += err / tol;
+        ++compared;
         EXPECT_LE(err, tol) << "output " << i << " (batch " << b << ", head " << qh << ", channel " << i % kHEAD
                             << "): got " << got << " expected " << ref[i];
     }
-    meanRatio /= static_cast<double>(out.size());
+    ASSERT_GT(compared, 0U);
+    meanRatio /= static_cast<double>(compared);
     EXPECT_LT(meanRatio, 0.2) << "worst error / tolerance " << worst;
-    std::cout << "XQA packed-V decode: batch " << batch << " q_heads " << tc.numQHeads << " kv_heads " << H << " paged "
+    std::cout << "XQA packed-V " << (tc.qSeqLen > 0 ? "verify rows " + std::to_string(tc.qSeqLen) + " mask "
+                                                                    + std::to_string(tc.maskKind) + " "
+                                                              : std::string("decode "))
+              << ": batch " << batch << " q_heads " << tc.numQHeads << " kv_heads " << H << " paged "
               << tc.paged << " splits " << tc.multiBlockSplits << " max_len " << maxLen << " worst err/tol " << worst
               << std::endl;
 }
@@ -447,6 +525,116 @@ TEST(XQAPackedVDecodingTest, PeakedAttentionSelectsEachTokenOfEveryTile)
             tc.peaked = true;
             runPackedDecode(tc);
         }
+    }
+}
+
+//! Paged verify case: lengths include the verify rows.
+PackedCase specCase(std::vector<int32_t> lengths, int32_t rows, int32_t maskKind, uint32_t seed)
+{
+    return PackedCase{8, 2, std::move(lengths), true, 1, seed, -1, 6.0F, false, rows, maskKind};
+}
+
+TEST(XQAPackedVSpecDecodeTest, VerifyRowsChainAtTileAndPageEdges)
+{
+    for (int32_t rows : {1, 2, 3, 4, 7, 8})
+    {
+        for (int32_t len : {8, 9, 15, 16, 17, 33, 64, 65, 127, 128, 129, 257, 513})
+        {
+            if (len < rows) continue;
+            SCOPED_TRACE("rows=" + std::to_string(rows) + " len=" + std::to_string(len));
+            runPackedDecode(specCase({len, std::max(rows, len / 2 + 1)}, rows, 0, 200 + rows));
+        }
+    }
+}
+
+TEST(XQAPackedVSpecDecodeTest, RandomTreesAndHeadRatios)
+{
+    for (int32_t ratio : {2, 4, 8, 16})
+    {
+        for (uint32_t seed = 300; seed < 304; ++seed)
+        {
+            SCOPED_TRACE("ratio=" + std::to_string(ratio) + " seed=" + std::to_string(seed));
+            PackedCase tc = specCase({37, 400, 129, 8}, 8, 1, seed);
+            tc.numQHeads = 2 * ratio;
+            runPackedDecode(tc);
+        }
+    }
+}
+
+TEST(XQAPackedVSpecDecodeTest, LongContextMultiBlock)
+{
+    for (uint32_t splits : {1U, 4U})
+    {
+        SCOPED_TRACE("splits=" + std::to_string(splits));
+        PackedCase tc = specCase({6000, 5000}, 8, 0, 400);
+        tc.multiBlockSplits = splits;
+        runPackedDecode(tc);
+    }
+}
+
+//! The attention plugin passes the per-sequence query lengths and, by default, kXQA_MULTI_BLOCK_AUTO.
+TEST(XQAPackedVSpecDecodeTest, PluginLaunchParametersQueryLengthsAndAutoMultiBlock)
+{
+    for (int32_t rows : {1, 3, 8})
+    {
+        for (int32_t maskKind : {0, 1})
+        {
+            for (std::vector<int32_t> lengths : {std::vector<int32_t>{200, 65}, std::vector<int32_t>{6000, 5000}})
+            {
+                SCOPED_TRACE("rows=" + std::to_string(rows) + " mask=" + std::to_string(maskKind)
+                    + " len0=" + std::to_string(lengths[0]));
+                PackedCase tc = specCase(lengths, rows, maskKind, 600 + rows);
+                tc.useQSeqLens = true;
+                tc.multiBlockSplits = kXQA_MULTI_BLOCK_AUTO;
+                runPackedDecode(tc);
+            }
+        }
+    }
+}
+
+//! Sequences of one launch verify different numbers of rows; the rest of the fixed width is padding that stays in KV
+//! (the sequence length counts the full width) and is masked out.
+TEST(XQAPackedVSpecDecodeTest, VariablePerSequenceVerifyRows)
+{
+    for (int32_t maskKind : {0, 1})
+    {
+        for (uint32_t splits : {1U, 4U, kXQA_MULTI_BLOCK_AUTO})
+        {
+            SCOPED_TRACE("mask=" + std::to_string(maskKind) + " splits=" + std::to_string(splits));
+            PackedCase tc = specCase({300, 129, 64, 2000}, 8, maskKind, 700);
+            tc.validRows = {2, 5, 1, 8};
+            tc.useQSeqLens = true;
+            tc.multiBlockSplits = splits;
+            runPackedDecode(tc);
+        }
+    }
+}
+
+TEST(XQAPackedVSpecDecodeTest, KvHeadCounts)
+{
+    for (int32_t kvHeads : {1, 2, 4})
+    {
+        for (int32_t ratio : {4, 8})
+        {
+            SCOPED_TRACE("kvHeads=" + std::to_string(kvHeads) + " ratio=" + std::to_string(ratio));
+            PackedCase tc = specCase({300, 129}, 5, 1, 800 + kvHeads);
+            tc.numKVHeads = kvHeads;
+            tc.numQHeads = kvHeads * ratio;
+            tc.useQSeqLens = true;
+            tc.multiBlockSplits = kXQA_MULTI_BLOCK_AUTO;
+            runPackedDecode(tc);
+        }
+    }
+}
+
+TEST(XQAPackedVSpecDecodeTest, ExtremeValueRangesPerPattern)
+{
+    for (int32_t pattern = 0; pattern < kNUM_PATTERNS; ++pattern)
+    {
+        SCOPED_TRACE("pattern=" + std::to_string(pattern));
+        PackedCase tc = specCase({200, 65}, 5, 1, 500 + pattern);
+        tc.fixedPattern = pattern;
+        runPackedDecode(tc);
     }
 }
 

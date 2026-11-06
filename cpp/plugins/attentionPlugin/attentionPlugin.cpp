@@ -18,6 +18,7 @@
 #include "attentionPlugin.h"
 
 #include "common/checkMacros.h"
+#include "common/kvFormatLimits.h"
 #include "common/cudaUtils.h"
 #include "common/executionPhase.h"
 #include "common/logger.h"
@@ -657,10 +658,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     ELLM_CHECK(!mEnableInt8KVCache || mSMVersion >= 80, "INT8 KV cache requires SM80 or newer.");
     ELLM_CHECK(mEnableInt8KVCache >= 0 && mEnableInt8KVCache <= 2, "enable_int8_kv_cache must be 0, 1 or 2.");
     ELLM_CHECK(!packedV4KVCache()
-            || (mHeadSize == 256 && mSlidingWindowSize <= 0 && !mEnableTreeAttention && !mEnableVisionBlockAttention
-                && !mSupportsBoundedKVCache),
-        "Packed 4-bit V (enable_int8_kv_cache = 2) is implemented for head_dim 256 full attention without tree "
-        "attention, vision blocks or a bounded KV cache.");
+            || (mHeadSize == 256 && mSlidingWindowSize <= 0 && !mEnableVisionBlockAttention && !mSupportsBoundedKVCache),
+        "Packed 4-bit V (enable_int8_kv_cache = 2) is implemented for head_dim 256 full attention without vision "
+        "blocks or a bounded KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || isFp8KVCacheSupportedSM(mSMVersion),
         "FP8 KV cache is supported only on SM89, SM90, SM100, SM101, SM110, SM120, and SM121; got SM"
             + std::to_string(mSMVersion) + ".");
@@ -812,10 +812,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     ELLM_CHECK(!mEnableInt8KVCache || mSMVersion >= 80, "INT8 KV cache requires SM80 or newer.");
     ELLM_CHECK(mEnableInt8KVCache >= 0 && mEnableInt8KVCache <= 2, "enable_int8_kv_cache must be 0, 1 or 2.");
     ELLM_CHECK(!packedV4KVCache()
-            || (mHeadSize == 256 && mSlidingWindowSize <= 0 && !mEnableTreeAttention && !mEnableVisionBlockAttention
-                && !mSupportsBoundedKVCache),
-        "Packed 4-bit V (enable_int8_kv_cache = 2) is implemented for head_dim 256 full attention without tree "
-        "attention, vision blocks or a bounded KV cache.");
+            || (mHeadSize == 256 && mSlidingWindowSize <= 0 && !mEnableVisionBlockAttention && !mSupportsBoundedKVCache),
+        "Packed 4-bit V (enable_int8_kv_cache = 2) is implemented for head_dim 256 full attention without vision "
+        "blocks or a bounded KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || isFp8KVCacheSupportedSM(mSMVersion),
         "FP8 KV cache is supported only on SM89, SM90, SM100, SM101, SM110, SM120, and SM121; got SM"
             + std::to_string(mSMVersion) + ".");
@@ -2496,6 +2495,12 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             params.qSeqLen = runtimeSeqLen;
             params.qSeqLens = static_cast<int32_t const*>(inputs[kIN_QUERY_LENGTH_IDX]);
             params.contiguousQuerySwa = mEnableContiguousQuerySwa && params.slidingWinSize > 0;
+            if (packedV4KVCache() && runtimeSeqLen > kPackedVMaxSpecRows)
+            {
+                LOG_ERROR("AttentionPlugin: packed-V tree decoding is tested for at most %d query rows per sequence, got %d.",
+                    kPackedVMaxSpecRows, static_cast<int32_t>(runtimeSeqLen));
+                return -1;
+            }
             xqaRunner.dispatchSpecDecodeXQAKernel(params, stream);
         }
         else

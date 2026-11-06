@@ -263,7 +263,10 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
     // writes per-token recurrent/conv snapshots; after accept, the decoder
     // scatters only the accepted prefix into the persistent state pools.
     {
-        ELLM_CHECK(!bundle.base.kvCacheVPacked, "Speculative decoding does not support packed V rows");
+        ELLM_CHECK(packedVSpeculationSupported(bundle),
+            "Packed V rows support speculative decoding only in MTP chain mode (draftingTopK = 1) with at most "
+            + std::to_string(kPackedVMaxSpecRows)
+                + " verify rows and an unpacked draft pool: the tree commit copies KV rows at the unpacked stride.");
         int32_t const baseMaxIntermediateSeqLen = baseVerifyIntermediateSeqLen(bundle);
         rt::KVCacheManager::Config kvCfg{
             /*.numAttentionLayers=*/static_cast<int32_t>(bundle.base.kvLayerConfigs.size()),

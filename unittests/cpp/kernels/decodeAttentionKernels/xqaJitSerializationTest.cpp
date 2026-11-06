@@ -64,18 +64,29 @@ TEST(XQAJitCapabilityTest, PackedK8V4KeyRejectedForOtherHeadDims)
     key.tokensPerPage = 128;
     EXPECT_THROW(compileXQAKernel(key), std::runtime_error);
 
-    // Head dim 256 is accepted, but not together with spec-decode, a sliding window or contiguous-query SWA.
+    // Head dim 256 is accepted, but not together with a sliding window or contiguous-query SWA.
     key.headSize = 256;
     key.qHeadsPerKv = 8;
-    for (int32_t variant = 0; variant < 3; ++variant)
+    for (int32_t variant = 0; variant < 2; ++variant)
     {
         XQAJitKey bad = key;
-        bad.specDecode = variant == 0;
-        bad.slidingWindow = variant == 1;
-        bad.contiguousQuerySwa = variant == 2;
-        bad.qHeadsPerKv = bad.specDecode ? 0 : 8;
+        bad.slidingWindow = variant == 0;
+        bad.contiguousQuerySwa = variant == 1;
         EXPECT_THROW(compileXQAKernel(bad), std::runtime_error) << "variant " << variant;
     }
+}
+
+TEST(XQAJitCapabilityTest, PackedK8V4SpecDecodeKeyIsAccepted)
+{
+    XQAJitKey key{};
+    key.sm = 89;
+    key.dataType = nvinfer1::DataType::kHALF;
+    key.kvDataType = nvinfer1::DataType::kINT4;
+    key.headSize = 256;
+    key.qHeadsPerKv = 0;
+    key.tokensPerPage = 128;
+    key.specDecode = true;
+    EXPECT_NO_THROW(compileXQAKernel(key));
 }
 
 XQAJitKey makeKey(bool specDecode, bool contiguousQuerySwa = false)
