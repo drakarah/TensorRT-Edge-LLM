@@ -189,6 +189,21 @@ public:
     int64_t totalAcceptedDraftTokens{0};
     //! Draft tokens proposed for verification (bonus token excluded)
     int64_t totalProposedDraftTokens{0};
+    //! Always-on counters of the served endpoint (the totals above only count while profiling is enabled): decoding
+    //! rounds, generated tokens, accepted and proposed draft tokens, summed over all requests since start.
+    int64_t liveRounds{0};
+    int64_t liveGeneratedTokens{0};
+    int64_t liveAcceptedDraftTokens{0};
+    int64_t liveProposedDraftTokens{0};
+
+    //! @brief Record one speculative decoding round (not gated by profiling)
+    void recordLiveRound(int64_t generatedTokens, int64_t acceptedDraftTokens, int64_t proposedDraftTokens) noexcept
+    {
+        ++liveRounds;
+        liveGeneratedTokens += generatedTokens;
+        liveAcceptedDraftTokens += acceptedDraftTokens;
+        liveProposedDraftTokens += proposedDraftTokens;
+    }
 
     //! @brief Record a speculative decoding generation run
     //! @param iterations Number of iterations

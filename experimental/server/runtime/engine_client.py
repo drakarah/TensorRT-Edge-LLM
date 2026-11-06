@@ -425,6 +425,8 @@ class EngineClient:
         timer = RequestTimer(stream)
         timer.reuse_before = self._reused_tokens(
         ) if self.active_requests == 1 else None
+        timer.spec_before = self._spec_counters(
+        ) if self.active_requests == 1 else None
         return timer
 
     def _end_timing(self, timer, status: str) -> None:
@@ -435,7 +437,26 @@ class EngineClient:
             after = self._reused_tokens()
             if after is not None:
                 timer.reused_tokens = after - before
+        before_spec = getattr(timer, "spec_before", None)
+        if before_spec is not None and self.active_requests == 1:
+            after_spec = self._spec_counters()
+            if after_spec is not None:
+                timer.spec = tuple(a - b for a, b in zip(after_spec, before_spec))
         self.stats.record(timer.entry(status))
+
+    def _spec_counters(self):
+        """Cumulative speculative-decoding counters (rounds, generated, accepted drafts, proposed drafts), or None when
+        the engine is not speculative. Per-request figures are the difference of two reads, as for the reuse counter."""
+        runtime = getattr(self._llm, "_runtime", None)
+        getter = getattr(runtime, "get_spec_decode_generation_metrics", None)
+        if getter is None:
+            return None
+        try:
+            m = getter()
+            return (int(m.live_rounds), int(m.live_generated_tokens), int(m.live_accepted_draft_tokens),
+                    int(m.live_proposed_draft_tokens))
+        except Exception:  # not a speculative engine, or the counters are not available
+            return None
 
     def _reused_tokens(self) -> Optional[int]:
         runtime = getattr(self._llm, "_runtime", None)

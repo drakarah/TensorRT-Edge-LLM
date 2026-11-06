@@ -105,11 +105,13 @@ td.bad { color: var(--bad); }
       <div class="card"><h2>Decode speed by context size</h2><p class="n">Requests with 30+ generated tokens after the first. Horizontal: prompt tokens in the context.</p><div class="chart" id="c-decode"></div></div>
       <div class="card"><h2>Time to first token over the requests</h2><p class="n">Oldest on the left, log scale. Each dot is one streamed request.</p><div class="chart" id="c-ttft-t"></div></div>
       <div class="card"><h2>Decode speed over the requests</h2><p class="n">Oldest on the left. Requests with 30+ generated tokens.</p><div class="chart" id="c-decode-t"></div></div>
+      <div class="card" id="spec-a" hidden><h2>Draft acceptance over the requests</h2><p class="n">Speculative decoding only. Share of the drafted tokens the model accepted, per request, oldest on the left. Requests that ran alone.</p><div class="chart" id="c-spec"></div></div>
+      <div class="card" id="spec-b" hidden><h2>Tokens per verification round over the requests</h2><p class="n">Speculative decoding only. Generated tokens divided by verification rounds (1 = no draft token accepted), oldest on the left.</p><div class="chart" id="c-spec-tpr"></div></div>
       <div class="card"><h2>Share of the prompt served from reuse</h2><p class="n">Per request, oldest on the left. Left out when another request ran at the same time.</p><div class="chart" id="c-reuse"></div></div>
     </section>
     <section class="card" style="margin-top:12px">
       <h2>Latest requests</h2><p class="n">Newest first, up to 40.</p>
-      <div class="tablewrap"><table id="tbl"><thead><tr><th>#</th><th>started</th><th>status</th><th>prompt</th><th>reused</th><th>new</th><th>generated</th><th>first token</th><th>decode</th><th>prefill</th><th>total</th></tr></thead><tbody></tbody></table></div>
+      <div class="tablewrap"><table id="tbl"><thead><tr><th>#</th><th>started</th><th>status</th><th>prompt</th><th>reused</th><th>new</th><th>generated</th><th>first token</th><th>decode</th><th>accept</th><th>prefill</th><th>total</th></tr></thead><tbody></tbody></table></div>
     </section>
     <p class="n" style="margin-top:12px">Decode is generated tokens after the first divided by the time after the first token. Prefill is only given for 256+ uncached prompt tokens; the time to first token also includes work that grows with the context size, so the rate understates the speed on small turns. Time to first token and the rates exist for streamed requests only. Reuse comes from the context-cache counters.</p>
   </div>
@@ -287,6 +289,7 @@ function render() {
   const ok = rows.filter((r) => r.status === "ok"), streamed = ok.filter((r) => r.ttft_ms != null);
   const dec = ok.filter((r) => r.decode_tokens >= 30 && r.decode_tok_s != null), pre = ok.filter((r) => r.prefill_tok_s != null);
   const known = ok.filter((r) => r.reused_tokens != null && r.prompt_tokens);
+  const spec = ok.filter((r) => r.spec_rounds);
   const share = known.length ? sum(known.map((r) => r.reused_tokens)) / sum(known.map((r) => r.prompt_tokens)) : null;
   $("#sub").textContent = `${f0(rows.length)} requests shown of ${f0(all.length)} kept (ring of ${f0(data.capacity)}), ${f0(ok.length)} completed, ${f0(streamed.length)} streamed`;
   const t = $("#tiles");
@@ -296,6 +299,7 @@ function render() {
     tile("Decode, median", f1(quantile(dec.map((r) => r.decode_tok_s), 0.5)) + " tok/s", `${f0(dec.length)} requests with 30+ tokens`),
     tile("Prefill, median", f0(quantile(pre.map((r) => r.prefill_tok_s), 0.5)) + " tok/s", `${f0(pre.length)} requests with 256+ new tokens`),
     tile("Prompt from reuse", share == null ? "—" : (share * 100).toFixed(1) + "%", `${f0(known.length)} requests with a known figure`),
+    ...(spec.length ? [tile("Draft acceptance", (100 * sum(spec.map((r) => r.spec_accepted)) / Math.max(1, sum(spec.map((r) => r.spec_proposed)))).toFixed(1) + "%", `${(sum(spec.map((r) => r.spec_generated)) / sum(spec.map((r) => r.spec_rounds))).toFixed(2)} tokens per round, ${f0(spec.length)} requests`)] : []),
     tile("Longest prompt", f0(Math.max(0, ...ok.map((r) => r.prompt_tokens || 0))), "tokens of context in the window"));
   const idx = new Map(rows.map((r, i) => [r.id, i + 1]));
   plot($("#c-ttft"), streamed, { keep: (r) => newTokens(r) > 0, x: newTokens, y: (r) => r.ttft_ms / 1000, log: true, ylog: true, xlabel: "New (uncached) prompt tokens", ylabel: "First token (s, log)", title: "First token time by new tokens", yfmt: (v) => String(v), tip: (r) => [...base(r), ["First token", fs(r.ttft_ms)]] });
@@ -303,11 +307,17 @@ function render() {
   plot($("#c-decode"), dec, { keep: () => true, x: (r) => r.prompt_tokens, y: (r) => r.decode_tok_s, xlabel: "Prompt tokens in the context", ylabel: "Decode tok/s", title: "Decode speed by context size", tip: (r) => [...base(r), ["Decode", f1(r.decode_tok_s) + " tok/s"], ["Generated", f0(r.completion_tokens) + " tokens"]] });
   plot($("#c-ttft-t"), streamed, { keep: () => true, x: (r) => idx.get(r.id), y: (r) => r.ttft_ms / 1000, connect: true, ylog: true, xlabel: "Request, oldest to newest", ylabel: "First token (s, log)", title: "First token time over the requests", yfmt: (v) => String(v), tip: (r) => [...base(r), ["First token", fs(r.ttft_ms)]] });
   plot($("#c-decode-t"), dec, { keep: () => true, x: (r) => idx.get(r.id), y: (r) => r.decode_tok_s, connect: true, color: "--warm", xlabel: "Request, oldest to newest", ylabel: "Decode tok/s", title: "Decode speed over the requests", tip: (r) => [...base(r), ["Decode", f1(r.decode_tok_s) + " tok/s"]] });
+  $("#spec-a").hidden = $("#spec-b").hidden = !spec.length;
+  if (spec.length) {
+    const specTip = (r) => [...base(r), ["Accepted", f0(r.spec_accepted) + " of " + f0(r.spec_proposed) + " drafted"], ["Tokens per round", f1(r.spec_tokens_per_round)], ["Rounds", f0(r.spec_rounds)]];
+    plot($("#c-spec"), spec.filter((r) => r.spec_accept_rate != null), { keep: () => true, x: (r) => idx.get(r.id), y: (r) => r.spec_accept_rate * 100, connect: true, xlabel: "Request, oldest to newest", ylabel: "Accepted (%)", title: "Draft acceptance over the requests", tip: specTip });
+    plot($("#c-spec-tpr"), spec, { keep: () => true, x: (r) => idx.get(r.id), y: (r) => r.spec_tokens_per_round, connect: true, color: "--warm", xlabel: "Request, oldest to newest", ylabel: "Tokens per round", title: "Tokens per verification round", tip: specTip });
+  }
   plot($("#c-reuse"), known, { keep: () => true, x: (r) => idx.get(r.id), y: (r) => (r.reused_tokens / r.prompt_tokens) * 100, connect: true, xlabel: "Request, oldest to newest", ylabel: "Reused (%)", title: "Share of the prompt served from reuse", tip: (r) => [...base(r), ["Reused", f1((r.reused_tokens / r.prompt_tokens) * 100) + "%"]] });
   const body = $("#tbl tbody"); body.replaceChildren();
   for (const r of rows.slice(-40).reverse()) {
     const tr = document.createElement("tr");
-    [["#" + r.id], [clock(r.started_at)], [r.status, r.status === "ok" ? "" : "bad"], [f0(r.prompt_tokens)], [f0(r.reused_tokens)], [f0(newTokens(r))], [f0(r.completion_tokens)], [fs(r.ttft_ms)], [r.decode_tok_s == null ? "—" : f1(r.decode_tok_s)], [r.prefill_tok_s == null ? "—" : f0(r.prefill_tok_s)], [fs(r.total_ms)]].forEach(([text, cls]) => { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); });
+    [["#" + r.id], [clock(r.started_at)], [r.status, r.status === "ok" ? "" : "bad"], [f0(r.prompt_tokens)], [f0(r.reused_tokens)], [f0(newTokens(r))], [f0(r.completion_tokens)], [fs(r.ttft_ms)], [r.decode_tok_s == null ? "—" : f1(r.decode_tok_s)], [r.spec_accept_rate == null ? "—" : (r.spec_accept_rate * 100).toFixed(0) + "%"], [r.prefill_tok_s == null ? "—" : f0(r.prefill_tok_s)], [fs(r.total_ms)]].forEach(([text, cls]) => { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); });
     body.appendChild(tr);
   }
 }

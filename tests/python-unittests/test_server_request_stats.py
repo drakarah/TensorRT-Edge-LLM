@@ -258,6 +258,43 @@ def test_summary_skips_unknown_reuse_and_non_streamed_requests():
     assert summary["reuse_share"] is None
 
 
+def test_speculative_counters_become_acceptance_figures():
+    timer = RequestTimer(stream=True)
+    timer.spec = (40, 120, 60, 80)  # rounds, generated tokens, accepted drafts, proposed drafts
+    timer.tokens(1)
+    entry = timer.entry("ok")
+    assert entry["spec_rounds"] == 40
+    assert entry["spec_tokens_per_round"] == pytest.approx(3.0)
+    assert entry["spec_accept_rate"] == pytest.approx(0.75)
+
+
+def test_request_without_speculative_counters_has_no_acceptance():
+    timer = RequestTimer(stream=True)
+    timer.tokens(1)
+    entry = timer.entry("ok")
+    assert entry["spec_rounds"] is None
+    assert entry["spec_tokens_per_round"] is None
+    assert entry["spec_accept_rate"] is None
+
+
+def test_summary_acceptance_is_weighted_by_drafted_tokens():
+    stats = RequestStats(5)
+    stats.record(_entry(spec_rounds=10, spec_generated=20, spec_accepted=10, spec_proposed=20))
+    stats.record(_entry(spec_rounds=30, spec_generated=90, spec_accepted=60, spec_proposed=60))
+    stats.record(_entry())  # not speculative: left out
+    summary = stats.snapshot()["summary"]
+    assert summary["spec_accept_rate"] == pytest.approx(70 / 80)
+    assert summary["spec_tokens_per_round"] == pytest.approx(110 / 40)
+
+
+def test_summary_without_speculative_requests_has_no_acceptance():
+    stats = RequestStats(5)
+    stats.record(_entry())
+    summary = stats.snapshot()["summary"]
+    assert summary["spec_accept_rate"] is None
+    assert summary["spec_tokens_per_round"] is None
+
+
 def _client(tmp_path, monkeypatch, enabled):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")

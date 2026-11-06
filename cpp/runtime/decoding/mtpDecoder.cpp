@@ -904,6 +904,38 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         ? std::optional{std::ref(mRuntime.sampling.baseVocabMappingTable)}
         : std::nullopt;
     Tensor const& acceptTokenIds = mUseTree ? mTreeTokenIds : mRuntime.preprocess.idsInput;
+    if (!mUseTree && context.reasoningBudget.enabled() && activeBatchSize == 1)
+    {
+        // Reasoning budget inside a window: row r of the window predicts the (r+1)-th next token. Counting ends after
+        // `remaining` more tokens, so row `remaining` has to emit the forced token (drafts after it are rejected, and
+        // a forcing that is already running is continued one token per round).
+        auto& budget = context.reasoningBudget;
+        decoder_utils::syncReasoningBudget(context);
+        int32_t const window = mRuntime.deployment.specConfig->verifySize;
+        if (auto const forced = budget.forcedToken())
+        {
+            forceTokenInRow(mRuntime.base.pipelineIO.outputLogits, 0, *forced, context.stream);
+        }
+        else if (budget.state() == ReasoningBudget::State::kCounting && budget.remaining() < window)
+        {
+            int32_t const rowToForce = budget.remaining();
+            std::vector<int32_t> ids(static_cast<size_t>(window));
+            CUDA_CHECK(cudaMemcpyAsync(ids.data(), mRuntime.preprocess.idsInput.rawPointer(),
+                ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
+            CUDA_CHECK(cudaStreamSynchronize(context.stream));
+            bool naturalEnd = false;
+            for (int32_t i = 1; i <= rowToForce; ++i)
+            {
+                naturalEnd = naturalEnd || budget.isEndToken(ids[static_cast<size_t>(i)]);
+            }
+            // The block may already end inside the drafted prefix, and the character before the forced token has to
+            // be complete: in both cases the budget machine decides in a later round.
+            if (!naturalEnd && budget.tokenEndsUtf8(ids[static_cast<size_t>(rowToForce)]))
+            {
+                forceTokenInRow(mRuntime.base.pipelineIO.outputLogits, rowToForce, budget.firstForced(), context.stream);
+            }
+        }
+    }
     bool const presence = !mUseTree && context.presencePenalty != 0.0f && activeBatchSize == 1;
     if (presence)
     {

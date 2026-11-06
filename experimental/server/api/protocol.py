@@ -176,6 +176,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # the chat template knows (xhigh, medium, low); "none"/"off" turns thinking off. EDGELLM_DEFAULT_REASONING_EFFORT
         # applies to requests that carry no level.
         effort = (self.reasoning_effort or os.environ.get("EDGELLM_DEFAULT_REASONING_EFFORT") or "").strip().lower()
+        # EDGELLM_REASONING_BUDGETS="minimal=512,low=1024,medium=4096,high=16384" turns the level of a client that
+        # cannot send reasoning_budget_tokens into a hard budget (the level alone only changes the instruction).
+        budgets = os.environ.get("EDGELLM_REASONING_BUDGETS", "")
+        if effort and budgets and "reasoning_budget_tokens" not in self.model_fields_set:
+            table = dict(item.split("=", 1) for item in budgets.split(",") if "=" in item)
+            if effort in table:
+                self.reasoning_budget_tokens = int(table[effort])
         if effort in ("none", "off", "disabled", "false"):
             self.enable_thinking = False
             self.reasoning_effort = None

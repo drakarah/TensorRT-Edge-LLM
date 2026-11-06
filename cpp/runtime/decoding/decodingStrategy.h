@@ -81,6 +81,8 @@ struct DecodingStrategyCapabilities
     bool requiresDefaultDecoderCudaGraphs{false};
     //! The decoder applies a presence penalty itself (window rows see the draft tokens before them).
     bool supportsPresencePenalty{false};
+    //! The decoder applies a reasoning budget itself (forced end of the thinking block inside a window).
+    bool supportsReasoningBudget{false};
 };
 
 struct SamplingBuffers

@@ -177,6 +177,9 @@ struct DecodingInferenceContext
     std::vector<int8_t> finishedStates;       //!< Finished state for each sequence
     std::vector<int64_t> acceptedDraftTokens; //!< Spec decode: accepted draft tokens summed per slot
     std::vector<int64_t> proposedDraftTokens; //!< Spec decode: proposed draft tokens summed per slot
+    int64_t specRoundGenerated{0}; //!< Spec decode: tokens generated, drafts accepted and drafts proposed in the current round,
+    int64_t specRoundAccepted{0};  //!< summed over the slots; read and cleared after every round for the runtime's metrics
+    int64_t specRoundProposed{0};
     //! Per-slot thinking tracker: 1 once thinking is complete (end marker emitted, or the model
     //! never entered thinking). Lives here, rather than as a `handleRequest` local, so batch
     //! compaction reindexes it together with every other per-slot vector; otherwise an eviction

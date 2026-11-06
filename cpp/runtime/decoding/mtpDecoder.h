@@ -62,7 +62,7 @@ public:
     {
         return {/*.ownsBaseVerificationCudaGraphs=*/false, /*.supportsLosslessSampling=*/!mUseTree,
             /*.maxSamplingSupport=*/0, /*.fallbackToVanillaForNonGreedySampling=*/mUseTree,
-            /*.requiresDefaultDecoderCudaGraphs=*/false, /*.supportsPresencePenalty=*/!mUseTree};
+            /*.requiresDefaultDecoderCudaGraphs=*/false, /*.supportsPresencePenalty=*/!mUseTree, /*.supportsReasoningBudget=*/!mUseTree};
     }
 
     DecodingKvHeadroom requiredKvHeadroom() const override;

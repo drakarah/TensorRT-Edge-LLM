@@ -167,6 +167,43 @@ public:
         mSeen = tokens.size();
     }
 
+    //! True once the machine has seen the request (a prompt replay or a sync).
+    bool primed() const noexcept
+    {
+        return mSeen > 0 || mPrimed;
+    }
+
+    /*!
+     * @brief Replays the full prompt from its last start sequence.
+     *
+     * With context reuse the token list a decoder syncs against holds only the prompt tail that was not reused, so a
+     * block the chat template opened in the reused part would never be found. Call this once with the full prompt before
+     * the first sync; the sync then only has to feed the generated tokens.
+     */
+    void primeFromPrompt(std::vector<int32_t> const& prompt)
+    {
+        if (!mEnabled || primed() || prompt.size() < mStart.size())
+        {
+            return;
+        }
+        mPrimed = true;
+        for (size_t i = prompt.size() - mStart.size() + 1; i-- > 0;)
+        {
+            if (std::equal(mStart.begin(), mStart.end(), prompt.begin() + static_cast<std::ptrdiff_t>(i)))
+            {
+                for (size_t k = i; k < prompt.size(); ++k)
+                {
+                    accept(prompt[k]);
+                    if (mState == State::kForcing)
+                    {
+                        break; // a budget of 0 opens the block already forcing: the rest of the prompt is not forced output
+                    }
+                }
+                return;
+            }
+        }
+    }
+
     //! Feeds one token of the prompt tail or of the generation, in order.
     void accept(int32_t token)
     {
@@ -302,6 +339,7 @@ private:
     int32_t mBudget{-1};
     int32_t mRemaining{-1};
     size_t mForcePos{0};
+    bool mPrimed{false};
     size_t mSeen{0};
     State mState{State::kIdle};
     bool mEnabled{false};

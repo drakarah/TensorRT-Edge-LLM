@@ -54,6 +54,8 @@ class RequestTimer:
         self.completion_tokens = 0
         self.reused_tokens: Optional[int] = None
         self.reuse_before: Optional[int] = None
+        self.spec_before = None  # cumulative speculative counters before the request
+        self.spec = None  # (rounds, generated, accepted drafts, proposed drafts) of this request
 
     def tokens(self, count: int) -> None:
         if count <= 0:
@@ -69,6 +71,10 @@ class RequestTimer:
         ttft = self._first - self._start if self.stream and self._first is not None else None
         decode_seconds = end - self._first if ttft is not None else None
         decode_tokens = self.completion_tokens - self._first_tokens
+        rounds = generated = accepted = proposed = 0
+        if self.spec is not None:
+            rounds, generated, accepted, proposed = self.spec
+        rounds = rounds or None
         new_prompt = None
         if self.prompt_tokens is not None:
             new_prompt = self.prompt_tokens - (self.reused_tokens or 0)
@@ -100,6 +106,18 @@ class RequestTimer:
             "decode_tok_s":
             None if decode_seconds is None else _rate(decode_tokens,
                                                       decode_seconds),
+            "spec_rounds":
+            rounds,
+            "spec_generated":
+            generated if rounds else None,
+            "spec_accepted":
+            accepted if rounds else None,
+            "spec_proposed":
+            proposed if rounds else None,
+            "spec_tokens_per_round":
+            None if not rounds else round(generated / rounds, 2),
+            "spec_accept_rate":
+            None if not proposed else round(accepted / proposed, 4),
         }
 
 
@@ -157,6 +175,11 @@ class RequestStats:
             if e["decode_tokens"]:
                 decode_tokens += e["decode_tokens"]
                 decode_seconds += e["decode_ms"] / 1000
+        spec = [e for e in done if e.get("spec_rounds")]
+        spec_rounds = sum(e["spec_rounds"] for e in spec)
+        spec_generated = sum(e["spec_generated"] for e in spec)
+        spec_accepted = sum(e["spec_accepted"] for e in spec)
+        spec_proposed = sum(e["spec_proposed"] for e in spec)
         known_reuse = [
             e for e in done
             if e["reused_tokens"] is not None and e["prompt_tokens"]
@@ -172,4 +195,6 @@ class RequestStats:
             "reuse_share": reused / prompts if prompts else None,
             "prefill_tok_s": _rate(prefill_tokens, prefill_seconds),
             "decode_tok_s": _rate(decode_tokens, decode_seconds),
+            "spec_accept_rate": spec_accepted / spec_proposed if spec_proposed else None,
+            "spec_tokens_per_round": spec_generated / spec_rounds if spec_rounds else None,
         }

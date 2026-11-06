@@ -258,6 +258,9 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
             = std::min(std::max(0, appended - (appended == acceptLength ? 1 : 0)), proposedDrafts);
         context.acceptedDraftTokens[batchIdx] += acceptedDrafts;
         context.proposedDraftTokens[batchIdx] += proposedDrafts;
+        context.specRoundGenerated += appended;
+        context.specRoundAccepted += acceptedDrafts;
+        context.specRoundProposed += proposedDrafts;
         LOG_DEBUG(
             "SpecRound %d batchIdx %d: generated=%d, acceptedDrafts=%d, proposedDrafts=%d, "
             "cumGenerateLength=%d",

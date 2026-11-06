@@ -227,11 +227,9 @@ class OpenAIServingChat:
         reasoning_budget = request.reasoning_budget_tokens if request.enable_thinking else -1
         if reasoning_budget >= 0:
             capabilities = getattr(self._client, "capabilities", None)
-            if (getattr(capabilities, "speculative_decoding", False)
-                    or (getattr(capabilities, "max_num_seqs", 1) or 1) > 1):
+            if (getattr(capabilities, "max_num_seqs", 1) or 1) > 1:
                 raise UnsupportedFeatureError(
-                    "reasoning_budget_tokens needs a deployment without speculative "
-                    "decoding and with a single request slot",
+                    "reasoning_budget_tokens needs a deployment with a single request slot",
                     param="reasoning_budget_tokens")
         try:
             tool_config = validate_tool_request(request.messages,

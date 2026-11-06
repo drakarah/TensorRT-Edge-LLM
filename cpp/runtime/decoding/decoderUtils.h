@@ -22,8 +22,10 @@
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/raggedBatchBuilder.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/decodingInferenceContext.h"
 #include "tokenizer/tokenizer.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -148,6 +150,22 @@ void collectSpecLogprobsFromHost(DecodingRuntimeContext& runtime, DecodingInfere
 inline bool baseKvCommitCopyNeeded(bool treeMode, bool packedV)
 {
     return treeMode || !packedV;
+}
+
+//! Brings the request's reasoning budget up to date before a decoding step. With context reuse the decoder's token list
+//! holds only the un-reused prompt tail, so the budget is primed once from the full prompt (the chat template's
+//! opened thinking block may sit in the reused part).
+inline void syncReasoningBudget(DecodingInferenceContext& context)
+{
+    auto& budget = context.reasoningBudget;
+    auto const& tokens = context.tokenIds[0];
+    size_t const generated = static_cast<size_t>(context.currentGenerateLengths[0]);
+    if (!budget.primed() && !context.rawBatchedInputIds.empty()
+        && tokens.size() - std::min(generated, tokens.size()) < context.rawBatchedInputIds[0].size())
+    {
+        budget.primeFromPrompt(context.rawBatchedInputIds[0]);
+    }
+    budget.sync(tokens, generated);
 }
 
 } // namespace decoder_utils

@@ -729,6 +729,10 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("total_generated_tokens", &metrics::SpecDecodeGenerationMetrics::totalGeneratedTokens)
         .def_readonly("total_accepted_draft_tokens", &metrics::SpecDecodeGenerationMetrics::totalAcceptedDraftTokens)
         .def_readonly("total_proposed_draft_tokens", &metrics::SpecDecodeGenerationMetrics::totalProposedDraftTokens)
+        .def_readonly("live_rounds", &metrics::SpecDecodeGenerationMetrics::liveRounds)
+        .def_readonly("live_generated_tokens", &metrics::SpecDecodeGenerationMetrics::liveGeneratedTokens)
+        .def_readonly("live_accepted_draft_tokens", &metrics::SpecDecodeGenerationMetrics::liveAcceptedDraftTokens)
+        .def_readonly("live_proposed_draft_tokens", &metrics::SpecDecodeGenerationMetrics::liveProposedDraftTokens)
         .def("get_total_runs", &metrics::SpecDecodeGenerationMetrics::getTotalRuns);
 
     py::class_<metrics::MultimodalMetrics>(m, "MultimodalMetrics")

@@ -1357,6 +1357,12 @@ bool LLMRankRuntime::GenerationSession::advance()
 
     emitTokenCallbacks(mContext);
     mContext.generationRound += 1;
+    if (mContext.specRoundProposed > 0)
+    {
+        mRuntime.mSpecDecodeGenerationMetrics.recordLiveRound(
+            mContext.specRoundGenerated, mContext.specRoundAccepted, mContext.specRoundProposed);
+        mContext.specRoundGenerated = mContext.specRoundAccepted = mContext.specRoundProposed = 0;
+    }
 
     // Perform batch eviction after all old-slot progress and terminal publication are complete.
     if (!performBatchEvictAndSnapshot())
@@ -2021,7 +2027,8 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     }
 
     if (request.reasoningBudgetTokens >= 0
-        && (enableSpecDecode || activeBatchSize > 1 || mDeployment.base.reducedVocabSize > 0))
+        && ((enableSpecDecode && !decodingCapabilities.supportsReasoningBudget) || activeBatchSize > 1
+            || mDeployment.base.reducedVocabSize > 0))
     {
         LOG_ERROR(
             "A reasoning budget needs vanilla decoding of a single request with the full vocabulary (speculative "
@@ -2662,15 +2669,11 @@ bool LLMRankRuntime::finishGeneration(SteppedGeneration& generation, LLMGenerati
     }
 
     mPrefillMetrics.recordRun(totalReusedTokens, totalComputedTokens, totalPrunedTokens);
-    if (enableSpecDecode)
-    {
-        mSpecDecodeGenerationMetrics.recordRun(
-            totalIterations, totalGeneratedTokens, totalAcceptedDraftTokens, totalProposedDraftTokens);
-    }
-    else
+    if (!enableSpecDecode)
     {
         mGenerationMetrics.recordRun(totalGeneratedTokens);
     }
+    // Speculative runs are recorded once per decoding round in SteppedGeneration::step, which every path goes through.
 
     // Save output ids and decoded texts to response.
     // Maintain original batch order using original batch indices.

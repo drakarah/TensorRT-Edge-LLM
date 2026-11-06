@@ -279,3 +279,24 @@ TEST(ReasoningBudgetTest, AccessorsForWindowForcing)
     EXPECT_FALSE(budget.isEndToken(kWord));
     EXPECT_TRUE(budget.tokenEndsUtf8(kWord));
 }
+
+TEST(ReasoningBudgetTest, PrimingFromThePromptFindsABlockOpenedInTheReusedPart)
+{
+    // With context reuse the decoder's token list holds only the prompt tail; the full prompt primes the machine.
+    auto budget = makeBudget(3);
+    EXPECT_FALSE(budget.primed());
+    budget.primeFromPrompt({kWord, kThinkStart, kWord});
+    EXPECT_TRUE(budget.primed());
+    EXPECT_EQ(budget.state(), State::kCounting);
+    EXPECT_EQ(budget.remaining(), 2); // the word after the start counted
+    budget.sync({kWord}, /*generated=*/0); // the tail alone finds no start, so the primed state stays
+    EXPECT_EQ(budget.state(), State::kCounting);
+}
+
+TEST(ReasoningBudgetTest, PrimingWithAZeroBudgetStaysForcing)
+{
+    auto budget = makeBudget(0);
+    budget.primeFromPrompt({kWord, kThinkStart, kWord});
+    EXPECT_EQ(budget.state(), State::kForcing);
+    EXPECT_EQ(budget.forcedToken(), kThinkEnd);
+}
