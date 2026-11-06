@@ -264,3 +264,18 @@ TEST(ReasoningBudgetTest, SyncOfAnEmptyOrShortListIsHarmless)
     budget.sync({20, 21});
     EXPECT_EQ(budget.state(), State::kCounting);
 }
+
+TEST(ReasoningBudgetTest, AccessorsForWindowForcing)
+{
+    // The speculative decoder forces row `remaining()` of a verify window with firstForced().
+    auto budget = makeBudget(3, {kMessageA, kMessageB, kThinkEnd});
+    budget.sync({kWord, kThinkStart}, /*generated=*/0);
+    ASSERT_EQ(budget.state(), State::kCounting);
+    EXPECT_EQ(budget.remaining(), 3);
+    budget.accept(kWord);
+    EXPECT_EQ(budget.remaining(), 2);
+    EXPECT_EQ(budget.firstForced(), kMessageA);
+    EXPECT_TRUE(budget.isEndToken(kThinkEnd));
+    EXPECT_FALSE(budget.isEndToken(kWord));
+    EXPECT_TRUE(budget.tokenEndsUtf8(kWord));
+}

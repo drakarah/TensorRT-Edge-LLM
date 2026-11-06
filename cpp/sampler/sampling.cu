@@ -1023,6 +1023,30 @@ void markWindowSeen(rt::Tensor& seenFlags, rt::Tensor const& windowIds, rt::Tens
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void forceTokenRowKernel(float* logits, int32_t vocabSize, int32_t row, int32_t tokenId)
+{
+    int32_t const column = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x)
+        + static_cast<int32_t>(threadIdx.x);
+    if (column < vocabSize && column != tokenId)
+    {
+        logits[static_cast<int64_t>(row) * vocabSize + column] = kMaskedLogitValue;
+    }
+}
+
+void forceTokenInRow(rt::Tensor& logits, int32_t row, int32_t tokenId, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU && logits.getDataType() == nvinfer1::DataType::kFLOAT,
+        "forceTokenInRow needs GPU Float logits");
+    auto const shape = logits.getShape();
+    check::check(shape.getNumDims() == 2, "Invalid tensor dimensions");
+    int32_t const vocabSize = static_cast<int32_t>(shape[1]);
+    check::check(row >= 0 && row < shape[0] && tokenId >= 0 && tokenId < vocabSize, "Forced row or token out of range");
+    constexpr int32_t kBLOCK_SIZE = 256;
+    forceTokenRowKernel<<<(vocabSize + kBLOCK_SIZE - 1) / kBLOCK_SIZE, kBLOCK_SIZE, 0, stream>>>(
+        logits.dataPointer<float>(), vocabSize, row, tokenId);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 __global__ void forceRowTokensKernel(float* logits, int32_t const* tokens, int32_t vocabSize)
 {
     int32_t const row = static_cast<int32_t>(blockIdx.x);

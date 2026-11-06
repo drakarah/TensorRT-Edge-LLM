@@ -1507,3 +1507,142 @@ TEST_F(ReturnAllTopKTests, SelectAllTopKAccuracy)
         }
     }
 }
+
+// ---- speculative chain helpers: forced row tokens, window presence penalty, window flags, forced token in one row ----
+
+namespace
+{
+int32_t argmaxRow(std::vector<float> const& values, int32_t row, int32_t vocab)
+{
+    return static_cast<int32_t>(std::max_element(values.begin() + row * vocab, values.begin() + (row + 1) * vocab)
+        - (values.begin() + row * vocab));
+}
+} // namespace
+
+TEST_F(SamplingTest, ForceRowTokensMakesEachRowsTokenTheArgmaxAndLeavesTheRestAlone)
+{
+    int32_t const vocab = 6;
+    rt::Tensor logits({3, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor tokens({3, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    std::vector<float> const host{9.f, 1.f, 2.f, 3.f, 4.f, 5.f, 0.f, 8.f, 0.f, 0.f, 0.f, 0.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f};
+    copyHostToDevice<float>(logits, host);
+    copyHostToDevice<int32_t>(tokens, {2, 5, 0});
+    forceRowTokens(logits, tokens, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto const out = copyDeviceToHost<float>(logits);
+    EXPECT_EQ(argmaxRow(out, 0, vocab), 2);
+    EXPECT_EQ(argmaxRow(out, 1, vocab), 5);
+    EXPECT_EQ(argmaxRow(out, 2, vocab), 0);
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        bool const forced = (i == 2) || (i == vocab + 5) || (i == 2 * vocab + 0);
+        if (!forced)
+        {
+            EXPECT_EQ(out[i], host[i]) << "index " << i;
+        }
+    }
+}
+
+TEST_F(SamplingTest, WindowPresencePenaltyCountsTheWindowTokensBeforeEachRow)
+{
+    int32_t const vocab = 8;
+    rt::Tensor logits({3, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor window({3}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor flags({1, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    copyHostToDevice<float>(logits, std::vector<float>(3 * vocab, 10.0f));
+    copyHostToDevice<int32_t>(window, {1, 3, 4}); // committed token, then two drafts
+    copyHostToDevice<int8_t>(flags, {0, 0, 0, 0, 0, 1, 0, 0}); // token 5 was generated earlier
+    applyWindowPresencePenalty(logits, window, flags, 2.0f, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto const out = copyDeviceToHost<float>(logits);
+    auto penalised = [&](int32_t row) {
+        std::vector<int32_t> tokens;
+        for (int32_t t = 0; t < vocab; ++t)
+        {
+            if (out[row * vocab + t] == 8.0f)
+            {
+                tokens.push_back(t);
+            }
+            else
+            {
+                EXPECT_EQ(out[row * vocab + t], 10.0f);
+            }
+        }
+        return tokens;
+    };
+    EXPECT_EQ(penalised(0), (std::vector<int32_t>{1, 5}));
+    EXPECT_EQ(penalised(1), (std::vector<int32_t>{1, 3, 5}));
+    EXPECT_EQ(penalised(2), (std::vector<int32_t>{1, 3, 4, 5}));
+}
+
+TEST_F(SamplingTest, MarkWindowSeenFlagsOnlyTheCommittedAndAcceptedTokens)
+{
+    int32_t const vocab = 8;
+    rt::Tensor flags({1, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor window({4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor accepted({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int8_t>(flags, std::vector<int8_t>(vocab, 0));
+    copyHostToDevice<int32_t>(window, {1, 3, 4, 2});
+    copyHostToDevice<int32_t>(accepted, {3});
+    markWindowSeen(flags, window, accepted, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(copyDeviceToHost<int8_t>(flags), (std::vector<int8_t>{0, 1, 0, 1, 1, 0, 0, 0}));
+    copyHostToDevice<int32_t>(accepted, {1});
+    copyHostToDevice<int8_t>(flags, std::vector<int8_t>(vocab, 0));
+    markWindowSeen(flags, window, accepted, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(copyDeviceToHost<int8_t>(flags), (std::vector<int8_t>{0, 1, 0, 0, 0, 0, 0, 0}));
+}
+
+TEST_F(SamplingTest, ForceTokenInRowMasksOnlyThatRow)
+{
+    int32_t const vocab = 5;
+    rt::Tensor logits({2, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    copyHostToDevice<float>(logits, {1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f, 9.f, 10.f});
+    forceTokenInRow(logits, 1, 2, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto const out = copyDeviceToHost<float>(logits);
+    for (int32_t t = 0; t < vocab; ++t)
+    {
+        EXPECT_EQ(out[t], static_cast<float>(t + 1));
+        EXPECT_EQ(out[vocab + t], t == 2 ? 8.0f : kMaskedLogitValue);
+    }
+}
+
+TEST_F(SamplingTest, SampleThenCompareAcceptsADraftWithItsTargetProbability)
+{
+    // The lossless rule used by the MTP chain: sample the target token for the row, accept the draft token only if it is
+    // the same one. For a point-mass draft that accepts with probability p(draft); the committed token is always a sample.
+    int32_t const vocab = 4;
+    int32_t const rows = 6000;
+    std::vector<float> const probs{0.5f, 0.3f, 0.15f, 0.05f};
+    std::vector<float> host;
+    for (int32_t r = 0; r < rows; ++r)
+    {
+        for (auto const p : probs)
+        {
+            host.push_back(std::log(p));
+        }
+    }
+    rt::Tensor logits({rows, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor selected({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<float>(logits, host);
+    SamplingParams params(rows, vocab, 1.0F, vocab, 1.0F);
+    rt::Tensor workspace({static_cast<int64_t>(getTopKtopPSamplingWorkspaceSize(rows, vocab, params))},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    topKtopPSamplingFromLogits(logits, selected, params, workspace, 0, TEST_SEED, 0);
+    forceRowTokens(logits, selected, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto const sampled = copyDeviceToHost<int32_t>(selected);
+    auto const out = copyDeviceToHost<float>(logits);
+    std::vector<int32_t> counts(vocab, 0);
+    for (int32_t r = 0; r < rows; ++r)
+    {
+        ++counts[sampled[r]];
+        EXPECT_EQ(argmaxRow(out, r, vocab), sampled[r]); // the greedy accept kernel then compares exactly the sample
+    }
+    for (int32_t t = 0; t < vocab; ++t)
+    {
+        EXPECT_NEAR(static_cast<double>(counts[t]) / rows, probs[t], 0.03) << "token " << t;
+    }
+}

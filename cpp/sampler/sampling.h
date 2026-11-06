@@ -221,6 +221,9 @@ void forceToken(rt::Tensor& logits, int32_t tokenId, cudaStream_t stream);
  */
 void forceRowTokens(rt::Tensor& logits, rt::Tensor const& tokens, cudaStream_t stream);
 
+//! Leaves one token as the only candidate of one logits row (the others get kMaskedLogitValue).
+void forceTokenInRow(rt::Tensor& logits, int32_t row, int32_t tokenId, cudaStream_t stream);
+
 /*!
  * \brief Presence penalty for the rows of one speculative chain window (batch of one): row r also counts the window
  * tokens 0..r as generated, because it is only used when the drafts before it were accepted.

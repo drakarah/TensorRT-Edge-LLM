@@ -85,6 +85,37 @@ public:
         return mState;
     }
 
+    //! Tokens still allowed in the block while counting.
+    int32_t remaining() const noexcept
+    {
+        return mRemaining;
+    }
+
+    //! First forced token (the message, or the end sequence when there is none).
+    int32_t firstForced() const noexcept
+    {
+        return mForced.front();
+    }
+
+    //! True when the token is a one-token natural end of the block.
+    bool isEndToken(int32_t token) const noexcept
+    {
+        for (auto const& end : mEnds)
+        {
+            if (end.size() == 1 && end[0] == token)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    //! True when the token's bytes leave no unfinished UTF-8 character.
+    bool tokenEndsUtf8(int32_t token) const noexcept
+    {
+        return endsUtf8(token);
+    }
+
     //! The token the next step has to emit, if the budget is forcing one.
     std::optional<int32_t> forcedToken() const noexcept
     {
