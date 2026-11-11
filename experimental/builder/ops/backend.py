@@ -22,6 +22,7 @@ Edge-LLM extension operation, and never receive this backend object.
 
 from typing import Dict, List, Mapping, Optional, Sequence
 
+import os
 import numpy as np
 import tensorrt as trt
 
@@ -744,6 +745,27 @@ class Net:
         """FP32 accumulation with an FP16 checkpoint-backed parameter."""
         if linear_weights.quant_type != quantization.QUANT_FP16:
             raise ValueError("FP32 accumulation requires an FP16 projection")
+        if (linear_weights.weight_recipe
+                and self.policy.externalizes_fp16(name)
+                and linear_weights.bias is None
+                and os.environ.get("EDGELLM_LINEAR_F32_VIA_FP16", "0") == "1"
+                and self._unwrap(x).dtype == trt.float16):
+            # An externalized weight is a runtime input, so casting it to fp32
+            # here re-runs a transposing cast of the whole matrix on every
+            # execution (44.7 ms for the 5120 x 25600 DFlash2 projection).
+            # fp16 inputs convert to fp32 exactly and the tensor cores
+            # accumulate in fp32, so run the GEMM in fp16 and widen the result.
+            weight = self.weight_input(name + ".weight",
+                                       linear_weights.weight,
+                                       "fp16",
+                                       recipe=linear_weights.weight_recipe)
+            if rank > 2:
+                weight = self.reshape(weight, [1] * (rank - 2) +
+                                      list(linear_weights.weight.shape))
+            out16 = self.matmul(self._unwrap(x), weight,
+                                trt.MatrixOperation.NONE,
+                                trt.MatrixOperation.TRANSPOSE)
+            return self.cast(out16, trt.float32)
         x32 = self.cast(self._unwrap(x), trt.float32)
         if linear_weights.weight_recipe and self.policy.externalizes_fp16(
                 name):
