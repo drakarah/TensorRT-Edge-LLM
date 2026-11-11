@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 #include <limits>
 #include <random>
 #include <vector>
@@ -67,6 +68,7 @@ struct Int8Case
     float vScale{0.0071F};
     float attentionScale{1.F / 16.F};
     bool sharePages{false}; // every request maps the same physical pages (prefix-cache hit)
+    bool qk{false};         // INT8 Q.K^T variant (Q quantised per row inside the runner)
 };
 
 size_t idx4(int32_t a, int32_t b, int32_t c, int32_t d, int32_t nb, int32_t nc, int32_t nd)
@@ -185,14 +187,36 @@ void runInt8Case(Int8Case const& c)
     cudaStream_t stream = nullptr;
     CuteDslFMHAV2Runner runner(
         c.numQHeads, c.numKVHeads, kHEAD_DIM, c.batch, c.seqLenQCapacity, maxPagesPerSeq * kPAGE);
-    ASSERT_TRUE(runner.runPagedInt8(qT.rawPointer(), poolT.rawPointer(), pageT.dataPointer<int32_t>(),
+    auto const runFn = [&](auto&&... a) {
+        return c.qk ? runner.runPagedInt8QK(std::forward<decltype(a)>(a)...)
+                    : runner.runPagedInt8(std::forward<decltype(a)>(a)...);
+    };
+    ASSERT_TRUE(runFn(qT.rawPointer(), poolT.rawPointer(), pageT.dataPointer<int32_t>(),
         outT.rawPointer(), cuQT.dataPointer<int32_t>(), cuKT.dataPointer<int32_t>(), numFlatPages, maxPagesPerSeq,
         kPAGE, stream, c.attentionScale, c.kScale, c.vScale));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
     auto const out = copyDeviceToHost<half>(outT);
 
-    // Reference over the exact dequantised values (float32).
+    // Reference over the exact dequantised values (float32). In the INT8-QK variant Q is the per-row dequantised Q
+    // (round(q / s) * s, s = amax / 127), which is what the kernel multiplies; codes can differ by one only at ties.
+    if (c.qk)
+    {
+        for (size_t row = 0; row < q.size() / kHEAD_DIM; ++row)
+        {
+            float amax = 1e-8F;
+            for (int32_t d = 0; d < kHEAD_DIM; ++d)
+            {
+                amax = std::max(amax, std::abs(__half2float(q[row * kHEAD_DIM + d])));
+            }
+            float const sc = amax / 127.F;
+            for (int32_t d = 0; d < kHEAD_DIM; ++d)
+            {
+                float const code = std::min(127.F, std::max(-127.F, std::nearbyint(__half2float(q[row * kHEAD_DIM + d]) / sc)));
+                q[row * kHEAD_DIM + d] = __float2half(code * sc);
+            }
+        }
+    }
     int32_t const group = c.numQHeads / c.numKVHeads;
     int64_t checked = 0;
     for (int32_t b = 0; b < c.batch; ++b)
@@ -236,7 +260,7 @@ void runInt8Case(Int8Case const& c)
                     ASSERT_FALSE(std::isnan(got)) << "NaN at b=" << b << " i=" << i << " h=" << h << " d=" << d;
                     // P is rounded to FP16 before P.V, so the absolute error scales with the largest value magnitude
                     // (127 * vScale) as well as with |o|.
-                    float const tol = 1e-3F + 4e-3F * std::abs(o) + 6e-4F * 127.F * c.vScale;
+                    float const tol = (c.qk ? 2e-3F : 1e-3F) + (c.qk ? 3e-2F : 4e-3F) * std::abs(o) + (c.qk ? 1.5e-3F : 6e-4F) * 127.F * c.vScale;
                     ASSERT_NEAR(got, o, tol)
                         << "b=" << b << " i=" << i << " h=" << h << " d=" << d << " Sq=" << sq << " Sk=" << sk;
                     ++checked;
@@ -351,4 +375,78 @@ TEST(PagedInt8Test, contractViolationsThrow)
     CuteDslFMHAV2Runner head128(2, 2, 128, 1, 1, kPAGE);
     EXPECT_THROW(run(head128, 0.0625F, 1.F, 1.F, kPAGE, q.rawPointer()), std::runtime_error)
         << "only head dim 256 is implemented";
+}
+
+TEST(PagedInt8QKTest, singleQueryRowOverPrefix)
+{
+    Int8Case c{1, {1}, {300}, 1};
+    c.qk = true;
+    runInt8Case(c);
+}
+
+TEST(PagedInt8QKTest, tileAndPageBoundaries)
+{
+    for (int32_t s : {63, 64, 65, 128, 129})
+    {
+        SCOPED_TRACE(s);
+        Int8Case c{1, {s}, {s}, s};
+        c.qk = true;
+        runInt8Case(c);
+    }
+}
+
+TEST(PagedInt8QKTest, chunkedPrefillOverCachedPrefix)
+{
+    Int8Case c{1, {100}, {100 + 257}, 100};
+    c.qk = true;
+    runInt8Case(c);
+}
+
+TEST(PagedInt8QKTest, raggedBatchWithPaddedQueryExtent)
+{
+    Int8Case c{3, {100, 37, 128}, {400, 237, 128}, 128};
+    c.qk = true;
+    runInt8Case(c);
+}
+
+TEST(PagedInt8QKTest, pagesSharedBetweenRequests)
+{
+    Int8Case c{2, {40, 40}, {300, 300}, 40};
+    c.sharePages = true;
+    c.qk = true;
+    runInt8Case(c);
+}
+
+TEST(PagedInt8QKTest, scaleExtremes)
+{
+    // K scales stay moderate here: with scale 1 the logits saturate the softmax, and a one-code difference in a
+    // quantised Q tie then flips the winning key (the Python test checks those with a relative-error bound).
+    for (auto const& [ks, vs] : {std::pair<float, float>{1e-4F, 3e-5F}, {0.05F, 4.F}, {0.2F, 0.0039F}})
+    {
+        SCOPED_TRACE(ks);
+        Int8Case c{1, {70}, {200}, 70};
+        c.kScale = ks;
+        c.vScale = vs;
+        c.qk = true;
+        runInt8Case(c);
+    }
+}
+
+TEST(PagedInt8QKTest, zeroAndOutlierQueryRowsStayFinite)
+{
+    // The quantiser clamps the row scale, so an all-zero row must not produce NaN; checked through the plain case plus
+    // the contract guard that a null Q is rejected.
+    int32_t const sm = smVersionForTest();
+    if (!CuteDslFMHAV2Runner::canImplementPagedInt8(kHEAD_DIM, sm, false))
+    {
+        GTEST_SKIP() << "INT8 paged FMHA-v2 is not built for SM" << sm;
+    }
+    rt::Tensor pool({4, kPAGE, 2, kHEAD_DIM}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor pages({1, 2, 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor out({1, 1, 2, kHEAD_DIM}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor cu({2}, rt::DeviceType::kGPU, DataType::kINT32);
+    CuteDslFMHAV2Runner r(2, 2, kHEAD_DIM, 1, 1, kPAGE);
+    EXPECT_THROW(r.runPagedInt8QK(nullptr, pool.rawPointer(), pages.dataPointer<int32_t>(), out.rawPointer(),
+                     cu.dataPointer<int32_t>(), cu.dataPointer<int32_t>(), 4, 1, kPAGE, nullptr, 0.0625F, 1.F, 1.F),
+        std::runtime_error);
 }

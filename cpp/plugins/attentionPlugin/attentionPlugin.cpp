@@ -2392,11 +2392,19 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                             runtimeBatchSize, runtimeSeqLen, kvCacheCapacity, mNumQHeads, mNumKVHeads, mHeadSize);
                         CuteDslFMHAV2Runner int8Runner(
                             mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
-                        if (!int8Runner.runPagedInt8(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(),
+                        // EDGELLM_FMHA_INT8_QK=1: Q.K^T on INT8 MMA (Q quantised per row; K needs no conversion).
+                        bool const ranKernel = CuteDslFMHAV2Runner::int8QKPagedUsable(mHeadSize, mSMVersion, stream)
+                            ? int8Runner.runPagedInt8QK(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(),
                                 pageTable, attentionOutputTensor.dataPointer<half>(),
                                 cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(),
                                 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE, stream, mAttentionScale, kScale,
-                                vScale))
+                                vScale)
+                            : int8Runner.runPagedInt8(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(),
+                                pageTable, attentionOutputTensor.dataPointer<half>(),
+                                cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(),
+                                2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE, stream, mAttentionScale, kScale,
+                                vScale);
+                        if (!ranKernel)
                         {
                             return -1;
                         }

@@ -119,6 +119,17 @@ public:
     //! True when the INT8-pool paged prefill kernel (head dim 256, full causal attention) is available here.
     static bool canImplementPagedInt8(int32_t headSize, int32_t smVersion, bool slidingWindow);
 
+    //! True when the INT8-QK variant of the paged INT8 kernel may run now: EDGELLM_FMHA_INT8_QK=1, head dim 256 and the
+    //! stream is not being captured into a CUDA graph (the Q scratch may need to grow).
+    static bool int8QKPagedUsable(int32_t headSize, int32_t smVersion, cudaStream_t stream);
+
+    //! As runPagedInt8, but Q.K^T runs on INT8 MMA: Q is quantised per row (amax / 127) into a scratch buffer and K is
+    //! read from the pool as INT8 with no conversion. P.V stays FP16. Q.K^T accumulates exactly in INT32; the only new
+    //! rounding is Q's.
+    bool runPagedInt8QK(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
+        int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens, int32_t numFlatPages, int32_t maxPagesPerSeq,
+        int32_t tokensPerPage, cudaStream_t stream, float attentionScale, float kScale, float vScale);
+
     //! Runs causal head-dim-256 attention directly against an INT8 NHD paged KV pool. kScale/vScale are the pool's
     //! static quant-to-original scales. No dense FP16 K/V copy is needed: the kernel expands INT8 tiles in shared
     //! memory (exact FP16 codes) and applies the scales to the softmax scale and the normalised output.
@@ -185,6 +196,7 @@ private:
     //! INT8 Q·Kᵀ variant of the causal D512 kernel (EDGELLM_FMHA_INT8_QK=1).
     static detail::LazyKernelModule<fmha_v2_d512_i8_Kernel_Module_t> sLLM_d512I8;
     static detail::LazyKernelModule<fmha_v2_d256_paged_i8_Kernel_Module_t> sLLM_d256PagedI8;
+    static detail::LazyKernelModule<fmha_v2_d256_paged_i8qk_Kernel_Module_t> sLLM_d256PagedI8Qk;
     static detail::LazyKernelModule<fmha_v2_d256_padding_Kernel_Module_t> sLLM_d256Padding;
     static detail::LazyKernelModule<fmha_v2_d64_sw_Kernel_Module_t> sLLM_d64Sw;
     static detail::LazyKernelModule<fmha_v2_d128_sw_Kernel_Module_t> sLLM_d128Sw;

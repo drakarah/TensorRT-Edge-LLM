@@ -41,6 +41,7 @@ detail::LazyKernelModule<fmha_v2_d256_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM
 detail::LazyKernelModule<fmha_v2_d512_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d512{};
 detail::LazyKernelModule<fmha_v2_d512_i8_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d512I8{};
 detail::LazyKernelModule<fmha_v2_d256_paged_i8_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256PagedI8{};
+detail::LazyKernelModule<fmha_v2_d256_paged_i8qk_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256PagedI8Qk{};
 detail::LazyKernelModule<fmha_v2_d256_padding_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256Padding{};
 detail::LazyKernelModule<fmha_v2_d64_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64Sw{};
 detail::LazyKernelModule<fmha_v2_d128_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128Sw{};
@@ -567,6 +568,52 @@ int32_t callFmhaV2PagedInt8(detail::LazyKernelModule<WrapperArgT<0, decltype(cut
         params.windowSizeLeft, params.attentionScale, kScale, vScale, getDeviceMultiProcessorCount(), params.stream);
 }
 
+//! Launch the INT8-QK paged variant: Q is INT8 data seen as 16-bit pairs with per-row scales, the pool is passed
+//! twice (bytes for V, 16-bit pairs for K).
+template <auto cuteDslKernelWrapper, auto moduleLoader, auto moduleUnloader>
+int32_t callFmhaV2PagedInt8Qk(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKernelWrapper)>>& state,
+    char const* moduleName, LlmFmhaPagedParams const& params, void const* qInt8, float const* qScale, float kScale,
+    float vScale)
+{
+    static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 15,
+        "callFmhaV2PagedInt8Qk: not an FMHA-v2 INT8-QK paged wrapper (module, q_tensor, q_scale, kv_cache_pool, "
+        "k_pool16, kv_cache_page_list, o_tensor, cum_seqlen_q, cum_seqlen_k, window_size_left, attention_scale, "
+        "k_scale, v_scale, sm_count, stream).");
+
+    if (!detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, params.stream))
+    {
+        return -1;
+    }
+    auto& module = state.module;
+
+    int64_t const halfDim = params.headDim / 2;
+    auto qTensor = makeBsndTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
+        qInt8, params.batchSize, params.seqLenQ, params.numQHeads, static_cast<int32_t>(halfDim));
+    auto qScaleTensor = makePackedTensor<WrapperArgT<2, decltype(cuteDslKernelWrapper)>>(
+        qScale, {params.batchSize, params.numQHeads, params.seqLenQ});
+    auto kvPoolTensor = makeStridedTensor<WrapperArgT<3, decltype(cuteDslKernelWrapper)>>(params.pagedKVPoolPtr,
+        {params.numPages, params.numKVHeads, params.tokensPerPage, params.headDim},
+        {static_cast<int64_t>(params.tokensPerPage) * params.numKVHeads * params.headDim,
+            static_cast<int64_t>(params.headDim), static_cast<int64_t>(params.numKVHeads) * params.headDim});
+    // The same bytes as 16-bit pairs: strides count 2-byte elements.
+    auto kPool16Tensor = makeStridedTensor<WrapperArgT<4, decltype(cuteDslKernelWrapper)>>(params.pagedKVPoolPtr,
+        {params.numPages, params.numKVHeads, params.tokensPerPage, static_cast<int32_t>(halfDim)},
+        {static_cast<int64_t>(params.tokensPerPage) * params.numKVHeads * halfDim, halfDim,
+            static_cast<int64_t>(params.numKVHeads) * halfDim});
+    auto pageListTensor = makePackedTensor<WrapperArgT<5, decltype(cuteDslKernelWrapper)>>(
+        params.kvCachePageList, {params.batchSize, 2, params.maxPagesPerSeq});
+    auto oTensor = makeBsndTensor<WrapperArgT<6, decltype(cuteDslKernelWrapper)>>(
+        params.oPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
+    auto cumSeqlenQ
+        = makeCuSeqLenTensor<WrapperArgT<7, decltype(cuteDslKernelWrapper)>>(params.cuQSeqLens, params.batchSize + 1);
+    auto cumSeqlenK
+        = makeCuSeqLenTensor<WrapperArgT<8, decltype(cuteDslKernelWrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
+
+    return cuteDslKernelWrapper(&module, &qTensor, &qScaleTensor, &kvPoolTensor, &kPool16Tensor, &pageListTensor,
+        &oTensor, &cumSeqlenQ, &cumSeqlenK, params.windowSizeLeft, params.attentionScale, kScale, vScale,
+        getDeviceMultiProcessorCount(), params.stream);
+}
+
 //! Launch an FMHA-v2 *_sink_paged LLM variant: callFmhaV2Paged plus the per-query-head FP32 sink logits.
 template <auto cuteDslKernelWrapper, auto moduleLoader, auto moduleUnloader>
 int32_t callFmhaV2PagedSink(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKernelWrapper)>>& state,
@@ -973,6 +1020,95 @@ bool CuteDslFMHAV2Runner::runPagedInt8(void const* qPtr, void const* pagedKVPool
     if (ret != 0)
     {
         LOG_ERROR("FMHA-v2 INT8 paged FMHA kernel failed with error code: %d", ret);
+    }
+    return ret == 0;
+}
+
+bool CuteDslFMHAV2Runner::int8QKPagedUsable(int32_t headSize, int32_t smVersion, cudaStream_t stream)
+{
+    if (headSize != 256 || !canImplementPagedInt8(headSize, smVersion, false) || int8QKMode() != 1)
+    {
+        return false;
+    }
+    cudaStreamCaptureStatus captureStatus{};
+    return cudaStreamIsCapturing(stream, &captureStatus) == cudaSuccess
+        && captureStatus == cudaStreamCaptureStatusNone;
+}
+
+bool CuteDslFMHAV2Runner::runPagedInt8QK(void const* qPtr, void const* pagedKVPoolPtr,
+    int32_t const* kvCachePageList, void* oPtr, int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens,
+    int32_t numFlatPages, int32_t maxPagesPerSeq, int32_t tokensPerPage, cudaStream_t stream, float attentionScale,
+    float kScale, float vScale)
+{
+    check::check(qPtr != nullptr && pagedKVPoolPtr != nullptr && kvCachePageList != nullptr && oPtr != nullptr
+            && cuQSeqLens != nullptr && cuKVSeqLens != nullptr,
+        "FMHA-v2 INT8-QK paged FMHA requires non-null pointers.");
+    check::check(mHeadDim == 256, "FMHA-v2 INT8-QK paged FMHA is implemented for head_dim 256 only.");
+    check::check(mBatchSize > 0 && mSeqLenQ > 0 && mKVSeqLen > 0 && mNumHeadsQ > 0 && mNumHeadsKV > 0,
+        "FMHA-v2 INT8-QK paged FMHA requires positive tensor extents.");
+    check::check(mNumHeadsQ >= mNumHeadsKV && mNumHeadsQ % mNumHeadsKV == 0,
+        "FMHA-v2 INT8-QK paged FMHA requires Q heads to be divisible by KV heads.");
+    check::check(numFlatPages > 0 && numFlatPages % 2 == 0 && maxPagesPerSeq > 0,
+        "FMHA-v2 INT8-QK paged FMHA requires an even positive flattened page count and maxPagesPerSeq.");
+    check::check(tokensPerPage == 128, "FMHA-v2 INT8-QK paged FMHA requires tokensPerPage == 128.");
+    check::check(mKVSeqLen == maxPagesPerSeq * tokensPerPage,
+        "FMHA-v2 INT8-QK paged FMHA runner capacity must equal maxPagesPerSeq * tokensPerPage.");
+    check::check(std::isfinite(kScale) && kScale > 0.F && std::isfinite(vScale) && vScale > 0.F,
+        "FMHA-v2 INT8-QK paged FMHA requires finite positive K and V scales.");
+    validateAttentionScale(attentionScale);
+    // Growing the scratch allocates, which is not allowed while a CUDA graph is being captured.
+    cudaStreamCaptureStatus captureStatus{};
+    check::check(cudaStreamIsCapturing(stream, &captureStatus) == cudaSuccess
+            && captureStatus == cudaStreamCaptureStatusNone,
+        "FMHA-v2 INT8-QK paged FMHA cannot run during CUDA graph capture (check int8QKPagedUsable first).");
+
+    size_t const qBytes = alignUp(static_cast<size_t>(mBatchSize) * mSeqLenQ * mNumHeadsQ * mHeadDim);
+    size_t const qsBytes = alignUp(static_cast<size_t>(mBatchSize) * mNumHeadsQ * mSeqLenQ * sizeof(float));
+    static Int8QKScratch scratch;
+    if (scratch.bytes < qBytes + qsBytes)
+    {
+        if (scratch.ptr != nullptr)
+        {
+            CUDA_CHECK(cudaFree(scratch.ptr));
+        }
+        CUDA_CHECK(cudaMalloc(&scratch.ptr, qBytes + qsBytes));
+        scratch.bytes = qBytes + qsBytes;
+    }
+    auto* qI8 = static_cast<int8_t*>(scratch.ptr);
+    auto* qScale = reinterpret_cast<float*>(static_cast<char*>(scratch.ptr) + qBytes);
+    static bool logged = false;
+    if (!logged)
+    {
+        LOG_INFO("FMHA-v2: paged INT8 prefill with INT8 Q.K^T (EDGELLM_FMHA_INT8_QK=1, head dim 256)");
+        logged = true;
+    }
+    kernel::quantizeQPerRowInt8(
+        static_cast<half const*>(qPtr), qI8, qScale, mBatchSize, mSeqLenQ, mNumHeadsQ, mHeadDim, stream);
+
+    LlmFmhaPagedParams params{};
+    params.qPtr = qPtr;
+    params.pagedKVPoolPtr = pagedKVPoolPtr;
+    params.kvCachePageList = kvCachePageList;
+    params.oPtr = oPtr;
+    params.cuQSeqLens = cuQSeqLens;
+    params.cuKVSeqLens = cuKVSeqLens;
+    params.batchSize = mBatchSize;
+    params.seqLenQ = mSeqLenQ;
+    params.numQHeads = mNumHeadsQ;
+    params.numKVHeads = mNumHeadsKV;
+    params.headDim = mHeadDim;
+    params.numPages = numFlatPages;
+    params.maxPagesPerSeq = maxPagesPerSeq;
+    params.tokensPerPage = tokensPerPage;
+    params.windowSizeLeft = 1 << 30;
+    params.attentionScale = attentionScale;
+    params.stream = stream;
+    int32_t const ret = callFmhaV2PagedInt8Qk<cute_dsl_fmha_v2_d256_paged_i8qk_wrapper,
+        fmha_v2_d256_paged_i8qk_Kernel_Module_Load, fmha_v2_d256_paged_i8qk_Kernel_Module_Unload>(
+        sLLM_d256PagedI8Qk, "fmha_v2_d256_paged_i8qk", params, qI8, qScale, kScale, vScale);
+    if (ret != 0)
+    {
+        LOG_ERROR("FMHA-v2 INT8-QK paged FMHA kernel failed with error code: %d", ret);
     }
     return ret == 0;
 }
@@ -1452,6 +1588,17 @@ bool CuteDslFMHAV2Runner::runPaged(void const*, void const*, int32_t const*, voi
 }
 
 bool CuteDslFMHAV2Runner::canImplementPagedInt8(int32_t, int32_t, bool)
+{
+    return false;
+}
+
+bool CuteDslFMHAV2Runner::int8QKPagedUsable(int32_t, int32_t, cudaStream_t)
+{
+    return false;
+}
+
+bool CuteDslFMHAV2Runner::runPagedInt8QK(void const*, void const*, int32_t const*, void*, int32_t const*,
+    int32_t const*, int32_t, int32_t, int32_t, cudaStream_t, float, float, float)
 {
     return false;
 }

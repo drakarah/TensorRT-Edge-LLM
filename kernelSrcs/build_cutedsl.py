@@ -864,6 +864,20 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    # Same pool and tile, Q.K^T on INT8 MMA with INT32 accumulate: Q arrives as per-row INT8 (D/2 16-bit columns plus
+    # fp32 scales), K is read from the pool as 16-bit pairs with no conversion, P.V stays FP16.
+    KernelVariant(
+        name="fmha_v2_d256_paged_i8qk",
+        group="fmha",
+        supported_sms=[80, 87],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "256",
+            "--m_block_size", "128", "--n_block_size", "64", "--num_threads", "256",
+            "--dtype", "Float16", "--is_causal", "--paged_kv", "--paged_kv_int8", "--paged_kv_i8qk",
+            "--skip_rescale", "--export_only",
+        ],
+    ),
     KernelVariant(
         name="fmha_v2_d512_paged",
         group="fmha",
