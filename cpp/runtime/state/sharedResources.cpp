@@ -59,6 +59,15 @@ int32_t kvInitialMappedTokens()
     return tokens > 0 && tokens <= std::numeric_limits<int32_t>::max() ? static_cast<int32_t>(tokens) : 0;
 }
 
+//! The draft's own KV pool maps on demand like the base's when EDGELLM_DRAFT_KV_GROWABLE=1 and the base is growable
+//! (EDGELLM_KV_INITIAL_TOKENS): a block drafter keeps 20 KiB of KV per token, which would otherwise be mapped for the whole
+//! engine capacity at start.
+int32_t draftKvInitialMappedTokens()
+{
+    char const* value = std::getenv("EDGELLM_DRAFT_KV_GROWABLE");
+    return value != nullptr && std::atoi(value) != 0 ? kvInitialMappedTokens() : 0;
+}
+
 bool isDFlashDDTreeShape(DeploymentConfig const& bundle)
 {
     return bundle.specConfig.has_value() && isCachedBlockDraftMode(bundle.base.specDecodeType)
@@ -323,6 +332,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.numPages=*/bundle.draft->kvPoolPages,
             /*.numSwaPages=*/bundle.draft->numSwaPages,
             /*.useBoundedSwaKVCache=*/bundle.draft->usesBoundedSwaKVCache(),
+            /*.kvSharingDonors=*/{},
+            /*.initialMappedTokens=*/draftKvInitialMappedTokens(),
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/0,

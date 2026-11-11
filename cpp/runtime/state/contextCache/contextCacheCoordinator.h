@@ -247,6 +247,9 @@ public:
     void limitBasePages(int32_t pages);
     //! One past the highest base KV page held by an active request or a retained record.
     int32_t baseHighWaterPages() const noexcept;
+    //! The draft pool of a speculative deployment: allocate lowest-first below @p pages / report the high water.
+    void limitDraftPages(int32_t pages);
+    int32_t draftHighWaterPages() const noexcept;
     //! Evict records holding a base page at or above @p pages (least recently used first), sparing the
     //! @p protectMostRecent most recently used; returns how many.
     size_t trimBasePagesTo(int32_t pages, size_t protectMostRecent = 0);

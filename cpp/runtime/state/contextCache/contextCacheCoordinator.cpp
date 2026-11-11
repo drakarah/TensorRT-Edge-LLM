@@ -2473,6 +2473,16 @@ int32_t ContextCacheCoordinator::baseHighWaterPages() const noexcept
     return mManager.baseHighWater();
 }
 
+void ContextCacheCoordinator::limitDraftPages(int32_t pages)
+{
+    mManager.limitDraftPages(pages);
+}
+
+int32_t ContextCacheCoordinator::draftHighWaterPages() const noexcept
+{
+    return mManager.draftHighWater();
+}
+
 size_t ContextCacheCoordinator::trimBasePagesTo(int32_t pages, size_t protectMostRecent)
 {
     size_t const evicted = mManager.evictToBaseHighWater(pages, protectMostRecent);

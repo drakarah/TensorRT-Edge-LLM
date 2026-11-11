@@ -223,6 +223,9 @@ public:
     void limitBasePages(int32_t pages);
     //! One past the highest base page held by an active request or a retained record.
     int32_t baseHighWater() const noexcept;
+    //! The same for the draft KV pool of a speculative deployment (its pages are leased and retained with the base ones).
+    void limitDraftPages(int32_t pages);
+    int32_t draftHighWater() const noexcept;
     //! Evict records that hold a base page at or above @p pages, least recently used first, until none is held. Records
     //! below the target and the @p protectMostRecent most recently used records are kept, so the high water can stay above
     //! the target. Between requests only. Returns the number of evicted records.
@@ -276,6 +279,7 @@ private:
     int32_t mPageSize{};
     ResourcePools mPools;
     bool mBasePagesLowestFirst{false};
+    bool mDraftPagesLowestFirst{false};
     BaseBlockIndex mBaseIndex;
     SpecStateIndex mSpecIndex;
     std::optional<SpecReuseContract> mSpecReuseContract;

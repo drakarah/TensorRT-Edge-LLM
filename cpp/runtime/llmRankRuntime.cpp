@@ -698,6 +698,14 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             {
                 mContextCache->limitBasePages(kv.mappedTokens() / kTOKENS_PER_PAGE);
             }
+            if (mSharedResources->cacheManagers.size() > 1)
+            {
+                KVCacheManager const& draftKv = mSharedResources->cacheManagers[1]->getKVCacheManager();
+                if (draftKv.isGrowable())
+                {
+                    mContextCache->limitDraftPages(draftKv.mappedTokens() / kTOKENS_PER_PAGE);
+                }
+            }
         }
 
         mHybridMtpContextReuseDeployment
@@ -2341,6 +2349,45 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         if (mContextCache != nullptr && kv.isGrowable())
         {
             mContextCache->limitBasePages(kv.mappedTokens() / kTOKENS_PER_PAGE);
+        }
+        // A draft that owns its KV pool maps it the same way (EDGELLM_DRAFT_KV_GROWABLE): the draft positions never
+        // exceed the base's, so the base need is its need too, and the mapping covers every draft page a record holds.
+        if (mSharedResources->cacheManagers.size() > 1 && mDeployment.draft.has_value())
+        {
+            rt::KVCacheManager& draftKv = mSharedResources->cacheManagers[1]->getKVCacheManager();
+            if (draftKv.isGrowable())
+            {
+                int32_t const draftCapacity = mDeployment.draft->maxKVCacheCapacity;
+                int32_t draftNeeded = std::min(needed, draftCapacity);
+                if (mContextCache != nullptr)
+                {
+                    draftNeeded = std::max(draftNeeded,
+                        std::min(draftCapacity, mContextCache->draftHighWaterPages() * kTOKENS_PER_PAGE));
+                }
+                if (!draftKv.ensureTokens(draftNeeded))
+                {
+                    kvLimit = std::min(kvLimit, draftKv.mappedTokens());
+                    LOG_WARNING("Draft KV cache needs %.1f MiB more for %d tokens and cannot grow (mapped %d tokens).",
+                        draftKv.bytesToMap(draftNeeded) / 1048576.0, draftNeeded, draftKv.mappedTokens());
+                    if (longestInput > kvLimit)
+                    {
+                        throw std::runtime_error("EDGELLM_INPUT_TOO_LONG: input length " + std::to_string(longestInput)
+                            + " exceeds the draft KV cache that could be mapped (" + std::to_string(kvLimit)
+                            + " tokens)");
+                    }
+                }
+                else if (static_cast<int64_t>(draftKv.mappedTokens())
+                    > static_cast<int64_t>(std::max(recentPeak, draftNeeded)) + kvShrinkSlackTokens())
+                {
+                    size_t const freed = draftKv.shrinkTokens(std::max(recentPeak, draftNeeded));
+                    LOG_INFO("Trimmed the draft KV cache to %d tokens (%.1f MiB freed).", draftKv.mappedTokens(),
+                        freed / 1048576.0);
+                }
+                if (mContextCache != nullptr)
+                {
+                    mContextCache->limitDraftPages(draftKv.mappedTokens() / kTOKENS_PER_PAGE);
+                }
+            }
         }
         if (cacheResized)
         {

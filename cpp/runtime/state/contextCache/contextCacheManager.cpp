@@ -959,6 +959,22 @@ int32_t ContextCacheManager::baseHighWater() const noexcept
     return mPools.highWater(ResourceType::kBaseKvPage);
 }
 
+void ContextCacheManager::limitDraftPages(int32_t pages)
+{
+    if (!mDraftPagesLowestFirst)
+    {
+        mPools.setLowestFirst(ResourceType::kDraftKvPage, pages);
+        mDraftPagesLowestFirst = true;
+        return;
+    }
+    mPools.setUsableLimit(ResourceType::kDraftKvPage, pages);
+}
+
+int32_t ContextCacheManager::draftHighWater() const noexcept
+{
+    return mPools.highWater(ResourceType::kDraftKvPage);
+}
+
 size_t ContextCacheManager::evictToBaseHighWater(int32_t pages, size_t protectMostRecent)
 {
     size_t evicted = 0;
