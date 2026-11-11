@@ -225,6 +225,19 @@ class OpenAIServingChat:
                     "presence_penalty needs a deployment with a single request slot",
                     param="presence_penalty")
         reasoning_budget = request.reasoning_budget_tokens if request.enable_thinking else -1
+        # The DFlash block drafter has no reasoning-budget or presence-penalty support in its verification (the MTP
+        # decoder forces the end-of-thinking token in the verify window; DFlash does not): the runtime refuses such a
+        # request, which an agent harness cannot recover from. Run it without the budget (the model ends its thinking
+        # itself, or max_tokens does) and say so, unless EDGELLM_DFLASH_ENFORCE_BUDGET=1 asks for the refusal.
+        spec_method = getattr(getattr(self._client, "capabilities", None), "speculative_method", "")
+        if spec_method == "dflash" and os.environ.get("EDGELLM_DFLASH_ENFORCE_BUDGET", "0") != "1":
+            if reasoning_budget >= 0:
+                logger.info("DFlash decoding does not enforce reasoning budgets: running without the %d-token budget.",
+                            reasoning_budget)
+                reasoning_budget = -1
+            if request.presence_penalty != 0:
+                logger.info("DFlash decoding does not support presence_penalty: ignoring it.")
+                request.presence_penalty = 0
         if reasoning_budget >= 0:
             capabilities = getattr(self._client, "capabilities", None)
             if (getattr(capabilities, "max_num_seqs", 1) or 1) > 1:

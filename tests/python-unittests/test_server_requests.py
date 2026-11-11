@@ -2040,6 +2040,43 @@ def test_chat_accepts_a_reasoning_budget_with_speculative_decoding_on_one_slot(t
     assert llm.last_sampling_params.reasoning_budget_tokens == 100
 
 
+def _dflash_app(tmp_path, monkeypatch, enforce=None):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    if enforce is None:
+        monkeypatch.delenv("EDGELLM_DFLASH_ENFORCE_BUDGET", raising=False)
+    else:
+        monkeypatch.setenv("EDGELLM_DFLASH_ENFORCE_BUDGET", enforce)
+    llm = _FakeLLM(tmp_path)
+    llm.has_draft_model = True
+    (Path(llm.bundle_dir) / "config.json").write_text(
+        json.dumps({"builder_config": {"max_input_len": 32, "max_batch_size": 1, "max_kv_cache_capacity": 128},
+                    "kv_cache_dtype": "fp16", "spec_decode_type": "dflash"}), encoding="utf-8")
+    return llm, TestClient(_create_app(llm, ApiConfig()))
+
+
+def test_dflash_runs_a_reasoning_budget_and_presence_penalty_request_without_them(tmp_path, monkeypatch):
+    llm, client = _dflash_app(tmp_path, monkeypatch)
+    body = {"messages": [{"role": "user", "content": "Hello"}], "enable_thinking": True,
+            "reasoning_budget_tokens": 100, "presence_penalty": 1.0}
+
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+    # The DFlash decoder cannot enforce either: the request runs without them instead of failing in the runtime.
+    assert llm.last_sampling_params.reasoning_budget_tokens == -1
+    assert llm.last_sampling_params.presence_penalty == 0.0
+    assert llm.last_sampling_params.enable_thinking is True
+
+
+def test_dflash_enforce_budget_switch_keeps_the_budget(tmp_path, monkeypatch):
+    llm, client = _dflash_app(tmp_path, monkeypatch, enforce="1")
+    body = {"messages": [{"role": "user", "content": "Hello"}], "enable_thinking": True, "reasoning_budget_tokens": 100}
+
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+    assert llm.last_sampling_params.reasoning_budget_tokens == 100
+
+
 def test_chat_refuses_a_reasoning_budget_with_several_request_slots(tmp_path):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
