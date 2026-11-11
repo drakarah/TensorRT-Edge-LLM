@@ -162,6 +162,28 @@ TEST(KvCacheManagerGrowTest, FailedGrowthRollsBackEveryLayer)
     EXPECT_EQ(kv.mappedTokens(), 8192);
 }
 
+TEST(KvCacheManagerGrowTest, IntegratedGpuRefusesGrowthThatWouldStarveTheHost)
+{
+    int integrated = 0;
+    ASSERT_EQ(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0), cudaSuccess);
+    if (integrated == 0)
+    {
+        GTEST_SKIP() << "discrete GPU: KV mappings are device memory and never touch host RAM";
+    }
+    rt::KVCacheManager kv(makeConfig(2, 1, 16384, 4096), nullptr);
+    ASSERT_TRUE(kv.isGrowable());
+    // A reserve larger than any machine's RAM: every growth must be refused and nothing may change.
+    ASSERT_EQ(setenv("EDGELLM_KV_MEM_RESERVE_MB", "1000000000", 1), 0);
+    EXPECT_FALSE(kv.ensureTokens(12000));
+    EXPECT_EQ(kv.mappedTokens(), 4096);
+    EXPECT_TRUE(kv.ensureTokens(100)) << "a request inside the mapped range needs no memory";
+    // Reserve off: growth works again.
+    ASSERT_EQ(setenv("EDGELLM_KV_MEM_RESERVE_MB", "0", 1), 0);
+    EXPECT_TRUE(kv.ensureTokens(12000));
+    EXPECT_GE(kv.mappedTokens(), 12000);
+    unsetenv("EDGELLM_KV_MEM_RESERVE_MB");
+}
+
 TEST(KvCacheManagerGrowTest, RetainedExtraPagesKeepTheFullPool)
 {
     rt::KVCacheManager::Config config = makeConfig(1, 1, 16384, 4096);

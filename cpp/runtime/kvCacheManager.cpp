@@ -22,7 +22,10 @@
 #include "kernels/posEncoding/kvInt4Quant.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
+#include <string>
 
 using namespace nvinfer1;
 
@@ -363,6 +366,67 @@ int32_t KVCacheManager::mappedTokens() const noexcept
     return isGrowable() ? std::min(mMappedPages * kTOKENS_PER_PAGE, mConfig.maxSequenceLength) : mConfig.maxSequenceLength;
 }
 
+namespace
+{
+
+//! Host memory the kernel still counts as available (MemAvailable of /proc/meminfo), or -1 when it cannot be read.
+int64_t hostMemAvailableBytes()
+{
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    int64_t kb = 0;
+    std::string unit;
+    while (meminfo >> key >> kb >> unit)
+    {
+        if (key == "MemAvailable:")
+        {
+            return kb * 1024;
+        }
+    }
+    return -1;
+}
+
+//! On an integrated (unified-memory) GPU the KV pages are system RAM, and a mapping succeeds until the machine is starved
+//! (page cache thrashing, the OOM killer too late or never) instead of failing cleanly. Refuse a growth that would leave
+//! less than EDGELLM_KV_MEM_RESERVE_MB (default 2048, 0 = off) of MemAvailable so the request fails with a clear error.
+//! Discrete GPUs map device memory, which does not touch host RAM: always allowed.
+bool hostMemoryAllowsKvGrowth(size_t extraBytes)
+{
+    static int const integrated = []() {
+        int device = 0;
+        int value = 0;
+        if (cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetAttribute(&value, cudaDevAttrIntegrated, device) != cudaSuccess)
+        {
+            return 0;
+        }
+        return value;
+    }();
+    if (integrated == 0)
+    {
+        return true;
+    }
+    char const* value = std::getenv("EDGELLM_KV_MEM_RESERVE_MB");
+    int64_t const reserveBytes = (value != nullptr ? std::atoll(value) : 2048) * 1024 * 1024;
+    if (reserveBytes <= 0)
+    {
+        return true;
+    }
+    int64_t const available = hostMemAvailableBytes();
+    if (available < 0)
+    {
+        return true;
+    }
+    if (available - static_cast<int64_t>(extraBytes) < reserveBytes)
+    {
+        LOG_WARNING("KVCacheManager: not mapping %.1f MiB more KV: %.1f MiB of host memory are available and %.1f MiB must stay free (EDGELLM_KV_MEM_RESERVE_MB).",
+            extraBytes / 1048576.0, available / 1048576.0, reserveBytes / 1048576.0);
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 bool KVCacheManager::ensureTokens(int32_t tokens) noexcept
 {
     if (!isGrowable() || tokens <= mappedTokens())
@@ -370,6 +434,10 @@ bool KVCacheManager::ensureTokens(int32_t tokens) noexcept
         return true;
     }
     int32_t const wantPages = std::min(mNumPages, (std::min(tokens, mConfig.maxSequenceLength) + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE);
+    if (!hostMemoryAllowsKvGrowth(bytesToMap(tokens)))
+    {
+        return false;
+    }
     size_t const before = mRegions.size();
     std::vector<std::pair<size_t, size_t>> previous(before, {0, 0});
     for (size_t i = 0; i < before; ++i)
