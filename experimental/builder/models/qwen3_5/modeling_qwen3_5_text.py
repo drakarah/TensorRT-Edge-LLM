@@ -105,8 +105,8 @@ class Qwen3_5ForCausalLM(NetworkModule):
 
     def input_tensors(self) -> Dict[str, object]:
         cfg = self.cfg
-        kv_dtype = (trt.DataType.FP8
-                    if cfg.kv_cache_quant == "fp8" else trt.float16)
+        kv_dtype = (trt.DataType.FP8 if cfg.kv_cache_quant == "fp8" else
+                    trt.int8 if cfg.kv_cache_quant == "int8" else trt.float16)
         recurrent = cfg.gdn_cfg or cfg.mamba_cfg
         if cfg.gdn_cfg is not None:
             recurrent_shape = (-1, recurrent.num_value_heads,

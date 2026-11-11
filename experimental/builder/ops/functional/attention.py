@@ -38,6 +38,7 @@ def attention(
     sliding_window_size: int = -1,
     enable_fp8_kv_cache: bool = False,
     qkv_scales: Sequence[float] = (1.0, 1.0, 1.0),
+    enable_int8_kv_cache: bool = False,
     q_norm_gamma: Optional[Tensor] = None,
     k_norm_gamma: Optional[Tensor] = None,
     rms_norm_eps: float = 1e-6,
@@ -88,6 +89,9 @@ def attention(
         "qkv_scales": qkv_scales,
         "skip_softmax_scale_factor": skip_softmax_scale_factor,
     }
+    if enable_int8_kv_cache:
+        # Emitted only when set so every other engine keeps its exact field set; the plugin defaults it to 0.
+        attributes["enable_int8_kv_cache"] = 1
     if attention_scale is not None:
         attributes["attention_scale"] = attention_scale
     if enable_qk_norm:

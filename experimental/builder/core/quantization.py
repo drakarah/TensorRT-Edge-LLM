@@ -17,7 +17,7 @@
 import json
 import os
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Dict, List, Optional, Tuple
 
@@ -108,7 +108,7 @@ def normalize_module_name(name: str) -> str:
     return name
 
 
-def parse_quantization(model_dir: str,
+def _parse_quantization_checkpoint(model_dir: str,
                        root: dict,
                        component: dict,
                        conversion: Optional[ModuleType] = None) -> QuantConfig:
@@ -492,3 +492,26 @@ def _normalize_kv(value: Optional[str]) -> Optional[str]:
         return None
     normalized = str(value).strip().lower()
     return normalized or None
+
+
+def parse_quantization(model_dir: str,
+                       root: dict,
+                       component: dict,
+                       conversion: Optional[ModuleType] = None) -> QuantConfig:
+    """Parse the checkpoint's quantization; ``EDGELLM_INT8_KV_SCALES`` adds an INT8 KV cache.
+
+    The KV storage is not a property of the checkpoint for INT8, so it is applied once here for every
+    checkpoint format (the ONNX export path does the same in ``_parse_quant``).
+    """
+    from . import int8_kv
+    quant = _parse_quantization_checkpoint(model_dir, root, component,
+                                           conversion)
+    # A block drafter (DFlash) keeps an FP16 KV cache: its engine declares FP16 pools whatever the base uses.
+    block_draft = bool(root.get("dflash_config") or component.get("dflash_config"))
+    if int8_kv.requested() and not block_draft:
+        if quant.kv_cache_quant not in (None, "int8"):
+            raise ValueError(
+                f"INT8 KV cache requested but the checkpoint carries a {quant.kv_cache_quant} KV cache"
+            )
+        quant = replace(quant, kv_cache_quant="int8")
+    return quant

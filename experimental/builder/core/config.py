@@ -266,7 +266,9 @@ class DeviceConfig:
 
     @property
     def kv_cache_dtype(self) -> str:
-        return "fp8" if self.kv_cache_quant == "fp8" else "fp16"
+        if self.kv_cache_quant in ("fp8", "int8"):
+            return self.kv_cache_quant
+        return "fp16"
 
     @property
     def uses_dual_rope(self) -> bool:

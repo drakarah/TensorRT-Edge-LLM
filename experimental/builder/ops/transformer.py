@@ -17,7 +17,7 @@
 import logging
 from typing import List, Optional, Sequence, Tuple, Type
 
-from ..core import quantization
+from ..core import int8_kv, quantization
 from . import functional as F
 from .linear import Linear
 from .mlp import GatedMLP
@@ -49,6 +49,14 @@ def pack_qkv(query: Tensor, key: Tensor, value: Tensor,
         # changing the engine I/O contract.
         return F.concatenate((query, F.concatenate((key, value), 1)), 1)
     return F.concatenate((query, key, value), 1)
+
+
+
+def _kv_qkv_scales(cfg, weights, prefix: str):
+    """Plugin ``qkv_scales``: per-layer INT8 KV scales, or the checkpoint's FP8 scales."""
+    if cfg.kv_cache_quant == "int8":
+        return int8_kv.qkv_scales_for_prefix(prefix)
+    return weights.qkv_scales(prefix)
 
 
 class DecoderAttention(Module):
@@ -111,7 +119,8 @@ class DecoderAttention(Module):
             head_size=cfg.head_dim,
             sliding_window_size=self.sliding_window_size,
             enable_fp8_kv_cache=cfg.kv_cache_quant == "fp8",
-            qkv_scales=self.weights.qkv_scales(self.prefix),
+            enable_int8_kv_cache=cfg.kv_cache_quant == "int8",
+            qkv_scales=_kv_qkv_scales(cfg, self.weights, self.prefix),
             skip_softmax_scale_factor=cfg.skip_softmax_scale_factor,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
@@ -203,7 +212,8 @@ class GatedDecoderAttention(Module):
             num_kv_heads=cfg.num_key_value_heads,
             head_size=cfg.head_dim,
             enable_fp8_kv_cache=cfg.kv_cache_quant == "fp8",
-            qkv_scales=self.weights.qkv_scales(self.prefix),
+            enable_int8_kv_cache=cfg.kv_cache_quant == "int8",
+            qkv_scales=_kv_qkv_scales(cfg, self.weights, self.prefix),
             skip_softmax_scale_factor=cfg.skip_softmax_scale_factor,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
@@ -262,7 +272,8 @@ class TreeAttention(Module):
             num_kv_heads=cfg.num_key_value_heads,
             head_size=cfg.head_dim,
             enable_fp8_kv_cache=cfg.kv_cache_quant == "fp8",
-            qkv_scales=self.weights.qkv_scales(self.prefix),
+            enable_int8_kv_cache=cfg.kv_cache_quant == "int8",
+            qkv_scales=_kv_qkv_scales(cfg, self.weights, self.prefix),
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
         )
