@@ -181,6 +181,18 @@ public:
     {
         return false;
     }
+    //! True when a prompt longer than one engine pass must feed the draft after every base pass (a block drafter reads
+    //! the target features of every prompt position, and the shared hidden-state buffer holds only the current pass).
+    virtual bool needsPerPassDraftUpdate() const noexcept
+    {
+        return false;
+    }
+    //! Feed the draft the target features of the base pass that just ran (context.effectivePrefillLengths rows). The
+    //! proposal it computes is discarded; the final pass goes through initializeForGeneration.
+    virtual bool absorbPrefillPass(DecodingInferenceContext&)
+    {
+        return true;
+    }
     virtual DecodingKvHeadroom requiredKvHeadroom() const
     {
         return {/*.baseExtraTokens=*/1, /*.draftExtraTokens=*/0};

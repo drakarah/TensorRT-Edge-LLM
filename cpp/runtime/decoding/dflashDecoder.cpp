@@ -44,6 +44,7 @@
 #include "runtime/decoding/requestStableRng.h"
 #include "sampler/sampling.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
@@ -278,6 +279,30 @@ bool DFlashDecoder::initializeForGeneration(DecodingInferenceContext& context)
     return true;
 }
 
+bool DFlashDecoder::supportsChunkedPrefill() const noexcept
+{
+    // The draft is fed after every base pass (absorbPrefillPass), so a prompt longer than one engine pass is accepted.
+    static bool const enabled = [] {
+        char const* value = std::getenv("EDGELLM_DFLASH_CHUNKED_PREFILL");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool DFlashDecoder::absorbPrefillPass(DecodingInferenceContext& context)
+{
+    // Round 0 semantics with the rows of this pass only: the base hidden-state buffer holds just this pass.
+    int32_t const savedLastPass = context.prefillLastPassLength;
+    context.prefillLastPassLength = 0;
+    bool const ok = runDraftForward(context);
+    context.prefillLastPassLength = savedLastPass;
+    if (!ok)
+    {
+        LOG_ERROR("DFlashDecoder: draft update after a prefill pass failed.");
+    }
+    return ok;
+}
+
 std::vector<int32_t> const& DFlashDecoder::commonMaterializedStateLengths() const noexcept
 {
     return mCommonStateTracker.commonMaterializedStateLengths();
@@ -384,11 +409,15 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     if (context.generationRound == 0)
     {
         sourceSeqLen
-            = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
+            = context.prefillLastPassLength > 0 ? context.prefillLastPassLength
+                                                : *std::max_element(context.effectivePrefillLengths.begin(),
+                                                    context.effectivePrefillLengths.end());
         maxDeltaLen = 0;
         for (int32_t b = 0; b < activeBatchSize; ++b)
         {
-            int32_t const prefillLen = context.effectivePrefillLengths[b];
+            // After a chunked prefill the base hidden states hold only the last pass (earlier passes were absorbed).
+            int32_t const prefillLen
+                = context.prefillLastPassLength > 0 ? context.prefillLastPassLength : context.effectivePrefillLengths[b];
             hostDeltaLens[b] = prefillLen;
             maxDeltaLen = std::max(maxDeltaLen, static_cast<int64_t>(prefillLen));
         }

@@ -147,10 +147,15 @@ ContextCacheDeploymentProfile validateContextCacheDeployment(DeploymentConfig co
 
     if (deployment.base.numLinearAttnLayers > 0)
     {
-        ELLM_CHECK(deployment.base.specDecodeType == SpecDecodeMode::kMTP && deployment.base.numAttentionLayers > 0,
-            "MTP context reuse requires a hybrid base with both attention and recurrent layers.");
+        // Hybrid base: MTP, or a block drafter (DFlash) whose draft keeps its own paged KV. The block drafter has no
+        // successor dependency (futureDependencyTokens == 0), so a checkpoint needs no boundary hidden state.
+        ELLM_CHECK((deployment.base.specDecodeType == SpecDecodeMode::kMTP
+                       || deployment.base.specDecodeType == SpecDecodeMode::kDFlash)
+                && deployment.base.numAttentionLayers > 0,
+            "Hybrid context reuse with a draft requires MTP or DFlash over a base with both attention and recurrent "
+            "layers.");
         ELLM_CHECK(deployment.draft->hasOwnKVCache && !deployment.draft->sharesTargetKV,
-            "MTP context reuse requires a draft engine with its own independent KV cache.");
+            "Hybrid speculative context reuse requires a draft engine with its own independent KV cache.");
         return ContextCacheDeploymentProfile{ContextCacheModelStateKind::kHybrid, *contract};
     }
 

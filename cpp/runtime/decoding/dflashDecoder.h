@@ -67,6 +67,12 @@ public:
 
     bool decodeStep(DecodingInferenceContext& context) override;
     bool captureCudaGraphs(cudaStream_t stream) override;
+    bool supportsChunkedPrefill() const noexcept override;
+    bool needsPerPassDraftUpdate() const noexcept override
+    {
+        return true;
+    }
+    bool absorbPrefillPass(DecodingInferenceContext& context) override;
     bool initializeForGeneration(DecodingInferenceContext& context) override;
     std::vector<int32_t> const& commonMaterializedStateLengths() const noexcept override;
 

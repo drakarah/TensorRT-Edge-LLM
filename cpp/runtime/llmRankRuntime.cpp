@@ -2539,7 +2539,9 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         return env == nullptr || std::atoi(env) != 0;
     }();
     bool const plainHybridContextReuse = plainReuseEnabled && !hybridMtpContextReuse && requestCacheEnabled
-        && decodingStrategy.kind() == DecodingStrategyKind::kVanilla && mDeployment.base.numLinearAttnLayers > 0
+        && (decodingStrategy.kind() == DecodingStrategyKind::kVanilla
+            || decodingStrategy.kind() == DecodingStrategyKind::kDFlash)
+        && mDeployment.base.numLinearAttnLayers > 0
         && context.activeBatchSize == 1 && !context.visualEmbeddings.has_value() && !context.audioEmbeddings.has_value()
         && request.recurrentCaptureInterval == 0;
 
@@ -2555,7 +2557,8 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     else if (plainHybridContextReuse)
     {
         context.contextCacheReplayTailLength = request.contextCacheReplayTailLength;
-        prefillStatus = runHybridPlainPrefill(context, *managedRequest);
+        prefillStatus = runHybridPlainPrefill(
+            context, *managedRequest, decodingStrategy.needsPerPassDraftUpdate() ? &decodingStrategy : nullptr);
     }
     else if (canChunkPrefill(context, decodingStrategy)
         && context.effectivePrefillLengths[0] > mDeployment.base.maxSupportedInputLength)
@@ -3570,7 +3573,8 @@ bool LLMRankRuntime::runHybridMtpPrefill(
     return true;
 }
 
-bool LLMRankRuntime::runHybridPlainPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest& managedKVCacheRequest)
+bool LLMRankRuntime::runHybridPlainPrefill(
+    DecodingInferenceContext& context, ManagedKVCacheRequest& managedKVCacheRequest, DecodingStrategy* draftStrategy)
 {
     int32_t const reuseLength = managedKVCacheRequest.reuseTokenLength(0);
     int32_t const inputLength = math::cast<int32_t>(context.rawBatchedInputIds[0].size());
@@ -3609,7 +3613,7 @@ bool LLMRankRuntime::runHybridPlainPrefill(DecodingInferenceContext& context, Ma
     if (!hasVolatileTail)
     {
         // nothing to split: single pass, the end-of-prompt checkpoint is captured by the prefill itself (serves exact continuations only)
-        return runBoundedBaseModelPrefill(context, &managedKVCacheRequest, /*sampleOutput=*/true);
+        return runBoundedBaseModelPrefill(context, &managedKVCacheRequest, /*sampleOutput=*/true, draftStrategy);
     }
 
     std::vector<int32_t> const completeSuffix = context.tokenIds[0];
@@ -3620,7 +3624,7 @@ bool LLMRankRuntime::runHybridPlainPrefill(DecodingInferenceContext& context, Ma
     // Chunk 1: the stable predecessor [reuseLength, predecessorLength), no sampling, then publish the checkpoint at its end.
     context.tokenIds[0].assign(completeSuffix.begin(), replayBegin);
     context.effectivePrefillLengths[0] = predecessorChunkLength;
-    if (!runBoundedBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/false))
+    if (!runBoundedBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/false, draftStrategy))
     {
         return false;
     }
@@ -3633,7 +3637,7 @@ bool LLMRankRuntime::runHybridPlainPrefill(DecodingInferenceContext& context, Ma
     // Chunk 2: replay the volatile tail with sampling, then restore the bookkeeping for the decode loop.
     context.tokenIds[0].assign(replayBegin, completeSuffix.end());
     context.effectivePrefillLengths[0] = replayTailLength;
-    if (!runBoundedBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/true))
+    if (!runBoundedBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/true, draftStrategy))
     {
         return false;
     }
@@ -3664,14 +3668,30 @@ bool LLMRankRuntime::hybridChunkedPrefillEnabled() noexcept
     return enabled;
 }
 
-bool LLMRankRuntime::runBoundedBaseModelPrefill(
-    DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest, bool sampleOutput)
+bool LLMRankRuntime::runBoundedBaseModelPrefill(DecodingInferenceContext& context,
+    ManagedKVCacheRequest* managedKVCacheRequest, bool sampleOutput, DecodingStrategy* draftStrategy)
 {
     int32_t const suffixLength = context.effectivePrefillLengths[0];
     int32_t const maxPassLength = mDeployment.base.maxSupportedInputLength;
     if (suffixLength <= maxPassLength || !hybridChunkedPrefillEnabled())
     {
-        return runBaseModelPrefill(context, managedKVCacheRequest, sampleOutput);
+        if (!runBaseModelPrefill(context, managedKVCacheRequest, sampleOutput))
+        {
+            return false;
+        }
+        if (draftStrategy != nullptr)
+        {
+            if (sampleOutput)
+            {
+                // The final pass: the decode setup feeds the draft with exactly these rows.
+                context.prefillLastPassLength = suffixLength;
+            }
+            else if (!draftStrategy->absorbPrefillPass(context))
+            {
+                return false;
+            }
+        }
+        return true;
     }
     // Longer than one pass: passes of at most maxPassLength, each continuing from the recurrent state and the KV the
     // previous one left in the resident slot. Only the last pass samples and carries the request (its end-of-prompt capture).
@@ -3695,6 +3715,14 @@ bool LLMRankRuntime::runBoundedBaseModelPrefill(
         if (!runBaseModelPrefill(context, lastPass ? managedKVCacheRequest : nullptr, sampleOutput && lastPass))
         {
             return false;
+        }
+        if (draftStrategy != nullptr && !(lastPass && sampleOutput))
+        {
+            // Not the request's final pass: the draft takes this pass's target features now.
+            if (!draftStrategy->absorbPrefillPass(context))
+            {
+                return false;
+            }
         }
         if (!lastPass)
         {
@@ -3726,6 +3754,7 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
     // only the current pass, so the draft prefill runs after each pass (positions [begin, begin + length) with the tokens
     // [begin + 1, begin + length]; the successor of the last position is the next pass's first token, or the sampled one).
     bool const perPassDraft = strategy.kind() == DecodingStrategyKind::kMTP && strategy.isSpeculative();
+    bool const blockDraftPerPass = strategy.needsPerPassDraftUpdate();
     if (perPassDraft)
     {
         ELLM_CHECK(context.committedLengths[0] == 0,
@@ -3774,6 +3803,10 @@ bool LLMRankRuntime::runChunkedBaseModelPrefill(
             {
                 return false;
             }
+        }
+        if (blockDraftPerPass && !lastPass && !strategy.absorbPrefillPass(context))
+        {
+            return false;
         }
         if (!lastPass)
         {

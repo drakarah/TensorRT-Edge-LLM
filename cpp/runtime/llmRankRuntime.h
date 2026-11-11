@@ -698,8 +698,9 @@ private:
     bool runChunkedBaseModelPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest,
         DecodingStrategy& strategy);
     //! Single pass when the suffix fits maxSupportedInputLength, otherwise passes of at most that length (hybrid bases).
-    bool runBoundedBaseModelPrefill(
-        DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest, bool sampleOutput);
+    //! draftStrategy: a block drafter that must absorb the target features after every non-final pass.
+    bool runBoundedBaseModelPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest,
+        bool sampleOutput, DecodingStrategy* draftStrategy = nullptr);
     static bool hybridChunkedPrefillEnabled() noexcept;
 
     //! Hybrid+MTP endpoint-reuse prefill. Mirrors the reference llmInferenceRuntime.cpp::runHybridMtpPrefill: a
@@ -714,7 +715,8 @@ private:
     //! hybrid path was only taken at the end of the prompt, including the volatile generation-prompt tail, so it never matched a later request.
     //! Here the prefill is split at the stable boundary (the prompt without the replay tail, or the prefix shared with an earlier request, see
     //! EDGELLM_HYBRID_DIVERGENCE_CHECKPOINT) and the recurrent + partial-KV checkpoint is published there, as runHybridMtpPrefill does for MTP.
-    bool runHybridPlainPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest& managedKVCacheRequest);
+    bool runHybridPlainPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest& managedKVCacheRequest,
+        DecodingStrategy* draftStrategy = nullptr);
 
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);

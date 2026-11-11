@@ -531,7 +531,9 @@ public:
         std::vector<int32_t> const* commonStateLengths) override
     {
         auto& impl = mCoordinator.checkedImpl(request);
-        ELLM_CHECK(commonStateLengths == nullptr || commonStateLengths->empty(),
+        // A block drafter (DFlash) over a hybrid base reports its common state lengths too; the snapshot flow does not
+        // use them (the draft pages are published with the base pages at the snapshot boundary).
+        ELLM_CHECK(mCoordinator.mProfile.isSpeculative() || commonStateLengths == nullptr || commonStateLengths->empty(),
             "Non-speculative prefill supplied speculative common-state lengths");
         impl.markDeviceWorkResolvedWithoutSync();
         mCoordinator.applyAdvances(impl, advances);
@@ -676,6 +678,21 @@ public:
     ContextCacheCoordinatorStatus publishMtpBoundary(RequestHandle& request, int32_t slot, int32_t residentStateLength,
         Tensor const& baseHiddenStates, int32_t boundaryHiddenRow) override
     {
+        return publishPairedBoundary(request, slot, residentStateLength, &baseHiddenStates, boundaryHiddenRow);
+    }
+
+    //! A block drafter (DFlash) over a hybrid base: the same paired base + draft checkpoint, but no successor-dependent
+    //! boundary hidden state is saved (the draft KV of every position is final once its target features were fed).
+    ContextCacheCoordinatorStatus publishHybridBoundary(
+        RequestHandle& request, int32_t slot, int32_t residentStateLength) override
+    {
+        return publishPairedBoundary(request, slot, residentStateLength, nullptr, -1);
+    }
+
+private:
+    ContextCacheCoordinatorStatus publishPairedBoundary(RequestHandle& request, int32_t slot,
+        int32_t residentStateLength, Tensor const* baseHiddenStates, int32_t boundaryHiddenRow)
+    {
         auto& impl = mCoordinator.checkedImpl(request);
         ELLM_CHECK(slot >= 0 && slot < static_cast<int32_t>(impl.sequences.size()),
             "Hybrid+MTP endpoint publication slot is outside the active batch");
@@ -691,7 +708,8 @@ public:
         }
         ELLM_CHECK(static_cast<size_t>(residentStateLength) <= sequence.tokenIds.size(),
             "Hybrid+MTP endpoint length exceeds the logical token history");
-        ELLM_CHECK(boundaryHiddenRow >= 0, "Hybrid+MTP publication has an empty prefill chunk for its boundary hidden");
+        ELLM_CHECK(baseHiddenStates == nullptr || boundaryHiddenRow >= 0,
+            "Hybrid+MTP publication has an empty prefill chunk for its boundary hidden");
 
         // Release any hit-restore snapshot pins before reserving producer storage (ref :3336), then reserve the paired
         // recurrent + partial-KV slots. Retention pressure is a soft skip, exactly like reserveHybridCapture.
@@ -723,8 +741,11 @@ public:
         mCoordinator.mHybridSnapshots->capturePartialKv(*reservation->partialKvSnapshotSlot,
             sequence.lease.basePages()[fullBlockCount], sequence.lease.draftPages()[fullBlockCount], partialTokenCount,
             impl.stream);
-        mCoordinator.mHybridSnapshots->captureBoundaryHidden(
-            reservation->recurrentSnapshotSlot, baseHiddenStates, boundaryHiddenRow, impl.stream);
+        if (baseHiddenStates != nullptr)
+        {
+            mCoordinator.mHybridSnapshots->captureBoundaryHidden(
+                reservation->recurrentSnapshotSlot, *baseHiddenStates, boundaryHiddenRow, impl.stream);
+        }
         impl.markDeviceWorkEnqueued();
 
         size_t const fullTokenCount = fullBlockCount * static_cast<size_t>(kTOKENS_PER_PAGE);
@@ -759,6 +780,7 @@ public:
         return ContextCacheCoordinatorStatus::kOk;
     }
 
+public:
     ContextCacheCoordinatorStatus restoreMtpBoundary(
         RequestHandle& request, int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow) override
     {
@@ -1878,8 +1900,9 @@ void ContextCacheCoordinator::validateMtpDecodeAdvances(RequestHandle::Impl cons
 {
     // MTP speculative-decodes without EAGLE's common-state tracking, so it supplies no common-state lengths, but it
     // shares EAGLE's committed-plus-lookahead bookkeeping and accepts a variable number of tokens per step.
-    ELLM_CHECK(
-        commonStateLengths == nullptr || commonStateLengths->empty(), "MTP decode supplied EAGLE common-state lengths");
+    // A block drafter (DFlash) over a hybrid base supplies common-state lengths as well; they are not used here.
+    ELLM_CHECK(commonStateLengths == nullptr || commonStateLengths->empty() || mProfile.isSpeculative(),
+        "MTP decode supplied EAGLE common-state lengths");
     validateCommittedLookaheadAdvances(request, advances, /*tokensPerStep=*/TokensPerDecodeStep::kAcceptedCount);
 }
 
@@ -1970,8 +1993,8 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridEndpoint(
     RequestHandle& request, int32_t slot, int32_t residentStateLength)
 {
     checkedImpl(request);
-    ELLM_CHECK(mProfile.isHybrid() && !mProfile.isSpeculative() && mHybridSnapshots != nullptr,
-        "Hybrid boundary publication requires a non-speculative hybrid deployment with snapshot storage");
+    ELLM_CHECK(mProfile.isHybrid() && mHybridSnapshots != nullptr,
+        "Hybrid boundary publication requires a hybrid deployment with snapshot storage");
     return checkedImpl(request).publicationPolicy->publishHybridBoundary(request, slot, residentStateLength);
 }
 

@@ -267,6 +267,34 @@ TEST(ContextCacheDeploymentTests, AdmitsHybridMtpAndRejectsAttentionOnlyOrShared
     EXPECT_THROW(validateContextCacheDeployment(sharedKv), std::runtime_error);
 }
 
+TEST(ContextCacheDeploymentTests, AdmitsHybridDFlashAndRejectsOtherHybridBlockDrafters)
+{
+    DeploymentConfig dflash = makeHybridMtpDeployment();
+    dflash.base.specDecodeType = SpecDecodeMode::kDFlash;
+    dflash.draft->specDecodeType = SpecDecodeMode::kDFlash;
+    dflash.specConfig->dflashBlockSize = 8;
+    ContextCacheDeploymentProfile const profile = validateContextCacheDeployment(dflash);
+    EXPECT_EQ(profile.baseStateKind, ContextCacheModelStateKind::kHybrid);
+    ASSERT_TRUE(profile.specReuseContract.has_value());
+    EXPECT_TRUE(profile.specReuseContract->ownsPagedSpecState);
+    EXPECT_EQ(profile.specReuseContract->futureDependencyTokens, 0);
+
+    // The other block drafters keep their single-pass, attention-only contract.
+    for (SpecDecodeMode const mode : {SpecDecodeMode::kJetSpec, SpecDecodeMode::kDSpark})
+    {
+        DeploymentConfig other = dflash;
+        other.base.specDecodeType = mode;
+        other.draft->specDecodeType = mode;
+        EXPECT_THROW(validateContextCacheDeployment(other), std::runtime_error);
+    }
+
+    // A draft without its own KV cache cannot be paired with the hybrid snapshot.
+    DeploymentConfig sharedKv = dflash;
+    sharedKv.draft->hasOwnKVCache = false;
+    sharedKv.draft->sharesTargetKV = true;
+    EXPECT_THROW(validateContextCacheDeployment(sharedKv), std::runtime_error);
+}
+
 TEST(ContextCacheDeploymentTests, ResolvesPerMethodReuseContract)
 {
     DeploymentConfig eagle = makeEagleDeployment();

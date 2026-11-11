@@ -123,7 +123,8 @@ void validateKVPoolMode(DeploymentConfig const& deployment)
         && (mode == SpecDecodeMode::kGemma4MTP || mode == SpecDecodeMode::kDFlash || mode == SpecDecodeMode::kJetSpec
             || mode == SpecDecodeMode::kDSpark);
     // Hybrid MTP: the context cache pairs retained attention KV pages with recurrent checkpoints.
-    bool const hybridMtp = mode == SpecDecodeMode::kMTP && deployment.base.numLinearAttnLayers > 0;
+    bool const hybridMtp
+        = (mode == SpecDecodeMode::kMTP || mode == SpecDecodeMode::kDFlash) && deployment.base.numLinearAttnLayers > 0;
     bool const baseSupportsCrossRequestRetention = !deployment.base.kvLayerConfigs.empty()
         && (mode == SpecDecodeMode::kNONE || nonHybridEagle || attentionOnlyManagedSpec || hybridMtp);
     if (!baseSupportsCrossRequestRetention)
