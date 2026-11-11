@@ -89,7 +89,13 @@ void KVPageTable::setRingPages(int32_t ringPages)
 {
     check::check(ringPages > 0 && ringPages <= mNumPages && mMode == Mode::kDense && mMaxBatch == 1,
         "KVPageTable::setRingPages: a ring needs a dense single-slot table and 0 < ringPages <= numPages.");
+    bool const rebuild = mIsIdentity;
     mRingPages = ringPages;
+    if (rebuild)
+    {
+        // The table was already built as an identity layout: map it as the ring now, not at some later setIdentity().
+        setIdentity();
+    }
 }
 
 void KVPageTable::setIdentity()

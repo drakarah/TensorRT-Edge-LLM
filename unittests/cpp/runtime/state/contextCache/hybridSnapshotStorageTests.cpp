@@ -59,6 +59,215 @@ TEST(HybridSnapshotStorageTests, ReportsExactBytesPerSlot)
     EXPECT_EQ(HybridSnapshotStorage::partialKvBytesPerSlot(config.kvConfig), 8192U);
 }
 
+TEST(HybridSnapshotStorageTests, DraftKvRingIsCopiedWholeWithTheRecurrentSnapshot)
+{
+    cudaStream_t stream{};
+    HybridCacheManager::Config const config = makeHybridConfig();
+    HybridCacheManager cacheManager(config, stream);
+    // A block drafter's attention-only cache whose pool is a small static ring (3 pages for any logical length).
+    HybridCacheManager::Config draftConfig;
+    draftConfig.layerTypes = {HybridCacheManager::LayerType::kAttention, HybridCacheManager::LayerType::kAttention};
+    draftConfig.kvConfig = KVCacheManager::Config{/*.numAttentionLayers=*/2, /*.maxBatchSize=*/1,
+        /*.maxSequenceLength=*/256, /*.layerConfigs=*/{KVLayerConfig{2, 4}, KVLayerConfig{2, 4}},
+        /*.kvCacheType=*/DataType::kHALF, /*.numPages=*/3};
+    draftConfig.mambaConfig = MambaCacheManager::Config{};
+    draftConfig.maxBatchSize = 1;
+    HybridCacheManager draftManager(draftConfig, stream);
+    KVCacheManager& draftKv = draftManager.getKVCacheManager();
+
+    size_t const slotBytes = HybridSnapshotStorage::draftRingBytesPerSlot(draftKv);
+    EXPECT_EQ(slotBytes, 2U * (2U * 3 * kTOKENS_PER_PAGE * 2 * 4) * sizeof(half));
+
+    HybridSnapshotStorage storage(cacheManager, 2, 2, &draftManager, 0, DataType::kHALF, SnapshotMemory::kDevice,
+        /*draftKvRing=*/true);
+    int32_t constexpr kSnapshotSlot{1};
+    size_t const layerBytes = slotBytes / 2;
+    for (int32_t layer = 0; layer < draftKv.numLayers(); ++layer)
+    {
+        CUDA_CHECK(cudaMemsetAsync(
+            draftKv.getCombinedKVCache(layer).rawPointer(), 0x50 + layer, layerBytes, stream));
+    }
+    storage.captureRecurrent(kSnapshotSlot, 0, stream);
+    // The ring moves on after the capture (decode continues and overwrites pages) ...
+    for (int32_t layer = 0; layer < draftKv.numLayers(); ++layer)
+    {
+        CUDA_CHECK(cudaMemsetAsync(draftKv.getCombinedKVCache(layer).rawPointer(), 0x11, layerBytes, stream));
+    }
+    // ... and a hit brings the captured ring back, layer by layer.
+    storage.restoreRecurrent(kSnapshotSlot, 1, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    for (int32_t layer = 0; layer < draftKv.numLayers(); ++layer)
+    {
+        std::vector<uint8_t> host(layerBytes);
+        CUDA_CHECK(cudaMemcpy(
+            host.data(), draftKv.getCombinedKVCache(layer).rawPointer(), layerBytes, cudaMemcpyDeviceToHost));
+        for (size_t byte = 0; byte < host.size(); ++byte)
+        {
+            ASSERT_EQ(host[byte], 0x50 + layer) << "layer " << layer << " byte " << byte;
+        }
+    }
+}
+
+namespace
+{
+HybridCacheManager::Config makeRingDraftConfig(int32_t ringPages = 3, int32_t initialMappedTokens = 0)
+{
+    HybridCacheManager::Config draftConfig;
+    draftConfig.layerTypes = {HybridCacheManager::LayerType::kAttention, HybridCacheManager::LayerType::kAttention};
+    draftConfig.kvConfig = KVCacheManager::Config{/*.numAttentionLayers=*/2, /*.maxBatchSize=*/1,
+        /*.maxSequenceLength=*/256, /*.layerConfigs=*/{KVLayerConfig{2, 4}, KVLayerConfig{2, 4}},
+        /*.kvCacheType=*/DataType::kHALF, /*.numPages=*/ringPages};
+    draftConfig.kvConfig.initialMappedTokens = initialMappedTokens;
+    draftConfig.mambaConfig = MambaCacheManager::Config{};
+    draftConfig.maxBatchSize = 1;
+    return draftConfig;
+}
+
+void fillRing(HybridCacheManager& draft, uint8_t base, cudaStream_t stream)
+{
+    KVCacheManager& kv = draft.getKVCacheManager();
+    size_t const layerBytes = HybridSnapshotStorage::draftRingBytesPerSlot(kv) / static_cast<size_t>(kv.numLayers());
+    for (int32_t layer = 0; layer < kv.numLayers(); ++layer)
+    {
+        CUDA_CHECK(cudaMemsetAsync(kv.getCombinedKVCache(layer).rawPointer(), base + layer, layerBytes, stream));
+    }
+}
+
+//! Every byte of every layer's ring equals base + layer.
+void expectRing(HybridCacheManager& draft, uint8_t base, cudaStream_t stream)
+{
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    KVCacheManager& kv = draft.getKVCacheManager();
+    size_t const layerBytes = HybridSnapshotStorage::draftRingBytesPerSlot(kv) / static_cast<size_t>(kv.numLayers());
+    for (int32_t layer = 0; layer < kv.numLayers(); ++layer)
+    {
+        std::vector<uint8_t> host(layerBytes);
+        CUDA_CHECK(cudaMemcpy(host.data(), kv.getCombinedKVCache(layer).rawPointer(), layerBytes, cudaMemcpyDeviceToHost));
+        for (size_t byte = 0; byte < host.size(); ++byte)
+        {
+            ASSERT_EQ(host[byte], static_cast<uint8_t>(base + layer)) << "layer " << layer << " byte " << byte;
+        }
+    }
+}
+} // namespace
+
+TEST(HybridSnapshotStorageTests, DraftKvRingSlotsAreIndependent)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    HybridCacheManager draft(makeRingDraftConfig(), stream);
+    HybridSnapshotStorage storage(
+        cacheManager, 3, 1, &draft, 0, DataType::kHALF, SnapshotMemory::kDevice, /*draftKvRing=*/true);
+
+    // Three different rings in three slots (first, middle and last slot index).
+    for (int32_t slot : {0, 1, 2})
+    {
+        fillRing(draft, static_cast<uint8_t>(0x20 + 0x10 * slot), stream);
+        storage.captureRecurrent(slot, 0, stream);
+    }
+    // Restoring in a different order returns each ring exactly, not its neighbour's.
+    for (int32_t slot : {2, 0, 1})
+    {
+        fillRing(draft, 0x77, stream);
+        storage.restoreRecurrent(slot, 1, stream);
+        expectRing(draft, static_cast<uint8_t>(0x20 + 0x10 * slot), stream);
+    }
+}
+
+TEST(HybridSnapshotStorageTests, DraftKvRingRoundTripsThroughPinnedHostMemory)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    HybridCacheManager draft(makeRingDraftConfig(), stream);
+    HybridSnapshotStorage storage(
+        cacheManager, 2, 1, &draft, 0, DataType::kHALF, SnapshotMemory::kPinnedHost, /*draftKvRing=*/true);
+    fillRing(draft, 0x41, stream);
+    storage.captureRecurrent(1, 0, stream);
+    fillRing(draft, 0x09, stream);
+    storage.restoreRecurrent(1, 1, stream);
+    expectRing(draft, 0x41, stream);
+}
+
+TEST(HybridSnapshotStorageTests, DraftKvRingLeavesTheBaseRecurrentRoundTripIntact)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    HybridCacheManager draft(makeRingDraftConfig(), stream);
+    HybridSnapshotStorage storage(
+        cacheManager, 2, 1, &draft, 0, DataType::kHALF, SnapshotMemory::kDevice, /*draftKvRing=*/true);
+    MambaCacheManager& mamba = cacheManager.getMambaCacheManager();
+    size_t const recurrentBytes = static_cast<size_t>(2 * 3 * 4) * sizeof(half);
+    CUDA_CHECK(cudaMemsetAsync(mamba.getRecurrentState(0).rawPointer(), 0x31, recurrentBytes, stream));
+    fillRing(draft, 0x50, stream);
+    storage.captureRecurrent(0, 0, stream);
+    storage.zeroRecurrent(0, stream);
+    fillRing(draft, 0x01, stream);
+    storage.restoreRecurrent(0, 0, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    std::vector<uint8_t> host(recurrentBytes);
+    CUDA_CHECK(cudaMemcpy(host.data(), mamba.getRecurrentState(0).rawPointer(), recurrentBytes, cudaMemcpyDeviceToHost));
+    for (uint8_t const byte : host)
+    {
+        ASSERT_EQ(byte, 0x31);
+    }
+    expectRing(draft, 0x50, stream);
+}
+
+TEST(HybridSnapshotStorageTests, WithoutARingFlagTheDraftPoolIsNotCopied)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    HybridCacheManager draft(makeRingDraftConfig(), stream);
+    // The paired (MTP) form: draft partial-KV pages ride on the partial axis, nothing is captured with the recurrent slot.
+    HybridSnapshotStorage storage(cacheManager, 2, 1, &draft, 0, DataType::kHALF, SnapshotMemory::kDevice, false);
+    fillRing(draft, 0x60, stream);
+    storage.captureRecurrent(0, 0, stream);
+    fillRing(draft, 0x0A, stream);
+    storage.restoreRecurrent(0, 0, stream);
+    expectRing(draft, 0x0A, stream);
+}
+
+TEST(HybridSnapshotStorageTests, DraftKvRingWithoutRecurrentSlotsAllocatesNothingAndCopiesNothing)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    HybridCacheManager draft(makeRingDraftConfig(), stream);
+    HybridSnapshotStorage storage(
+        cacheManager, 0, 0, &draft, 0, DataType::kHALF, SnapshotMemory::kDevice, /*draftKvRing=*/true);
+    EXPECT_EQ(storage.recurrentSlotCount(), 0);
+    EXPECT_THROW(storage.captureRecurrent(0, 0, stream), std::runtime_error) << "no slot to capture into";
+}
+
+TEST(HybridSnapshotStorageTests, DraftKvRingNeedsTheDraftCacheAndAFixedPool)
+{
+    cudaStream_t stream{};
+    HybridCacheManager cacheManager(makeHybridConfig(), stream);
+    EXPECT_THROW((void) HybridSnapshotStorage(cacheManager, 2, 1, nullptr, 0, DataType::kHALF, SnapshotMemory::kDevice,
+                     /*draftKvRing=*/true),
+        std::runtime_error);
+
+    // A pool mapped on demand (growable) has no fixed bytes to snapshot.
+    HybridCacheManager::Config growable = makeRingDraftConfig(8, /*initialMappedTokens=*/4096);
+    growable.kvConfig.layerConfigs = {KVLayerConfig{2, 256}, KVLayerConfig{2, 256}};
+    growable.kvConfig.kvCacheType = DataType::kINT8;
+    growable.kvConfig.numPages = 0;
+    growable.kvConfig.maxSequenceLength = 16384;
+    HybridCacheManager draft(growable, stream);
+    EXPECT_THROW((void) HybridSnapshotStorage(cacheManager, 2, 1, &draft, 0, DataType::kHALF,
+                     SnapshotMemory::kDevice, /*draftKvRing=*/true),
+        std::runtime_error);
+}
+
+TEST(HybridSnapshotStorageTests, DraftRingBytesPerSlotCountsEveryLayerAndBothHalves)
+{
+    cudaStream_t stream{};
+    HybridCacheManager::Config config = makeRingDraftConfig(5);
+    config.kvConfig.layerConfigs = {KVLayerConfig{2, 4}, KVLayerConfig{1, 8}};
+    HybridCacheManager draft(config, stream);
+    size_t const expected = (2U * 5 * kTOKENS_PER_PAGE * (2 * 4) + 2U * 5 * kTOKENS_PER_PAGE * (1 * 8)) * sizeof(half);
+    EXPECT_EQ(HybridSnapshotStorage::draftRingBytesPerSlot(draft.getKVCacheManager()), expected);
+}
+
 TEST(HybridSnapshotStorageTests, RejectsLiveRecurrentShapeDrift)
 {
     cudaStream_t stream{};

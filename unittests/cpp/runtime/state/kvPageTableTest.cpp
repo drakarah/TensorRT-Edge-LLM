@@ -552,3 +552,68 @@ TEST(KVPageTableTest, GatherUsesResidentOrderAndKeepsDestinationAddressStable)
     EXPECT_EQ(gathered.rawPointer(), gatheredAddress);
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
+
+
+TEST(KVPageTableTest, RingMapsLogicalPagesModuloThePoolAndDerivesVFromThePoolSize)
+{
+    constexpr int32_t maxPagesPerSeq = 70;
+    constexpr int32_t ring = 8;
+    KVPageTable table(1, maxPagesPerSeq, ring);
+    table.setRingPages(ring);
+    table.setIdentity();
+    for (int32_t j = 0; j < maxPagesPerSeq; ++j)
+    {
+        EXPECT_EQ(hostEntry(table, 0, 0, j, maxPagesPerSeq), j % ring) << "j=" << j;
+        EXPECT_EQ(hostEntry(table, 0, 1, j, maxPagesPerSeq), j % ring + ring) << "j=" << j;
+    }
+    // Page j and page j + ring share storage: that is the point of a ring.
+    EXPECT_EQ(hostEntry(table, 0, 0, 3, maxPagesPerSeq), hostEntry(table, 0, 0, 3 + ring, maxPagesPerSeq));
+}
+
+TEST(KVPageTableTest, RingSetAfterIdentityRemapsTheTableImmediately)
+{
+    KVPageTable table(1, 20, 4);
+    table.setRingPages(4);
+    // A table that was already built as the identity layout must not keep its old entries.
+    KVPageTable late(1, 20, 20);
+    late.setIdentity();
+    EXPECT_EQ(hostEntry(late, 0, 0, 19, 20), 19);
+    late.setRingPages(4);
+    EXPECT_EQ(hostEntry(late, 0, 0, 19, 20), 19 % 4);
+    EXPECT_EQ(hostEntry(late, 0, 1, 19, 20), 19 % 4 + 20);
+}
+
+TEST(KVPageTableTest, RingBoundaryValues)
+{
+    // A one-page ring maps every logical page to page 0; a ring as large as the pool is accepted.
+    KVPageTable one(1, 6, 6);
+    one.setRingPages(1);
+    one.setIdentity();
+    for (int32_t j = 0; j < 6; ++j)
+    {
+        EXPECT_EQ(hostEntry(one, 0, 0, j, 6), 0);
+    }
+    KVPageTable full(1, 6, 6);
+    full.setRingPages(6);
+    full.setIdentity();
+    for (int32_t j = 0; j < 6; ++j)
+    {
+        EXPECT_EQ(hostEntry(full, 0, 0, j, 6), j);
+    }
+}
+
+TEST(KVPageTableTest, RingRejectsInvalidGeometry)
+{
+    KVPageTable table(1, 20, 8);
+    EXPECT_THROW(table.setRingPages(0), std::runtime_error);
+    EXPECT_THROW(table.setRingPages(-3), std::runtime_error);
+    EXPECT_THROW(table.setRingPages(9), std::runtime_error) << "more ring pages than the pool holds";
+    KVPageTable batched(2, 4, 8);
+    EXPECT_THROW(batched.setRingPages(4), std::runtime_error) << "a ring is a single-slot layout";
+}
+
+TEST(KVPageTableTest, WithoutARingAPoolSmallerThanTheIdentityLayoutIsStillRefused)
+{
+    KVPageTable table(1, 20, 8);
+    EXPECT_THROW(table.setIdentity(), std::runtime_error);
+}

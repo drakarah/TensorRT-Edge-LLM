@@ -1447,3 +1447,57 @@ TEST_F(LLMEngineConfigTest, ParseDraftEngineConfigDoesNotRequireEagleTargetLayer
     auto const config = parseDraftEngineConfig(path);
     EXPECT_TRUE(config.specTargetLayerIds.empty());
 }
+
+
+namespace
+{
+//! A single-slot engine of 262,144 tokens whose declared pool is `poolPages` (a full pool is 2,048 pages).
+std::filesystem::path writeRingConfig(int64_t poolPages, int64_t maxInputLen)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_batch_size"] = 1;
+    json["builder_config"]["max_input_len"] = maxInputLen;
+    json["builder_config"]["max_kv_cache_capacity"] = 262144;
+    json["builder_config"]["max_kv_pool_pages"] = poolPages;
+    return writeJsonToTempFile(json);
+}
+} // namespace
+
+TEST_F(LLMEngineConfigTest, AcceptsAFullPoolAndRejectsAnythingBetweenTheRingFloorAndNothing)
+{
+    EXPECT_EQ(parseEngineConfig(writeRingConfig(2048, 1024)).kvPoolPages, 2048);
+    EXPECT_EQ(parseEngineConfig(writeRingConfig(4096, 1024)).kvPoolPages, 4096) << "retained extra pages";
+}
+
+TEST_F(LLMEngineConfigTest, AcceptsARingPoolFromTheFloorUpButNotBelow)
+{
+    // Floor = 16 window pages + ceil(1024 / 128) = 8 prefill pages + 2 margin = 26.
+    EXPECT_EQ(parseEngineConfig(writeRingConfig(26, 1024)).kvPoolPages, 26);
+    EXPECT_EQ(parseEngineConfig(writeRingConfig(32, 1024)).kvPoolPages, 32);
+    EXPECT_EQ(parseEngineConfig(writeRingConfig(2047, 1024)).kvPoolPages, 2047);
+    EXPECT_THROW(parseEngineConfig(writeRingConfig(25, 1024)), std::runtime_error);
+    EXPECT_THROW(parseEngineConfig(writeRingConfig(1, 1024)), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, RingFloorRoundsTheInputLengthUpToWholePages)
+{
+    // 1,025 tokens need 9 pages: floor 27.
+    EXPECT_EQ(parseEngineConfig(writeRingConfig(27, 1025)).kvPoolPages, 27);
+    EXPECT_THROW(parseEngineConfig(writeRingConfig(26, 1025)), std::runtime_error);
+    // 128 tokens need 1 page: floor 19.
+    EXPECT_EQ(parseEngineConfig(writeRingConfig(19, 128)).kvPoolPages, 19);
+    EXPECT_THROW(parseEngineConfig(writeRingConfig(18, 128)), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, ASmallCapacityEngineKeepsItsFullPoolRequirement)
+{
+    // The capacity-limited minimum (2 pages) is below the ring floor, so it stays the bound.
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_batch_size"] = 1;
+    json["builder_config"]["max_input_len"] = 128;
+    json["builder_config"]["max_kv_cache_capacity"] = 256;
+    json["builder_config"]["max_kv_pool_pages"] = 1;
+    EXPECT_THROW(parseEngineConfig(writeJsonToTempFile(json)), std::runtime_error);
+    json["builder_config"]["max_kv_pool_pages"] = 2;
+    EXPECT_EQ(parseEngineConfig(writeJsonToTempFile(json)).kvPoolPages, 2);
+}

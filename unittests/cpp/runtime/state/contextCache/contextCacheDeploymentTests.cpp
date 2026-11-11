@@ -295,6 +295,76 @@ TEST(ContextCacheDeploymentTests, AdmitsHybridDFlashAndRejectsOtherHybridBlockDr
     EXPECT_THROW(validateContextCacheDeployment(sharedKv), std::runtime_error);
 }
 
+TEST(ContextCacheDeploymentTests, RingedDFlashDraftIsAPlainHybridWithASnapshottedRing)
+{
+    DeploymentConfig dflash = makeHybridMtpDeployment();
+    dflash.base.specDecodeType = SpecDecodeMode::kDFlash;
+    dflash.draft->specDecodeType = SpecDecodeMode::kDFlash;
+    dflash.specConfig->dflashBlockSize = 8;
+    ContextCacheDeploymentProfile const paged = validateContextCacheDeployment(dflash);
+    EXPECT_FALSE(paged.ringedDraftKv());
+    EXPECT_TRUE(paged.ownsPagedSpecState());
+
+    // The builder's --draft-kv-ring-pages: a draft pool smaller than its capacity needs, at least the 2,048-token
+    // window (16 pages) plus one prefill pass plus a margin.
+    DeploymentConfig ringed = dflash;
+    ringed.draft->maxSupportedBatchSize = 1;
+    ringed.draft->maxSupportedInputLength = 1024;
+    ringed.draft->maxKVCacheCapacity = 262144;
+    ringed.draft->kvPoolPages = 32;
+    ContextCacheDeploymentProfile const profile = validateContextCacheDeployment(ringed);
+    EXPECT_TRUE(profile.ringedDraftKv());
+    EXPECT_FALSE(profile.ownsPagedSpecState());
+    EXPECT_EQ(profile.specReuseContract->futureDependencyTokens, 0);
+
+    // A pool below the window cannot be a ring.
+    DeploymentConfig tooSmall = ringed;
+    tooSmall.draft->kvPoolPages = 17;
+    EXPECT_THROW(validateContextCacheDeployment(tooSmall), std::runtime_error);
+
+    // Only DFlash drafts may declare a ring.
+    DeploymentConfig mtp = makeHybridMtpDeployment();
+    mtp.draft->kvPoolPages = 4;
+    EXPECT_THROW(validateContextCacheDeployment(mtp), std::runtime_error);
+}
+
+TEST(ContextCacheDeploymentTests, RingDetectionBoundaries)
+{
+    DeploymentConfig dflash = makeHybridMtpDeployment();
+    dflash.base.specDecodeType = SpecDecodeMode::kDFlash;
+    dflash.draft->specDecodeType = SpecDecodeMode::kDFlash;
+    dflash.specConfig->dflashBlockSize = 8;
+    dflash.draft->maxSupportedBatchSize = 1;
+    dflash.draft->maxSupportedInputLength = 1024;
+    dflash.draft->maxKVCacheCapacity = 262144;
+
+    // Exactly the floor (26) is a ring, one page less is refused, the full pool and above are plain paged drafts.
+    dflash.draft->kvPoolPages = 26;
+    EXPECT_TRUE(validateContextCacheDeployment(dflash).ringedDraftKv());
+    dflash.draft->kvPoolPages = 25;
+    EXPECT_THROW(validateContextCacheDeployment(dflash), std::runtime_error);
+    dflash.draft->kvPoolPages = 2047;
+    EXPECT_TRUE(validateContextCacheDeployment(dflash).ringedDraftKv());
+    dflash.draft->kvPoolPages = 2048;
+    EXPECT_FALSE(validateContextCacheDeployment(dflash).ringedDraftKv());
+    dflash.draft->kvPoolPages = 4096;
+    EXPECT_FALSE(validateContextCacheDeployment(dflash).ringedDraftKv());
+
+    // The floor follows the input length in whole pages.
+    dflash.draft->maxSupportedInputLength = 1025;
+    dflash.draft->kvPoolPages = 26;
+    EXPECT_THROW(validateContextCacheDeployment(dflash), std::runtime_error);
+    dflash.draft->kvPoolPages = 27;
+    EXPECT_TRUE(validateContextCacheDeployment(dflash).ringedDraftKv());
+}
+
+TEST(ContextCacheDeploymentTests, RingedProfileHelpersAreFalseWithoutASpeculativeContract)
+{
+    ContextCacheDeploymentProfile const vanilla{ContextCacheModelStateKind::kHybrid, std::nullopt};
+    EXPECT_FALSE(vanilla.ringedDraftKv());
+    EXPECT_FALSE(vanilla.ownsPagedSpecState());
+}
+
 TEST(ContextCacheDeploymentTests, ResolvesPerMethodReuseContract)
 {
     DeploymentConfig eagle = makeEagleDeployment();

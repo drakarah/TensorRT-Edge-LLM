@@ -364,3 +364,73 @@ TEST(KvCacheManagerGrowTest, MappedBytesFallWhenTheMappingIsTrimmed)
     EXPECT_LT(kv.mappedBytes(), grown);
     EXPECT_EQ(kv.mappedBytes() + kv.bytesToMap(12288), grown);
 }
+
+
+// --- A ring pool: a sliding-window drafter's KV lives in `ringPages` pages for any capacity ---
+
+TEST(KvCacheManagerRingTest, RingPoolHoldsOnlyTheRingPagesWhateverTheCapacity)
+{
+    rt::KVCacheManager::Config config = makeConfig(2, 1, 262144, 0);
+    config.ringPages = 32;
+    config.useBoundedSwaKVCache = false;
+    rt::KVCacheManager kv(config, nullptr);
+    EXPECT_EQ(kv.numPages(), 32);
+    EXPECT_FALSE(kv.isGrowable());
+    // 2 layers x 2 (K and V) x 32 pages x 64 KiB
+    EXPECT_EQ(kv.getCombinedKVCache(0).getShape()[1], 32);
+}
+
+TEST(KvCacheManagerRingTest, RingPoolNeedsASingleSlotEngine)
+{
+    rt::KVCacheManager::Config config = makeConfig(1, 2, 16384, 0);
+    config.ringPages = 8;
+    config.useBoundedSwaKVCache = false;
+    EXPECT_ANY_THROW(rt::KVCacheManager(config, nullptr));
+    config.maxBatchSize = 1; // the same config is fine for one slot
+    EXPECT_NO_THROW(rt::KVCacheManager(config, nullptr));
+}
+
+TEST(KvCacheManagerRingTest, RingPoolCannotBeCombinedWithOnDemandMappingPackedVOrSharing)
+{
+    rt::KVCacheManager::Config growable = makeConfig(1, 1, 16384, 4096);
+    growable.ringPages = 8;
+    growable.useBoundedSwaKVCache = false;
+    EXPECT_ANY_THROW(rt::KVCacheManager(growable, nullptr));
+
+    rt::KVCacheManager::Config packed = makeConfig(1, 1, 16384, 0);
+    packed.ringPages = 8;
+    packed.useBoundedSwaKVCache = false;
+    packed.packedV = true;
+    EXPECT_ANY_THROW(rt::KVCacheManager(packed, nullptr));
+
+    rt::KVCacheManager::Config shared = makeConfig(3, 1, 16384, 0);
+    shared.ringPages = 8;
+    shared.useBoundedSwaKVCache = false;
+    shared.kvSharingDonors = {-1, 0, 0};
+    EXPECT_ANY_THROW(rt::KVCacheManager(shared, nullptr));
+
+    rt::KVCacheManager::Config bounded = makeConfig(1, 1, 16384, 0);
+    bounded.ringPages = 8;
+    bounded.useBoundedSwaKVCache = true;
+    EXPECT_ANY_THROW(rt::KVCacheManager(bounded, nullptr));
+}
+
+TEST(KvCacheManagerRingTest, RingAsLargeAsTheFullPoolIsNotARing)
+{
+    rt::KVCacheManager::Config config = makeConfig(1, 1, 16384, 0); // 128 pages
+    config.useBoundedSwaKVCache = false;
+    config.ringPages = 128;
+    EXPECT_ANY_THROW(rt::KVCacheManager(config, nullptr));
+    config.ringPages = 127;
+    rt::KVCacheManager kv(config, nullptr);
+    EXPECT_EQ(kv.numPages(), 127);
+}
+
+TEST(KvCacheManagerRingTest, ZeroRingPagesKeepsTheDefaultPool)
+{
+    rt::KVCacheManager::Config config = makeConfig(1, 1, 16384, 0);
+    config.ringPages = 0;
+    config.useBoundedSwaKVCache = false;
+    rt::KVCacheManager kv(config, nullptr);
+    EXPECT_EQ(kv.numPages(), 128);
+}

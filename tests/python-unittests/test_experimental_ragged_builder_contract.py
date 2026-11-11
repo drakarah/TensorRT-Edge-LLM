@@ -917,3 +917,26 @@ def test_specialized_full_row_decoders_omit_logits_indices(
                              required_portals=required_portals,
                              hidden_inputs=hidden_inputs,
                              include_logits_indices=False)
+
+
+def test_draft_kv_ring_pages_sizes_the_draft_pool_to_the_ring():
+    from experimental.builder.core.ragged import draft_ring_pool_pages
+    draft = SimpleNamespace(draft_kv_ring_pages=32,
+                            resolved_spec_role=contracts.SpecRole.DRAFT,
+                            spec_type="dflash",
+                            max_batch_size=1,
+                            max_input_len=1024)
+    # 2,048-token window (16 pages) + one 1,024-token pass (8 pages) + margin 2 = 26 pages minimum.
+    assert draft_ring_pool_pages(draft, 2048) == 32
+    assert draft_ring_pool_pages(SimpleNamespace(draft_kv_ring_pages=0), 2048) == 2048
+    draft.draft_kv_ring_pages = 25
+    with pytest.raises(ValueError, match="below the 26 pages"):
+        draft_ring_pool_pages(draft, 2048)
+    draft.draft_kv_ring_pages = 32
+    draft.max_batch_size = 2
+    with pytest.raises(ValueError, match="max-batch-size 1"):
+        draft_ring_pool_pages(draft, 2048)
+    draft.max_batch_size = 1
+    draft.spec_type = "eagle3"
+    with pytest.raises(ValueError, match="DFlash draft engine only"):
+        draft_ring_pool_pages(draft, 2048)

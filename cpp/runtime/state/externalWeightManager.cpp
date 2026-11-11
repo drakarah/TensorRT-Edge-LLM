@@ -740,13 +740,17 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
         ELLM_CHECK(arenaAlignmentPadding <= std::numeric_limits<size_t>::max() - storageBytes,
             "Aligned weight arena size overflow");
         size_t const allocationBytes = storageBytes + arenaAlignmentPadding;
-        mWeightStorage = Tensor(Coords{static_cast<int64_t>(allocationBytes)}, DeviceType::kGPU,
-            nvinfer1::DataType::kUINT8, "ExternalWeightManager::weightArena");
+        // Every binding may be shared with another engine's manager: then there is nothing to allocate here.
+        if (allocationBytes > 0)
+        {
+            mWeightStorage = Tensor(Coords{static_cast<int64_t>(allocationBytes)}, DeviceType::kGPU,
+                nvinfer1::DataType::kUINT8, "ExternalWeightManager::weightArena");
+        }
         weightArenaBytes = allocationBytes;
         arenaAllocationTime = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - phaseStart);
 
         phaseStart = Clock::now();
-        auto* storage = static_cast<uint8_t*>(mWeightStorage.rawPointer());
+        auto* storage = allocationBytes > 0 ? static_cast<uint8_t*>(mWeightStorage.rawPointer()) : nullptr;
         if (hasPackedNvfp4Weights)
         {
             uintptr_t const address = reinterpret_cast<uintptr_t>(storage);
