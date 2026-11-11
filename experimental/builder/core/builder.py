@@ -150,6 +150,7 @@ class BuildArgs:
     draft_model_dir: str = ""
     target_model_dir: str = ""
     fp8_embedding: bool = False
+    int8_embedding: bool = False
     plugin_path: Optional[str] = None
     profiling_detailed: bool = False
     dense_quant: str = "auto"  # auto | nvfp4-qdq | fp16
@@ -194,9 +195,11 @@ class BuildArgs:
                 weight_policy.EXTERNAL_WEIGHT_NVFP4_MOE,
             )
             policy = policy.without(unsupported_tp, strict=tp_strict)
-        if self.fp8_embedding:
+        if self.fp8_embedding or self.int8_embedding:
+            # An explicit quantized-embedding request replaces the checkpoint-backed table even when every
+            # external weight was asked for ("--externalize-weights all"), so the drop is not an error.
             policy = policy.without(
-                (weight_policy.EXTERNAL_WEIGHT_EMBEDDING, ), strict=strict)
+                (weight_policy.EXTERNAL_WEIGHT_EMBEDDING, ), strict=False)
         vocab_dir = (self.draft_reduced_vocab_dir if self.resolved_spec_role
                      == contracts.SpecRole.DRAFT else self.reduced_vocab_dir)
         if vocab_dir:
@@ -311,7 +314,10 @@ class BuildArgs:
             raise ValueError(
                 "DFlash V2 verify and draft profile sizes must match in [2, 16]"
             )
-        if self.fp8_embedding and self.resolved_spec_role == contracts.SpecRole.DRAFT:
+        if self.fp8_embedding and self.int8_embedding:
+            raise ValueError("--fp8-embedding and --int8-embedding are exclusive")
+        if ((self.fp8_embedding or self.int8_embedding)
+                and self.resolved_spec_role == contracts.SpecRole.DRAFT):
             raise ValueError("draft engines use the base embedding sidecar")
 
 

@@ -161,6 +161,20 @@ def write_embedding(weights: Weights, cfg: DeviceConfig, args,
             "embedding": encoded,
             "embedding_scale": scales.astype(np.float32),
         }, {"embedding": "F8_E4M3"})
+    elif args.int8_embedding:
+        if weight.shape[1] % 128:
+            raise ValueError(
+                "INT8 embedding hidden size must be divisible by 128")
+        # Symmetric INT8 with one FP32 scale per 128 values (amax / 127), the layout the runtime loads as
+        # an INT8 embedding table (relative squared error about 1e-5 on Qwen3.8).
+        grouped = weight.astype(np.float32).reshape(weight.shape[0], -1, 128)
+        scales = np.maximum(np.max(np.abs(grouped), axis=2), 1e-8) / 127.0
+        quantized = np.clip(np.rint(grouped / scales[..., None]), -127,
+                            127).astype(np.int8).reshape(weight.shape)
+        save_safetensors(path, {
+            "embedding": quantized,
+            "embedding_scale": scales.astype(np.float32),
+        }, {"embedding": "I8"})
     else:
         save_safetensors(path, {"embedding": weight})
 

@@ -65,6 +65,7 @@ def _build_args(args: argparse.Namespace, component: str):
         draft_model_dir=args.draft_model_dir or "",
         target_model_dir=args.target_model_dir or "",
         fp8_embedding=args.fp8_embedding,
+        int8_embedding=args.int8_embedding,
         plugin_path=args.plugin_path,
         profiling_detailed=args.profiling_detailed,
         dense_quant=args.dense,
@@ -189,6 +190,9 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
             tree_base=False,
             draft_model_dir=None,
             target_model_dir=args.model_dir,
+            # The draft shares the base's embedding sidecar, so it never writes its own.
+            fp8_embedding=False,
+            int8_embedding=False,
         )
         plan.extend((
             ("spec-base", base_args, bundle, component),
@@ -344,6 +348,11 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--draft-reduced-vocab-dir")
     parser.add_argument("--draft-model-dir")
     parser.add_argument("--fp8-embedding", action="store_true")
+    parser.add_argument(
+        "--int8-embedding",
+        action="store_true",
+        help="Write the token embedding as INT8 with per-128 FP32 scales "
+        "(1.27 GB less than FP16 for a 248k x 5120 table).")
     parser.add_argument(
         "--externalize-weights",
         action="append",
