@@ -40,11 +40,44 @@ import cutlass.cute.testing as testing
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import numpy as np
+from cutlass._mlir.dialects import arith, llvm
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import dsl_user_op
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from cutedsl_utils import aot_placeholders  # isort: skip
+
+
+@dsl_user_op
+def _int8x4_to_f16x2x2(word, *, loc=None, ip=None):
+    """Exactly convert four signed bytes (one 32-bit word) to two fp16x2 words.
+
+    Flipping the sign bits turns each byte ``b`` into ``b + 128`` as an
+    unsigned value ``u``; ``prmt`` places ``u`` under the high byte ``0x64``,
+    which is the fp16 ``1024 + u`` (the mantissa step at 1024 is exactly 1), and
+    one ``sub.f16x2`` removes ``1152`` to leave ``b``. Every INT8 code is an
+    exact fp16, so no rounding happens; the per-tensor quantisation scale is
+    applied to the FP32 accumulators instead (K through the softmax scale, V in
+    the normalisation). One xor, two prmt and two sub.f16x2 cover four bytes.
+    """
+    i32 = cutlass.Int32.mlir_type
+    u32 = cutlass.Uint32.mlir_type
+    src = cutlass.Uint32(word).ir_value(loc=loc, ip=ip)
+    bias = arith.constant(u32, 0x64806480, loc=loc, ip=ip)  # fp16x2 {1152, 1152}
+
+    def asm(text, constraints, operands):
+        return llvm.inline_asm(
+            i32, operands, text, constraints, has_side_effects=False,
+            is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+    flipped = asm("xor.b32 $0, $1, 0x80808080;", "=r,r", [src])
+    lo = asm("prmt.b32 $0, $1, 0x64646464, 0x5140;", "=r,r", [flipped])
+    hi = asm("prmt.b32 $0, $1, 0x64646464, 0x5342;", "=r,r", [flipped])
+    lo = asm("sub.f16x2 $0, $1, $2;", "=r,r,r", [lo, bias])
+    hi = asm("sub.f16x2 $0, $1, $2;", "=r,r,r", [hi, bias])
+    return cutlass.Uint32(lo), cutlass.Uint32(hi)
 
 
 """FMHA-v2 Ampere-floor forward kernel (CuTe DSL), AOT-export build.
@@ -111,6 +144,7 @@ class FMHAV2Ampere:
         skip_rescale: bool = False,
         hybrid_exp2: bool = False,
         has_sink: bool = False,
+        kv_int8: bool = False,
     ):
         """Initialize the FMHA-v2 Ampere-floor kernel.
 
@@ -136,7 +170,16 @@ class FMHAV2Ampere:
             owns one FP32 logit ``sink[h]`` that joins the softmax denominator
             as an extra column with no value contribution.  ``False`` (the
             default) generates exactly the sink-free kernel.
+        :param kv_int8: paged context entry ``__call_context_paged_i8__`` only.
+            The KV pool is INT8 with one static dequantisation scale for K and
+            one for V.  Tiles are staged with 8-byte cp.async and expanded to
+            exact FP16 codes in shared memory (no dense FP16 K/V copy exists);
+            the K scale joins the softmax scale and the V scale multiplies the
+            normalised output, so the result differs from gather + FP16 only by
+            the rounding that gather applied to ``code * scale``.
         """
+        self._kv_int8 = kv_int8
+        self._kv_vector_bytes = 8 if kv_int8 else 16
         self._has_sink = has_sink
         self._head_dim = head_dim
         self._m_block_size = m_block_size
@@ -603,6 +646,8 @@ class FMHAV2Ampere:
         sm_count: cutlass.Int32,
         stream: cuda.CUstream,
         sink_tensor: Optional[cute.Tensor] = None,
+        k_scale: Optional[cutlass.Float32] = None,
+        v_scale: Optional[cutlass.Float32] = None,
     ):
         """Launch FMHA-v2 directly against Edge-LLM's paged NHD KV cache.
 
@@ -627,10 +672,30 @@ class FMHAV2Ampere:
             )
         if cutlass.const_expr(
             q_tensor.element_type != cutlass.Float16
-            or kv_cache_pool.element_type != cutlass.Float16
             or o_tensor.element_type != cutlass.Float16
+            or kv_cache_pool.element_type
+            != (cutlass.Int8 if self._kv_int8 else cutlass.Float16)
         ):
-            raise TypeError("FMHA-v2 paged attention requires Float16 Q, K/V, and O")
+            raise TypeError(
+                "FMHA-v2 paged attention requires Float16 Q and O and an "
+                "FP16 (or, with kv_int8, INT8) K/V pool"
+            )
+        if cutlass.const_expr(
+            self._kv_int8
+            and (
+                k_scale is None
+                or v_scale is None
+                or self._num_output_blocks != 1
+                or self._has_sink
+                or self._packed_varlen
+            )
+        ):
+            raise TypeError(
+                "FMHA-v2 INT8 paged attention needs k/v scales and a single "
+                "output block (head_dim <= 256), no sink, no packed varlen"
+            )
+        if cutlass.const_expr((k_scale is not None) != self._kv_int8):
+            raise TypeError("FMHA-v2 paged attention: scales belong to kv_int8 only")
         if cutlass.const_expr(
             not self._is_causal or 128 % self._n_block_size != 0
         ):
@@ -677,6 +742,10 @@ class FMHAV2Ampere:
                 (0, 1),
             )
 
+        kq_elems = (
+            self._n_block_size * self._head_dim_padded if self._kv_int8 else 16
+        )
+
         @cute.struct
         class SharedStorage:
             sQ: cute.struct.Align[
@@ -687,6 +756,12 @@ class FMHAV2Ampere:
             ]
             sV: cute.struct.Align[
                 cute.struct.MemRange[self._dtype, cute.cosize(sV_layout)], 1024
+            ]
+            # INT8 staging for one K or V tile; a single buffer is enough
+            # because every thread consumes its own staged bytes before it
+            # issues the next load (see _dequant_kv_tile).
+            sKq: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int8, kq_elems], 1024
             ]
 
         universal_copy_bits = 128
@@ -713,6 +788,36 @@ class FMHAV2Ampere:
         gmem_tiled_copy_O = cute.make_tiled_copy_tv(
             atom_universal_copy, tQKV_layout, vQKV_layout
         )
+        # INT8 K/V: the same thread tiling with one 8-byte vector per thread,
+        # so every thread stages exactly the 8 columns it later expands. The
+        # 8-byte cp.async needs the L1-allocating (.ca) cache mode.
+        gmem_tiled_copy_KV8 = None
+        gmem_tiled_copy_DQ = None
+        sKq_layout = None
+        if cutlass.const_expr(self._kv_int8):
+            atom_async_copy_i8 = cute.make_copy_atom(
+                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+                cutlass.Int8,
+                num_bits_per_copy=64,
+            )
+            # One warp spans one full 256-byte row: 32 threads x 8 bytes. The
+            # global read is a single coalesced segment and the shared-memory
+            # staging accesses are bank-conflict free.
+            row_threads = self._head_dim_padded // 8
+            tKV8_layout = cute.make_layout(
+                (self._num_threads // row_threads, row_threads),
+                stride=(row_threads, 1),
+            )
+            gmem_tiled_copy_KV8 = cute.make_tiled_copy_tv(
+                atom_async_copy_i8, tKV8_layout, cute.make_layout((1, 8))
+            )
+            gmem_tiled_copy_DQ = cute.make_tiled_copy_tv(
+                atom_universal_copy, tKV8_layout, vQKV_layout
+            )
+            sKq_layout = cute.make_layout(
+                (self._n_block_size, self._head_dim_padded),
+                stride=(self._head_dim_padded, 1),
+            )
         tiled_mma = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
             (self._num_threads // 32, 1, 1),
@@ -741,7 +846,12 @@ class FMHAV2Ampere:
                 cute.size(q_tensor.shape[0]),
             )
         log2_e = 1.4426950408889634074
-        softmax_scale_log2 = attention_scale * log2_e
+        if cutlass.const_expr(self._kv_int8):
+            # S = Q . (k_scale * code)^T = k_scale * (Q . code^T): the exact
+            # INT8 codes feed the MMA and k_scale joins the softmax scale.
+            softmax_scale_log2 = (attention_scale * k_scale) * log2_e
+        else:
+            softmax_scale_log2 = attention_scale * log2_e
         _ = sm_count
         runtime_window = (
             window_size_left
@@ -773,6 +883,10 @@ class FMHAV2Ampere:
             tiled_mma,
             SharedStorage,
             sink_tensor,
+            gmem_tiled_copy_KV8,
+            sKq_layout,
+            v_scale,
+            gmem_tiled_copy_DQ,
         ).launch(
             grid=grid_dim,
             block=[self._num_threads, 1, 1],
@@ -805,6 +919,43 @@ class FMHAV2Ampere:
             attention_scale,
             sm_count,
             stream,
+        )
+
+    @cute.jit
+    def __call_context_paged_i8__(
+        self,
+        q_tensor: cute.Tensor,
+        kv_cache_pool: cute.Tensor,
+        kv_cache_page_list: cute.Tensor,
+        o_tensor: cute.Tensor,
+        cum_seqlen_q: cute.Tensor,
+        cum_seqlen_k: cute.Tensor,
+        window_size_left: cutlass.Int32,
+        attention_scale: cutlass.Float32,
+        k_scale: cutlass.Float32,
+        v_scale: cutlass.Float32,
+        sm_count: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """Paged causal context attention over an INT8 pool (``kv_int8=True``).
+
+        ``k_scale``/``v_scale`` are the pool's static quant-to-original scales.
+        """
+        self._launch_context_paged(
+            q_tensor,
+            kv_cache_pool,
+            kv_cache_page_list,
+            o_tensor,
+            cum_seqlen_q,
+            cum_seqlen_k,
+            None,
+            window_size_left,
+            attention_scale,
+            sm_count,
+            stream,
+            None,
+            k_scale,
+            v_scale,
         )
 
     @cute.jit
@@ -1062,6 +1213,10 @@ class FMHAV2Ampere:
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
         mSink: Optional[cute.Tensor] = None,
+        gmem_tiled_copy_KV8: Optional[cute.TiledCopy] = None,
+        sKq_layout: Optional[cute.Layout] = None,
+        kv_scale_v: Optional[cutlass.Float32] = None,
+        gmem_tiled_copy_DQ: Optional[cute.TiledCopy] = None,
     ):
         """FA2 kernel body: prologue cp.async Q/K, KV outer loop in reverse,
         ``compute_one_n_block`` for BMM1 → softmax_rescale → BMM2.  Epilogue
@@ -1335,6 +1490,26 @@ class FMHAV2Ampere:
             tVgV = gmem_thr_copy_QKV.partition_S(gV)
         tKsK = gmem_thr_copy_QKV.partition_D(sK)
         tVsV = gmem_thr_copy_QKV.partition_D(sV)
+        # K/V global->shared copies go through ``gmem_tiled_copy_KV`` into the
+        # destination ``tKdst``/``tVdst``: the FP16 tiles themselves, or for an
+        # INT8 pool the staging buffer that _dequant_kv_tile expands.
+        gmem_tiled_copy_KV = gmem_tiled_copy_QKV
+        gmem_thr_copy_KV = gmem_thr_copy_QKV
+        tKdst = tKsK
+        tVdst = tVsV
+        # tKz/tVz: this thread's view of the FP16 tiles in the same thread
+        # mapping as the global copy; used to zero-fill and to expand INT8.
+        tKz = tKsK
+        tVz = tVsV
+        if cutlass.const_expr(self._kv_int8):
+            sKq = storage.sKq.get_tensor(sKq_layout)
+            gmem_tiled_copy_KV = gmem_tiled_copy_KV8
+            gmem_thr_copy_KV = gmem_tiled_copy_KV8.get_slice(tidx)
+            tKdst = gmem_thr_copy_KV.partition_D(sKq)
+            tVdst = tKdst
+            dq_thr_copy = gmem_tiled_copy_DQ.get_slice(tidx)
+            tKz = dq_thr_copy.partition_D(sK)
+            tVz = dq_thr_copy.partition_D(sV)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Tile MMA compute thread partitions and allocate accumulators
@@ -1399,7 +1574,7 @@ class FMHAV2Ampere:
         )
 
         tQcQ = gmem_thr_copy_QKV.partition_S(cQ)
-        tKVcKV = gmem_thr_copy_QKV.partition_S(cKV)
+        tKVcKV = gmem_thr_copy_KV.partition_S(cKV)
         tVcV = tKVcKV
         if cutlass.const_expr(self._num_output_blocks == 2):
             cV = cute.local_tile(
@@ -1424,11 +1599,11 @@ class FMHAV2Ampere:
         tKVpKV = cute.make_rmem_tensor(
             cute.make_layout(
                 (
-                    tKsK.shape[0][1],
-                    cute.size(tKsK, mode=[1]),
-                    cute.size(tKsK, mode=[2]),
+                    tKdst.shape[0][1],
+                    cute.size(tKdst, mode=[1]),
+                    cute.size(tKdst, mode=[2]),
                 ),
-                stride=(cute.size(tKsK, mode=[2]), 0, 1),
+                stride=(cute.size(tKdst, mode=[2]), 0, 1),
             ),
             cutlass.Boolean,
         )
@@ -1497,18 +1672,18 @@ class FMHAV2Ampere:
                     num_head_kv,
                     0,
                     n_block,
-                    gmem_thr_copy_QKV,
+                    gmem_thr_copy_KV,
                 )
-                for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                for n in cutlass.range_constexpr(cute.size(tKdst.shape[1])):
                     if cute.elem_less(tKVcKV[0, n, 0][1], seqlen_k_b):
                         cute.copy(
-                            gmem_tiled_copy_QKV,
+                            gmem_tiled_copy_KV,
                             tPagedK[None, n, None],
-                            tKsK[None, n, None],
+                            tKdst[None, n, None],
                             pred=tKVpKV[None, n, None],
                         )
                     else:
-                        tKsK[None, n, None].fill(0)
+                        tKz[None, n, None].fill(0)
             else:
                 for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
                     if cute.elem_less(tKVcKV[0, n, 0][1], seqlen_k_b):
@@ -1576,6 +1751,12 @@ class FMHAV2Ampere:
             batch_size=batch_size,
             num_head_kv=num_head_kv,
             output_column_offset=output_column_offset,
+            gmem_tiled_copy_KV=gmem_tiled_copy_KV,
+            gmem_thr_copy_KV=gmem_thr_copy_KV,
+            tKdst=tKdst,
+            tVdst=tVdst,
+            tKz=tKz,
+            tVz=tVz,
         )
         smem_copy_params = SimpleNamespace(
             smem_tiled_copy_Q=smem_tiled_copy_Q,
@@ -1787,7 +1968,7 @@ class FMHAV2Ampere:
                 softmax_scale_log2,
             )
         else:
-            self.normalize_softmax(acc_O, row_sum)
+            self.normalize_softmax(acc_O, row_sum, kv_scale_v)
         rO = cute.make_fragment_like(acc_O, self._dtype)
         rO.store(acc_O.load().to(self._dtype))
         sO = cute.make_tensor(sQ.iterator, sO_layout)
@@ -1917,6 +2098,11 @@ class FMHAV2Ampere:
         page_stride = mPagedKV.layout.stride[0]
         head_stride = mPagedKV.layout.stride[1]
         token_stride = mPagedKV.layout.stride[2]
+        if cutlass.const_expr(self._kv_int8):
+            # Row slices of the 8-byte copy step by only a few rows; tell the
+            # compiler the token stride (Hkv * head_dim bytes) is a multiple
+            # of 16 so their addresses stay 8-byte aligned.
+            token_stride = cute.assume(token_stride, divby=16)
         element_offset = (
             physical_page * page_stride
             + num_head_kv * head_stride
@@ -1964,8 +2150,11 @@ class FMHAV2Ampere:
         tPagedKV = gmem_thr_copy_QKV.partition_S(gPagedKV)
         # Dynamic page/head/token offsets make partitioning conservatively
         # drop the ABI's 16-byte alignment. Each thread still begins on one
-        # complete 128-bit copy vector, so restore that fact at the copy edge.
-        return cute.make_tensor(tPagedKV.iterator.align(16), tPagedKV.layout)
+        # complete copy vector (16 B FP16, 8 B INT8), so restore that fact at
+        # the copy edge.
+        return cute.make_tensor(
+            tPagedKV.iterator.align(self._kv_vector_bytes), tPagedKV.layout
+        )
 
     @cute.jit
     def _paged_partition_from_physical_page(
@@ -1986,7 +2175,9 @@ class FMHAV2Ampere:
             self._head_dim_padded,
         )
         tPagedKV = gmem_thr_copy_QKV.partition_S(gPagedKV)
-        return cute.make_tensor(tPagedKV.iterator.align(16), tPagedKV.layout)
+        return cute.make_tensor(
+            tPagedKV.iterator.align(self._kv_vector_bytes), tPagedKV.layout
+        )
 
     @cute.jit
     def _paged_partition_output(
@@ -2036,6 +2227,63 @@ class FMHAV2Ampere:
         return cute.make_tensor(tPagedV.iterator.align(16), tPagedV.layout)
 
     @cute.jit
+    def _dequant_kv_tile(
+        self,
+        gmem_copy_params: SimpleNamespace,
+        tDst: cute.Tensor,
+        is_first_n_block: cutlass.Constexpr,
+        seqlen_k_b: cutlass.Int32,
+    ):
+        """Expand this thread's staged INT8 K or V codes into the FP16 tile.
+
+        The codes become exact fp16 values (see ``_int8x4_to_f16x2x2``); the
+        per-tensor scale is applied elsewhere. The thread reads back the very
+        bytes it issued with cp.async (same thread/value tiling), so the only
+        synchronisation needed is the caller's cp.async wait; the CTA barrier
+        that follows publishes the FP16 tile to the other threads. Rows at or
+        past ``seqlen_k_b`` in the boundary tile keep the zero fill written by
+        the prologue.
+        """
+        ld_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), cutlass.Int8, num_bits_per_copy=64
+        )
+        st_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self._dtype, num_bits_per_copy=128
+        )
+        tSrc = gmem_copy_params.tKdst
+        for n in cutlass.range_constexpr(cute.size(tDst.shape[1])):
+            if cutlass.const_expr(is_first_n_block):
+                if cute.elem_less(
+                    gmem_copy_params.tKVcKV[0, n, 0][1], seqlen_k_b
+                ):
+                    self._dequant_slice(
+                        ld_atom, st_atom, tSrc[None, n, None], tDst[None, n, None]
+                    )
+            else:
+                self._dequant_slice(
+                    ld_atom, st_atom, tSrc[None, n, None], tDst[None, n, None]
+                )
+
+    @cute.jit
+    def _dequant_slice(
+        self,
+        ld_atom: cute.CopyAtom,
+        st_atom: cute.CopyAtom,
+        src: cute.Tensor,
+        dst: cute.Tensor,
+    ):
+        codes = cute.make_fragment_like(src)
+        cute.copy(ld_atom, src, codes)
+        halves = cute.make_fragment_like(dst)
+        code_words = cute.recast_tensor(codes, cutlass.Uint32)
+        half_words = cute.recast_tensor(halves, cutlass.Uint32)
+        for w in cutlass.range_constexpr(cute.size(code_words)):
+            lo, hi = _int8x4_to_f16x2x2(code_words[w])
+            half_words[2 * w] = lo
+            half_words[2 * w + 1] = hi
+        cute.copy(st_atom, halves, dst)
+
+    @cute.jit
     def compute_one_n_block(
         self,
         basic_params: SimpleNamespace,
@@ -2073,6 +2321,13 @@ class FMHAV2Ampere:
                 ]
 
         cute.arch.cp_async_wait_group(0)
+        if cutlass.const_expr(self._kv_int8):
+            self._dequant_kv_tile(
+                gmem_copy_params,
+                gmem_copy_params.tKz,
+                is_first_n_block,
+                basic_params.seqlen_k_b,
+            )
         self.cta_sync_barrier.arrive_and_wait()
         # First tile: load V into smem with the n-residue predicate (otherwise
         # a single vectorised copy is enough — the `if` here is a constexpr).
@@ -2094,29 +2349,29 @@ class FMHAV2Ampere:
                     gmem_copy_params.num_head_kv,
                     current_v_page,
                     basic_params.n_block,
-                    gmem_copy_params.gmem_thr_copy_QKV,
+                    gmem_copy_params.gmem_thr_copy_KV,
                 )
             if is_first_n_block:
                 for n in cutlass.range_constexpr(
-                    cute.size(gmem_copy_params.tVsV.shape[1])
+                    cute.size(gmem_copy_params.tVdst.shape[1])
                 ):
                     if cute.elem_less(
                         gmem_copy_params.tVcV[0, n, 0][1],
                         basic_params.seqlen_k_b,
                     ):
                         cute.copy(
-                            gmem_copy_params.gmem_tiled_copy_QKV,
+                            gmem_copy_params.gmem_tiled_copy_KV,
                             tPagedV[None, n, None],
-                            gmem_copy_params.tVsV[None, n, None],
+                            gmem_copy_params.tVdst[None, n, None],
                             pred=gmem_copy_params.tVpV[None, n, None],
                         )
                     else:
-                        gmem_copy_params.tVsV[None, n, None].fill(0.0)
+                        gmem_copy_params.tVz[None, n, None].fill(0.0)
             else:
                 cute.copy(
-                    gmem_copy_params.gmem_tiled_copy_QKV,
+                    gmem_copy_params.gmem_tiled_copy_KV,
                     tPagedV,
-                    gmem_copy_params.tVsV,
+                    gmem_copy_params.tVdst,
                     pred=gmem_copy_params.tVpV,
                 )
         else:
@@ -2183,6 +2438,13 @@ class FMHAV2Ampere:
             )
 
         cute.arch.cp_async_wait_group(0)
+        if cutlass.const_expr(self._kv_int8):
+            self._dequant_kv_tile(
+                gmem_copy_params,
+                gmem_copy_params.tVz,
+                is_first_n_block,
+                basic_params.seqlen_k_b,
+            )
         self.cta_sync_barrier.arrive_and_wait()
 
         if basic_params.n_block > basic_params.n_block_min:
@@ -2192,12 +2454,12 @@ class FMHAV2Ampere:
                     gmem_copy_params.num_head_kv,
                     next_k_page,
                     basic_params.n_block - 1,
-                    gmem_copy_params.gmem_thr_copy_QKV,
+                    gmem_copy_params.gmem_thr_copy_KV,
                 )
                 cute.copy(
-                    gmem_copy_params.gmem_tiled_copy_QKV,
+                    gmem_copy_params.gmem_tiled_copy_KV,
                     tPagedKNext,
-                    gmem_copy_params.tKsK,
+                    gmem_copy_params.tKdst,
                     pred=gmem_copy_params.tKVpKV,
                 )
             else:
@@ -2427,8 +2689,12 @@ class FMHAV2Ampere:
         self,
         acc_O: cute.Tensor,
         row_sum: cute.Tensor,
+        out_scale: Optional[cutlass.Float32] = None,
     ):
-        """Final softmax normalisation: ``acc_O[r, :] /= row_sum[r]``."""
+        """Final softmax normalisation: ``acc_O[r, :] /= row_sum[r]``.
+
+        ``out_scale`` (INT8 V pool) multiplies the result: O = v_scale * (P . code_V).
+        """
         acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
         for r in cutlass.range_constexpr(cute.size(row_sum)):
             row_sum[r] = self._threadquad_reduce_sum(row_sum[r])
@@ -2438,6 +2704,8 @@ class FMHAV2Ampere:
                 1.0 if acc_O_mn_row_is_zero_or_nan else cute.arch.rcp_approx(row_sum[r])
             )
 
+            if cutlass.const_expr(out_scale is not None):
+                scale = scale * out_scale
             acc_O_mn[r, None] = acc_O_mn[r, None].load() * scale
 
     @cute.jit
@@ -2539,6 +2807,8 @@ class FMHAV2Ampere:
 def _cutlass_to_cupy_dtype(cutlass_dtype):
     if cutlass_dtype == cutlass.Float16:
         return cp.float16
+    if cutlass_dtype == cutlass.Int8:
+        return cp.int8
     if cutlass_dtype == cutlass.BFloat16:
         # CuPy lacks a native bf16 dtype; store as raw uint16 bytes — `from_dlpack`
         # plus `element_type = cutlass.BFloat16` interpret it correctly device-side.
@@ -2619,8 +2889,8 @@ def _create_paged_kv_pool_tensor(
     exposes the logical ``(2P, H_kv, tokens_per_page, D)`` view consumed by
     ``__call_context_paged__`` while preserving physical NHD strides.
     """
-    if dtype != cutlass.Float16:
-        raise ValueError("FMHA-v2 paged attention supports Float16 K/V only")
+    if dtype not in (cutlass.Float16, cutlass.Int8):
+        raise ValueError("FMHA-v2 paged attention supports Float16 or Int8 K/V only")
     if tokens_per_page != 128:
         raise ValueError("FMHA-v2 paged attention requires 128-token pages")
 
@@ -2930,6 +3200,7 @@ def run(
     d512_ws: bool = False,
     d512_ws_i8: bool = False,
     attention_sink: bool = False,
+    paged_kv_int8: bool = False,
     warmup_iterations: int = 3,
     iterations: int = 10,
     skip_ref_check: bool = False,
@@ -2989,6 +3260,13 @@ def run(
         raise ValueError(f"{_tag} --attention_sink requires --paged_kv (not --paged_kv_ragged)")
     if paged_kv and not is_causal:
         raise ValueError(f"{_tag} --paged_kv requires --is_causal")
+    if paged_kv_int8 and (
+        not paged_kv or paged_kv_ragged or attention_sink or not export_only or head_dim > 256
+    ):
+        raise ValueError(
+            f"{_tag} --paged_kv_int8 requires --paged_kv with --export_only, head_dim <= 256, "
+            "no sink and no ragged variant (numerics are covered by test_fmha_v2_paged_i8.py)"
+        )
     if paged_kv and (
         dtype != cutlass.Float16
         or n_block_size <= 0
@@ -3130,7 +3408,7 @@ def run(
             tokens_per_page,
             h_kv,
             head_dim,
-            dtype,
+            cutlass.Int8 if paged_kv_int8 else dtype,
             storage_free=export_only,
         )
         if export_only:
@@ -3205,6 +3483,7 @@ def run(
         skip_rescale=skip_rescale,
         hybrid_exp2=hybrid_exp2,
         has_sink=attention_sink,
+        kv_int8=paged_kv_int8,
     )
     sink_dyn = None
     sink_arr = None
@@ -3304,6 +3583,23 @@ def run(
             sink_dyn,
             cutlass.Int32(max(window_size_left, 0)),
             cutlass.Float32(softmax_scale),
+            _sm_count,
+            current_stream,
+            **compile_options,
+        )
+    elif paged_kv and paged_kv_int8:
+        compiled_fa2 = cute.compile(
+            fa2_fwd.__call_context_paged_i8__,
+            q_dyn,
+            kv_pool_dyn,
+            page_list_dyn,
+            o_dyn,
+            cu_q_dyn,
+            cu_k_dyn,
+            cutlass.Int32(max(window_size_left, 0)),
+            cutlass.Float32(softmax_scale),
+            cutlass.Float32(1.0),  # k_scale
+            cutlass.Float32(1.0),  # v_scale
             _sm_count,
             current_stream,
             **compile_options,
@@ -3877,6 +4173,8 @@ def _parse_args(argv=None):
                    help="Causal context with INT8 Q·Kᵀ (fmha_d512_ws_i8.py; head 256 or 512); export only.")
     p.add_argument("--attention_sink", action="store_true",
                    help="Compile the learned attention-sink paged context variant (requires --paged_kv).")
+    p.add_argument("--paged_kv_int8", action="store_true",
+                   help="Compile the INT8-pool paged context variant (requires --paged_kv --export_only).")
     p.add_argument("--warmup_iterations", type=int, default=3)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--skip_ref_check", action="store_true")
@@ -3934,6 +4232,7 @@ def main():
         d512_ws=args.d512_ws,
         d512_ws_i8=args.d512_ws_i8,
         attention_sink=args.attention_sink,
+        paged_kv_int8=args.paged_kv_int8,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
         skip_ref_check=args.skip_ref_check or args.benchmark_paged_kv_ragged,

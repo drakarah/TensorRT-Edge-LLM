@@ -220,6 +220,20 @@ protected:
     }
 
     //! INT8 K with V rows packed to 4 bits (enable_int8_kv_cache == 2); the pool dtype is INT8.
+    //! Chunked prefill over an INT8 paged pool reads the pool directly (FMHA-v2 INT8 paged kernel) when the layer
+    //! is full-attention, head dim 256, plain INT8 (not packed V4), with no FP8/vision/padding-mask variants
+    //! and the kernel exists for this SM. Those layers need no dense FP16 K/V workspace, so the workspace size and
+    //! the runtime branch both key off this one predicate and cannot disagree.
+    bool usesNativeInt8PagedPrefill() const noexcept;
+
+    //! True when no execution path of this layer can reach the dequantising/padding gather (splitPagedKV), so the
+    //! capacity-wide dense FP16 K/V workspace is not reserved: layers on native paged INT8 prefill, and FP16 layers
+    //! on native paged FMHA-v2 with no padding mask, vision blocks or bounded cache. Sizing and runtime both use it.
+    bool elidesDenseKVWorkspace() const noexcept;
+
+    //! Fails loudly if a gather is reached although the dense workspace was elided (it would overrun the buffer).
+    void requireDenseKVWorkspace() const;
+
     bool packedV4KVCache() const noexcept
     {
         return mEnableInt8KVCache == 2;

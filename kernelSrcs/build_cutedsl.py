@@ -849,6 +849,21 @@ KERNEL_VARIANTS = [
             "--dtype", "Float16", "--is_causal", "--paged_kv", "--skip_rescale", "--export_only",
         ],
     ),
+    # INT8-pool paged prefill (head dim 256): the pool stays INT8 and tiles are expanded to exact
+    # FP16 codes in shared memory, so no dense FP16 K/V workspace is needed (see
+    # fmha_v2_cutedsl/test_fmha_v2_paged_i8.py). 147 KB of shared memory: Ampere GA10B / GA100 only.
+    KernelVariant(
+        name="fmha_v2_d256_paged_i8",
+        group="fmha",
+        supported_sms=[80, 87],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "256",
+            "--m_block_size", "128", "--n_block_size", "64", "--num_threads", "256",
+            "--dtype", "Float16", "--is_causal", "--paged_kv", "--paged_kv_int8", "--skip_rescale",
+            "--export_only",
+        ],
+    ),
     KernelVariant(
         name="fmha_v2_d512_paged",
         group="fmha",

@@ -405,7 +405,8 @@ std::vector<uint8_t> parsePluginBytesField(char const* fieldName, PluginFieldCol
 //
 // Total allocation is the sum of all conditional slots (safe upper bound).
 size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCacheCapacity, int32_t numQHeads,
-    int32_t numKVHeads, int32_t headSize, bool useCuteDslFMHA, bool enableFp8KVCache, bool enableVisionBlockAttention)
+    int32_t numKVHeads, int32_t headSize, bool useCuteDslFMHA, bool enableFp8KVCache, bool enableVisionBlockAttention,
+    bool elideDenseKV)
 {
     size_t workspaceSize = 0;
 
@@ -417,8 +418,11 @@ size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCa
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize}, DataType::kINT32);
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
-    workspaceSize = accumulateWorkspaceSize(
-        workspaceSize, rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headSize}, DataType::kHALF);
+    // The capacity-wide dense FP16 K/V buffer (4 KiB per token of capacity at Hkv 4, D 256) is only used by the
+    // gather; native paged prefill (INT8 pool or FP16 pool) reads the pool directly and needs none of it.
+    workspaceSize = accumulateWorkspaceSize(workspaceSize,
+        rt::Coords{batchSize, 2, numKVHeads, elideDenseKV ? int64_t{1} : kvCacheCapacity, headSize},
+        DataType::kHALF);
 
     // Roped Q is written to a scratch tensor (always needed).
     workspaceSize
@@ -545,6 +549,57 @@ REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
 // FMHA-v2 fallback paths consume separate FP16 K/V tensors, so gather logical pages from the pool into workspace.
 // The gather follows the page table and dequantizes FP8 pools.
+bool AttentionPlugin::usesNativeInt8PagedPrefill() const noexcept
+{
+#ifdef CUTE_DSL_FMHA_ENABLED
+    return mEnableInt8KVCache == 1 && !packedV4KVCache() && mHeadSize == 256 && mSlidingWindowSize <= 0
+        && !mEnableFp8KVCache && !mEnableVisionBlockAttention && !mEnableContextMaskSelector
+        && !mEnableKVShared && !mSupportsBoundedKVCache
+        && mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_V2
+        && CuteDslFMHAV2Runner::canImplementPagedInt8(mHeadSize, mSMVersion, false);
+#else
+    return false;
+#endif
+}
+
+namespace
+{
+//! EDGELLM_FMHA_INT8_PAGED=0 forces the gather + dequantised FP16 path. Only valid on engines built with the dense
+//! K/V workspace (built before the native INT8 paged prefill); it exists for A/B measurements.
+bool int8PagedPrefillEnabled()
+{
+    static bool const enabled = []() {
+        char const* env = std::getenv("EDGELLM_FMHA_INT8_PAGED");
+        return env == nullptr || std::string(env) != "0";
+    }();
+    return enabled;
+}
+} // namespace
+
+bool AttentionPlugin::elidesDenseKVWorkspace() const noexcept
+{
+#ifdef CUTE_DSL_FMHA_ENABLED
+    if (usesNativeInt8PagedPrefill())
+    {
+        return true;
+    }
+    return !quantizedKVCache() && !mEnableContextMaskSelector && !mEnableVisionBlockAttention
+        && !mSupportsBoundedKVCache && !mEnableKVShared && mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_V2
+        && mDataType == DataType::kHALF
+        && CuteDslFMHAV2Runner::canImplementPaged(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType,
+            mSlidingWindowSize > 0 ? CuteDslFMHAV2MaskType::kSLIDING_CAUSAL : CuteDslFMHAV2MaskType::kCAUSAL);
+#else
+    return false;
+#endif
+}
+
+void AttentionPlugin::requireDenseKVWorkspace() const
+{
+    ELLM_CHECK(!int8PagedPrefillEnabled() || !elidesDenseKVWorkspace(),
+        "AttentionPlugin: a dense FP16 K/V gather was reached on a layer whose workspace was sized without it "
+        "(native paged prefill). Rebuild the engine or report this path.");
+}
+
 std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::splitPagedKV(rt::Tensor const& poolTensor, int32_t const* pageTable,
     int32_t const* kvSeqLens, int32_t maxPagesPerSeq, std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads,
     int32_t capPadded, int32_t headSize, int32_t seqLen, float kScale, float vScale, cudaStream_t stream,
@@ -1372,7 +1427,7 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
     int64_t const maxKVCacheCapacity = inputs[kIN_KV_PAGE_TABLE_IDX].max.d[2] * rt::kTOKENS_PER_PAGE;
     size_t const workspaceSize = getAttentionWorkspaceSize(maxBatchSize, maxSeqLen, maxKVCacheCapacity, mNumQHeads,
         mNumKVHeads, mHeadSize, mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, mEnableFp8KVCache,
-        mEnableVisionBlockAttention != 0);
+        mEnableVisionBlockAttention != 0, elidesDenseKVWorkspace());
 
     LOG_DEBUG("AttentionPlugin workspace size: %zu bytes (+%zu XQA multi-block scratch)", workspaceSize,
         xqaScratchBytes);
@@ -1863,6 +1918,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     "Hkv=%d, window=%d)",
                     mHeadSize, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, mSlidingWindowSize);
 
+                requireDenseKVWorkspace();
                 auto [kSplit, vSplit]
                     = splitPagedKV(kvCacheTensor, pageTable, kvCacheEndIdxsTensor.dataPointer<int32_t>(),
                         maxPagesPerSeq, alignedWorkspacePtr, runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize,
@@ -2085,6 +2141,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     // INT8 Q·Kᵀ FMHA: keep K as the cache's INT8 bytes (no K dequantisation or requantisation).
                     bool const int8K = mEnableInt8KVCache && slidingWindow == INT_MAX
                         && CuteDslFMHAV2Runner::int8QKUsable(mHeadSize, stream);
+                    requireDenseKVWorkspace();
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
                         runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,
@@ -2126,6 +2183,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 {
                     // The special padding kernel retains its independent split-K/V contract.
                     int32_t const splitSeqLen = splitLenForFallback();
+                    requireDenseKVWorkspace();
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
                         runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,
@@ -2323,10 +2381,32 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                         rt::OptionalInputTensor{cuQSeqLensTensor}, true /* writeKVCache */, enableRopePdl,
                         true /* tokenAlignedRope */);
 
+                    if (int8PagedPrefillEnabled() && usesNativeInt8PagedPrefill() && !usePaddingContextMask
+                        && slidingWindow == INT_MAX)
+                    {
+                        // The pool stays INT8: no dense FP16 K/V copy exists (see usesNativeInt8PagedPrefill()).
+                        LOG_DEBUG(
+                            "AttentionPlugin: own-KV %s prefill via native paged INT8 FMHA-v2 "
+                            "(B=%d, Sq=%d, capacity=%d, Hq=%d, Hkv=%d, D=%d)",
+                            executionMode == AttentionExecutionMode::kCHUNKED_PREFILL ? "chunked" : "normal",
+                            runtimeBatchSize, runtimeSeqLen, kvCacheCapacity, mNumQHeads, mNumKVHeads, mHeadSize);
+                        CuteDslFMHAV2Runner int8Runner(
+                            mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
+                        if (!int8Runner.runPagedInt8(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(),
+                                pageTable, attentionOutputTensor.dataPointer<half>(),
+                                cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(),
+                                2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE, stream, mAttentionScale, kScale,
+                                vScale))
+                        {
+                            return -1;
+                        }
+                        return 0;
+                    }
                     int32_t const splitSeqLen = splitLenForFallback();
                     // INT8 Q·Kᵀ FMHA: keep K as the cache's INT8 bytes (no K dequantisation or requantisation).
                     bool const int8K = mEnableInt8KVCache && !usePaddingContextMask && slidingWindow == INT_MAX
                         && CuteDslFMHAV2Runner::int8QKUsable(mHeadSize, stream);
+                    requireDenseKVWorkspace();
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
                         runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream,

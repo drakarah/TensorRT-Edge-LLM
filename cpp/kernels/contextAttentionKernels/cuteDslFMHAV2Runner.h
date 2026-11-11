@@ -116,6 +116,16 @@ public:
         int32_t tokensPerPage, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX,
         float const* attentionSinks = nullptr);
 
+    //! True when the INT8-pool paged prefill kernel (head dim 256, full causal attention) is available here.
+    static bool canImplementPagedInt8(int32_t headSize, int32_t smVersion, bool slidingWindow);
+
+    //! Runs causal head-dim-256 attention directly against an INT8 NHD paged KV pool. kScale/vScale are the pool's
+    //! static quant-to-original scales. No dense FP16 K/V copy is needed: the kernel expands INT8 tiles in shared
+    //! memory (exact FP16 codes) and applies the scales to the softmax scale and the normalised output.
+    bool runPagedInt8(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
+        int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens, int32_t numFlatPages, int32_t maxPagesPerSeq,
+        int32_t tokensPerPage, cudaStream_t stream, float attentionScale, float kScale, float vScale);
+
     /**
      * @brief Runs causal or sliding-causal attention over packed Q/O and an FP16 NHD paged KV pool.
      *
@@ -174,6 +184,7 @@ private:
     static detail::LazyKernelModule<fmha_v2_d512_Kernel_Module_t> sLLM_d512;
     //! INT8 Q·Kᵀ variant of the causal D512 kernel (EDGELLM_FMHA_INT8_QK=1).
     static detail::LazyKernelModule<fmha_v2_d512_i8_Kernel_Module_t> sLLM_d512I8;
+    static detail::LazyKernelModule<fmha_v2_d256_paged_i8_Kernel_Module_t> sLLM_d256PagedI8;
     static detail::LazyKernelModule<fmha_v2_d256_padding_Kernel_Module_t> sLLM_d256Padding;
     static detail::LazyKernelModule<fmha_v2_d64_sw_Kernel_Module_t> sLLM_d64Sw;
     static detail::LazyKernelModule<fmha_v2_d128_sw_Kernel_Module_t> sLLM_d128Sw;
