@@ -93,10 +93,16 @@ ResourceDemand makeResourceCapacities(ContextCachePhysicalResources const& resou
         // count, or the pool overshoots the caller's declared device-memory ceiling by the unpriced slabs.
         size_t recurrentBytes
             = HybridSnapshotStorage::recurrentBytesPerSlot(resources.baseCache.getMambaCacheManager().getConfig());
+        bool const ringedDraft = hybridMtp && profile.ringedDraftKv();
         if (hybridMtp)
         {
             recurrentBytes
                 += HybridSnapshotStorage::boundaryHiddenBytesPerSlot(deployment.base.hiddenSize, kBOUNDARY_HIDDEN_TYPE);
+        }
+        if (ringedDraft)
+        {
+            ELLM_CHECK(resources.draftCache != nullptr, "A ringed draft needs its cache to size the ring snapshot");
+            recurrentBytes += HybridSnapshotStorage::draftRingBytesPerSlot(resources.draftCache->getKVCacheManager());
         }
         recurrentSlots
             = snapshotSlotCount(config.recurrentSnapshotPoolBytes, recurrentBytes, "recurrent snapshot pool");
@@ -104,7 +110,7 @@ ResourceDemand makeResourceCapacities(ContextCachePhysicalResources const& resou
         {
             size_t partialKvBytes
                 = HybridSnapshotStorage::partialKvBytesPerSlot(resources.baseCache.getKVCacheManager().getConfig());
-            if (hybridMtp)
+            if (hybridMtp && !ringedDraft)
             {
                 ELLM_CHECK(resources.draftCache != nullptr,
                     "Hybrid+MTP context reuse requires draft cache resources to size the partial-KV snapshot pool");
@@ -798,6 +804,27 @@ public:
     }
 };
 
+//! A block drafter (DFlash) over a hybrid base whose draft KV is a static ring: the cache record is the plain hybrid
+//! checkpoint (recurrent state + the base partial page); the ring is copied into the recurrent snapshot slot by
+//! HybridSnapshotStorage, so nothing draft-specific is leased, paired or published.
+class ContextCacheCoordinator::HybridBlockDraftPolicy : public ContextCacheCoordinator::HybridSnapshotPolicy
+{
+public:
+    using HybridSnapshotPolicy::HybridSnapshotPolicy;
+    char const* name() const noexcept override
+    {
+        return "hybrid-block-draft";
+    }
+
+protected:
+    void validateDecodeAdvances(RequestHandle::Impl const& request,
+        std::vector<ContextCacheSequenceAdvance> const& advances,
+        std::vector<int32_t> const* commonStateLengths) const override
+    {
+        mCoordinator.validateMtpDecodeAdvances(request, advances, commonStateLengths);
+    }
+};
+
 class ContextCacheCoordinator::EagleSpecPolicy : public ContextCacheCoordinator::PublicationPolicy
 {
 public:
@@ -922,6 +949,10 @@ public:
 std::unique_ptr<ContextCacheCoordinator::PublicationPolicy> ContextCacheCoordinator::makePublicationPolicy(
     bool speculativeRequest)
 {
+    if (speculativeRequest && mProfile.isHybrid() && mProfile.ringedDraftKv())
+    {
+        return std::make_unique<HybridBlockDraftPolicy>(*this);
+    }
     if (speculativeRequest && mProfile.isHybrid())
     {
         return std::make_unique<HybridMtpPolicy>(*this);
@@ -979,7 +1010,10 @@ ContextCacheCoordinator::ContextCacheCoordinator(ContextCacheConfig const& confi
     if (isSpecDeployment())
     {
         bool const pagedSpecState = ownsPagedSpecState();
-        ELLM_CHECK((mDraftCache != nullptr && mDraftPageTable != nullptr) == pagedSpecState,
+        // A ringed draft binds its cache (the ring is snapshotted whole) but no page table is ever rewritten.
+        bool const ringedDraft = mProfile.ringedDraftKv();
+        ELLM_CHECK(ringedDraft ? mDraftCache != nullptr
+                               : (mDraftCache != nullptr && mDraftPageTable != nullptr) == pagedSpecState,
             "Speculative context-cache physical resources do not match the state contract");
     }
     else
@@ -1027,7 +1061,8 @@ ContextCacheCoordinator::ContextCacheCoordinator(ContextCacheConfig const& confi
             // (the successor-dependent boundary hidden state); makeResourceCapacities prices both into the slot counts.
             ELLM_CHECK(mDraftCache != nullptr, "Hybrid+MTP context reuse requires validated draft cache resources");
             mHybridSnapshots = std::make_unique<HybridSnapshotStorage>(mBaseCache, recurrentSlots, partialKvSlots,
-                mDraftCache, deployment.base.hiddenSize, kBOUNDARY_HIDDEN_TYPE, snapshotMemory);
+                mDraftCache, deployment.base.hiddenSize, kBOUNDARY_HIDDEN_TYPE, snapshotMemory,
+                mProfile.ringedDraftKv());
         }
         else
         {
@@ -1062,8 +1097,13 @@ ContextCacheCoordinator::~ContextCacheCoordinator() noexcept
 
 ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireSequence(
     ContextCacheSequenceAdmission const& admission, bool speculativeRequest, ContextCacheLookupPolicy lookupPolicy,
-    DecodingKvHeadroom const& headroom)
+    DecodingKvHeadroom const& requestedHeadroom)
 {
+    DecodingKvHeadroom headroom = requestedHeadroom;
+    if (mProfile.ringedDraftKv())
+    {
+        headroom.draftExtraTokens = 0; // a ringed draft has no page pool to reserve headroom in
+    }
     ELLM_CHECK(!admission.tokenIds.empty(), "Context cache cannot admit an empty token sequence");
     ELLM_CHECK(admission.tokenIds.size() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
         "Context cache input contains too many tokens");
@@ -1107,7 +1147,7 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
         }
     }
     auto makePlan = [&](ContextCacheLookupPolicy policy) {
-        if (speculativeRequest && mProfile.isHybrid())
+        if (speculativeRequest && mProfile.isHybrid() && !mProfile.ringedDraftKv())
         {
             // Hybrid+MTP binds the base recurrent/attention path and the equally long coherent draft path at an exact
             // checkpoint. The candidate list is built identically to the hybrid branch above.
@@ -1561,7 +1601,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::preparePrefill(RequestHan
                 // Hybrid+MTP always keeps the boundary token (reuseLength - 1) in a private partial page so its draft
                 // KV can be rewritten by the fold: index the boundary page as (reuseLength - 1) / P (mirrors ref
                 // llmInferenceRuntime.cpp :3011-3027). Plain hybrid uses the natural page split.
-                bool const isMtp = isSpecRequest(impl) && mProfile.isHybrid();
+                bool const isMtp = isSpecRequest(impl) && mProfile.isHybrid() && !mProfile.ringedDraftKv();
                 size_t const destinationIndex = isMtp
                     ? static_cast<size_t>((sequence.reuseTokenLength - 1) / kTOKENS_PER_PAGE)
                     : static_cast<size_t>(sequence.reuseTokenLength / kTOKENS_PER_PAGE);
@@ -1591,7 +1631,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::preparePrefill(RequestHan
     // Any paired-draft request (EAGLE or Hybrid+MTP) must reset the draft cache's per-request active batch size / KV
     // lengths here too; otherwise the draft cache keeps the previous request's compacted batch size and the draft-side
     // commitSequenceLength fails on the next request.
-    if (runsPairedDraftWorkingSet(impl))
+    if (runsPairedDraftWorkingSet(impl) || (isSpecRequest(impl) && mProfile.ringedDraftKv()))
     {
         mDraftCache->resetForNewSequences(*mHostReuseLengths, impl.stream);
     }
@@ -2016,8 +2056,13 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::restoreHybridMtpBoundaryH
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(
-    RequestHandle& request, DecodingKvHeadroom const& headroom)
+    RequestHandle& request, DecodingKvHeadroom const& requestedHeadroom)
 {
+    DecodingKvHeadroom headroom = requestedHeadroom;
+    if (mProfile.ringedDraftKv())
+    {
+        headroom.draftExtraTokens = 0;
+    }
     RequestHandle::Impl& impl = checkedImpl(request);
     ELLM_CHECK(impl.executing()
             && (!impl.hasPendingDeviceWork()
@@ -2121,7 +2166,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(
             }
             int32_t const currentPages = static_cast<int32_t>(sequence.lease.basePages().size());
             bool const grewPages = requiredPages <= currentPages
-                || (isSpecRequest(impl) ? mManager.growSpecPages(sequence.lease, requiredPages - currentPages, 0)
+                || ((isSpecRequest(impl) && !mProfile.ringedDraftKv()) ? mManager.growSpecPages(sequence.lease, requiredPages - currentPages, 0)
                                         : mManager.growBasePages(sequence.lease, requiredPages - currentPages));
             flushHostTransfers(/*synchronize=*/false);
             if (!grewPages)

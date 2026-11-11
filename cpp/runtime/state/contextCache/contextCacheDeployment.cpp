@@ -29,7 +29,7 @@ namespace trt_edgellm::rt
 namespace
 {
 
-void validateStateContract(LLMEngineConfig const& config, char const* label)
+void validateStateContract(LLMEngineConfig const& config, char const* label, bool allowKvRing = false)
 {
     int32_t const attentionCount = static_cast<int32_t>(
         std::count(config.layerTypes.begin(), config.layerTypes.end(), HybridCacheManager::LayerType::kAttention));
@@ -57,7 +57,10 @@ void validateStateContract(LLMEngineConfig const& config, char const* label)
         // for every attention layer so cached pages remain valid when rebound across requests.
         int64_t const minimumActivePages
             = computeMinimumKvPoolPages(config.maxSupportedBatchSize, config.maxKVCacheCapacity);
-        ELLM_CHECK(config.kvPoolPages >= minimumActivePages && config.kvPoolPages <= kMAX_KV_POOL_PAGES,
+        // A ringed DFlash draft (see resolveSpecReuseContract) declares the 2,048-token window plus one prefill pass.
+        int64_t const ringFloorPages = 16 + (config.maxSupportedInputLength + 127) / 128 + 2;
+        int64_t const requiredPages = allowKvRing ? std::min(minimumActivePages, ringFloorPages) : minimumActivePages;
+        ELLM_CHECK(config.kvPoolPages >= requiredPages && config.kvPoolPages <= kMAX_KV_POOL_PAGES,
             std::string(label) + " has invalid context-cache pool geometry.");
     }
 
@@ -109,7 +112,7 @@ void validateSpecDeploymentTuple(DeploymentConfig const& deployment)
             && deployment.draft->specDecodeType == deployment.base.specDecodeType
             && !deployment.draft->isSpecDecodeBase,
         "Speculative context-cache deployment requires matching base-role/draft-role engines and configuration.");
-    validateStateContract(*deployment.draft, "draft engine");
+    validateStateContract(*deployment.draft, "draft engine", deployment.base.specDecodeType == SpecDecodeMode::kDFlash);
     ELLM_CHECK(deployment.specConfig->verifySize > 0 && deployment.specConfig->draftingStep > 0
             && deployment.specConfig->draftingTopK > 0,
         "Speculative context reuse has invalid execution geometry.");

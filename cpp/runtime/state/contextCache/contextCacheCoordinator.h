@@ -273,6 +273,7 @@ private:
     class BaseEndpointPolicy;
     class HybridSnapshotPolicy;
     class HybridMtpPolicy;
+    class HybridBlockDraftPolicy;
     class EagleSpecPolicy;
     class SharedKvSpecPolicy;
 

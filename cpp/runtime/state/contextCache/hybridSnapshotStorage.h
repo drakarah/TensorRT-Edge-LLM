@@ -50,10 +50,13 @@ public:
     //! successor-dependent boundary MTP draft slot is recomputed at restore from this saved hidden state instead of
     //! being matched by the lookup key, which lets a checkpoint be reused regardless of the token that follows it. A
     //! non-null draftCacheManager additionally captures the paired draft KV pool page alongside every base page.
+    //! With draftKvRing the draft KV is a static ring (a block drafter's sliding window): no pages are paired, and
+    //! every recurrent slot instead holds a copy of the whole draft KV pool, written by captureRecurrent and read back
+    //! by restoreRecurrent.
     HybridSnapshotStorage(HybridCacheManager& cacheManager, int32_t recurrentSlotCount, int32_t partialKvSlotCount,
         HybridCacheManager* draftCacheManager = nullptr, int32_t boundaryHiddenDim = 0,
         nvinfer1::DataType boundaryHiddenType = nvinfer1::DataType::kHALF,
-        SnapshotMemory memory = SnapshotMemory::kDevice);
+        SnapshotMemory memory = SnapshotMemory::kDevice, bool draftKvRing = false);
     HybridSnapshotStorage(HybridSnapshotStorage const&) = delete;
     HybridSnapshotStorage& operator=(HybridSnapshotStorage const&) = delete;
 
@@ -63,6 +66,8 @@ public:
     static size_t recurrentBytesPerSlot(MambaCacheManager::Config const& config);
     static size_t partialKvBytesPerSlot(KVCacheManager::Config const& config);
     static size_t boundaryHiddenBytesPerSlot(int32_t boundaryHiddenDim, nvinfer1::DataType boundaryHiddenType);
+    //! Per-recurrent-slot bytes of the draft KV ring copy.
+    static size_t draftRingBytesPerSlot(KVCacheManager const& draftKv);
 
     void zeroRecurrent(int32_t batchSlot, cudaStream_t stream);
     void captureRecurrent(int32_t snapshotSlot, int32_t batchSlot, cudaStream_t stream);
@@ -111,6 +116,8 @@ private:
     std::vector<Tensor> mConvSnapshots;
     std::vector<Tensor> mPartialKvSnapshots;
     std::vector<Tensor> mDraftPartialKvSnapshots;
+    //! Per draft layer, [recurrentSlotCount, poolElements]: one copy of the draft KV ring per checkpoint.
+    std::vector<Tensor> mDraftRingSnapshots;
     //! One [recurrentSlotCount, boundaryHiddenDim] slab holding each checkpoint's saved boundary hidden state.
     Tensor mBoundaryHiddenSnapshot;
     //! Pinned host bytes of the slabs above (empty when they live on the device).

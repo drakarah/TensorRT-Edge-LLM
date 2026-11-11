@@ -18,6 +18,7 @@
 #include "runtime/state/contextCache/specReuseContract.h"
 
 #include "common/checkMacros.h"
+#include "common/pagedKvTypes.h"
 
 #include <cstdint>
 #include <limits>
@@ -47,8 +48,15 @@ std::optional<SpecReuseContract> resolveSpecReuseContract(DeploymentConfig const
         break;
     case SpecDecodeMode::kDFlash:
     case SpecDecodeMode::kJetSpec:
-        contract = SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/0};
+    {
+        // A DFlash draft built with --draft-kv-ring-pages declares a pool smaller than its capacity needs: its window
+        // lives in a static ring that the cache snapshots instead of leasing pages.
+        bool const ringed = deployment.draft->numAttentionLayers > 0
+            && deployment.draft->kvPoolPages
+                < computeMinimumKvPoolPages(deployment.draft->maxSupportedBatchSize, deployment.draft->maxKVCacheCapacity);
+        contract = SpecReuseContract{/*ownsPagedSpecState=*/!ringed, /*futureDependencyTokens=*/0, ringed};
         break;
+    }
     case SpecDecodeMode::kDSpark:
         contract = SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/0};
         break;

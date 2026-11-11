@@ -69,6 +69,12 @@ struct ContextCacheDeploymentProfile
     {
         return isSpeculative() && specReuseContract->ownsPagedSpecState;
     }
+
+    //! A speculative draft whose KV is a static ring that checkpoints snapshot whole.
+    bool ringedDraftKv() const noexcept
+    {
+        return isSpeculative() && specReuseContract->ringedDraftKv;
+    }
 };
 
 //! Validate the logical deployment contract and return its context-cache profile.

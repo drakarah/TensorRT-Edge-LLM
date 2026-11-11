@@ -43,6 +43,9 @@ struct SpecReuseContract
 {
     bool ownsPagedSpecState{};
     int32_t futureDependencyTokens{};
+    //! The draft keeps its KV in a static ring (logical page j in pool page j % ring) instead of a page pool the cache
+    //! can lease from. A cache record then carries a snapshot of the whole ring next to the recurrent state.
+    bool ringedDraftKv{};
 };
 
 enum class ResourceType : uint8_t

@@ -90,7 +90,7 @@ std::byte* byteOffset(void* pointer, size_t offset)
 
 HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, int32_t recurrentSlotCount,
     int32_t partialKvSlotCount, HybridCacheManager* draftCacheManager, int32_t boundaryHiddenDim,
-    nvinfer1::DataType boundaryHiddenType, SnapshotMemory memory)
+    nvinfer1::DataType boundaryHiddenType, SnapshotMemory memory, bool draftKvRing)
     : mCacheManager(cacheManager)
     , mDraftCacheManager(draftCacheManager)
     , mRecurrentSlotCount(recurrentSlotCount)
@@ -191,7 +191,7 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
                 "Partial KV snapshot layer " + std::to_string(layer), slabDevice);
         }
 
-        if (mDraftCacheManager != nullptr)
+        if (mDraftCacheManager != nullptr && !draftKvRing)
         {
             KVCacheManager& draftKv = mDraftCacheManager->getKVCacheManager();
             KVCacheManager::Config const& draftKvConfig = draftKv.getConfig();
@@ -219,6 +219,24 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
         }
     }
 
+    if (draftKvRing && recurrentSlotCount > 0)
+    {
+        ELLM_CHECK(mDraftCacheManager != nullptr, "A draft KV ring snapshot needs the draft cache manager");
+        KVCacheManager& draftKv = mDraftCacheManager->getKVCacheManager();
+        KVCacheManager::Config const& draftKvConfig = draftKv.getConfig();
+        ELLM_CHECK(draftKv.numLayers() > 0 && !draftKv.isGrowable(),
+            "A draft KV ring snapshot needs a fixed draft KV pool with at least one layer");
+        mDraftRingSnapshots.reserve(static_cast<size_t>(draftKv.numLayers()));
+        for (int32_t layer = 0; layer < draftKv.numLayers(); ++layer)
+        {
+            KVLayerConfig const& layerConfig = draftKv.getLayerConfig(layer);
+            int64_t const poolElements = int64_t{2} * draftKv.numPages() * kTOKENS_PER_PAGE * layerConfig.numKVHeads
+                * layerConfig.headDim;
+            mDraftRingSnapshots.emplace_back(Tensor({recurrentSlotCount, poolElements}, slabDevice,
+                draftKvConfig.kvCacheType, "HybridSnapshotStorage::draftRing_" + std::to_string(layer)));
+        }
+    }
+
     if (mBoundaryHiddenDim > 0 && recurrentSlotCount > 0)
     {
         size_t const rowBytes = checkedMultiply(
@@ -232,7 +250,8 @@ HybridSnapshotStorage::HybridSnapshotStorage(HybridCacheManager& cacheManager, i
     if (memory == SnapshotMemory::kPinnedHost)
     {
         int64_t hostBytes = mBoundaryHiddenSnapshot.getMemoryCapacity();
-        for (auto const* slabs : {&mRecurrentSnapshots, &mConvSnapshots, &mPartialKvSnapshots, &mDraftPartialKvSnapshots})
+        for (auto const* slabs : {&mRecurrentSnapshots, &mConvSnapshots, &mPartialKvSnapshots, &mDraftPartialKvSnapshots,
+                 &mDraftRingSnapshots})
         {
             for (Tensor const& slab : *slabs)
             {
@@ -263,6 +282,23 @@ size_t HybridSnapshotStorage::partialKvBytesPerSlot(KVCacheManager::Config const
         elements = checkedMultiply(elements, static_cast<size_t>(2 * kTOKENS_PER_PAGE), "partial KV page");
         bytes = checkedAdd(bytes, checkedMultiply(elements, utils::getTypeSize(config.kvCacheType), "partial KV dtype"),
             "partial KV layers");
+    }
+    return bytes;
+}
+
+size_t HybridSnapshotStorage::draftRingBytesPerSlot(KVCacheManager const& draftKv)
+{
+    size_t bytes{};
+    for (int32_t layer = 0; layer < draftKv.numLayers(); ++layer)
+    {
+        KVLayerConfig const& layerConfig = draftKv.getLayerConfig(layer);
+        size_t elements = checkedMultiply(static_cast<size_t>(layerConfig.numKVHeads),
+            static_cast<size_t>(layerConfig.headDim), "draft ring heads");
+        elements = checkedMultiply(elements, static_cast<size_t>(2 * kTOKENS_PER_PAGE), "draft ring page");
+        elements = checkedMultiply(elements, static_cast<size_t>(draftKv.numPages()), "draft ring pool");
+        bytes = checkedAdd(bytes,
+            checkedMultiply(elements, utils::getTypeSize(draftKv.getConfig().kvCacheType), "draft ring dtype"),
+            "draft ring layers");
     }
     return bytes;
 }
@@ -310,6 +346,15 @@ void HybridSnapshotStorage::captureRecurrent(int32_t snapshotSlot, int32_t batch
             byteOffset(mamba.getConvState(layer).rawPointer(), static_cast<size_t>(batchSlot) * convBytes), convBytes,
             captureKind(), stream));
     }
+    for (size_t layer = 0; layer < mDraftRingSnapshots.size(); ++layer)
+    {
+        Tensor const& pool = mDraftCacheManager->getKVCacheManager().getCombinedKVCache(static_cast<int32_t>(layer));
+        size_t const poolBytes = static_cast<size_t>(mDraftRingSnapshots[layer].getStride(0))
+            * utils::getTypeSize(mDraftRingSnapshots[layer].getDataType());
+        CUDA_CHECK(cudaMemcpyAsync(
+            byteOffset(mDraftRingSnapshots[layer].rawPointer(), static_cast<size_t>(snapshotSlot) * poolBytes),
+            pool.rawPointer(), poolBytes, captureKind(), stream));
+    }
 }
 
 void HybridSnapshotStorage::restoreRecurrent(int32_t snapshotSlot, int32_t batchSlot, cudaStream_t stream)
@@ -331,6 +376,15 @@ void HybridSnapshotStorage::restoreRecurrent(int32_t snapshotSlot, int32_t batch
             byteOffset(
                 mConvSnapshots[static_cast<size_t>(layer)].rawPointer(), static_cast<size_t>(snapshotSlot) * convBytes),
             convBytes, restoreKind(), stream));
+    }
+    for (size_t layer = 0; layer < mDraftRingSnapshots.size(); ++layer)
+    {
+        Tensor& pool = mDraftCacheManager->getKVCacheManager().getCombinedKVCache(static_cast<int32_t>(layer));
+        size_t const poolBytes = static_cast<size_t>(mDraftRingSnapshots[layer].getStride(0))
+            * utils::getTypeSize(mDraftRingSnapshots[layer].getDataType());
+        CUDA_CHECK(cudaMemcpyAsync(pool.rawPointer(),
+            byteOffset(mDraftRingSnapshots[layer].rawPointer(), static_cast<size_t>(snapshotSlot) * poolBytes),
+            poolBytes, restoreKind(), stream));
     }
 }
 
