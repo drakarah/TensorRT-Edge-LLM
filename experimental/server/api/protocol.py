@@ -114,6 +114,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     add_generation_prompt: StrictBool = True
     enable_thinking: bool = Field(default_factory=lambda: _env_flag_default("EDGELLM_DEFAULT_ENABLE_THINKING", False))
     reasoning_effort: Optional[str] = None
+    # Other clients' spellings of the thinking switch: Z.ai / Anthropic style `thinking: {"type": "enabled"|"disabled", "budget_tokens": n}`
+    # and OpenRouter style `reasoning: {"effort": ..., "enabled": bool, "max_tokens": n}` (or a bare effort string).
+    thinking: Optional[Dict[str, Any]] = None
+    reasoning: Optional[Union[Dict[str, Any], str]] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     disable_spec_decode: bool = False
     reuse_context: StrictBool = True
@@ -172,6 +176,31 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "chat_template_kwargs.reasoning_effort must be a string")
             if effort is not None:
                 self.reasoning_effort = effort
+        explicit_enable = "enable_thinking" in self.model_fields_set
+        on_requested = False
+        off_requested = False
+        if self.thinking is not None:
+            kind = str(self.thinking.get("type", "")).strip().lower()
+            if kind in ("disabled", "off", "none", "false"):
+                off_requested = True
+            elif kind in ("enabled", "adaptive", "auto", "on", "true"):
+                on_requested = True
+            budget = self.thinking.get("budget_tokens")
+            if isinstance(budget, int) and budget > 0 and "reasoning_budget_tokens" not in self.model_fields_set:
+                self.reasoning_budget_tokens = budget
+        if self.reasoning is not None:
+            if isinstance(self.reasoning, str):
+                self.reasoning_effort = self.reasoning_effort or self.reasoning
+            else:
+                if self.reasoning.get("enabled") is False:
+                    off_requested = True
+                elif self.reasoning.get("enabled") is True:
+                    on_requested = True
+                if isinstance(self.reasoning.get("effort"), str):
+                    self.reasoning_effort = self.reasoning_effort or self.reasoning["effort"]
+                budget = self.reasoning.get("max_tokens")
+                if isinstance(budget, int) and budget > 0 and "reasoning_budget_tokens" not in self.model_fields_set:
+                    self.reasoning_budget_tokens = budget
         # Reasoning level as clients send it (OpenAI: minimal/low/medium/high, pi also xhigh/off): mapped onto the levels
         # the chat template knows (xhigh, medium, low); "none"/"off" turns thinking off. EDGELLM_DEFAULT_REASONING_EFFORT
         # applies to requests that carry no level.
@@ -183,13 +212,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
             table = dict(item.split("=", 1) for item in budgets.split(",") if "=" in item)
             if effort in table:
                 self.reasoning_budget_tokens = int(table[effort])
-        if effort in ("none", "off", "disabled", "false"):
+        if effort in ("none", "off", "disabled", "false") or off_requested:
             self.enable_thinking = False
             self.reasoning_effort = None
         elif effort:
             self.reasoning_effort = {
                 "minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh",
             }.get(effort, "medium")
+        # A reasoning level (or thinking/reasoning enabled) means the client wants thinking even when the server default is off;
+        # an explicit enable_thinking=false still wins.
+        if (effort or on_requested) and not off_requested and effort not in ("none", "off", "disabled", "false"):
+            if not (explicit_enable and self.enable_thinking is False):
+                self.enable_thinking = True
+        logger.info("chat request reasoning: effort=%r thinking=%r reasoning=%r enable_thinking(sent)=%s ctk=%r -> thinking=%s effort=%r budget=%s max_tokens=%s",
+                    effort or None, self.thinking, self.reasoning, explicit_enable, self.chat_template_kwargs,
+                    self.enable_thinking, self.reasoning_effort, self.reasoning_budget_tokens,
+                    self.max_tokens or self.max_completion_tokens)
         wants_audio = bool(self.modalities and "audio" in self.modalities)
         if wants_audio != (self.audio is not None):
             raise ValueError(

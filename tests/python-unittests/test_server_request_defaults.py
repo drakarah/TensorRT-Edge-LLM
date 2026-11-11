@@ -120,3 +120,63 @@ def test_reasoning_budget_default_comes_from_the_environment(monkeypatch):
 def test_invalid_reasoning_budget_default_falls_back(monkeypatch, value):
     monkeypatch.setenv("EDGELLM_DEFAULT_REASONING_BUDGET", value)
     assert _request().reasoning_budget_tokens == -1
+
+
+def _req(**extra):
+    return ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **extra)
+
+
+@pytest.mark.parametrize("extra", [
+    {"reasoning_effort": "none"},
+    {"reasoning_effort": "off"},
+    {"enable_thinking": False},
+    {"chat_template_kwargs": {"enable_thinking": False}},
+    {"thinking": {"type": "disabled"}},
+    {"reasoning": {"enabled": False}},
+    {"reasoning": {"effort": "none"}},
+    {"reasoning": "off"},
+])
+def test_every_spelling_of_reasoning_off_turns_thinking_off(monkeypatch, extra):
+    monkeypatch.setenv("EDGELLM_DEFAULT_ENABLE_THINKING", "1")
+    request = _req(**extra)
+    assert request.enable_thinking is False
+    assert request.reasoning_effort is None
+
+
+@pytest.mark.parametrize("extra,effort", [
+    ({"reasoning_effort": "low"}, "low"),
+    ({"reasoning_effort": "high"}, "xhigh"),
+    ({"reasoning": {"effort": "medium"}}, "medium"),
+    ({"reasoning": "high"}, "xhigh"),
+    ({"chat_template_kwargs": {"reasoning_effort": "low"}}, "low"),
+])
+def test_a_reasoning_level_turns_thinking_on_even_when_the_default_is_off(monkeypatch, extra, effort):
+    monkeypatch.setenv("EDGELLM_DEFAULT_ENABLE_THINKING", "0")
+    request = _req(**extra)
+    assert request.enable_thinking is True
+    assert request.reasoning_effort == effort
+
+
+@pytest.mark.parametrize("extra", [{"thinking": {"type": "enabled"}}, {"reasoning": {"enabled": True}}])
+def test_thinking_enabled_without_a_level_turns_thinking_on(monkeypatch, extra):
+    monkeypatch.setenv("EDGELLM_DEFAULT_ENABLE_THINKING", "0")
+    assert _req(**extra).enable_thinking is True
+
+
+def test_explicit_enable_thinking_false_beats_a_level(monkeypatch):
+    monkeypatch.setenv("EDGELLM_DEFAULT_ENABLE_THINKING", "1")
+    request = _req(enable_thinking=False, reasoning_effort="high")
+    assert request.enable_thinking is False
+
+
+def test_a_silent_client_gets_the_server_default(monkeypatch):
+    monkeypatch.setenv("EDGELLM_DEFAULT_ENABLE_THINKING", "0")
+    assert _req().enable_thinking is False
+    monkeypatch.setenv("EDGELLM_DEFAULT_ENABLE_THINKING", "1")
+    assert _req().enable_thinking is True
+
+
+def test_thinking_budget_tokens_become_the_reasoning_budget(monkeypatch):
+    assert _req(thinking={"type": "enabled", "budget_tokens": 2048}).reasoning_budget_tokens == 2048
+    assert _req(reasoning={"effort": "low", "max_tokens": 512}).reasoning_budget_tokens == 512
+    assert _req(thinking={"type": "enabled", "budget_tokens": 2048}, reasoning_budget_tokens=64).reasoning_budget_tokens == 64

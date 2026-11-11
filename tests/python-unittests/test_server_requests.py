@@ -1991,7 +1991,7 @@ def test_chat_forwards_presence_penalty_to_the_runtime(client_and_llm):
     assert llm.last_sampling_params.presence_penalty == -0.5
 
 
-def test_chat_refuses_presence_penalty_with_speculative_decoding(tmp_path):
+def test_chat_accepts_presence_penalty_with_speculative_decoding_on_one_slot(tmp_path):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
@@ -2001,10 +2001,63 @@ def test_chat_refuses_presence_penalty_with_speculative_decoding(tmp_path):
     client = TestClient(_create_app(llm, ApiConfig()))
     body = {"messages": [{"role": "user", "content": "Hello"}], "presence_penalty": 1.0}
 
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+    assert llm.last_sampling_params.presence_penalty == 1.0
+
+
+def test_chat_refuses_presence_penalty_with_several_request_slots(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    llm = _FakeLLM(tmp_path)
+    llm.has_draft_model = True
+    llm._engine = object()  # in-flight batching: the engine's batch dimension counts as request slots
+    (Path(llm.bundle_dir) / "config.json").write_text(
+        json.dumps({"builder_config": {"max_input_len": 32, "max_batch_size": 2, "max_kv_cache_capacity": 128},
+                    "kv_cache_dtype": "fp16"}), encoding="utf-8")
+    client = TestClient(_create_app(llm, ApiConfig()))
+    body = {"messages": [{"role": "user", "content": "Hello"}], "presence_penalty": 1.0}
+
     response = client.post("/v1/chat/completions", json=body)
     assert response.status_code >= 400
     assert response.json()["error"]["param"] == "presence_penalty"
     body["presence_penalty"] = 0.0
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+
+
+def test_chat_accepts_a_reasoning_budget_with_speculative_decoding_on_one_slot(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    llm = _FakeLLM(tmp_path)
+    llm.has_draft_model = True
+    client = TestClient(_create_app(llm, ApiConfig()))
+    body = {"messages": [{"role": "user", "content": "Hello"}], "enable_thinking": True, "reasoning_budget_tokens": 100}
+
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+    assert llm.last_sampling_params.reasoning_budget_tokens == 100
+
+
+def test_chat_refuses_a_reasoning_budget_with_several_request_slots(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    llm = _FakeLLM(tmp_path)
+    llm.has_draft_model = True
+    llm._engine = object()
+    (Path(llm.bundle_dir) / "config.json").write_text(
+        json.dumps({"builder_config": {"max_input_len": 32, "max_batch_size": 2, "max_kv_cache_capacity": 128},
+                    "kv_cache_dtype": "fp16"}), encoding="utf-8")
+    client = TestClient(_create_app(llm, ApiConfig()))
+    body = {"messages": [{"role": "user", "content": "Hello"}], "enable_thinking": True, "reasoning_budget_tokens": 100}
+
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code >= 400
+    assert response.json()["error"]["param"] == "reasoning_budget_tokens"
+    body["reasoning_budget_tokens"] = -1
     assert client.post("/v1/chat/completions", json=body).status_code == 200
 
 
@@ -2032,23 +2085,6 @@ def test_chat_forwards_the_reasoning_budget_only_when_thinking_is_on(client_and_
     response = client.post("/v1/chat/completions", json={**body, "enable_thinking": True, "reasoning_budget_tokens": 0})
     assert response.status_code == 200, response.text
     assert llm.last_sampling_params.reasoning_budget_tokens == 0
-
-
-def test_chat_refuses_a_reasoning_budget_with_speculative_decoding(tmp_path):
-    pytest.importorskip("fastapi")
-    pytest.importorskip("httpx")
-    from fastapi.testclient import TestClient
-
-    llm = _FakeLLM(tmp_path)
-    llm.has_draft_model = True
-    client = TestClient(_create_app(llm, ApiConfig()))
-    body = {"messages": [{"role": "user", "content": "Hello"}], "enable_thinking": True, "reasoning_budget_tokens": 100}
-
-    response = client.post("/v1/chat/completions", json=body)
-    assert response.status_code >= 400
-    assert response.json()["error"]["param"] == "reasoning_budget_tokens"
-    body["reasoning_budget_tokens"] = -1
-    assert client.post("/v1/chat/completions", json=body).status_code == 200
 
 
 def test_chat_rejects_a_reasoning_budget_below_minus_one(client_and_llm):
