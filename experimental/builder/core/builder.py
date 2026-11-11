@@ -154,6 +154,9 @@ class BuildArgs:
     #! DFlash draft only: pool of this many KV pages (a ring over the draft's sliding window) instead of one for the
     #! whole capacity; the runtime then keeps the draft KV in a static ring (KVCacheManager::Config::ringPages).
     draft_kv_ring_pages: int = 0
+    #! DFlash2 base: rows of each GDN layer's intermediate-states output (a build-time layout of the tree-verify
+    #! scratch; 0 = one row per verified token). The plugin refuses a count below what the tree verify needs.
+    gdn_tree_scratch_rows: int = 0
     plugin_path: Optional[str] = None
     profiling_detailed: bool = False
     dense_quant: str = "auto"  # auto | nvfp4-qdq | fp16

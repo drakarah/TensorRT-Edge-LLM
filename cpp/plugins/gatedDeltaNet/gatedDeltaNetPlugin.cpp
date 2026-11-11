@@ -114,13 +114,14 @@ REGISTER_TENSORRT_PLUGIN(GatedDeltaNetPluginCreator);
 // ---------------------------------------------------------------------------
 #ifdef CUTE_DSL_GDN_ENABLED
 GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, int32_t kDim, int32_t vDim, bool useSpecVerifyState,
-    bool useDDTree, bool useDiffusionState)
+    bool useDDTree, bool useDiffusionState, int32_t treeScratchRows)
     : mLayerName(name)
     , mKDim(kDim)
     , mVDim(vDim)
     , mUseSpecVerifyState(useSpecVerifyState || useDDTree)
     , mUseDDTree(useDDTree)
     , mUseDiffusionState(useDiffusionState)
+    , mTreeScratchRows(useDDTree ? treeScratchRows : 0)
     , mSMVersion(getSMVersion())
 {
     if (!CuteDslGDNRunner::canImplement(mKDim, mVDim, mSMVersion))
@@ -135,13 +136,14 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, int32_t kDim, 
 }
 #else
 GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, int32_t kDim, int32_t vDim, bool useSpecVerifyState,
-    bool useDDTree, bool useDiffusionState)
+    bool useDDTree, bool useDiffusionState, int32_t treeScratchRows)
     : mLayerName(name)
     , mKDim(kDim)
     , mVDim(vDim)
     , mUseSpecVerifyState(useSpecVerifyState || useDDTree)
     , mUseDDTree(useDDTree)
     , mUseDiffusionState(useDiffusionState)
+    , mTreeScratchRows(useDDTree ? treeScratchRows : 0)
 {
     LOG_ERROR("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
     throw std::runtime_error("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
@@ -157,6 +159,7 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, PluginFieldCol
     mUseDDTree = parsePluginScalarField<int32_t>("use_ddtree", fc).value_or(0) != 0;
     mUseDiffusionState = parsePluginScalarField<int32_t>("use_diffusion_state", fc).value_or(0) != 0;
     mUseSpecVerifyState = mUseSpecVerifyState || mUseDDTree;
+    mTreeScratchRows = mUseDDTree ? std::max(0, parsePluginScalarField<int32_t>("tree_scratch_rows", fc).value_or(0)) : 0;
 
 #ifdef CUTE_DSL_GDN_ENABLED
     mSMVersion = getSMVersion();
@@ -197,7 +200,8 @@ IPluginV3* GatedDeltaNetPlugin::clone() noexcept
     try
     {
         auto* p
-            = new GatedDeltaNetPlugin(mLayerName, mKDim, mVDim, mUseSpecVerifyState, mUseDDTree, mUseDiffusionState);
+            = new GatedDeltaNetPlugin(
+            mLayerName, mKDim, mVDim, mUseSpecVerifyState, mUseDDTree, mUseDiffusionState, mTreeScratchRows);
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
@@ -281,7 +285,12 @@ int32_t GatedDeltaNetPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_un
         if (mUseSpecVerifyState)
         {
             outputs[kOUT_INTERMEDIATE_STATES_IDX].nbDims = 4;
-            outputs[kOUT_INTERMEDIATE_STATES_IDX].d[0] = inputs[kIN_Q_IDX].d[0];
+            // Token-major by default (one row per verified token). With tree_scratch_rows the tree verify's scratch is
+            // the whole buffer: that many rows per sequence, whatever the tree size.
+            outputs[kOUT_INTERMEDIATE_STATES_IDX].d[0] = mTreeScratchRows > 0
+                ? exprBuilder.operation(DimensionOperation::kPROD, *inputs[kIN_CONTEXT_LENGTHS_IDX].d[0],
+                    *exprBuilder.constant(mTreeScratchRows))
+                : inputs[kIN_Q_IDX].d[0];
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[1] = inputs[kIN_V_IDX].d[1];
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[2] = inputs[kIN_Q_IDX].d[2];
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[3] = inputs[kIN_V_IDX].d[2];
@@ -372,6 +381,24 @@ int32_t GatedDeltaNetPlugin::configurePlugin(DynamicPluginTensorDesc const* in, 
     {
         LOG_ERROR("gated_delta_net: context_sequence_count_carrier must be 1D INT32");
         return -1;
+    }
+    if (mTreeScratchRows > 0)
+    {
+        // The engine-declared scratch rows must hold the tree verify's stash, KS/QS export and prep blocks; the
+        // verify itself refuses to launch otherwise, but a build should fail here instead of at the first request.
+        int32_t const hv = static_cast<int32_t>(in[kIN_H0_SOURCE_IDX].desc.dims.d[1]);
+        int32_t const kDim = static_cast<int32_t>(in[kIN_H0_SOURCE_IDX].desc.dims.d[2]);
+        int32_t const vDim = static_cast<int32_t>(in[kIN_H0_SOURCE_IDX].desc.dims.d[3]);
+        int32_t const h = static_cast<int32_t>(in[kIN_Q_IDX].desc.dims.d[1]);
+        size_t const rowBytes = static_cast<size_t>(hv) * kDim * vDim * sizeof(float);
+        size_t const needed = kernel::gdnTreeScratchBytes(h, hv);
+        if (static_cast<size_t>(mTreeScratchRows) * rowBytes < needed)
+        {
+            LOG_ERROR("gated_delta_net: tree_scratch_rows=%d (%zu B) is below the tree verify scratch (%zu B); need at least %zu rows",
+                mTreeScratchRows, static_cast<size_t>(mTreeScratchRows) * rowBytes, needed,
+                (needed + rowBytes - 1) / rowBytes);
+            return -1;
+        }
     }
     if (mUseDDTree
         && (in[kIN_TREE_PARENT_IDS_IDX].desc.type != DataType::kINT32
@@ -675,8 +702,10 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
 
         // Per-batch stash stride == one intermediate buffer row, so batches
         // land in disjoint, engine-compatible regions.
-        size_t const stashBatchStrideBytes
-            = static_cast<size_t>(seq_len) * hv * static_cast<size_t>(k_dim) * v_dim * sizeof(float);
+        // One batch row of the intermediate buffer: one row per token, or tree_scratch_rows rows (engine-declared).
+        size_t const stashRowsPerBatch = mTreeScratchRows > 0 ? static_cast<size_t>(mTreeScratchRows)
+                                                              : static_cast<size_t>(seq_len);
+        size_t const stashBatchStrideBytes = stashRowsPerBatch * hv * static_cast<size_t>(k_dim) * v_dim * sizeof(float);
         // Standard scaled dot-product attention scale for the chunk-form verify kernel.
         float const qScale = 1.f / std::sqrt(static_cast<float>(k_dim));
         cudaError_t const verifyErr = kernel::gdnTreeVerifyChunk(static_cast<float const*>(h0State),
@@ -823,6 +852,8 @@ PluginFieldCollection const* GatedDeltaNetPlugin::getFieldsToSerialize() noexcep
     mDataToSerialize.emplace_back("use_ddtree", &mUseDDTreeField, PluginFieldType::kINT32, 1);
     mUseDiffusionStateField = mUseDiffusionState ? 1 : 0;
     mDataToSerialize.emplace_back("use_diffusion_state", &mUseDiffusionStateField, PluginFieldType::kINT32, 1);
+    mTreeScratchRowsField = mTreeScratchRows;
+    mDataToSerialize.emplace_back("tree_scratch_rows", &mTreeScratchRowsField, PluginFieldType::kINT32, 1);
 
     mFCToSerialize.nbFields = mDataToSerialize.size();
     mFCToSerialize.fields = mDataToSerialize.data();
@@ -843,6 +874,7 @@ GatedDeltaNetPluginCreator::GatedDeltaNetPluginCreator()
     mPluginAttributes.emplace_back(PluginField("use_mtp", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("use_ddtree", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("use_diffusion_state", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("tree_scratch_rows", nullptr, PluginFieldType::kINT32, 1));
     mFieldCollection.nbFields = static_cast<int32_t>(mPluginAttributes.size());
     mFieldCollection.fields = mPluginAttributes.data();
 }

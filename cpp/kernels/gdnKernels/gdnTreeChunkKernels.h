@@ -54,6 +54,12 @@ constexpr int32_t kGDN_TREE_CHUNK_MAX_ACCEPT{16};
 //! decoder: hybrid-state commit).
 bool gdnTreeChunkVerifyEnabled(int32_t treeSize);
 
+//! Bytes of one batch's intermediate-states row the chunk-form tree verify uses (stash cells, KS/QS export and prep
+//! blocks, for the largest tree). The verify refuses to launch when a batch row is smaller, so an engine may declare
+//! its intermediate buffer as few rows of hv * 128 * 128 fp32 as cover this (see the plugin's tree_scratch_rows).
+//! h = #k-heads, hv = #v-heads, dk = dv = 128.
+size_t gdnTreeScratchBytes(int32_t h, int32_t hv);
+
 //! Per-(batch, hv-head) prep block exported by the verify prep kernel for the
 //! apply kernel (prep/apply split): M + Attn [MAX_NODES^2 f32 each], gamma/beta/invK/
 //! invQ [MAX_NODES f32 each], depth [MAX_NODES i32] + maxDepth i32, padded to

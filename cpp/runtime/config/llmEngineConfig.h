@@ -183,6 +183,9 @@ struct LLMEngineConfig
     //! MTP spec-verify recurrent-state commit mode, parsed from `recurrent_spec_verify_mode`
     //! ("replay" → true, "snapshot"/absent → false).
     bool recurrentSpecVerifyUsesReplay{false};
+    //! GDN DDTree base: rows of each recurrent layer's intermediate-states output per sequence, parsed from
+    //! `gdn_tree_scratch_rows` (0/absent: one row per verified token, the full-state snapshot layout).
+    int32_t gdnTreeScratchRows{0};
     int32_t convDim{0};    //!< Conv1d channel dimension
     int32_t convKernel{0}; //!< Conv1d kernel width
 

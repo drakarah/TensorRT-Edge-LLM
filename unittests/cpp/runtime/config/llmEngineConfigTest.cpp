@@ -1501,3 +1501,34 @@ TEST_F(LLMEngineConfigTest, ASmallCapacityEngineKeepsItsFullPoolRequirement)
     json["builder_config"]["max_kv_pool_pages"] = 2;
     EXPECT_EQ(parseEngineConfig(writeJsonToTempFile(json)).kvPoolPages, 2);
 }
+
+TEST_F(LLMEngineConfigTest, GdnTreeScratchRowsDefaultToTheTokenMajorLayout)
+{
+    EXPECT_EQ(parseEngineConfig(writeJsonToTempFile(makeMinimalConfig())).gdnTreeScratchRows, 0);
+}
+
+TEST_F(LLMEngineConfigTest, ParsesGdnTreeScratchRows)
+{
+    Json json = makeMinimalConfig();
+    json["gdn_tree_scratch_rows"] = 2;
+    EXPECT_EQ(parseEngineConfig(writeJsonToTempFile(json)).gdnTreeScratchRows, 2);
+    json["gdn_tree_scratch_rows"] = 0;
+    EXPECT_EQ(parseEngineConfig(writeJsonToTempFile(json)).gdnTreeScratchRows, 0);
+}
+
+TEST_F(LLMEngineConfigTest, RejectsNegativeGdnTreeScratchRows)
+{
+    Json json = makeMinimalConfig();
+    json["gdn_tree_scratch_rows"] = -1;
+    EXPECT_THROW(parseEngineConfig(writeJsonToTempFile(json)), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, GdnTreeScratchRowsAreNotAllowedWithTheReplayLayout)
+{
+    Json json = makeMinimalConfig();
+    json["gdn_tree_scratch_rows"] = 2;
+    json["recurrent_spec_verify_mode"] = "replay";
+    EXPECT_THROW(parseEngineConfig(writeJsonToTempFile(json)), std::runtime_error);
+    json["recurrent_spec_verify_mode"] = "snapshot";
+    EXPECT_EQ(parseEngineConfig(writeJsonToTempFile(json)).gdnTreeScratchRows, 2);
+}

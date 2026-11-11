@@ -203,7 +203,7 @@ edgellm_add_unit_test(
 edgellm_add_unit_test(
   NAME unitTestPlugins DIRS cpp/plugins/nvfp4A16GemmPlugin
   cpp/plugins/nvfp4A16BlackwellMoePlugin cpp/plugins/allReducePlugin
-  cpp/plugins/int4MoePlugin cpp/plugins/attentionPlugin)
+  cpp/plugins/int4MoePlugin cpp/plugins/attentionPlugin cpp/plugins/gatedDeltaNet)
 
 edgellm_add_unit_test(NAME unitTestCuteDslKernels DIRS
                       kernelSrcs/int4_fp16_gemm_cutedsl)

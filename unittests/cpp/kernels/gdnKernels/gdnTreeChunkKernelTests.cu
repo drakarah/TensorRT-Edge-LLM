@@ -39,6 +39,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <tuple>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -1041,4 +1043,110 @@ TEST(GdnTreeChunkReplayTest, InvalidAcceptedPathLeavesPersistentStateUnchanged)
         cudaFree(dInfos);
     }
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+
+// --- The verify's scratch is the whole intermediate row: a tree_scratch_rows engine declares no more than that ---
+
+TEST(GdnTreeScratchBytesTest, MatchesTheHarnessRowAndGrowsWithTheHeads)
+{
+    for (auto const& [h, hv] : std::vector<std::pair<int32_t, int32_t>>{{1, 2}, {2, 6}, {4, 32}, {16, 48}})
+    {
+        EXPECT_EQ(gdnTreeScratchBytes(h, hv), stashRowBytes(h, hv)) << "h=" << h << " hv=" << hv;
+    }
+    EXPECT_LT(gdnTreeScratchBytes(2, 6), gdnTreeScratchBytes(2, 12));
+    EXPECT_LT(gdnTreeScratchBytes(2, 6), gdnTreeScratchBytes(4, 6));
+    // Qwen3.8-27B (16 k-heads, 48 v-heads): 6,116,096 B, under two 3 MiB state rows.
+    EXPECT_EQ(gdnTreeScratchBytes(16, 48), 6116096U);
+}
+
+//! One verify at an explicit per-batch stride; returns the status and leaves the output and stash for comparison.
+struct StrideRun
+{
+    cudaError_t status{cudaSuccess};
+    std::vector<__half> out;
+    std::vector<char> stash;
+};
+
+StrideRun runAtStride(ChunkProblem const& prob, size_t strideBytes, size_t stashAllocBatches, float scale)
+{
+    StrideRun result;
+    DeviceRun reference; // uploads the inputs, runs once at the exact stride (not used for the result)
+    reference.run(prob, scale, /*useL2Norm=*/true);
+    __half* dO{};
+    char* dStash{};
+    size_t const oCount = static_cast<size_t>(prob.batch) * prob.numNodes * prob.hv * kDv;
+    EXPECT_EQ(cudaMalloc(&dO, oCount * sizeof(__half)), cudaSuccess);
+    size_t const stashBytes = std::max(strideBytes, reference.rowBytes) * stashAllocBatches;
+    EXPECT_EQ(cudaMalloc(&dStash, stashBytes), cudaSuccess);
+    EXPECT_EQ(cudaMemset(dStash, 0, stashBytes), cudaSuccess);
+    EXPECT_EQ(cudaMemset(dO, 0, oCount * sizeof(__half)), cudaSuccess);
+    result.status = gdnTreeVerifyChunk(reference.dH0, reference.dQ, reference.dK, reference.dV, reference.dA,
+        reference.dB, reference.dALog, reference.dDtBias, reference.dMasks, dO, dStash, strideBytes, prob.batch,
+        prob.numNodes, prob.h, prob.hv, scale, true, nullptr);
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    result.out = downloadVec(dO, oCount);
+    result.stash = downloadVec(dStash, stashBytes);
+    cudaFree(dO);
+    cudaFree(dStash);
+    return result;
+}
+
+TEST(GdnTreeChunkVerifyScratchRowsTest, ExactScratchStrideGivesTheSameOutputAndStashAsAGenerousStride)
+{
+    constexpr int32_t kBatch = 3;
+    float const scale = 1.f / std::sqrt(static_cast<float>(kDk));
+    for (auto const& [h, hv, nodes] : std::vector<std::tuple<int32_t, int32_t, int32_t>>{{2, 6, 8}, {1, 2, 5}, {2, 4, 16}})
+    {
+        ChunkProblem prob;
+        prob.batch = kBatch;
+        prob.numNodes = nodes;
+        prob.h = h;
+        prob.hv = hv;
+        prob.addInvalidNode = false;
+        prob.generate(/*seed=*/4242 + nodes);
+        size_t const exact = stashRowBytes(h, hv);
+        // The old layout: one state row (hv * 128 * 128 fp32) per verified token.
+        size_t const generous = static_cast<size_t>(nodes) * hv * kDk * kDk * sizeof(float);
+        ASSERT_GE(generous, exact);
+        StrideRun const tight = runAtStride(prob, exact, kBatch, scale);
+        StrideRun const wide = runAtStride(prob, generous, kBatch, scale);
+        ASSERT_EQ(tight.status, cudaSuccess);
+        ASSERT_EQ(wide.status, cudaSuccess);
+        EXPECT_EQ(std::memcmp(tight.out.data(), wide.out.data(), tight.out.size() * sizeof(__half)), 0)
+            << "verify output depends on the stride (h=" << h << " hv=" << hv << " nodes=" << nodes << ")";
+        // Every batch's stash cells (what the replay commit reads) are identical; the KS/QS and prep blocks behind them
+        // are consumed by the apply kernel, so the equal outputs above cover them (their padding is not defined).
+        size_t const cellBytes = static_cast<size_t>(nodes) * gdnTreeStashNodeBytes(h, hv);
+        for (int32_t b = 0; b < kBatch; ++b)
+        {
+            EXPECT_EQ(std::memcmp(tight.stash.data() + static_cast<size_t>(b) * exact,
+                          wide.stash.data() + static_cast<size_t>(b) * generous, cellBytes),
+                0)
+                << "batch " << b << " stash cells differ (h=" << h << " hv=" << hv << " nodes=" << nodes << ")";
+        }
+    }
+}
+
+TEST(GdnTreeChunkVerifyScratchRowsTest, AStrideBelowTheScratchIsRefusedWithoutWriting)
+{
+    float const scale = 1.f / std::sqrt(static_cast<float>(kDk));
+    ChunkProblem prob;
+    prob.batch = 2;
+    prob.numNodes = 8;
+    prob.h = 2;
+    prob.hv = 6;
+    prob.addInvalidNode = false;
+    prob.generate(/*seed=*/77);
+    size_t const exact = stashRowBytes(prob.h, prob.hv);
+    StrideRun const refused = runAtStride(prob, exact - 1, 2, scale);
+    EXPECT_EQ(refused.status, cudaErrorInvalidValue);
+    EXPECT_TRUE(std::all_of(refused.stash.begin(), refused.stash.end(), [](char c) { return c == 0; }))
+        << "a refused launch must not touch the buffer";
+    for (__half const value : refused.out)
+    {
+        ASSERT_EQ(__half2float(value), 0.F);
+    }
+    StrideRun const zero = runAtStride(prob, 0, 2, scale);
+    EXPECT_EQ(zero.status, cudaErrorInvalidValue);
 }

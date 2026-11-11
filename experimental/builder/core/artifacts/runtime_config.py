@@ -193,6 +193,7 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
             "recurrent_state_head_dim": gc.key_head_dim,
             "recurrent_state_size": gc.value_head_dim,
             "recurrent_spec_verify_mode": "snapshot",
+            "gdn_tree_scratch_rows": cfg.gdn_tree_scratch_rows,
             "conv_dim": gc.conv_dim,
             "conv_kernel": gc.conv_kernel,
             "use_rope": cfg.num_attn_layers > 0,

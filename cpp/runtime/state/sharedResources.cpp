@@ -332,6 +332,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.convStateType=*/bundle.base.convStateDtype,
             /*.recurrentStateNumGroups=*/bundle.base.recurrentStateNumGroups,
             /*.specVerifyUsesReplay=*/bundle.base.recurrentSpecVerifyUsesReplay,
+            /*.recurrentScratchRows=*/bundle.base.gdnTreeScratchRows,
         };
         rt::HybridCacheManager::Config hybridCfg{
             /*.layerTypes=*/bundle.base.layerTypes,

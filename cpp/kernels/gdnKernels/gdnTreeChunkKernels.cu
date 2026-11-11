@@ -1252,6 +1252,11 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedRegKernel
 
 } // namespace
 
+size_t gdnTreeScratchBytes(int32_t h, int32_t hv)
+{
+    return gdnTreeScratchEndBytes(stashOffsets(h, hv), hv);
+}
+
 bool gdnTreeChunkVerifyEnabled(int32_t treeSize)
 {
     return treeSize <= kGDN_TREE_CHUNK_MAX_NODES;

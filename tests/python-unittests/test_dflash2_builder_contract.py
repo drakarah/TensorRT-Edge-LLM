@@ -507,3 +507,37 @@ def test_dflash2_draft_profiles_do_not_bind_runtime_selector_inputs():
                                                             (128, ))
         assert profile.shapes["packed_attention_mask"] == ((2, 1), (64, 1),
                                                            (128, 1))
+
+
+@pytest.mark.parametrize("requested, expected", [(2, 2), (0, 0), (None, 0)])
+def test_dflash2_base_takes_gdn_tree_scratch_rows_from_the_build_arguments(
+        monkeypatch, requested, expected):
+    target = _qwen38_config()
+    draft = _qwen38_config(draft=True)
+    monkeypatch.setattr(DeviceConfig, "from_pretrained",
+                        lambda model_dir: draft)
+
+    configured = registry.configure_for_build(
+        target,
+        contracts.SpecRole.BASE,
+        "dflash",
+        paired_draft_dir="draft",
+        build_args=SimpleNamespace(dflash_version=DFlashVersion.V2,
+                                   gdn_tree_scratch_rows=requested),
+    )
+    assert configured.gdn_tree_scratch_rows == expected
+
+
+def test_dflash2_base_without_the_build_argument_keeps_the_token_major_layout(
+        monkeypatch):
+    target = _qwen38_config()
+    draft = _qwen38_config(draft=True)
+    monkeypatch.setattr(DeviceConfig, "from_pretrained",
+                        lambda model_dir: draft)
+    configured = registry.configure_for_build(
+        target,
+        contracts.SpecRole.BASE,
+        "dflash",
+        paired_draft_dir="draft",
+        build_args=SimpleNamespace(dflash_version=DFlashVersion.V2))
+    assert configured.gdn_tree_scratch_rows == 0

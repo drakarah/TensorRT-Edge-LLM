@@ -159,6 +159,8 @@ class DeviceConfig:
     mtp_tree_base: bool = False
     dflash_base: bool = False
     dflash_tree_base: bool = False
+    #! DDTree GDN layers: rows of the per-layer intermediate-states output (0 = one per verified token).
+    gdn_tree_scratch_rows: int = 0
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
     dflash_mask_token_id: int = 248070
@@ -477,6 +479,7 @@ class DeviceConfig:
             mtp_tree_base=bool(llm.get("mtp_tree_base", False)),
             dflash_base=bool(llm.get("dflash_base", False)),
             dflash_tree_base=bool(llm.get("dflash_tree_base", False)),
+            gdn_tree_scratch_rows=int(llm.get("gdn_tree_scratch_rows", 0)),
             dflash_target_layer_ids=list((llm.get("dflash_config") or {}).get(
                 "target_layer_ids",
                 llm.get("dflash_target_layer_ids",

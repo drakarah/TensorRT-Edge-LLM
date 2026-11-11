@@ -896,6 +896,10 @@ LLMEngineConfig parseEngineConfig(
         "parseEngineConfig: invalid recurrent_spec_verify_mode '" + recurrentSpecVerifyMode
             + "'; expected \"replay\" or \"snapshot\".");
     cfg.recurrentSpecVerifyUsesReplay = (recurrentSpecVerifyMode == "replay");
+    cfg.gdnTreeScratchRows = configJson.value("gdn_tree_scratch_rows", 0);
+    ELLM_CHECK(cfg.gdnTreeScratchRows >= 0, "parseEngineConfig: gdn_tree_scratch_rows must be non-negative");
+    ELLM_CHECK(cfg.gdnTreeScratchRows == 0 || !cfg.recurrentSpecVerifyUsesReplay,
+        "parseEngineConfig: gdn_tree_scratch_rows applies to the GDN snapshot layout, not to replay (Mamba) engines");
     cfg.recurrentStateHeadDim = configJson.value("recurrent_state_head_dim", 0);
     cfg.recurrentStateSize = configJson.value("recurrent_state_size", 0);
     cfg.convDim = configJson.value("conv_dim", 0);

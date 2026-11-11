@@ -101,6 +101,12 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
         }
 
         int64_t const stashSeq = static_cast<int64_t>(mConfig.maxBatchSize) * mConfig.maxIntermediateSeqLen;
+        check::check(mConfig.recurrentScratchRows >= 0 && (mConfig.recurrentScratchRows == 0 || !useReplay),
+            "MambaCacheManager: recurrentScratchRows applies to the GDN snapshot layout only.");
+        // The recurrent intermediate buffer of a GDN DDTree engine has the engine-declared scratch rows per sequence.
+        int32_t const recurrentRows
+            = mConfig.recurrentScratchRows > 0 ? mConfig.recurrentScratchRows : mConfig.maxIntermediateSeqLen;
+        int64_t const recurrentStashSeq = static_cast<int64_t>(mConfig.maxBatchSize) * recurrentRows;
         for (int32_t i = 0; i < mConfig.numRecurrentLayers; ++i)
         {
             auto const idx = std::to_string(i);
@@ -132,11 +138,11 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
             }
             else
             {
-                int64_t const intermRecVolume = stashSeq * mConfig.recurrentStateNumHeads
+                int64_t const intermRecVolume = recurrentStashSeq * mConfig.recurrentStateNumHeads
                     * mConfig.recurrentStateHeadDim * mConfig.recurrentStateSize;
                 size_t const intermRecBytes = static_cast<size_t>(intermRecVolume) * recurrentElemSize;
                 mIntermediateRecurrentStates.emplace_back(
-                    rt::Tensor({mConfig.maxBatchSize, mConfig.maxIntermediateSeqLen, mConfig.recurrentStateNumHeads,
+                    rt::Tensor({mConfig.maxBatchSize, recurrentRows, mConfig.recurrentStateNumHeads,
                                    mConfig.recurrentStateHeadDim, mConfig.recurrentStateSize},
                         DeviceType::kGPU, mConfig.recurrentStateType,
                         "MambaCacheManager::intermediateRecurrentState_" + idx));
@@ -437,9 +443,11 @@ void MambaCacheManager::reshapeIntermediateStates(int32_t activeBatchSize, int32
         }
         else
         {
+            // A scratch-row layout does not follow the verify length: its row count is fixed by the engine.
+            int32_t const recurrentRows = mConfig.recurrentScratchRows > 0 ? mConfig.recurrentScratchRows : seqLen;
             check::check(
-                mIntermediateRecurrentStates[i].reshape({activeBatchSize, seqLen, mConfig.recurrentStateNumHeads,
-                    mConfig.recurrentStateHeadDim, mConfig.recurrentStateSize}),
+                mIntermediateRecurrentStates[i].reshape({activeBatchSize, recurrentRows,
+                    mConfig.recurrentStateNumHeads, mConfig.recurrentStateHeadDim, mConfig.recurrentStateSize}),
                 "Intermediate recurrent state reshape failed");
         }
         check::check(mIntermediateConvStates[i].reshape({activeBatchSize, seqLen, mConfig.convDim, mConfig.convKernel}),
@@ -596,6 +604,9 @@ void MambaCacheManager::scatterAcceptedTreeStates(rt::Tensor const& acceptedStat
     auto const intermediateShape = mIntermediateRecurrentStates[0].getShape();
     check::check(intermediateShape[0] == activeBatchSize,
         "Intermediate recurrent states must be reshaped to the active batch size before accepted tree scatter.");
+    check::check(mConfig.recurrentScratchRows == 0,
+        "The per-token full-state scatter needs one intermediate row per verified token; this engine declares "
+        "scratch rows (use the replay commit).");
     int32_t const verifyTreeSize = static_cast<int32_t>(intermediateShape[1]);
     int32_t const recElements
         = mConfig.recurrentStateNumHeads * mConfig.recurrentStateHeadDim * mConfig.recurrentStateSize;
@@ -669,7 +680,11 @@ void MambaCacheManager::replayCommitAcceptedTreeStates(rt::Tensor const& accepte
     auto const intermediateShape = mIntermediateRecurrentStates[0].getShape();
     check::check(intermediateShape[0] == activeBatchSize,
         "Intermediate recurrent states must be reshaped to the active batch size before replay commit.");
-    int32_t const verifyTreeSize = static_cast<int32_t>(intermediateShape[1]);
+    // The tree size is the conv checkpoints' row count (always one per verified token); the recurrent buffer's row
+    // count is the stash stride and may be a smaller engine-declared scratch (recurrentScratchRows).
+    int32_t const stashRows = static_cast<int32_t>(intermediateShape[1]);
+    int32_t const verifyTreeSize = static_cast<int32_t>(mIntermediateConvStates[0].getShape()[1]);
+    check::check(maxAcceptLen <= verifyTreeSize, "replayCommitAcceptedTreeStates: maxAcceptLen exceeds the verify tree.");
 
     // GDN dims: hv/dk/dv live in the config; the k-head count derives from
     // the fused-QKV conv width: convDim = 2*h*dk + hv*dv.
@@ -683,8 +698,9 @@ void MambaCacheManager::replayCommitAcceptedTreeStates(rt::Tensor const& accepte
     // Stash rows sit at the head of each per-batch intermediate row; the
     // stride is the (now unused) checkpoint row size. Must match the layout
     // the chunk-form verify wrote in gatedDeltaNetPlugin.
-    size_t const stashBatchStrideBytes
-        = static_cast<size_t>(verifyTreeSize) * hv * static_cast<size_t>(dk) * dv * sizeof(float);
+    size_t const stashBatchStrideBytes = static_cast<size_t>(stashRows) * hv * static_cast<size_t>(dk) * dv * sizeof(float);
+    check::check(stashBatchStrideBytes >= kernel::gdnTreeScratchBytes(h, hv),
+        "replayCommitAcceptedTreeStates: the intermediate buffer is smaller than the tree verify scratch.");
 
     int32_t const* const idsPtr = acceptedStateNodeIds.dataPointer<int32_t>();
     int32_t const* const lensPtr = acceptLengths.dataPointer<int32_t>();

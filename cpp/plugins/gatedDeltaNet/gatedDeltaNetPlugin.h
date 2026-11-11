@@ -76,7 +76,8 @@ public:
     //! \param kDim         Head dimension K (must be 128 for CuTe DSL kernel)
     //! \param vDim         Head dimension V (must be 128 for CuTe DSL kernel)
     GatedDeltaNetPlugin(std::string const& name, int32_t kDim = 128, int32_t vDim = 128,
-        bool useSpecVerifyState = false, bool useDDTree = false, bool useDiffusionState = false);
+        bool useSpecVerifyState = false, bool useDDTree = false, bool useDiffusionState = false,
+        int32_t treeScratchRows = 0);
     GatedDeltaNetPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     GatedDeltaNetPlugin() = delete;
@@ -125,6 +126,10 @@ private:
     bool mUseSpecVerifyState{false}; //!< Enable spec-verify intermediate_states output
     bool mUseDDTree{false};          //!< Enable DDTree parent/depth metadata inputs for tree-state execution.
     bool mUseDiffusionState{false};  //!< Enable transactional diffusion denoise/commit phases.
+    //! DDTree only: rows (of hv * k * v fp32) the intermediate_states output has per sequence. 0 keeps the
+    //! token-major layout (one row per verified token); a positive count sizes it to the tree verify's scratch.
+    int32_t mTreeScratchRows{0};
+    int32_t mTreeScratchRowsField{0};
     int32_t mSMVersion{0};           //!< Captured device SM version used for build-time capability checks
     int32_t mUseSpecVerifyStateField{0};
     int32_t mUseDDTreeField{0};

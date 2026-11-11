@@ -80,8 +80,16 @@ def gated_delta_net(
     tree_depths: Optional[Tensor] = None,
     use_intermediate: bool = False,
     use_diffusion_state: bool = False,
+    tree_scratch_rows: int = 0,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
-    """Run recurrent Gated DeltaNet attention."""
+    """Run recurrent Gated DeltaNet attention.
+
+    ``tree_scratch_rows`` (DDTree only) declares the intermediate-states output as that many rows of
+    ``num_value_heads * key_dim * value_dim`` fp32 per sequence instead of one row per verified token: the chunk-form
+    tree verify only needs its stash and scratch there, not a full state per token. 0 keeps the token-major layout.
+    """
+    if tree_scratch_rows < 0:
+        raise ValueError("tree_scratch_rows must be non-negative")
     if (tree_parent_ids is None) != (tree_depths is None):
         raise ValueError(
             "tree parent IDs and depths must be supplied together")
@@ -95,6 +103,10 @@ def gated_delta_net(
         "use_ddtree": int(use_ddtree),
         "use_diffusion_state": int(use_diffusion_state),
     }
+    if tree_scratch_rows:
+        if not use_ddtree:
+            raise ValueError("tree_scratch_rows applies to DDTree recurrent state only")
+        attributes["tree_scratch_rows"] = int(tree_scratch_rows)
     inputs = [
         q, k, v, a, b, a_log, dt_bias, state, ragged.query_lengths,
         ragged.query_start_offsets, ragged.state_indices,

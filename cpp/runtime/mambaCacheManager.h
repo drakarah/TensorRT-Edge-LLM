@@ -59,6 +59,9 @@ public:
         //! MTP spec-verify commit mode: true → Mamba replay reconstruction (allocate the dA/u/B
         //! replay stash), false → GDN/DDTree per-token snapshot scatter.
         bool specVerifyUsesReplay{false};
+        //! GDN DDTree engines declare the recurrent intermediate output as this many rows per sequence (the tree
+        //! verify's stash and scratch) instead of one row per verified token (0 = maxIntermediateSeqLen rows).
+        int32_t recurrentScratchRows{0};
     };
     //! \endcond
 

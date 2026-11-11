@@ -72,7 +72,7 @@ def configure_base(config,
                    build_args=None,
                    **kwargs) -> None:
     """Read and validate the DFlash2 contract required by the target graph."""
-    del build_args, kwargs
+    del kwargs
     if not paired_draft_dir:
         raise ValueError("DFlash2 base requires a paired draft checkpoint")
     draft = core_config.DeviceConfig.from_pretrained(paired_draft_dir)
@@ -87,6 +87,7 @@ def configure_base(config,
             f"DFlash2 target-layer IDs outside base model: {invalid}")
     config.dflash_version = DFlashVersion.V2
     config.dflash_tree_base = True
+    config.gdn_tree_scratch_rows = int(getattr(build_args, "gdn_tree_scratch_rows", 0) or 0)
     config.dflash2_target_layer_ids = list(draft.dflash2_target_layer_ids)
     config.dflash2_block_size = draft.dflash2_block_size
     config.dflash2_mask_token_id = draft.dflash2_mask_token_id

@@ -139,7 +139,9 @@ class GatedDeltaNet(Module):
             tree_parent_ids=tree_parent_ids,
             tree_depths=tree_depths,
             use_intermediate=collect_intermediate,
-            use_diffusion_state=cfg.engine_role == "dllm")
+            use_diffusion_state=cfg.engine_role == "dllm",
+            tree_scratch_rows=(cfg.gdn_tree_scratch_rows
+                               if tree_parent_ids is not None else 0))
         gate = gate.reshape((0, gdn.num_value_heads, gdn.value_head_dim))
         norm_weight = self.weights.f16(self.key("norm.weight"))
         if norm_weight.shape != (gdn.value_head_dim, ):

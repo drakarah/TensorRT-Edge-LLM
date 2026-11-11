@@ -940,3 +940,13 @@ def test_draft_kv_ring_pages_sizes_the_draft_pool_to_the_ring():
     draft.spec_type = "eagle3"
     with pytest.raises(ValueError, match="DFlash draft engine only"):
         draft_ring_pool_pages(draft, 2048)
+
+
+def test_runtime_config_declares_gdn_tree_scratch_rows():
+    cfg = _hybrid_config()
+    assert build_runtime_config(cfg, _build_args())["gdn_tree_scratch_rows"] == 0
+    cfg.gdn_tree_scratch_rows = 2
+    assert build_runtime_config(cfg, _build_args())["gdn_tree_scratch_rows"] == 2
+    # Mamba (replay) engines have no such layout.
+    assert "gdn_tree_scratch_rows" not in build_runtime_config(
+        _mamba_config(), _build_args())
