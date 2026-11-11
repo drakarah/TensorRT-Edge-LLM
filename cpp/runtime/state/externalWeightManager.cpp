@@ -461,6 +461,7 @@ ExternalWeightManager& ExternalWeightManager::operator=(ExternalWeightManager&& 
     releasePluginResources();
     mWeightStorage = std::move(other.mWeightStorage);
     mWeights = std::move(other.mWeights);
+    mBindingContracts = std::move(other.mBindingContracts);
     mHostWeights = std::move(other.mHostWeights);
     mPluginResourceTensors = std::move(other.mPluginResourceTensors);
     mPluginResourceRegistrations = std::move(other.mPluginResourceRegistrations);
@@ -493,7 +494,8 @@ void ExternalWeightManager::releasePluginResources() noexcept
 
 void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::filesystem::path const& configPath,
     cudaStream_t stream, std::filesystem::path const& componentCheckpointDir,
-    std::filesystem::path const& targetCheckpointDir, std::optional<int32_t> tpRank, std::optional<int32_t> tpSize)
+    std::filesystem::path const& targetCheckpointDir, std::optional<int32_t> tpRank, std::optional<int32_t> tpSize,
+    ExternalWeightManager const* sharedWeightsFrom)
 {
     NVTX_SCOPED_RANGE(nvtx_model_weight_preparation, "MODEL_WEIGHT_PREPARATION", nvtx_colors::YELLOW);
     ELLM_CHECK(!mLoaded, "ExternalWeightManager::load called more than once");
@@ -535,6 +537,7 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
     std::chrono::milliseconds transformTime{0};
     size_t weightArenaBytes = 0;
     size_t aliasedWeightBytes = 0;
+    size_t sharedWeightBytes = 0;
     size_t peakRegisteredSourceBytes = 0;
     if (bindings.empty())
     {
@@ -641,6 +644,7 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
             nvinfer1::DataType dtype{nvinfer1::DataType::kFLOAT};
             size_t offset{0};
             bool materialize{true};
+            void* shared{nullptr}; //!< Address of an identical tensor another engine's manager already holds.
         };
         std::vector<BindingLayout> layouts(bindings.size());
         std::unordered_map<std::string, size_t> bindingIndices;
@@ -661,6 +665,23 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
                 = safetensors::dataTypeFromString(binding["dtype"].get_ref<std::string const&>());
             layouts[bindingIndex].shape = shape;
             layouts[bindingIndex].dtype = dtype;
+
+            Json contract = binding;
+            contract.erase("checkpoint_source");
+            std::string const contractText = contract.dump();
+            if (sharedWeightsFrom != nullptr && binding.value("checkpoint_source", "component") == "target"
+                && !binding.contains(kStorageAliasField) && !isPluginResourceBinding(binding)
+                && !isEmbeddingBinding(binding) && !isPleEmbeddingBinding(binding))
+            {
+                Tensor const* const peer = sharedWeightsFrom->findSharedWeight(name, contractText);
+                if (peer != nullptr && peer->getShape() == shape && peer->getDataType() == dtype)
+                {
+                    layouts[bindingIndex].shared = const_cast<void*>(peer->rawPointer());
+                    layouts[bindingIndex].materialize = false;
+                    sharedWeightBytes += static_cast<size_t>(shape.volume()) * utils::getTypeSize(dtype);
+                }
+            }
+            mBindingContracts[name] = contractText;
         }
         bool const hasPackedNvfp4Weights = std::any_of(bindings.begin(), bindings.end(),
             [](Json const& binding) { return !binding.contains(kStorageAliasField) && isPackedNvfp4Binding(binding); });
@@ -668,7 +689,8 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
             for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex)
             {
                 Json const& binding = bindings[bindingIndex];
-                if (binding.contains(kStorageAliasField) || isPackedNvfp4Binding(binding) != packedNvfp4)
+                if (binding.contains(kStorageAliasField) || isPackedNvfp4Binding(binding) != packedNvfp4
+                    || layouts[bindingIndex].shared != nullptr)
                 {
                     continue;
                 }
@@ -700,6 +722,7 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
 
             BindingLayout& layout = layouts[bindingIndex];
             BindingLayout const& targetLayout = layouts[target->second];
+            ELLM_CHECK(targetLayout.shared == nullptr, "A storage alias cannot target a weight shared with another engine");
             ELLM_CHECK(layout.shape == targetLayout.shape && layout.dtype == targetLayout.dtype,
                 "Checkpoint storage alias shape or dtype differs from target: "
                     + binding["engine_name"].get<std::string>());
@@ -737,8 +760,9 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
         {
             Json const& binding = bindings[bindingIndex];
             BindingLayout const& layout = layouts[bindingIndex];
-            preparedWeights.emplace_back(storage + layout.offset, layout.shape, DeviceType::kGPU, layout.dtype,
-                binding.at("engine_name").get<std::string>());
+            preparedWeights.emplace_back(layout.shared != nullptr ? static_cast<void*>(layout.shared)
+                                                                  : static_cast<void*>(storage + layout.offset),
+                layout.shape, DeviceType::kGPU, layout.dtype, binding.at("engine_name").get<std::string>());
         }
         auto materializePhase = [&](CheckpointWeightPhase phase) {
             for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex)
@@ -913,13 +937,13 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
             LOG_INFO(
                 "Prepared %d model weight tensor(s)%s%s from checkpoint in %lld ms "
                 "(index %lld ms, validate %lld ms, map/register %lld ms, peak mapped source %zu bytes, "
-                "arena %zu bytes, aliases saved %zu bytes in %lld ms, transform %lld ms)",
+                "arena %zu bytes, shared with the target engine %zu bytes, aliases saved %zu bytes in %lld ms, transform %lld ms)",
                 modelWeightTensorCount, mEmbedding.has_value() ? " and the embedding table" : "",
                 mPleEmbedding.has_value() ? " and the PLE table" : "", static_cast<long long>(elapsed.count()),
                 static_cast<long long>(checkpointIndexTime.count()),
                 static_cast<long long>(checkpointValidationTime.count()),
                 static_cast<long long>(checkpointRegistrationTime.count()), peakRegisteredSourceBytes, weightArenaBytes,
-                aliasedWeightBytes, static_cast<long long>(arenaAllocationTime.count()),
+                sharedWeightBytes, aliasedWeightBytes, static_cast<long long>(arenaAllocationTime.count()),
                 static_cast<long long>(transformTime.count()));
         }
     }
@@ -939,6 +963,23 @@ std::optional<Tensor> ExternalWeightManager::takePleEmbedding()
     std::optional<Tensor> embedding = std::move(mPleEmbedding);
     mPleEmbedding.reset();
     return embedding;
+}
+
+Tensor const* ExternalWeightManager::findSharedWeight(std::string const& engineName, std::string const& contract) const
+{
+    auto const known = mBindingContracts.find(engineName);
+    if (known == mBindingContracts.end() || known->second != contract)
+    {
+        return nullptr;
+    }
+    for (Tensor const& weight : mWeights)
+    {
+        if (weight.getName() == engineName)
+        {
+            return &weight;
+        }
+    }
+    return nullptr;
 }
 
 void ExternalWeightManager::validateAgainstEngine(EngineExecutor const& executor, std::string_view engineLabel)

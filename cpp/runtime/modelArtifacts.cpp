@@ -257,8 +257,12 @@ ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& en
         }
         else
         {
-            artifacts.draftWeights.load(
-                engineDir, draftConfig, stream, artifacts.draftCheckpointDir, artifacts.checkpointDir);
+            // The draft's output head is the target's: take the already loaded tensors instead of a second copy
+            // (EDGELLM_SHARE_DRAFT_WEIGHTS=0 loads its own).
+            char const* const shareEnv = std::getenv("EDGELLM_SHARE_DRAFT_WEIGHTS");
+            bool const shareWithTarget = shareEnv == nullptr || std::atoi(shareEnv) != 0;
+            artifacts.draftWeights.load(engineDir, draftConfig, stream, artifacts.draftCheckpointDir,
+                artifacts.checkpointDir, std::nullopt, std::nullopt, shareWithTarget ? &artifacts.weights : nullptr);
         }
         // Name the mode in the label. Loading moved here from the decoders, and each of them used to pass its own
         // ("dflash_draft", "dspark_draft", ...); one call site would otherwise report every mismatch as plain "draft"

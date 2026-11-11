@@ -23,7 +23,9 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace trt_edgellm
@@ -62,7 +64,13 @@ public:
     //! engine-input tensors and plugin resources in their final layouts.
     void load(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, cudaStream_t stream,
         std::filesystem::path const& componentCheckpointDir = {}, std::filesystem::path const& targetCheckpointDir = {},
-        std::optional<int32_t> tpRank = std::nullopt, std::optional<int32_t> tpSize = std::nullopt);
+        std::optional<int32_t> tpRank = std::nullopt, std::optional<int32_t> tpSize = std::nullopt,
+        ExternalWeightManager const* sharedWeightsFrom = nullptr);
+
+    //! A loaded engine input whose binding contract (everything but its checkpoint source) equals `contract`, or
+    //! nullptr. A draft engine built on the target's own weights (checkpoint_source "target") can use it in place of
+    //! a second copy.
+    Tensor const* findSharedWeight(std::string const& engineName, std::string const& contract) const;
 
     void validateAgainstEngine(EngineExecutor const& executor, std::string_view engineLabel);
 
@@ -101,6 +109,8 @@ private:
     // storage.
     Tensor mWeightStorage{};
     std::vector<Tensor> mWeights{};
+    //! engine_name -> binding contract of every materialized checkpoint binding (see findSharedWeight).
+    std::unordered_map<std::string, std::string> mBindingContracts{};
     std::vector<Tensor> mHostWeights{}; // pinned-host owners of sidecar tensors the engine reads over PCIe
     std::vector<Tensor> mPluginResourceTensors{};
     std::vector<PluginResourceRegistration> mPluginResourceRegistrations{};

@@ -303,8 +303,12 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
         }
         else
         {
-            artifacts.draftWeights.load(
-                engineRoot, draftConfig, stream, artifacts.draftCheckpointDir, artifacts.checkpointDir);
+            // The draft's output head is the target's: take the already loaded tensors instead of a second copy
+            // (EDGELLM_SHARE_DRAFT_WEIGHTS=0 loads its own).
+            char const* const shareEnv = std::getenv("EDGELLM_SHARE_DRAFT_WEIGHTS");
+            bool const shareWithTarget = shareEnv == nullptr || std::atoi(shareEnv) != 0;
+            artifacts.draftWeights.load(engineRoot, draftConfig, stream, artifacts.draftCheckpointDir,
+                artifacts.checkpointDir, std::nullopt, std::nullopt, shareWithTarget ? &artifacts.weights : nullptr);
         }
         std::string const draftLabel
             = std::string{specDecodeModeName(artifacts.deployment.specDecodeMode())} + " draft";
@@ -974,6 +978,13 @@ constexpr int32_t kKvGrowExtraReleases = 4;
 int64_t kvShrinkSlackTokens()
 {
     return kvEnvInteger("EDGELLM_KV_SHRINK_SLACK_TOKENS", 16384, 0);
+}
+
+//! Pages mapped beyond a request's own need while the context cache holds records (pages shared with a retained record
+//! are counted once in its high-water mark). A page is 128 tokens, so 128 pages of INT8 KV are 512 MiB on this model.
+int64_t kvCacheSlackPages()
+{
+    return kvEnvInteger("EDGELLM_KV_CACHE_SLACK_PAGES", 128, 0);
 }
 } // namespace
 
@@ -2281,7 +2292,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         int64_t const wantedCapped = std::min<int64_t>(mDeployment.base.maxKVCacheCapacity, wanted);
         // With the context cache the pages of a request are leased lowest-ID-first below the mapped range. The slack
         // covers pages the request shares with a retained record, which are counted once in the high-water mark.
-        constexpr int64_t kCacheSlackPages = 128;
+        int64_t const kCacheSlackPages = kvCacheSlackPages();
         int64_t const wantedPages
             = (wantedCapped + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE + (mContextCache != nullptr ? kCacheSlackPages : 0);
         int32_t needed = static_cast<int32_t>(std::min<int64_t>(mDeployment.base.maxKVCacheCapacity, wantedPages * kTOKENS_PER_PAGE));
