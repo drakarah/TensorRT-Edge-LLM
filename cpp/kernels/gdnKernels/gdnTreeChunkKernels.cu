@@ -1098,6 +1098,147 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedKernel(Mt
 #undef REPLAY_ISSUE_LOAD
 }
 
+
+// Batched replay commit, register-resident variant. One CTA owns one (layer, batch, hv-head, V-tile of 64 columns):
+// grid = [batch*hv, numLayers, kTILE_K/64]. A thread owns the column pair c0, c0+1 (c0 = warp*8 + 2*(lane%4)) of the
+// tile and the 16 rows kk = it*8 + lane/4 (it = 0..15), so the 128 x 64 state tile lives in 32 registers per thread
+// across all L accepted steps. Each row segment a warp touches is 4 lanes x float2 = 32 contiguous bytes, a whole
+// DRAM sector (one column per thread used half of every sector). The k.H reduction is an intra-warp xor-shuffle, as
+// in the shared-memory kernel, and there is no shared-memory traffic for the state. Per column the arithmetic (scale,
+// ordered partial sums, shuffle order, rank-1 update) is the same sequence as treeReplayCommitBatchedKernel, so the
+// result is bit-identical.
+__global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedRegKernel(MtpLayerInfo const* __restrict__ infos,
+    size_t stashBatchStrideBytes, int32_t const* __restrict__ acceptedIndices,
+    int32_t const* __restrict__ acceptLengths, int32_t const* __restrict__ stateIndices, int32_t residentPoolRows,
+    int32_t maxAcceptLen, int32_t numNodes, int32_t H, int32_t HV)
+{
+    constexpr int32_t kTILE_V{64};
+    constexpr int32_t kROWS_PER_THREAD{kTILE_K / 8}; // 16
+
+    int32_t const layer = blockIdx.y;
+    int32_t const vt = blockIdx.z;
+    int32_t const stateIdx = blockIdx.x;
+    int32_t const iN = stateIdx / HV;
+    int32_t const residentIdx = stateIndices[iN];
+    if (residentIdx < 0 || residentIdx >= residentPoolRows)
+    {
+        return;
+    }
+    int32_t const iHv = stateIdx % HV;
+    int32_t const iH = iHv / (HV / H);
+    int32_t const tid = threadIdx.x;
+
+    __shared__ int32_t acceptedPathLength;
+    if (tid == 0)
+    {
+        int32_t const length = acceptLengths[iN];
+        bool valid = length >= 0 && length <= maxAcceptLen && length <= kGDN_TREE_CHUNK_MAX_ACCEPT;
+        for (int32_t i = 0; valid && i < length; ++i)
+        {
+            int32_t const node = acceptedIndices[static_cast<int64_t>(iN) * maxAcceptLen + i];
+            valid = node >= 0 && node < numNodes;
+        }
+        acceptedPathLength = valid ? length : -1;
+    }
+    __syncthreads();
+    if (acceptedPathLength < 0)
+    {
+        return;
+    }
+    int32_t const L = acceptedPathLength;
+
+    float* h0 = static_cast<float*>(infos[layer].recurrentDst);
+    char const* stash = static_cast<char const*>(infos[layer].recurrentSrc);
+
+    __shared__ __align__(16) float sKvec[kGDN_TREE_CHUNK_MAX_ACCEPT * kTILE_K];
+    __shared__ float sG[kGDN_TREE_CHUNK_MAX_ACCEPT];
+    __shared__ float sBetaS[kGDN_TREE_CHUNK_MAX_ACCEPT];
+    __shared__ __half sV[kGDN_TREE_CHUNK_MAX_ACCEPT * kTILE_V];
+
+    int32_t const warp = tid / 32;
+    int32_t const lane = tid % 32;
+    int32_t const kLocal = lane / 4;
+    int32_t const c0 = warp * 8 + (lane % 4) * 2;
+
+    // The state tile does not depend on the stash: issue its loads first so they overlap the stash staging below.
+    float* const hBase = h0 + (static_cast<int64_t>(residentIdx) * HV + iHv) * kTILE_K * kTILE_K + vt * kTILE_V + c0;
+    float rH0[kROWS_PER_THREAD];
+    float rH1[kROWS_PER_THREAD];
+#pragma unroll
+    for (int32_t it = 0; it < kROWS_PER_THREAD; ++it)
+    {
+        float2 const pair = *reinterpret_cast<float2 const*>(hBase + static_cast<int64_t>(it * 8 + kLocal) * kTILE_K);
+        rH0[it] = pair.x;
+        rH1[it] = pair.y;
+    }
+
+    StashOffsets const so = stashOffsets(H, HV);
+    char const* nodeBase = stash + static_cast<size_t>(iN) * stashBatchStrideBytes;
+    for (int32_t i = 0; i < L; ++i)
+    {
+        int32_t const node = acceptedIndices[static_cast<int64_t>(iN) * maxAcceptLen + i];
+        char const* cell = nodeBase + static_cast<size_t>(node) * so.nodeBytes;
+        float const* kSrc = reinterpret_cast<float const*>(cell + so.kNorm) + static_cast<size_t>(iH) * kTILE_K;
+        for (int32_t kk = tid; kk < kTILE_K; kk += kNUM_THREADS)
+        {
+            sKvec[i * kTILE_K + kk] = kSrc[kk];
+        }
+        if (tid == 0)
+        {
+            sG[i] = reinterpret_cast<float const*>(cell + so.g)[iHv];
+            sBetaS[i] = reinterpret_cast<float const*>(cell + so.beta)[iHv];
+        }
+        if (tid < kTILE_V)
+        {
+            __half const* vSrc = reinterpret_cast<__half const*>(cell + so.v) + static_cast<size_t>(iHv) * kTILE_K;
+            sV[i * kTILE_V + tid] = vSrc[vt * kTILE_V + tid];
+        }
+    }
+    __syncthreads();
+
+    for (int32_t i = 0; i < L; ++i)
+    {
+        float const g = sG[i];
+        float const beta = sBetaS[i];
+
+        float sumHk0 = 0.f;
+        float sumHk1 = 0.f;
+#pragma unroll
+        for (int32_t it = 0; it < kROWS_PER_THREAD; ++it)
+        {
+            float const kv = sKvec[i * kTILE_K + it * 8 + kLocal];
+            float const hg0 = rH0[it] * g;
+            float const hg1 = rH1[it] * g;
+            rH0[it] = hg0;
+            rH1[it] = hg1;
+            sumHk0 += hg0 * kv;
+            sumHk1 += hg1 * kv;
+        }
+#pragma unroll
+        for (int32_t off = 4; off < 32; off <<= 1)
+        {
+            sumHk0 += __shfl_xor_sync(0xffffffffu, sumHk0, off);
+            sumHk1 += __shfl_xor_sync(0xffffffffu, sumHk1, off);
+        }
+        float const vNew0 = (__half2float(sV[i * kTILE_V + c0]) - sumHk0) * beta;
+        float const vNew1 = (__half2float(sV[i * kTILE_V + c0 + 1]) - sumHk1) * beta;
+#pragma unroll
+        for (int32_t it = 0; it < kROWS_PER_THREAD; ++it)
+        {
+            float const kv = sKvec[i * kTILE_K + it * 8 + kLocal];
+            rH0[it] += kv * vNew0;
+            rH1[it] += kv * vNew1;
+        }
+    }
+
+#pragma unroll
+    for (int32_t it = 0; it < kROWS_PER_THREAD; ++it)
+    {
+        *reinterpret_cast<float2*>(hBase + static_cast<int64_t>(it * 8 + kLocal) * kTILE_K)
+            = make_float2(rH0[it], rH1[it]);
+    }
+}
+
 } // namespace
 
 bool gdnTreeChunkVerifyEnabled(int32_t treeSize)
@@ -1238,9 +1379,21 @@ cudaError_t gdnTreeReplayCommitBatched(MtpLayerInfo const* deviceLayerInfos, int
         cudaEventRecord(t0, stream);
     }
 
-    dim3 const grid(batch * hv, numLayers);
-    treeReplayCommitBatchedKernel<<<grid, kNUM_THREADS, 0, stream>>>(deviceLayerInfos, stashBatchStrideBytes,
-        acceptedIndices, acceptLengths, stateIndices, residentPoolRows, maxAcceptLen, numNodes, h, hv);
+    // EDGELLM_GDN_REPLAY_V1=1 selects the shared-memory kernel (the register-resident one is bit-identical).
+    char const* const replayV1Env = std::getenv("EDGELLM_GDN_REPLAY_V1");
+    bool const kUseSharedMemoryKernel = replayV1Env != nullptr && std::atoi(replayV1Env) != 0;
+    if (kUseSharedMemoryKernel)
+    {
+        dim3 const grid(batch * hv, numLayers);
+        treeReplayCommitBatchedKernel<<<grid, kNUM_THREADS, 0, stream>>>(deviceLayerInfos, stashBatchStrideBytes,
+            acceptedIndices, acceptLengths, stateIndices, residentPoolRows, maxAcceptLen, numNodes, h, hv);
+    }
+    else
+    {
+        dim3 const grid(batch * hv, numLayers, kTILE_K / 64);
+        treeReplayCommitBatchedRegKernel<<<grid, kNUM_THREADS, 0, stream>>>(deviceLayerInfos, stashBatchStrideBytes,
+            acceptedIndices, acceptLengths, stateIndices, residentPoolRows, maxAcceptLen, numNodes, h, hv);
+    }
     cudaError_t const launchErr = gdnTreeTraceLaunch("treeReplayCommitBatched");
 
     if (kTimeCommit)

@@ -35,6 +35,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -718,6 +721,138 @@ TEST(GdnTreeChunkReplayTest, VerifyThenReplayMatchesReference)
     cudaFree(dLens);
     cudaFree(dStateIndices);
     cudaFree(dInfos);
+}
+
+namespace
+{
+//! One verify (to produce a real stash) plus a replay commit at the engine's geometry, run with the shared-memory
+//! kernel (EDGELLM_GDN_REPLAY_V1=1) and the register-resident kernel on the same inputs.
+struct ReplayHarness
+{
+    int32_t layers{};
+    int32_t h{};
+    int32_t hv{};
+    int32_t acceptLen{};
+    ChunkProblem prob;
+    DeviceRun dev;
+    std::vector<float> hostState;
+    float* dState{};
+    int32_t *dIndices{}, *dLens{}, *dStateIndices{};
+    MtpLayerInfo* dInfos{};
+
+    void setup(int32_t numLayers, int32_t kH, int32_t kHv, int32_t numNodes, int32_t accepted)
+    {
+        layers = numLayers;
+        h = kH;
+        hv = kHv;
+        acceptLen = accepted;
+        prob.batch = 1;
+        prob.numNodes = numNodes;
+        prob.h = h;
+        prob.hv = hv;
+        prob.addInvalidNode = false;
+        prob.generate(/*seed=*/4242);
+        for (int32_t i = 1; i < numNodes; ++i)
+        {
+            prob.parents[i] = i - 1;
+        }
+        dev.run(prob, 1.f / std::sqrt(static_cast<float>(kDk)), /*useL2Norm=*/true);
+        hostState = prob.h0;
+        dState = uploadVec(hostState);
+        std::vector<int32_t> idx(kGDN_TREE_CHUNK_MAX_ACCEPT, 0);
+        for (int32_t i = 0; i < accepted; ++i)
+        {
+            idx[i] = i;
+        }
+        dIndices = uploadVec(idx);
+        dLens = uploadVec(std::vector<int32_t>{accepted});
+        dStateIndices = uploadVec(std::vector<int32_t>{0});
+        std::vector<MtpLayerInfo> infos(layers);
+        for (auto& info : infos)
+        {
+            info.recurrentDst = dState;
+            info.recurrentSrc = dev.dStash;
+            info.convDst = nullptr;
+            info.convSrc = nullptr;
+        }
+        dInfos = uploadVec(infos);
+    }
+
+    cudaError_t commit()
+    {
+        return gdnTreeReplayCommitBatched(dInfos, layers, stashRowBytes(h, hv), dIndices, dLens, dStateIndices, 1, 1,
+            kGDN_TREE_CHUNK_MAX_ACCEPT, prob.numNodes, h, hv, nullptr);
+    }
+
+    void resetState()
+    {
+        ASSERT_EQ(cudaMemcpy(dState, hostState.data(), hostState.size() * sizeof(float), cudaMemcpyHostToDevice),
+            cudaSuccess);
+    }
+};
+} // namespace
+
+TEST(GdnTreeChunkReplayTest, RegisterKernelIsBitIdenticalToSharedMemoryKernel)
+{
+    for (int32_t accepted : {1, 2, 3, 5, 8, 16})
+    {
+        ReplayHarness harness;
+        // One layer pair is enough: every layer runs the same CTA code on its own (aliased) state pointer, so use a
+        // single layer to keep the result independent of the repeated in-place updates.
+        harness.setup(/*numLayers=*/1, /*kH=*/16, /*kHv=*/48, /*numNodes=*/16, accepted);
+        ASSERT_EQ(setenv("EDGELLM_GDN_REPLAY_V1", "1", 1), 0);
+        ASSERT_EQ(harness.commit(), cudaSuccess);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        std::vector<float> const shared = downloadVec(harness.dState, harness.hostState.size());
+        harness.resetState();
+        ASSERT_EQ(setenv("EDGELLM_GDN_REPLAY_V1", "0", 1), 0);
+        ASSERT_EQ(harness.commit(), cudaSuccess);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        std::vector<float> const registers = downloadVec(harness.dState, harness.hostState.size());
+        unsetenv("EDGELLM_GDN_REPLAY_V1");
+        ASSERT_EQ(shared.size(), registers.size());
+        EXPECT_EQ(std::memcmp(shared.data(), registers.data(), shared.size() * sizeof(float)), 0)
+            << "register kernel differs from the shared-memory kernel for accepted length " << accepted;
+        EXPECT_NE(std::memcmp(shared.data(), harness.hostState.data(), shared.size() * sizeof(float)), 0)
+            << "replay left the state unchanged for accepted length " << accepted;
+    }
+}
+
+//! Timing at the engine's geometry (48 layers, 16 key heads, 48 value heads, batch 1). Disabled by default:
+//! ./unitTestKernelsMisc --gtest_also_run_disabled_tests --gtest_filter='*ReplayCommitTiming*'
+TEST(GdnTreeChunkReplayTest, DISABLED_ReplayCommitTiming)
+{
+    for (int32_t accepted : {1, 3, 5, 8})
+    {
+        ReplayHarness harness;
+        harness.setup(/*numLayers=*/48, /*kH=*/16, /*kHv=*/48, /*numNodes=*/16, accepted);
+        for (char const* mode : {"1", "0"})
+        {
+            ASSERT_EQ(setenv("EDGELLM_GDN_REPLAY_V1", mode, 1), 0);
+            for (int32_t warm = 0; warm < 5; ++warm)
+            {
+                ASSERT_EQ(harness.commit(), cudaSuccess);
+            }
+            cudaEvent_t t0, t1;
+            cudaEventCreate(&t0);
+            cudaEventCreate(&t1);
+            constexpr int32_t kIters = 50;
+            cudaEventRecord(t0);
+            for (int32_t i = 0; i < kIters; ++i)
+            {
+                ASSERT_EQ(harness.commit(), cudaSuccess);
+            }
+            cudaEventRecord(t1);
+            cudaEventSynchronize(t1);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, t0, t1);
+            std::printf("replay commit accepted=%d kernel=%s: %.3f ms per call (48 layers)\n", accepted,
+                std::string(mode) == "1" ? "shared-memory" : "registers   ", ms / kIters);
+            cudaEventDestroy(t0);
+            cudaEventDestroy(t1);
+        }
+        unsetenv("EDGELLM_GDN_REPLAY_V1");
+    }
 }
 
 TEST(GdnTreeChunkReplayTest, ZeroAcceptLengthLeavesStateUnchanged)
