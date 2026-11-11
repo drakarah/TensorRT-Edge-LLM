@@ -85,9 +85,16 @@ KVPageTable::~KVPageTable() noexcept
     }
 }
 
+void KVPageTable::setRingPages(int32_t ringPages)
+{
+    check::check(ringPages > 0 && ringPages <= mNumPages && mMode == Mode::kDense && mMaxBatch == 1,
+        "KVPageTable::setRingPages: a ring needs a dense single-slot table and 0 < ringPages <= numPages.");
+    mRingPages = ringPages;
+}
+
 void KVPageTable::setIdentity()
 {
-    check::check(static_cast<int64_t>(mMaxBatch) * mMaxPagesPerSeq <= mNumPages,
+    check::check(mRingPages > 0 || static_cast<int64_t>(mMaxBatch) * mMaxPagesPerSeq <= mNumPages,
         "KVPageTable::setIdentity: physical pool is smaller than the identity layout.");
     for (int32_t b = 0; b < mMaxBatch; ++b)
     {
@@ -96,7 +103,7 @@ void KVPageTable::setIdentity()
         size_t const rowOffset = static_cast<size_t>(b) * kKV_HALVES * mMaxPagesPerSeq;
         for (int32_t j = 0; j < mMaxPagesPerSeq; ++j)
         {
-            int32_t const k = b * mMaxPagesPerSeq + j;
+            int32_t const k = mRingPages > 0 ? j % mRingPages : b * mMaxPagesPerSeq + j;
             setHostValue(rowOffset + j, k);
             setHostValue(rowOffset + mMaxPagesPerSeq + j, deriveV(k, mNumPages));
             if (mMode == Mode::kSparseWindow)

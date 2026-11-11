@@ -75,10 +75,10 @@ bool isCompatiblePageTableShape(
     {
         bool const matchingBatch = pageTable.d[0] == -1 || pageTable.d[0] > 0;
         bool const validMaxPages = pageTable.d[2] == -1 || pageTable.d[2] > 0;
-        bool const maxPagesFitsPool = pageTable.d[2] == -1 || pastKV.d[1] == -1 || pageTable.d[2] <= pastKV.d[1];
-        return matchingBatch && validMaxPages && maxPagesFitsPool;
+        // A ringed draft cache maps logical page j to pool page j % ring, so the table may be wider than the pool.
+        return matchingBatch && validMaxPages;
     }
-    return pageTable.d[0] > 0 && pageTable.d[2] > 0 && pageTable.d[2] <= pastKV.d[1];
+    return pageTable.d[0] > 0 && pageTable.d[2] > 0;
 }
 
 bool hasConcretePagedKVContract(Dims const& kDelta, Dims const& vDelta, Dims const& pastKV, Dims const& deltaPositions,

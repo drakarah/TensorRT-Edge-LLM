@@ -62,6 +62,28 @@ def checked_kv_pool_pages(max_num_sequences: int,
     return pages_per_sequence, max_num_sequences * pages_per_sequence
 
 
+def draft_ring_pool_pages(args, pool_pages: int) -> int:
+    """Pool pages of a DFlash draft built with a KV ring (``--draft-kv-ring-pages``), else ``pool_pages``.
+
+    The ring must cover the draft's 2,048-token attention window (16 pages), one prefill pass written at once and a
+    margin; the page table keeps its full width (capacity / page size) and maps logical page j to pool page j % ring.
+    """
+    ring = int(getattr(args, "draft_kv_ring_pages", 0) or 0)
+    if ring <= 0:
+        return pool_pages
+    from . import contracts
+    if args.resolved_spec_role != contracts.SpecRole.DRAFT or args.spec_type != "dflash":
+        raise ValueError("--draft-kv-ring-pages applies to the DFlash draft engine only")
+    if args.max_batch_size != 1:
+        raise ValueError("--draft-kv-ring-pages needs --max-batch-size 1")
+    minimum = 16 + (int(args.max_input_len) + _KV_PAGE_SIZE - 1) // _KV_PAGE_SIZE + 2
+    if ring < minimum:
+        raise ValueError(
+            f"--draft-kv-ring-pages {ring} is below the {minimum} pages the 2,048-token window, one prefill pass of "
+            f"{args.max_input_len} tokens and a margin need")
+    return min(ring, pool_pages)
+
+
 def _role_generation_query_length(args) -> int:
     if args.resolved_spec_role == contracts.SpecRole.DRAFT:
         return _checked_positive_int32(args.max_draft_tree_size,

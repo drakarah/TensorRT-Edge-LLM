@@ -62,6 +62,31 @@ int32_t kvInitialMappedTokens()
 //! The draft's own KV pool maps on demand like the base's when EDGELLM_DRAFT_KV_GROWABLE=1 and the base is growable
 //! (EDGELLM_KV_INITIAL_TOKENS): a block drafter keeps 20 KiB of KV per token, which would otherwise be mapped for the whole
 //! engine capacity at start.
+//! A DFlash draft built with --draft-kv-ring-pages declares a KV pool smaller than its capacity needs: its KV then lives in
+//! a static ring (logical page j in pool page j % ringPages) because the draft attends only to its sliding window. The
+//! ring must cover the 2,048-token window (16 pages), one prefill pass written at once and a margin.
+int32_t draftKvRingPages(DeploymentConfig const& bundle)
+{
+    if (!bundle.draft.has_value() || bundle.specDecodeMode() != SpecDecodeMode::kDFlash
+        || bundle.draft->kvPoolPages <= 0)
+    {
+        return 0;
+    }
+    int64_t const fullPages = computeMinimumKvPoolPages(bundle.draft->maxSupportedBatchSize, bundle.draft->maxKVCacheCapacity);
+    if (bundle.draft->kvPoolPages >= fullPages)
+    {
+        return 0;
+    }
+    check::check(bundle.draft->maxSupportedBatchSize == 1 && bundle.base.maxSupportedBatchSize == 1,
+        "A draft KV ring needs a single-slot engine.");
+    int64_t const minimum = 16 + (bundle.base.maxSupportedInputLength + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE + 2;
+    check::check(bundle.draft->kvPoolPages >= minimum,
+        "The draft KV ring (" + std::to_string(bundle.draft->kvPoolPages)
+            + " pages) must cover the 2,048-token draft window plus one prefill pass and a margin (at least "
+            + std::to_string(minimum) + " pages for this engine).");
+    return bundle.draft->kvPoolPages;
+}
+
 int32_t draftKvInitialMappedTokens()
 {
     char const* value = std::getenv("EDGELLM_DRAFT_KV_GROWABLE");
@@ -115,6 +140,10 @@ std::unique_ptr<KVPageTable> makeIdentityPageTable(KVCacheManager const& kv, cud
 {
     auto table = std::make_unique<KVPageTable>(
         kv.getConfig().maxBatchSize, computeMaxPagesPerSeq(kv.getConfig().maxSequenceLength), kv.numPages());
+    if (kv.getConfig().ringPages > 0)
+    {
+        table->setRingPages(kv.getConfig().ringPages);
+    }
     table->setIdentity();
     table->upload(stream);
     return table;
@@ -333,7 +362,9 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.numSwaPages=*/bundle.draft->numSwaPages,
             /*.useBoundedSwaKVCache=*/bundle.draft->usesBoundedSwaKVCache(),
             /*.kvSharingDonors=*/{},
-            /*.initialMappedTokens=*/draftKvInitialMappedTokens(),
+            /*.initialMappedTokens=*/draftKvRingPages(bundle) > 0 ? 0 : draftKvInitialMappedTokens(),
+            /*.packedV=*/false,
+            /*.ringPages=*/draftKvRingPages(bundle),
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/0,

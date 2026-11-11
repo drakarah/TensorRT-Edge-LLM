@@ -96,12 +96,25 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     int64_t const minimumActivePages = computeMinimumKvPoolPages(mConfig.maxBatchSize, mConfig.maxSequenceLength);
     check::check(minimumActivePages <= kMAX_KV_POOL_PAGES,
         "KVCacheManager: minimum active pages exceed the largest int32-addressable paged-KV pool.");
-    check::check(mConfig.numPages == 0 || static_cast<int64_t>(mConfig.numPages) >= minimumActivePages,
-        "KVCacheManager: Config::numPages (" + std::to_string(mConfig.numPages)
-            + ") must be >= the minimum active pages (" + std::to_string(minimumActivePages) + ") when non-zero.");
-    check::check(mConfig.numPages <= kMAX_KV_POOL_PAGES,
-        "KVCacheManager: Config::numPages exceeds the largest supported paged-KV pool.");
-    mNumPages = (mConfig.numPages == 0) ? static_cast<int32_t>(minimumActivePages) : mConfig.numPages;
+    if (mConfig.ringPages > 0)
+    {
+        check::check(mConfig.maxBatchSize == 1, "KVCacheManager: a ring pool needs a single-slot engine.");
+        check::check(mConfig.initialMappedTokens == 0 && !mConfig.packedV && mConfig.kvSharingDonors.empty()
+                && !mConfig.useBoundedSwaKVCache,
+            "KVCacheManager: a ring pool cannot be combined with on-demand mapping, packed V, KV sharing or bounded SWA.");
+        check::check(static_cast<int64_t>(mConfig.ringPages) < minimumActivePages,
+            "KVCacheManager: a ring pool must be smaller than the full-capacity pool.");
+        mNumPages = mConfig.ringPages;
+    }
+    else
+    {
+        check::check(mConfig.numPages == 0 || static_cast<int64_t>(mConfig.numPages) >= minimumActivePages,
+            "KVCacheManager: Config::numPages (" + std::to_string(mConfig.numPages)
+                + ") must be >= the minimum active pages (" + std::to_string(minimumActivePages) + ") when non-zero.");
+        check::check(mConfig.numPages <= kMAX_KV_POOL_PAGES,
+            "KVCacheManager: Config::numPages exceeds the largest supported paged-KV pool.");
+        mNumPages = (mConfig.numPages == 0) ? static_cast<int32_t>(minimumActivePages) : mConfig.numPages;
+    }
 
     std::optional<int32_t> boundedCapability;
     std::optional<int32_t> boundedCapPadded;

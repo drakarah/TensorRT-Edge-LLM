@@ -522,7 +522,7 @@ bool hasConcretePagedKVContract(Dims const& qkv, Dims const& sequenceLengths, Di
     return validExecutionShape && isPagedPoolShape(kvCacheInput, numKVHeads, headSize, false)
         && haveSameShape(kvCacheInput, kvCacheOutput) && kvPageTable.nbDims == 3 && kvPageTable.d[0] == batchSize
         && kvPageTable.d[1] == 2 && kvPageTable.d[2] > 0
-        && (allowSparseLogicalTable || kvCacheInput.d[1] >= kvPageTable.d[2]);
+        && (allowSparseLogicalTable || kvCacheInput.d[1] > 0);
 }
 
 bool hasConcretePagedKVContract(PluginTensorDesc const* in, PluginTensorDesc const* out, int32_t numKVHeads,
@@ -1552,8 +1552,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
     check::check(!kvPageTableTensor.isEmpty(), "AttentionPlugin: kv_page_table input is required for paged attention.");
     int32_t const* const pageTable = kvPageTableTensor.dataPointer<int32_t>();
     int32_t const maxPagesPerSeq = static_cast<int32_t>(kvPageTableInputDesc.dims.d[2]);
-    check::check(useBoundedSwaCache || numPages >= maxPagesPerSeq,
-        "AttentionPlugin full-cache mode requires at least one physical page per logical page-table column.");
+    // A ringed draft cache (page table column j -> pool page j % ring) has fewer pool pages than columns.
+    check::check(useBoundedSwaCache || numPages > 0, "AttentionPlugin full-cache mode requires a non-empty KV pool.");
     // Padded per-slot token capacity spanned by the page table (each page holds kTOKENS_PER_PAGE).
     int32_t const kvCacheCapacity = maxPagesPerSeq * rt::kTOKENS_PER_PAGE;
 

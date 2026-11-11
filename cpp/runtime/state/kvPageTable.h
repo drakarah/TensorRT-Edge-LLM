@@ -78,6 +78,12 @@ public:
     //!        K pages `[b*maxPagesPerSeq, (b+1)*maxPagesPerSeq)` (V = K + numPages).
     void setIdentity();
 
+    //! @brief Turn the "identity" layout into a static ring: logical page j of the (single) slot maps to K page
+    //!        `j % ringPages`. For a pool of `ringPages` pages that holds only a sliding window (KVCacheManager::Config::
+    //!        ringPages). Must be called before the first setIdentity(); the table then stays a ring (setIdentity()
+    //!        rebuilds the ring and isIdentity() keeps meaning "the unmodified default layout").
+    void setRingPages(int32_t ringPages);
+
     //! @brief Set slot `slot`'s live K page ids from `kPageIds[0..count)`; V ids are
     //!        derived as `k + numPages`. Entries `[count, maxPagesPerSeq)` are cleared.
     //! @throws std::runtime_error if the row description or a page id is invalid
@@ -178,6 +184,7 @@ private:
     int32_t mNumPages{};
     Mode mMode{Mode::kDense};
     bool mIsIdentity{false};
+    int32_t mRingPages{0};
     std::vector<int32_t> mHost;      //!< [maxBatch, 2, maxPagesPerSeq], row-major.
     std::vector<uint8_t> mDirtyRows; //!< One bit-like byte per logical slot.
     std::vector<int32_t> mUploadedHost;

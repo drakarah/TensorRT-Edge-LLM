@@ -22,7 +22,8 @@ from tensorrt_edgellm.dflash import DFlashVersion
 
 from .. import contracts
 from ..config import LAYER_ATTN, LAYER_GDN, LAYER_MAMBA, DeviceConfig
-from ..ragged import builder_config_fields, checked_kv_pool_pages
+from ..ragged import (builder_config_fields, checked_kv_pool_pages,
+                      draft_ring_pool_pages)
 
 
 def normalize_rope_scaling(rope_scaling):
@@ -326,6 +327,7 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
 
     _, max_kv_pool_pages = checked_kv_pool_pages(args.max_batch_size,
                                                  args.max_kv_cache_capacity)
+    max_kv_pool_pages = draft_ring_pool_pages(args, max_kv_pool_pages)
     builder_config = {
         "tp_size": args.tp_size,
         "max_input_len": args.max_input_len,

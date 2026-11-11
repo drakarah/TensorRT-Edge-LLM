@@ -151,6 +151,9 @@ class BuildArgs:
     target_model_dir: str = ""
     fp8_embedding: bool = False
     int8_embedding: bool = False
+    #! DFlash draft only: pool of this many KV pages (a ring over the draft's sliding window) instead of one for the
+    #! whole capacity; the runtime then keeps the draft KV in a static ring (KVCacheManager::Config::ringPages).
+    draft_kv_ring_pages: int = 0
     plugin_path: Optional[str] = None
     profiling_detailed: bool = False
     dense_quant: str = "auto"  # auto | nvfp4-qdq | fp16
@@ -659,6 +662,7 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     page_size = KV_PAGE_SIZE
     pages_per_sequence, pool_pages = ragged.checked_kv_pool_pages(
         max_sequences, args.max_kv_cache_capacity)
+    pool_pages = ragged.draft_ring_pool_pages(args, pool_pages)
     hidden_size = cfg.hidden_size
     num_kv_heads = cfg.num_key_value_heads
     head_dim = cfg.head_dim

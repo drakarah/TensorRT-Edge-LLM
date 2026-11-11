@@ -66,6 +66,7 @@ def _build_args(args: argparse.Namespace, component: str):
         target_model_dir=args.target_model_dir or "",
         fp8_embedding=args.fp8_embedding,
         int8_embedding=args.int8_embedding,
+        draft_kv_ring_pages=args.draft_kv_ring_pages,
         plugin_path=args.plugin_path,
         profiling_detailed=args.profiling_detailed,
         dense_quant=args.dense,
@@ -194,6 +195,7 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
             fp8_embedding=False,
             int8_embedding=False,
         )
+        base_args.draft_kv_ring_pages = 0
         plan.extend((
             ("spec-base", base_args, bundle, component),
             ("spec-draft", draft_args, draft_bundle, component),
@@ -347,6 +349,13 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reduced-vocab-dir")
     parser.add_argument("--draft-reduced-vocab-dir")
     parser.add_argument("--draft-model-dir")
+    parser.add_argument(
+        "--draft-kv-ring-pages",
+        type=int,
+        default=0,
+        help="DFlash draft: keep its KV in a ring of this many pages (at least "
+        "16 + ceil(max-input-len / 128) + 2) instead of a pool for the whole "
+        "capacity; needs --max-batch-size 1.")
     parser.add_argument("--fp8-embedding", action="store_true")
     parser.add_argument(
         "--int8-embedding",

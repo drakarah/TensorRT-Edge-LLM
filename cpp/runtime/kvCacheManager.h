@@ -105,6 +105,11 @@ public:
         //! holds numPages pages of that stride and starts, as before, right after the K plane, so the binding keeps its
         //! nominal [2, numPages, kTOKENS_PER_PAGE, H, D] shape over a smaller allocation.
         bool packedV{false};
+        //! When non-zero, the pool holds only this many pages and logical page j always lives in page j % ringPages
+        //! (the page table is a static ring, KVPageTable::setRingPages). For a layer stack whose attention reads only a
+        //! sliding window much shorter than the capacity (the DFlash2 draft), this replaces the full-capacity pool.
+        //! Single-slot engines only; nothing may rely on pages holding data older than the ring.
+        int32_t ringPages{0};
     };
     //! \endcond
 

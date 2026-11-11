@@ -615,7 +615,10 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     ELLM_CHECK(minimumActivePages <= kMAX_KV_POOL_PAGES,
         "parseEngineConfig: minimum active pages (" + std::to_string(minimumActivePages) + ")"
             + " exceeds the largest int32-addressable paged-KV pool " + std::to_string(kMAX_KV_POOL_PAGES) + ".");
-    ELLM_CHECK(serializedKvPoolPages >= minimumActivePages,
+    // A ringed DFlash draft cache (builder --draft-kv-ring-pages) is smaller than the capacity: it holds the 2,048
+    // token attention window (16 pages), one prefill pass and a margin, with logical page j mapped to pool page j % ring.
+    int64_t const ringFloorPages = 16 + (cfg.maxSupportedInputLength + 127) / 128 + 2;
+    ELLM_CHECK(serializedKvPoolPages >= std::min<int64_t>(minimumActivePages, ringFloorPages),
         "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
             + ") cannot be smaller than the minimum active pages (" + std::to_string(minimumActivePages) + ")");
     ELLM_CHECK(serializedKvPoolPages <= kMAX_KV_POOL_PAGES,
