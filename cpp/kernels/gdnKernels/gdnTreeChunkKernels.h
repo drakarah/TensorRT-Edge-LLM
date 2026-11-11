@@ -105,7 +105,7 @@ cudaError_t gdnTreeBuildAncestorMasks(int32_t const* parentIds, uint32_t* masksO
 cudaError_t gdnTreeVerifyChunk(float const* h0, __half const* q, __half const* k, __half const* v, __half const* a,
     __half const* b, float const* A_log, __half const* dt_bias, uint32_t const* masks, __half* o, void* stash,
     size_t stashBatchStrideBytes, int32_t batch, int32_t numNodes, int32_t h, int32_t hv, float scale, bool useQKL2Norm,
-    cudaStream_t stream);
+    cudaStream_t stream, int32_t const* stateIndices = nullptr, int32_t statePoolRows = 0);
 
 //! Batched replay commit across ALL recurrent layers in one launch (grid =
 //! [batch*hv, numLayers]). Per layer, advances the persistent state

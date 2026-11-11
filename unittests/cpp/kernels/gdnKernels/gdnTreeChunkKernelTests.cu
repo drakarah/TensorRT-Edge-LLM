@@ -792,6 +792,87 @@ struct ReplayHarness
 };
 } // namespace
 
+//! The verify prep kernel reads the resident pool row through the state indices (the gather copy the plugin used to
+//! run is gone): same output and stash as a contiguous h0, bit for bit; an invalid row reads as a zero state.
+TEST(GdnTreeChunkVerifyIndexedStateTest, MatchesGatheredStateBitwise)
+{
+    constexpr int32_t kBatch = 2;
+    constexpr int32_t kH = 2;
+    constexpr int32_t kHv = 6;
+    constexpr int32_t kPoolRows = 5;
+    constexpr int32_t kNodes = 8;
+    float const scale = 1.f / std::sqrt(static_cast<float>(kDk));
+    for (bool const invalidRow : {false, true})
+    {
+        ChunkProblem prob;
+        prob.batch = kBatch;
+        prob.numNodes = kNodes;
+        prob.h = kH;
+        prob.hv = kHv;
+        prob.addInvalidNode = false;
+        prob.generate(/*seed=*/909);
+        size_t const rowElements = prob.h0.size() / kBatch;
+
+        std::vector<int32_t> const hostIndices{invalidRow ? -1 : 3, 1};
+        // Reference: the gathered contiguous state (a zero row where the index is invalid).
+        ChunkProblem gathered = prob;
+        if (invalidRow)
+        {
+            std::fill(gathered.h0.begin(), gathered.h0.begin() + rowElements, 0.F);
+        }
+        DeviceRun reference;
+        reference.run(gathered, scale, /*useL2Norm=*/true);
+
+        // Pool: the problem's rows at the indexed slots, garbage elsewhere (including the slot an invalid index
+        // would hit if it were not rejected).
+        std::vector<float> pool(static_cast<size_t>(kPoolRows) * rowElements, 123.F);
+        for (int32_t b = 0; b < kBatch; ++b)
+        {
+            if (hostIndices[b] >= 0)
+            {
+                std::copy(prob.h0.begin() + static_cast<size_t>(b) * rowElements,
+                    prob.h0.begin() + static_cast<size_t>(b + 1) * rowElements,
+                    pool.begin() + static_cast<size_t>(hostIndices[b]) * rowElements);
+            }
+        }
+        float* dPool = uploadVec(pool);
+        int32_t* dIdx = uploadVec(hostIndices);
+        __half* dO{};
+        char* dStash{};
+        size_t const oCount = static_cast<size_t>(kBatch) * kNodes * kHv * kDv;
+        ASSERT_EQ(cudaMalloc(&dO, oCount * sizeof(__half)), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&dStash, static_cast<size_t>(kBatch) * reference.rowBytes), cudaSuccess);
+        ASSERT_EQ(cudaMemset(dStash, 0, static_cast<size_t>(kBatch) * reference.rowBytes), cudaSuccess);
+        ASSERT_EQ(gdnTreeVerifyChunk(dPool, reference.dQ, reference.dK, reference.dV, reference.dA, reference.dB,
+                      reference.dALog, reference.dDtBias, reference.dMasks, dO, dStash, reference.rowBytes, kBatch,
+                      kNodes, kH, kHv, scale, true, nullptr, dIdx, kPoolRows),
+            cudaSuccess);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        std::vector<__half> const outIndexed = downloadVec(dO, oCount);
+        std::vector<__half> const outReference = downloadVec(reference.dO, oCount);
+        EXPECT_EQ(std::memcmp(outIndexed.data(), outReference.data(), oCount * sizeof(__half)), 0)
+            << "indexed-state verify output differs (invalid row " << invalidRow << ")";
+        size_t const stashBytes = static_cast<size_t>(kBatch) * reference.rowBytes;
+        std::vector<char> const stashIndexed = downloadVec(dStash, stashBytes);
+        std::vector<char> const stashReference = downloadVec(reference.dStash, stashBytes);
+        // Rows are compared on the bytes the verify writes (stash cells and scratch), which are fully determined by
+        // the inputs; the untouched remainder of each row is zero in the indexed run and uninitialised in the other.
+        size_t const nodeBytes = gdnTreeStashNodeBytes(kH, kHv);
+        for (int32_t b = 0; b < kBatch; ++b)
+        {
+            EXPECT_EQ(std::memcmp(stashIndexed.data() + static_cast<size_t>(b) * reference.rowBytes,
+                          stashReference.data() + static_cast<size_t>(b) * reference.rowBytes, kNodes * nodeBytes),
+                0)
+                << "indexed-state verify stash cells differ for batch " << b << " (invalid row " << invalidRow << ")";
+        }
+        cudaFree(dPool);
+        cudaFree(dIdx);
+        cudaFree(dO);
+        cudaFree(dStash);
+    }
+}
+
 TEST(GdnTreeChunkReplayTest, RegisterKernelIsBitIdenticalToSharedMemoryKernel)
 {
     for (int32_t accepted : {1, 2, 3, 5, 8, 16})

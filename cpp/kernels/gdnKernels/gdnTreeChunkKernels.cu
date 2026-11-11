@@ -209,7 +209,8 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeVerifyChunkPrepKernel(__half
     __half const* __restrict__ k, __half const* __restrict__ v, __half const* __restrict__ a,
     __half const* __restrict__ b, float const* __restrict__ A_log, __half const* __restrict__ dt_bias,
     uint32_t const* __restrict__ masks, char* __restrict__ stash, size_t stashBatchStrideBytes,
-    float const* __restrict__ h0, int32_t numNodes, int32_t H, int32_t HV, float scale, int32_t useQKL2Norm)
+    float const* __restrict__ h0, int32_t numNodes, int32_t H, int32_t HV, float scale, int32_t useQKL2Norm,
+    int32_t const* __restrict__ stateIndices, int32_t statePoolRows)
 {
     using namespace nvcuda;
 
@@ -257,13 +258,23 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeVerifyChunkPrepKernel(__half
     {
         sMask[tid] = masks[(static_cast<int64_t>(iN) * N) * kMASK_WORDS + tid];
     }
-    // Full h0 tile [K][K] as fp16: B operand of the KS/QS GEMM below.
+    // Full h0 tile [K][K] as fp16: B operand of the KS/QS GEMM below. With stateIndices the tile is read straight
+    // from the resident pool row (an invalid row reads as a zero state, as the gather it replaces wrote zeros);
+    // without them h0 is a contiguous [batch, HV, K, K] array.
+    int64_t h0Row = static_cast<int64_t>(iN);
+    bool h0Valid = true;
+    if (stateIndices != nullptr)
+    {
+        int32_t const residentRow = stateIndices[iN];
+        h0Valid = residentRow >= 0 && residentRow < statePoolRows;
+        h0Row = residentRow;
+    }
     for (int32_t idx = tid; idx < kTILE_K * kTILE_K; idx += kNUM_THREADS)
     {
         int32_t const row = idx / kTILE_K;
         int32_t const col = idx % kTILE_K;
         sH0h[prepWmmaSwizzleK(row) * kPREP_WMMA_SMEM_STRIDE + col]
-            = __float2half(h0[(static_cast<int64_t>(iN) * HV + iHv) * kTILE_K * kTILE_K + idx]);
+            = h0Valid ? __float2half(h0[(h0Row * HV + iHv) * kTILE_K * kTILE_K + idx]) : __float2half(0.F);
     }
     __syncthreads();
 
@@ -1270,7 +1281,7 @@ cudaError_t gdnTreeBuildAncestorMasks(int32_t const* parentIds, uint32_t* masksO
 cudaError_t gdnTreeVerifyChunk(float const* h0, __half const* q, __half const* k, __half const* v, __half const* a,
     __half const* b, float const* A_log, __half const* dt_bias, uint32_t const* masks, __half* o, void* stash,
     size_t stashBatchStrideBytes, int32_t batch, int32_t numNodes, int32_t h, int32_t hv, float scale, bool useQKL2Norm,
-    cudaStream_t stream)
+    cudaStream_t stream, int32_t const* stateIndices, int32_t statePoolRows)
 {
     int32_t const nPad = (numNodes + 15) & ~15;
     size_t const smemPrep = 2 * static_cast<size_t>(nPad) * kPREP_WMMA_SMEM_STRIDE * sizeof(__half) // sK, sQ
@@ -1335,7 +1346,8 @@ cudaError_t gdnTreeVerifyChunk(float const* h0, __half const* q, __half const* k
         }
     }
     treeVerifyChunkPrepKernel<<<batch * hv, kNUM_THREADS, smemPrep, stream>>>(q, k, v, a, b, A_log, dt_bias, masks,
-        static_cast<char*>(stash), stashBatchStrideBytes, h0, numNodes, h, hv, scale, useQKL2Norm ? 1 : 0);
+        static_cast<char*>(stash), stashBatchStrideBytes, h0, numNodes, h, hv, scale, useQKL2Norm ? 1 : 0, stateIndices,
+        statePoolRows);
     if (cudaError_t const e = gdnTreeTraceLaunch("treeVerifyChunkPrep"); e != cudaSuccess)
     {
         return e;

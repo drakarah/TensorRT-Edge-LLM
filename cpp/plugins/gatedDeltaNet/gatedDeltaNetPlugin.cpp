@@ -638,7 +638,9 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
 
     // Linear MTP verify reads the resident pool rows directly and never writes them (the accepted step's
     // intermediate state is committed by the runtime), so it needs no transactional copy of the state.
-    if ((verifyActive && !mtpActive) || diffusionDenoise)
+    // The DDTree verify reads the resident pool row itself (gdnTreeVerifyChunk takes the state indices), so it needs
+    // no transactional copy of the state: the gather it used to run cost 3.3 ms per round on Qwen3.8-27B.
+    if ((verifyActive && !mtpActive && !ddtreeActive) || diffusionDenoise)
     {
         if (workspace == nullptr)
         {
@@ -683,7 +685,7 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
             static_cast<__half const*>(inputs[kIN_B_IDX]), static_cast<float const*>(inputs[kIN_A_LOG_IDX]),
             static_cast<__half const*>(inputs[kIN_DT_BIAS_IDX]), masks, static_cast<__half*>(outputs[kOUT_O_IDX]),
             outputs[kOUT_INTERMEDIATE_STATES_IDX], stashBatchStrideBytes, n, seq_len, h, hv, qScale,
-            /*useQKL2Norm=*/true, stream);
+            /*useQKL2Norm=*/true, stream, static_cast<int32_t const*>(inputs[kIN_STATE_INDICES_IDX]), statePoolRows);
         if (verifyErr != cudaSuccess)
         {
             LOG_ERROR("gated_delta_net: chunk-form verify launch failed: %s", cudaGetErrorString(verifyErr));
