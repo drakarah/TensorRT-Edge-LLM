@@ -511,7 +511,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
         return false;
     }
 
-    if (isV2())
+    if (isV2() && mBlockDraft.treePolicy != dflash_utils::BlockDraftTreePolicy::kDDTree)
     {
         kernel::launchDFlash2CandidateSelector(mProposalSupportIds, mProposalUnaryValues, mProposalProjectedHidden,
             mLastAcceptedTokens, mSelectorPredecessorCodebook, mSelectorSuccessorCodebook, mProposalUniforms,

@@ -89,7 +89,11 @@ CachedBlockDraftRuntimeConfig makeCachedBlockDraftRuntimeConfig(DeploymentConfig
     cfg.treePolicy = spec.draftingTopK > 1 ? BlockDraftTreePolicy::kDDTree : BlockDraftTreePolicy::kLinear;
     cfg.blockSize = runtimeBlockSize(deployment);
     cfg.verifySize = spec.verifySize;
-    cfg.proposalLen = cfg.treePolicy == BlockDraftTreePolicy::kDDTree ? cfg.blockSize : cfg.verifySize - 1;
+    // DFlash2's draft emits block_size - 1 proposal rows (the anchor row is dropped), also under the DDTree policy.
+    bool const isDFlash2 = deployment.base.specDecodeType == SpecDecodeMode::kDFlash
+        && deployment.base.dflashVersion == DFlashVersion::kV2;
+    cfg.proposalLen = cfg.treePolicy == BlockDraftTreePolicy::kDDTree ? (isDFlash2 ? cfg.blockSize - 1 : cfg.blockSize)
+                                                                      : cfg.verifySize - 1;
     cfg.candidateTopK = spec.draftingTopK;
     cfg.maskTokenId = deployment.draft->specDraftMaskTokenId > 0 ? deployment.draft->specDraftMaskTokenId
                                                                  : deployment.base.specDraftMaskTokenId;

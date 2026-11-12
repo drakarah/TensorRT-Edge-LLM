@@ -486,8 +486,12 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             {
                 ELLM_CHECK(
                     cfg.draft->reducedVocabSize == 0, "DFlash V2 does not support reduced-vocabulary draft engines.");
-                ELLM_CHECK(specConfig.draftingTopK == 1,
-                    "DFlash2 selector_top_k is checkpoint-owned and does not use DDTree; draftingTopK must be 1.");
+                // draftingTopK > 1 selects the experimental DDTree mode of DFlash2: a best-first tree over the drafter's
+                // top-k candidates and unary logits (the learned selector chain is not used); needs an engine whose
+                // verify profile is larger than the block.
+                ELLM_CHECK(specConfig.draftingTopK >= 1 && specConfig.draftingTopK <= kernel::kDDTreeMaxCandidateTopK
+                        && specConfig.draftingTopK <= cfg.base.specSelectorTopK,
+                    "DFlash2 draftingTopK must be 1 (selector chain) or in [2, min(8, selector_top_k)] (DDTree).");
                 ELLM_CHECK(
                     cfg.base.dflashVersion == DFlashVersion::kV2 && cfg.draft->dflashVersion == DFlashVersion::kV2,
                     "DFlash V2 base and draft must both use dflash_config.version=2.");

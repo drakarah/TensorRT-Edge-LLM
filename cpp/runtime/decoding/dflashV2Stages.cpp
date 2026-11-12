@@ -27,6 +27,8 @@
 #include "kernels/gdnKernels/gdnTreeChunkKernels.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/speculative/dflash2CandidateSelector.h"
+#include "kernels/speculative/dflash2TreeAccept.h"
+#include "kernels/speculative/ddtreeKernels.h"
 #include "kernels/speculative/dflashRuntimeKernels.h"
 #include "kernels/speculative/dsparkKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
@@ -91,10 +93,14 @@ void DFlashDecoder::initializeDFlash2(
         "DFlashDecoder normalized user mode does not match the base engine config.");
     ELLM_CHECK(baseCfg.specDecodeType == SpecDecodeMode::kDFlash && baseCfg.dflashVersion == DFlashVersion::kV2,
         "DFlashDecoder requires spec_decode_type=dflash with dflash_config.version=2.");
-    ELLM_CHECK(mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kLinear && mBlockDraft.blockSize >= 2
-            && mBlockDraft.blockSize <= 16 && mBlockDraft.verifySize == mBlockDraft.blockSize
-            && mBlockDraft.proposalLen == mBlockDraft.blockSize - 1,
-        "DFlashDecoder requires a linear block_size=verify_size contract in [2, 16].");
+    bool const treeMode = mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kDDTree;
+    ELLM_CHECK(mBlockDraft.blockSize >= 2 && mBlockDraft.blockSize <= 16
+            && mBlockDraft.proposalLen == mBlockDraft.blockSize - 1
+            && (treeMode ? (mBlockDraft.verifySize > mBlockDraft.blockSize && mBlockDraft.verifySize <= 16
+                               && mBlockDraft.candidateTopK >= 2)
+                         : mBlockDraft.verifySize == mBlockDraft.blockSize),
+        "DFlashDecoder requires block_size=verify_size (linear) or block_size < verify_size <= 16 with "
+        "draft_top_k >= 2 (DDTree), block_size in [2, 16].");
 
     int32_t const maxBatch = deployment.maxRuntimeBatchSize();
 
@@ -198,6 +204,28 @@ void DFlashDecoder::initializeDFlash2(
     mHostAcceptLengths = Tensor({maxBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DFlash2::hostAcceptLengths");
     mHostAcceptedTokenIds = Tensor(
         {maxBatch, maxAcceptBufferSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DFlash2::hostAcceptedIds");
+    if (treeMode)
+    {
+        // DDTree over the drafter's top-k candidates. The builder reads [batch, rows, columns] sparse logits with one
+        // leading placeholder row (rows 1..proposalLen carry the candidates, firstCandidateLogitsRow = 1).
+        int32_t const candRows = mBlockDraft.blockSize;
+        mTreeCandidateLogits = Tensor({maxBatch, candRows, selectorTopK}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
+            "DFlash2::treeCandidateLogits");
+        mTreeCandidateIds = Tensor({maxBatch, candRows, selectorTopK}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
+            "DFlash2::treeCandidateIds");
+        mTreeTokenIds = Tensor(
+            {maxBatch, mBlockDraft.verifySize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash2::treeTokenIds");
+        mTreeNodeScores = Tensor({maxBatch, mBlockDraft.verifySize}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
+            "DFlash2::treeNodeScores");
+        mValidCounts = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash2::validCounts");
+        mVerifyTreeMask = Tensor({maxBatch, mBlockDraft.verifySize, mBlockDraft.verifySize}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT8, "DFlash2::verifyTreeMask");
+        size_t const buildWorkspaceSize = kernel::getDDTreeBuildWorkspaceSize(
+            maxBatch, candRows, mBlockDraft.verifySize, selectorTopK, mBlockDraft.candidateTopK);
+        ELLM_CHECK(buildWorkspaceSize > 0, "DFlash2: DDTree build workspace size must be > 0.");
+        mBuildWorkspace = Tensor({static_cast<int64_t>(buildWorkspaceSize)}, DeviceType::kGPU,
+            nvinfer1::DataType::kUINT8, "DFlash2::buildWorkspace");
+    }
     mRemainingGenerationLengths
         = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash2::remainingGenerationLengths");
     mHostRemainingGenerationLengths
@@ -240,6 +268,11 @@ bool DFlashDecoder::prepareV2Proposal(DecodingInferenceContext& context)
 
     int32_t const activeBatchSize = context.activeBatchSize;
     int32_t const verifySize = mBlockDraft.verifySize;
+    if (mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kDDTree)
+    {
+        ELLM_CHECK(!context.hasGuidedDecoding, "DFlash2 DDTree does not support guided decoding yet.");
+        return buildV2TreeVerifyInputs(context);
+    }
     check::check(mVerifyTokenIds.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
     check::check(mDraftTokenIds.reshape({activeBatchSize, mBlockDraft.proposalLen}), "Tensor reshape failed");
     kernel::dsparkBuildVerifyTokens(mLastAcceptedTokens, mDraftTokenIds, mVerifyTokenIds, activeBatchSize,
@@ -309,6 +342,21 @@ bool DFlashDecoder::runV2Acceptance(DecodingInferenceContext& context, int32_t v
     CUDA_CHECK(cudaMemcpyAsync(mRemainingGenerationLengths.rawPointer(), hostRemainingGenerationLengths,
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
+    if (mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kDDTree)
+    {
+        ELLM_CHECK(!useDenseTarget, "DFlash2 DDTree needs a bounded sampling support: set top_k (1..128) or sample greedily.");
+        kernel::dflash2TreeSampleAccept(mTargetTopKProbs, mTargetTopKIds, mTreeTokenIds,
+            mRuntime.base.pipelineIO.specTreeParentIds, mValidCounts, mAcceptUniforms, mBlockDraft.proposalLen,
+            !targetNonGreedy, &mRemainingGenerationLengths, mAcceptedTokenIds, mAcceptedTokenIndices, mAcceptLength,
+            context.stream);
+        if (!checkCudaLastError("DFlash2 DDTree accept"))
+        {
+            return false;
+        }
+        commitAcceptedTreePath(context, verifySize, maxAcceptLength);
+        dumpV2Accepted(context, maxAcceptLength);
+        return true;
+    }
     if (useDenseTarget)
     {
         kernel::speculativeDenseTargetAccept(mTargetProbabilities, mProposalSupportProbs, mProposalSupportIds,
@@ -341,6 +389,57 @@ bool DFlashDecoder::runV2Acceptance(DecodingInferenceContext& context, int32_t v
 
     dumpV2Accepted(context, maxAcceptLength);
     return true;
+}
+
+bool DFlashDecoder::buildV2TreeVerifyInputs(DecodingInferenceContext& context)
+{
+    NVTX_SCOPED_RANGE(nvtx_dflash2_ddtree_build, "DFlashDecoder::buildV2TreeVerifyInputs", nvtx_colors::LIGHT_ORANGE);
+    int32_t const activeBatchSize = context.activeBatchSize;
+    int32_t const verifySize = mBlockDraft.verifySize;
+    int32_t const rows = mBlockDraft.blockSize;
+    int32_t const proposalLen = mBlockDraft.proposalLen;
+    int32_t const columns = mRuntime.deployment.draft->specSelectorTopK;
+    auto& io = mRuntime.base.pipelineIO;
+
+    check::check(mTreeTokenIds.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
+    check::check(mTreeNodeScores.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
+    check::check(mValidCounts.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(io.specTreeParentIds.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
+    check::check(io.specTreeDepths.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
+    check::check(mVerifyTokenIds.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
+    check::check(io.specDecodePositionIds.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
+    check::check(io.packedAttentionMask.reshape({activeBatchSize, verifySize, static_cast<int64_t>(divUp(verifySize, 32))}),
+        "Tensor reshape failed");
+    check::check(mVerifyTreeMask.reshape({activeBatchSize, verifySize, verifySize}), "Tensor reshape failed");
+    check::check(io.contextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(io.selectTokenIndices.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
+
+    // Copy the proposal rows into rows 1..proposalLen of the builder's [batch, rows, columns] inputs.
+    check::check(mProposalUnaryValues.reshape({activeBatchSize, proposalLen, columns}), "Tensor reshape failed");
+    check::check(mProposalSupportIds.reshape({activeBatchSize, proposalLen, columns}), "Tensor reshape failed");
+    check::check(mTreeCandidateLogits.reshape({activeBatchSize * rows, columns}), "Tensor reshape failed");
+    check::check(mTreeCandidateIds.reshape({activeBatchSize * rows, columns}), "Tensor reshape failed");
+    size_t const srcPitch = static_cast<size_t>(proposalLen) * columns * sizeof(float);
+    size_t const dstPitch = static_cast<size_t>(rows) * columns * sizeof(float);
+    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char*>(mTreeCandidateLogits.rawPointer()) + columns * sizeof(float),
+        dstPitch, mProposalUnaryValues.rawPointer(), srcPitch, srcPitch, activeBatchSize, cudaMemcpyDeviceToDevice,
+        context.stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char*>(mTreeCandidateIds.rawPointer()) + columns * sizeof(int32_t),
+        dstPitch, mProposalSupportIds.rawPointer(), srcPitch, srcPitch, activeBatchSize, cudaMemcpyDeviceToDevice,
+        context.stream));
+
+    Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
+    kernel::DDTreeBuildParams const buildParams{
+        {mTreeCandidateLogits, mLastAcceptedTokens, baseKVCacheLengths, nullptr, nullptr, 0.0F, &mTreeCandidateIds},
+        {mTreeTokenIds, io.specTreeDepths, io.specTreeParentIds, mTreeNodeScores, mValidCounts, mVerifyTokenIds,
+            io.specDecodePositionIds, io.packedAttentionMask, mVerifyTreeMask, io.contextLengths,
+            io.selectTokenIndices},
+        mBlockDraft.candidateTopK, mBuildWorkspace.rawPointer(), static_cast<size_t>(mBuildWorkspace.getMemoryCapacity()),
+        context.stream, /*firstCandidateLogitsRow=*/1};
+    kernel::ddtreeBuild(buildParams);
+
+    copyVerifyTokenIdsToBaseInput(activeBatchSize, verifySize, context.stream);
+    return checkCudaLastError("prepare DFlash2 DDTree verify inputs");
 }
 
 namespace

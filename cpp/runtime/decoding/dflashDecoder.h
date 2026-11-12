@@ -106,6 +106,7 @@ private:
     bool runV2Acceptance(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
     //! Debug dumps for offline tree-acceptance studies (EDGELLM_DFLASH2_DUMP=<file>): proposal candidates per round and
     //! the accepted tokens. Off unless the variable is set; synchronises the stream when on.
+    bool buildV2TreeVerifyInputs(DecodingInferenceContext& context);
     void dumpV2Proposal(DecodingInferenceContext& context);
     void dumpV2Accepted(DecodingInferenceContext& context, int32_t maxAcceptLength);
     bool executeBaseVerification(DecodingInferenceContext& context, int32_t verifySize);
@@ -187,6 +188,8 @@ private:
     Tensor mProposalSupportIds;             //!< [B, proposalLen, selectorTopK] INT32
     Tensor mProposalSupportProbs;           //!< [B, proposalLen, selectorTopK] FP32
     Tensor mProposalUnaryValues;            //!< [B, proposalLen, selectorTopK] FP32
+    Tensor mTreeCandidateLogits;            //!< [B, blockSize, selectorTopK] FP32, DFlash2 DDTree builder input (row 0 unused)
+    Tensor mTreeCandidateIds;               //!< [B, blockSize, selectorTopK] INT32, DFlash2 DDTree candidate token ids
     Tensor mProposalProjectedHidden;        //!< [B, proposalLen, selectorRank] FP16
     Tensor mSelectorPredecessorCodebook;    //!< [vocabSize, selectorRank] FP16
     Tensor mSelectorSuccessorCodebook;      //!< [vocabSize, selectorRank] FP16
