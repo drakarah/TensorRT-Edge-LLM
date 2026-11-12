@@ -1023,6 +1023,109 @@ void markWindowSeen(rt::Tensor& seenFlags, rt::Tensor const& windowIds, rt::Tens
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Presence penalty for verify rows that form a tree (or a chain when parentIds is null). Row r predicts the token
+// after the tokens on its root path (the row's own token included), so those count as generated for it, besides the
+// flagged ones. Tokens of the root path are found by walking the parent pointers (depth is bounded by the block).
+__global__ void applyTreePresencePenaltyKernel(float* logits, int32_t const* rowTokenIds, int32_t const* parentIds,
+    int8_t const* seenFlags, int32_t vocabSize, int32_t rowsPerBatch, float penalty)
+{
+    int32_t const row = static_cast<int32_t>(blockIdx.y);
+    int32_t const token = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x)
+        + static_cast<int32_t>(threadIdx.x);
+    if (token >= vocabSize)
+    {
+        return;
+    }
+    int32_t const batch = row / rowsPerBatch;
+    int32_t const node = row % rowsPerBatch;
+    bool seen = seenFlags[static_cast<int64_t>(batch) * vocabSize + token] != 0;
+    int32_t const* tokens = rowTokenIds + static_cast<int64_t>(batch) * rowsPerBatch;
+    if (parentIds == nullptr)
+    {
+        for (int32_t j = 0; j <= node && !seen; ++j)
+        {
+            seen = tokens[j] == token;
+        }
+    }
+    else
+    {
+        int32_t const* parents = parentIds + static_cast<int64_t>(batch) * rowsPerBatch;
+        int32_t current = node;
+        for (int32_t hops = 0; hops < rowsPerBatch && current >= 0 && current < rowsPerBatch && !seen; ++hops)
+        {
+            seen = tokens[current] == token;
+            current = parents[current];
+        }
+    }
+    if (seen)
+    {
+        logits[static_cast<int64_t>(row) * vocabSize + token] -= penalty;
+    }
+}
+
+void applyTreePresencePenalty(rt::Tensor& logits, rt::Tensor const& rowTokenIds, rt::Tensor const* parentIds,
+    rt::Tensor const& seenFlags, int32_t rowsPerBatch, float penalty, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU && logits.getDataType() == nvinfer1::DataType::kFLOAT
+            && rowTokenIds.getDataType() == nvinfer1::DataType::kINT32
+            && seenFlags.getDataType() == nvinfer1::DataType::kINT8,
+        "Invalid tensors for the tree presence penalty");
+    auto const shape = logits.getShape();
+    check::check(shape.getNumDims() == 2 && rowsPerBatch > 0, "Invalid tensor dimensions");
+    int32_t const rows = static_cast<int32_t>(shape[0]);
+    int32_t const vocabSize = static_cast<int32_t>(shape[1]);
+    check::check(rowTokenIds.getShape().volume() >= rows && seenFlags.getShape()[1] == vocabSize
+            && (parentIds == nullptr || parentIds->getShape().volume() >= rows),
+        "Tree presence penalty shape mismatch");
+    if (rows == 0 || vocabSize == 0)
+    {
+        return;
+    }
+    constexpr int32_t kBLOCK_SIZE = 256;
+    dim3 const grid(static_cast<uint32_t>((vocabSize + kBLOCK_SIZE - 1) / kBLOCK_SIZE), static_cast<uint32_t>(rows));
+    applyTreePresencePenaltyKernel<<<grid, kBLOCK_SIZE, 0, stream>>>(logits.dataPointer<float>(),
+        rowTokenIds.dataPointer<int32_t>(), parentIds != nullptr ? parentIds->dataPointer<int32_t>() : nullptr,
+        seenFlags.dataPointer<int8_t>(), vocabSize, rowsPerBatch, penalty);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// After a round: the root token (the previous round's last token) and the accepted tokens except the last one (the
+// round's final token becomes the next root and is flagged then) are generated tokens.
+__global__ void markTreeSeenKernel(int8_t* seenFlags, int32_t const* rowTokenIds, int32_t const* acceptedTokenIds,
+    int32_t const* acceptLength, int32_t rowsPerBatch, int32_t maxAccept, int32_t vocabSize, int32_t batch)
+{
+    int32_t const b = static_cast<int32_t>(threadIdx.x);
+    if (b >= batch)
+    {
+        return;
+    }
+    int8_t* flags = seenFlags + static_cast<int64_t>(b) * vocabSize;
+    int32_t const root = rowTokenIds[static_cast<int64_t>(b) * rowsPerBatch];
+    if (root >= 0 && root < vocabSize)
+    {
+        flags[root] = 1;
+    }
+    int32_t const n = min(acceptLength[b], maxAccept);
+    for (int32_t i = 0; i + 1 < n; ++i)
+    {
+        int32_t const token = acceptedTokenIds[static_cast<int64_t>(b) * maxAccept + i];
+        if (token >= 0 && token < vocabSize)
+        {
+            flags[token] = 1;
+        }
+    }
+}
+
+void markTreeSeen(rt::Tensor& seenFlags, rt::Tensor const& rowTokenIds, rt::Tensor const& acceptedTokenIds,
+    rt::Tensor const& acceptLength, int32_t rowsPerBatch, int32_t maxAccept, int32_t batch, cudaStream_t stream)
+{
+    check::check(batch >= 1 && batch <= 1024, "Invalid batch for markTreeSeen");
+    markTreeSeenKernel<<<1, batch, 0, stream>>>(seenFlags.dataPointer<int8_t>(), rowTokenIds.dataPointer<int32_t>(),
+        acceptedTokenIds.dataPointer<int32_t>(), acceptLength.dataPointer<int32_t>(), rowsPerBatch, maxAccept,
+        static_cast<int32_t>(seenFlags.getShape()[1]), batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 __global__ void forceTokenRowKernel(float* logits, int32_t vocabSize, int32_t row, int32_t tokenId)
 {
     int32_t const column = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x)

@@ -1575,6 +1575,77 @@ TEST_F(SamplingTest, WindowPresencePenaltyCountsTheWindowTokensBeforeEachRow)
     EXPECT_EQ(penalised(2), (std::vector<int32_t>{1, 3, 4, 5}));
 }
 
+TEST_F(SamplingTest, TreePresencePenaltyCountsTheRootPathOfEachRow)
+{
+    // Tree: 0 (token 1) -> {1 (token 3), 2 (token 4)}, 1 -> 3 (token 6); row 4 is padding with parent -1.
+    int32_t const vocab = 8;
+    int32_t const rows = 5;
+    rt::Tensor logits({rows, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor tokens({1, rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor parents({1, rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor flags({1, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    copyHostToDevice<float>(logits, std::vector<float>(rows * vocab, 10.0f));
+    copyHostToDevice<int32_t>(tokens, {1, 3, 4, 6, 7});
+    copyHostToDevice<int32_t>(parents, {-1, 0, 0, 1, -1});
+    copyHostToDevice<int8_t>(flags, {0, 0, 0, 0, 0, 1, 0, 0}); // token 5 was generated earlier
+    applyTreePresencePenalty(logits, tokens, &parents, flags, rows, 2.0f, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto const out = copyDeviceToHost<float>(logits);
+    auto penalised = [&](int32_t row) {
+        std::vector<int32_t> hit;
+        for (int32_t t = 0; t < vocab; ++t)
+        {
+            if (out[row * vocab + t] == 8.0f)
+            {
+                hit.push_back(t);
+            }
+            else
+            {
+                EXPECT_EQ(out[row * vocab + t], 10.0f);
+            }
+        }
+        return hit;
+    };
+    EXPECT_EQ(penalised(0), (std::vector<int32_t>{1, 5}));
+    EXPECT_EQ(penalised(1), (std::vector<int32_t>{1, 3, 5}));
+    EXPECT_EQ(penalised(2), (std::vector<int32_t>{1, 4, 5}));      // sibling 3 is not on the path
+    EXPECT_EQ(penalised(3), (std::vector<int32_t>{1, 3, 5, 6}));
+    EXPECT_EQ(penalised(4), (std::vector<int32_t>{5, 7}));         // root-less padding row: itself and the flags
+}
+
+TEST_F(SamplingTest, TreePresencePenaltyWithoutParentsIsTheChainWindowPenalty)
+{
+    int32_t const vocab = 8;
+    rt::Tensor logitsA({3, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor logitsB({3, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor window({3}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor flags({1, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    copyHostToDevice<float>(logitsA, std::vector<float>(3 * vocab, 10.0f));
+    copyHostToDevice<float>(logitsB, std::vector<float>(3 * vocab, 10.0f));
+    copyHostToDevice<int32_t>(window, {1, 3, 4});
+    copyHostToDevice<int8_t>(flags, {0, 0, 0, 0, 0, 1, 0, 0});
+    applyWindowPresencePenalty(logitsA, window, flags, 2.0f, 0);
+    applyTreePresencePenalty(logitsB, window, nullptr, flags, 3, 2.0f, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(copyDeviceToHost<float>(logitsA), copyDeviceToHost<float>(logitsB));
+}
+
+TEST_F(SamplingTest, MarkTreeSeenFlagsTheRootAndTheAcceptedTokensExceptTheLast)
+{
+    int32_t const vocab = 8;
+    rt::Tensor flags({1, vocab}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor tokens({1, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor accepted({1, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor length({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int8_t>(flags, std::vector<int8_t>(vocab, 0));
+    copyHostToDevice<int32_t>(tokens, {2, 3, 4, 5});
+    copyHostToDevice<int32_t>(accepted, {3, 6, 7}); // two drafts accepted (3 and 6), then the final token 7
+    copyHostToDevice<int32_t>(length, {3});
+    markTreeSeen(flags, tokens, accepted, length, 4, 3, 1, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(copyDeviceToHost<int8_t>(flags), (std::vector<int8_t>{0, 0, 1, 1, 0, 0, 1, 0}));
+}
+
 TEST_F(SamplingTest, MarkWindowSeenFlagsOnlyTheCommittedAndAcceptedTokens)
 {
     int32_t const vocab = 8;

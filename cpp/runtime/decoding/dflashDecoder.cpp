@@ -765,10 +765,12 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
 
     if (isV2())
     {
+        applyV2RequestControls(context, verifySize);
         if (!runV2Acceptance(context, verifySize, maxAcceptLength))
         {
             return false;
         }
+        markV2PresenceSeen(context, verifySize, maxAcceptLength);
     }
     else
     {

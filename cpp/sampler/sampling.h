@@ -234,6 +234,17 @@ void applyWindowPresencePenalty(
 //! After a round: flags the first `acceptLength` window tokens (the committed token and the accepted drafts).
 void markWindowSeen(rt::Tensor& seenFlags, rt::Tensor const& windowIds, rt::Tensor const& acceptLength, cudaStream_t stream);
 
+//! Presence penalty for speculative verify rows laid out as a tree ([batch * rowsPerBatch] rows, parentIds
+//! [batch, rowsPerBatch] with -1 at the root) or as a chain (parentIds null). Row r counts the tokens on its root path
+//! (itself included) as generated, besides the flagged ones.
+void applyTreePresencePenalty(rt::Tensor& logits, rt::Tensor const& rowTokenIds, rt::Tensor const* parentIds,
+    rt::Tensor const& seenFlags, int32_t rowsPerBatch, float penalty, cudaStream_t stream);
+
+//! Flags the round's generated tokens: the root of each batch row's verify window and its accepted tokens except the
+//! last (the next round's root).
+void markTreeSeen(rt::Tensor& seenFlags, rt::Tensor const& rowTokenIds, rt::Tensor const& acceptedTokenIds,
+    rt::Tensor const& acceptLength, int32_t rowsPerBatch, int32_t maxAccept, int32_t batch, cudaStream_t stream);
+
 /*!
  * \brief Zero out grammar-forbidden tokens ahead of sampling.
  *

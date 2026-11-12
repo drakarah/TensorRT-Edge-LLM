@@ -230,7 +230,9 @@ class OpenAIServingChat:
         # request, which an agent harness cannot recover from. Run it without the budget (the model ends its thinking
         # itself, or max_tokens does) and say so, unless EDGELLM_DFLASH_ENFORCE_BUDGET=1 asks for the refusal.
         spec_method = getattr(getattr(self._client, "capabilities", None), "speculative_method", "")
-        if spec_method == "dflash" and os.environ.get("EDGELLM_DFLASH_ENFORCE_BUDGET", "0") != "1":
+        # DFlash2 (block drafter version 2) enforces both in its verify window; earlier DFlash versions do not.
+        dflash_v2 = getattr(getattr(self._client, "capabilities", None), "dflash_version", 0) >= 2
+        if spec_method == "dflash" and not dflash_v2 and os.environ.get("EDGELLM_DFLASH_ENFORCE_BUDGET", "0") != "1":
             if reasoning_budget >= 0:
                 logger.info("DFlash decoding does not enforce reasoning budgets: running without the %d-token budget.",
                             reasoning_budget)

@@ -2040,7 +2040,7 @@ def test_chat_accepts_a_reasoning_budget_with_speculative_decoding_on_one_slot(t
     assert llm.last_sampling_params.reasoning_budget_tokens == 100
 
 
-def _dflash_app(tmp_path, monkeypatch, enforce=None):
+def _dflash_app(tmp_path, monkeypatch, enforce=None, version=None):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
@@ -2053,7 +2053,8 @@ def _dflash_app(tmp_path, monkeypatch, enforce=None):
     llm.has_draft_model = True
     (Path(llm.bundle_dir) / "config.json").write_text(
         json.dumps({"builder_config": {"max_input_len": 32, "max_batch_size": 1, "max_kv_cache_capacity": 128},
-                    "kv_cache_dtype": "fp16", "spec_decode_type": "dflash"}), encoding="utf-8")
+                    "kv_cache_dtype": "fp16", "spec_decode_type": "dflash",
+                    **({"dflash_config": {"version": version}} if version is not None else {})}), encoding="utf-8")
     return llm, TestClient(_create_app(llm, ApiConfig()))
 
 
@@ -2067,6 +2068,17 @@ def test_dflash_runs_a_reasoning_budget_and_presence_penalty_request_without_the
     assert llm.last_sampling_params.reasoning_budget_tokens == -1
     assert llm.last_sampling_params.presence_penalty == 0.0
     assert llm.last_sampling_params.enable_thinking is True
+
+
+def test_dflash2_keeps_the_reasoning_budget_and_presence_penalty(tmp_path, monkeypatch):
+    llm, client = _dflash_app(tmp_path, monkeypatch, version=2)
+    body = {"messages": [{"role": "user", "content": "Hello"}], "enable_thinking": True,
+            "reasoning_budget_tokens": 100, "presence_penalty": 1.0}
+
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+    # The DFlash2 verify window applies both itself.
+    assert llm.last_sampling_params.reasoning_budget_tokens == 100
+    assert llm.last_sampling_params.presence_penalty == 1.0
 
 
 def test_dflash_enforce_budget_switch_keeps_the_budget(tmp_path, monkeypatch):

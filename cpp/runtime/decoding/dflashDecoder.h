@@ -60,7 +60,8 @@ public:
             /*.supportsLosslessSampling=*/isV2(),
             /*.maxSamplingSupport=*/isV2() ? dflash_utils::kDFlash2MaxSamplingSupport : 0,
             /*.fallbackToVanillaForNonGreedySampling=*/greedyOnlyTree,
-            /*.requiresDefaultDecoderCudaGraphs=*/greedyOnlyTree};
+            /*.requiresDefaultDecoderCudaGraphs=*/greedyOnlyTree,
+            /*.supportsPresencePenalty=*/isV2(), /*.supportsReasoningBudget=*/isV2()};
     }
 
     DecodingKvHeadroom requiredKvHeadroom() const override;
@@ -104,6 +105,11 @@ private:
     bool buildTreeVerifyInputs(DecodingInferenceContext& context);
     bool runBaseVerification(DecodingInferenceContext& context);
     bool runV2Acceptance(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
+    //! Request controls on the verify logits of a DFlash2 round (single request): the hard reasoning budget forces the
+    //! end of the thinking block in the rows at the matching depth, the presence penalty counts each row's root path.
+    void applyV2RequestControls(DecodingInferenceContext& context, int32_t verifySize);
+    //! Flags the generated tokens of the round for the presence penalty (after acceptance).
+    void markV2PresenceSeen(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
     //! Debug dumps for offline tree-acceptance studies (EDGELLM_DFLASH2_DUMP=<file>): proposal candidates per round and
     //! the accepted tokens. Off unless the variable is set; synchronises the stream when on.
     bool buildV2TreeVerifyInputs(DecodingInferenceContext& context);

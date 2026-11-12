@@ -52,6 +52,7 @@ class EngineCapabilities:
     speculative_method: str
     context_reuse: bool
     in_flight_batching: bool = False
+    dflash_version: int = 0  #: block drafter version when speculative_method is dflash
 
 
 class _AdmissionController:
@@ -281,6 +282,10 @@ def _capabilities_for(llm: Union[LLM, TTS]) -> EngineCapabilities:
     max_num_seqs = 1
     if in_flight and isinstance(builder_batch, int) and builder_batch > 0:
         max_num_seqs = builder_batch
+
+    dflash_cfg = config.get("dflash_config", {})
+    dflash_version = int(dflash_cfg.get("version", 0)) if (isinstance(dflash_cfg, dict)
+                                                          and speculative_method == "dflash") else 0
     return EngineCapabilities(
         chat=chat,
         transcription=chat and layout.has_transcription,
@@ -298,6 +303,7 @@ def _capabilities_for(llm: Union[LLM, TTS]) -> EngineCapabilities:
         speculative_decoding=llm.has_draft_model,
         speculative_method=speculative_method,
         context_reuse=bool(getattr(llm, "context_cache_enabled", False)),
+        dflash_version=dflash_version,
         in_flight_batching=in_flight,
     )
 

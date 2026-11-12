@@ -270,8 +270,18 @@ bool DFlashDecoder::prepareV2Proposal(DecodingInferenceContext& context)
     int32_t const verifySize = mBlockDraft.verifySize;
     if (mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kDDTree)
     {
-        ELLM_CHECK(!context.hasGuidedDecoding, "DFlash2 DDTree does not support guided decoding yet.");
-        return buildV2TreeVerifyInputs(context);
+        if (!buildV2TreeVerifyInputs(context))
+        {
+            return false;
+        }
+        if (context.hasGuidedDecoding)
+        {
+            // One grammar state per tree node (the node's root path): the base logits of every verify row are masked
+            // with it in runBaseVerification, so the lossless accept kernel only sees grammar-legal probabilities.
+            mRuntime.guidedDecoder.captureDraftTree(mTreeTokenIds, mRuntime.base.pipelineIO.specTreeParentIds,
+                std::ref(mValidCounts), activeBatchSize, verifySize, context.stream);
+        }
+        return checkCudaLastError("prepare DFlash2 guided DDTree inputs");
     }
     check::check(mVerifyTokenIds.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
     check::check(mDraftTokenIds.reshape({activeBatchSize, mBlockDraft.proposalLen}), "Tensor reshape failed");
@@ -389,6 +399,94 @@ bool DFlashDecoder::runV2Acceptance(DecodingInferenceContext& context, int32_t v
 
     dumpV2Accepted(context, maxAcceptLength);
     return true;
+}
+
+void DFlashDecoder::applyV2RequestControls(DecodingInferenceContext& context, int32_t verifySize)
+{
+    if (context.activeBatchSize != 1)
+    {
+        return;
+    }
+    bool const tree = mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kDDTree;
+    auto& logits = mRuntime.base.pipelineIO.outputLogits;
+    auto& budget = context.reasoningBudget;
+    if (budget.enabled())
+    {
+        // Row r of a chain predicts the (r+1)-th next token; in a tree a row at depth d does. Counting ends after
+        // `remaining` more tokens, so the rows at depth `remaining` emit the forced token (a forcing that is already
+        // running is continued one token per round, in the root row).
+        decoder_utils::syncReasoningBudget(context);
+        if (auto const forced = budget.forcedToken())
+        {
+            forceTokenInRow(logits, 0, *forced, context.stream);
+        }
+        else if (budget.state() == ReasoningBudget::State::kCounting && budget.remaining() < verifySize)
+        {
+            int32_t const depthToForce = budget.remaining();
+            std::vector<int32_t> ids(static_cast<size_t>(verifySize));
+            std::vector<int32_t> parents(static_cast<size_t>(verifySize));
+            CUDA_CHECK(cudaMemcpyAsync(ids.data(), mVerifyTokenIds.rawPointer(), ids.size() * sizeof(int32_t),
+                cudaMemcpyDeviceToHost, context.stream));
+            if (tree)
+            {
+                CUDA_CHECK(cudaMemcpyAsync(parents.data(), mRuntime.base.pipelineIO.specTreeParentIds.rawPointer(),
+                    parents.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
+            }
+            CUDA_CHECK(cudaStreamSynchronize(context.stream));
+            if (!tree)
+            {
+                for (int32_t i = 0; i < verifySize; ++i)
+                {
+                    parents[static_cast<size_t>(i)] = i - 1;
+                }
+            }
+            for (int32_t row = 0; row < verifySize; ++row)
+            {
+                // Depth of the row and whether the thinking already ends inside its root path.
+                int32_t depth = 0;
+                bool naturalEnd = false;
+                bool valid = row == 0 || parents[static_cast<size_t>(row)] >= 0;
+                for (int32_t node = row; valid && node > 0 && depth <= verifySize;)
+                {
+                    naturalEnd = naturalEnd || budget.isEndToken(ids[static_cast<size_t>(node)]);
+                    node = parents[static_cast<size_t>(node)];
+                    ++depth;
+                    valid = node >= 0;
+                }
+                if (!valid || depth != depthToForce || naturalEnd)
+                {
+                    continue;
+                }
+                // The character before the forced token has to be complete; otherwise the budget machine decides in
+                // a later round.
+                if (budget.tokenEndsUtf8(ids[static_cast<size_t>(row)]))
+                {
+                    forceTokenInRow(logits, row, budget.firstForced(), context.stream);
+                }
+            }
+        }
+    }
+    if (context.presencePenalty != 0.0f)
+    {
+        if (context.presenceFlagsPending)
+        {
+            CUDA_CHECK(cudaMemsetAsync(mRuntime.sampling.presenceSeen.rawPointer(), 0,
+                mRuntime.sampling.presenceSeen.getMemoryCapacity(), context.stream));
+            context.presenceFlagsPending = false;
+        }
+        applyTreePresencePenalty(logits, mVerifyTokenIds, tree ? &mRuntime.base.pipelineIO.specTreeParentIds : nullptr,
+            mRuntime.sampling.presenceSeen, verifySize, context.presencePenalty, context.stream);
+    }
+}
+
+void DFlashDecoder::markV2PresenceSeen(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength)
+{
+    if (context.activeBatchSize != 1 || context.presencePenalty == 0.0f)
+    {
+        return;
+    }
+    markTreeSeen(mRuntime.sampling.presenceSeen, mVerifyTokenIds, mAcceptedTokenIds, mAcceptLength, verifySize,
+        maxAcceptLength, context.activeBatchSize, context.stream);
 }
 
 bool DFlashDecoder::buildV2TreeVerifyInputs(DecodingInferenceContext& context)
