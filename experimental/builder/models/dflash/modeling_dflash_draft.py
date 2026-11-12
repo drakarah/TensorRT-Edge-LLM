@@ -176,6 +176,16 @@ class DFlashTargetProjection(Module):
     """Project concatenated target states before proposal decoding."""
 
     def forward(self, hidden):
+        if self.weights.has(self.prefix + ".qweight"):
+            # INT4 g128 projection (the 5120 x 25600 matrix is 262 MB in fp16, read every round): the INT4 plugin
+            # accumulates in fp32 inside the kernel and returns fp16, which is widened here.
+            descriptor = self.weights.linear_descriptor(
+                self.prefix, quantization.QUANT_INT4_GPTQ)
+            out16 = F.linear_from_weights(hidden,
+                                          descriptor,
+                                          hidden.ndim,
+                                          name=self.prefix)
+            return F.cast(out16, trt.float32)
         descriptor = self.weights.linear_descriptor(self.prefix,
                                                     quantization.QUANT_FP16)
         return F.linear_f32_from_weights(hidden, descriptor, self.prefix,
