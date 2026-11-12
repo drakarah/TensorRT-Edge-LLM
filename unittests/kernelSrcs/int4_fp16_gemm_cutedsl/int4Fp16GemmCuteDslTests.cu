@@ -473,6 +473,33 @@ TEST(Int4GemmSweep, DISABLED_Table)
     std::vector<std::pair<int32_t, int32_t>> shapes = {{10240, 5120}, {1024, 5120}, {12288, 5120}, {17408, 5120},
         {248320, 5120}, {4096, 5120}, {5120, 17408}, {5120, 4096}, {5120, 6144}, {6144, 5120}};
     std::vector<int32_t> ms = {8, 12, 16, 20, 24, 28, 32, 40, 48, 64};
+    // Profiling filters (ncu): EDGELLM_SWEEP_SHAPE="N,K", EDGELLM_SWEEP_M="16,32", EDGELLM_SWEEP_V="2,7" (variant indices).
+    std::vector<int32_t> onlyV;
+    auto parseList = [](char const* env) {
+        std::vector<int32_t> out;
+        if (env != nullptr)
+        {
+            std::string t(env);
+            size_t pos = 0;
+            while (pos < t.size())
+            {
+                size_t e = t.find(',', pos);
+                e = e == std::string::npos ? t.size() : e;
+                out.push_back(std::atoi(t.substr(pos, e - pos).c_str()));
+                pos = e + 1;
+            }
+        }
+        return out;
+    };
+    if (auto sh = parseList(std::getenv("EDGELLM_SWEEP_SHAPE")); sh.size() == 2)
+    {
+        shapes = {{sh[0], sh[1]}};
+    }
+    if (auto mm = parseList(std::getenv("EDGELLM_SWEEP_M")); !mm.empty())
+    {
+        ms = mm;
+    }
+    onlyV = parseList(std::getenv("EDGELLM_SWEEP_V"));
     std::mt19937 rng(1);
     for (auto const& [N, K] : shapes)
     {
@@ -513,6 +540,10 @@ TEST(Int4GemmSweep, DISABLED_Table)
             for (size_t vi = 0; vi < variants.size(); ++vi)
             {
                 auto const& v = variants[vi];
+                if (!onlyV.empty() && std::find(onlyV.begin(), onlyV.end(), static_cast<int32_t>(vi)) == onlyV.end())
+                {
+                    continue;
+                }
                 if (!(v.splitK == 1 || ceilDiv(K, 64) % v.splitK == 0))
                 {
                     continue;
