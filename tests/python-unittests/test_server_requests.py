@@ -2089,6 +2089,20 @@ def test_dflash_enforce_budget_switch_keeps_the_budget(tmp_path, monkeypatch):
     assert llm.last_sampling_params.reasoning_budget_tokens == 100
 
 
+def test_chat_sampling_without_any_filter_uses_a_full_mass_nucleus(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    llm = _FakeLLM(tmp_path)
+    client = TestClient(_create_app(llm, ApiConfig()))
+    body = {"messages": [{"role": "user", "content": "Hello"}], "temperature": 0.7, "top_k": 0, "top_p": 1.0}
+
+    assert client.post("/v1/chat/completions", json=body).status_code == 200
+    assert llm.last_sampling_params.top_p == 0.99999
+    assert llm.last_sampling_params.top_k == 0
+
+
 def test_chat_refuses_a_reasoning_budget_with_several_request_slots(tmp_path):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")

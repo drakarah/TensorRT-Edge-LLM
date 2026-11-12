@@ -318,10 +318,16 @@ class OpenAIServingChat:
         # being refused (the seed and sampling fields are then ignored).
         greedy = (request.temperature == 0
                   or os.environ.get("EDGELLM_FORCE_GREEDY") == "1")
+        top_p = 1.0 if greedy else request.top_p
+        top_k = 1 if greedy else request.top_k
+        if not greedy and top_k <= 0 and top_p >= 1.0:
+            # Plain sampling over the whole distribution: the sampler needs one of the two filters, and a nucleus of
+            # 99.999% of the mass is the same distribution up to the last 1e-5.
+            top_p = 0.99999
         sampling = SamplingParams(
             temperature=0.0 if greedy else request.temperature,
-            top_p=1.0 if greedy else request.top_p,
-            top_k=1 if greedy else request.top_k,
+            top_p=top_p,
+            top_k=top_k,
             presence_penalty=request.presence_penalty,
             reasoning_budget_tokens=reasoning_budget,
             reasoning_budget_message=request.reasoning_budget_message,

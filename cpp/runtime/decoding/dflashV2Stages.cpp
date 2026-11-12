@@ -308,9 +308,23 @@ bool DFlashDecoder::runV2Acceptance(DecodingInferenceContext& context, int32_t v
     int32_t const activeBatchSize = context.activeBatchSize;
     bool const targetNonGreedy
         = ::trt_edgellm::shouldUseNonGreedySampling(context.temperature, context.topK, context.topP);
-    int32_t const targetTopK = targetNonGreedy ? static_cast<int32_t>(context.topK) : 1;
+    int32_t targetTopK = targetNonGreedy ? static_cast<int32_t>(context.topK) : 1;
     int32_t const targetRows = activeBatchSize * verifySize;
-    bool const useDenseTarget = targetNonGreedy && targetTopK == 0;
+    bool useDenseTarget = targetNonGreedy && targetTopK <= 0;
+    if (useDenseTarget && mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kDDTree)
+    {
+        // The tree accepts through the target's top-k probabilities, so a request without top-k (top-p only) is bounded
+        // to the largest supported support: the nucleus of a language model's next-token distribution is far smaller
+        // than that, and only a very flat row loses tail mass beyond the 128 most likely tokens.
+        static bool const sWarned = [] {
+            LOG_WARNING("DFlash2 DDTree: a request without top_k samples from the %d most likely tokens.",
+                dflash_utils::kDFlash2MaxSamplingSupport);
+            return true;
+        }();
+        (void) sWarned;
+        targetTopK = dflash_utils::kDFlash2MaxSamplingSupport;
+        useDenseTarget = false;
+    }
     if (useDenseTarget)
     {
         int32_t const vocabSize = mRuntime.deployment.base.outputVocabSize;
