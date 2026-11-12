@@ -96,7 +96,7 @@ void DFlashDecoder::initializeDFlash2(
     bool const treeMode = mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kDDTree;
     ELLM_CHECK(mBlockDraft.blockSize >= 2 && mBlockDraft.blockSize <= 16
             && mBlockDraft.proposalLen == mBlockDraft.blockSize - 1
-            && (treeMode ? (mBlockDraft.verifySize > mBlockDraft.blockSize && mBlockDraft.verifySize <= 16
+            && (treeMode ? (mBlockDraft.verifySize > mBlockDraft.blockSize && mBlockDraft.verifySize <= kernel::kGDN_TREE_CHUNK_MAX_NODES
                                && mBlockDraft.candidateTopK >= 2)
                          : mBlockDraft.verifySize == mBlockDraft.blockSize),
         "DFlashDecoder requires block_size=verify_size (linear) or block_size < verify_size <= 16 with "

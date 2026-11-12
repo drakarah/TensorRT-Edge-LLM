@@ -316,9 +316,10 @@ class BuildArgs:
                 and self.dflash_version == DFlashVersion.V2
                 and (self.max_verify_tree_size != self.max_draft_tree_size
                      or self.max_draft_tree_size < 2
-                     or self.max_draft_tree_size > 16)):
+                     or self.max_draft_tree_size > 64)):
             raise ValueError(
-                "DFlash V2 verify and draft profile sizes must match in [2, 16]"
+                "DFlash V2 verify and draft profile sizes must match in [2, 64] "
+                "(above the checkpoint block size the engine verifies a DDTree)"
             )
         if self.fp8_embedding and self.int8_embedding:
             raise ValueError("--fp8-embedding and --int8-embedding are exclusive")

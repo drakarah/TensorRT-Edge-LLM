@@ -149,10 +149,12 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
             draft_size = _value_or_default(args.max_draft_tree_size,
                                            block_size)
             if (verify_size != draft_size or draft_size < block_size
-                    or draft_size > 16):
+                    or draft_size > 64):
                 raise ValueError(
                     "DFlash V2 verify and draft profile sizes must match, include "
-                    f"checkpoint block_size={block_size}, and not exceed 16")
+                    f"checkpoint block_size={block_size}, and not exceed 64 "
+                    "(above the block size the engine verifies a DDTree; the "
+                    "GDN tree verify kernel supports at most 64 nodes)")
             args = _copy_args(args,
                               max_verify_tree_size=verify_size,
                               max_draft_tree_size=draft_size)

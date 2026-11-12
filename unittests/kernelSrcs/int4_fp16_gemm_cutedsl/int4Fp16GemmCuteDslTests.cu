@@ -453,6 +453,109 @@ INSTANTIATE_TEST_SUITE_P(Int4Fp16GemmAllVariants, Int4Fp16GemmCuteDslTest, ::tes
             + std::to_string(c.N) + "_K" + std::to_string(c.K) + "_sw" + std::to_string(c.swizzle);
     });
 
+
+// Decode-size variant sweep: DISABLED by default; run with
+//   --gtest_also_run_disabled_tests --gtest_filter='Int4GemmSweep.*'
+// Prints, per model GEMM shape and decode M, the time of every valid variant (weights rotate through enough copies
+// that the L2 stays cold, as in a real decode round) and the index of the fastest one in the plugin's variant table.
+struct SweepVariant
+{
+    int32_t bM, stages, splitK;
+};
+
+TEST(Int4GemmSweep, DISABLED_Table)
+{
+    ASSERT_TRUE(loadModules());
+    std::vector<SweepVariant> variants;
+#define ADD_SWEEP(prefix, bM, bN, bK, st, sk) variants.push_back(SweepVariant{bM, st, sk});
+    INT4_FP16_GEMM_VARIANTS(ADD_SWEEP)
+#undef ADD_SWEEP
+    std::vector<std::pair<int32_t, int32_t>> shapes = {{10240, 5120}, {1024, 5120}, {12288, 5120}, {17408, 5120},
+        {248320, 5120}, {4096, 5120}, {5120, 17408}, {5120, 4096}, {5120, 6144}, {6144, 5120}};
+    std::vector<int32_t> ms = {8, 12, 16, 20, 24, 28, 32, 40, 48, 64};
+    std::mt19937 rng(1);
+    for (auto const& [N, K] : shapes)
+    {
+        int32_t const qwRows = ceilDiv(N, 128) * ceilDiv(K, 64) * 8;
+        size_t const qwBytes = static_cast<size_t>(qwRows) * 128 * 4;
+        int32_t const copies = static_cast<int32_t>(std::max<size_t>(3, (size_t{160} << 20) / qwBytes + 1));
+        std::vector<uint32_t> hW(static_cast<size_t>(qwRows) * 128);
+        for (auto& v : hW)
+        {
+            v = static_cast<uint32_t>(rng());
+        }
+        std::vector<DeviceBuffer<uint32_t>> dW(copies);
+        std::vector<DeviceBuffer<half>> dS(copies);
+        int32_t const scaleRows = ceilDiv(K, kGroupSize);
+        std::vector<half> hS(static_cast<size_t>(scaleRows) * N, __float2half(0.02F));
+        for (int32_t c = 0; c < copies; ++c)
+        {
+            ASSERT_CUDA_OK(dW[c].alloc(hW.size()));
+            ASSERT_CUDA_OK(dS[c].alloc(hS.size()));
+            ASSERT_CUDA_OK(cudaMemcpy(dW[c].ptr, hW.data(), hW.size() * 4, cudaMemcpyHostToDevice));
+            ASSERT_CUDA_OK(cudaMemcpy(dS[c].ptr, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice));
+        }
+        DeviceBuffer<half> dA, dC;
+        DeviceBuffer<int32_t> dLocks;
+        ASSERT_CUDA_OK(dA.alloc(static_cast<size_t>(64) * K));
+        ASSERT_CUDA_OK(dC.alloc(static_cast<size_t>(64) * N));
+        ASSERT_CUDA_OK(dLocks.alloc(static_cast<size_t>(1) << 20));
+        std::vector<half> hA(static_cast<size_t>(64) * K, __float2half(0.1F));
+        ASSERT_CUDA_OK(cudaMemcpy(dA.ptr, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        for (int32_t M : ms)
+        {
+            std::string line = "SWEEP N=" + std::to_string(N) + " K=" + std::to_string(K) + " M=" + std::to_string(M) + " :";
+            float best = 1e30F;
+            int32_t bestIdx = -1;
+            for (size_t vi = 0; vi < variants.size(); ++vi)
+            {
+                auto const& v = variants[vi];
+                if (!(v.splitK == 1 || ceilDiv(K, 64) % v.splitK == 0))
+                {
+                    continue;
+                }
+                int64_t const nTiles = static_cast<int64_t>(ceilDiv(M, v.bM)) * ceilDiv(N, 128);
+                auto run = [&](int32_t c) {
+                    if (v.splitK > 1)
+                    {
+                        cudaMemsetAsync(dLocks.ptr, 0, static_cast<size_t>(nTiles) * sizeof(int32_t), nullptr);
+                    }
+                    return launchVariant(v.bM, 128, 64, v.stages, v.splitK, dA.ptr, dW[c].ptr, dS[c].ptr, dC.ptr,
+                        dLocks.ptr, M, N, K, 1, nullptr);
+                };
+                if (run(0) != 0)
+                {
+                    continue;
+                }
+                cudaDeviceSynchronize();
+                int32_t const iters = 3 * copies;
+                cudaEventRecord(e0);
+                for (int32_t i = 0; i < iters; ++i)
+                {
+                    run(i % copies);
+                }
+                cudaEventRecord(e1);
+                cudaEventSynchronize(e1);
+                float ms1 = 0.F;
+                cudaEventElapsedTime(&ms1, e0, e1);
+                float const us = ms1 * 1000.F / iters;
+                line += " v" + std::to_string(vi) + "=" + std::to_string(static_cast<int>(us + 0.5F));
+                if (us < best)
+                {
+                    best = us;
+                    bestIdx = static_cast<int32_t>(vi);
+                }
+            }
+            line += " | BEST v" + std::to_string(bestIdx) + " " + std::to_string(static_cast<int>(best + 0.5F)) + "us";
+            std::printf("%s\n", line.c_str());
+            std::fflush(stdout);
+        }
+    }
+}
+
 } // namespace
 
 #endif // CUTE_DSL_INT4_FP16_GEMM_ENABLED
