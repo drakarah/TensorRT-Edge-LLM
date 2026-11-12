@@ -44,6 +44,7 @@ namespace
 constexpr char const* kINT4_GEMM_V2_PLUGIN_VERSION{"1"};
 constexpr char const* kINT4_GEMM_V2_PLUGIN_NAME{"Int4GroupwiseGemmPluginV2"};
 constexpr char const* kMAX_LOCK_WORKSPACE_BYTES_FIELD{"max_lock_workspace_bytes"};
+constexpr char const* kGATED_SILU_FIELD{"gated_silu"};
 // Worst-case lock sizing follows the current CuTe DSL kernel set: bM=16 is
 // the smallest M tile and bN=128 is fixed across variants.
 constexpr int32_t kWORST_CASE_LOCK_TILE_M{16};
@@ -126,6 +127,10 @@ Int4GroupwiseGemmPluginV2::Int4GroupwiseGemmPluginV2(std::string const& name, Pl
         {
             mMaxLockWorkspaceBytes = *static_cast<int64_t const*>(fc->fields[i].data);
         }
+        else if (fieldName == kGATED_SILU_FIELD && fc->fields[i].data != nullptr)
+        {
+            mGatedSilu = *static_cast<int32_t const*>(fc->fields[i].data) != 0 ? 1 : 0;
+        }
     }
 }
 
@@ -163,6 +168,7 @@ IPluginV3* Int4GroupwiseGemmPluginV2::clone() noexcept
         plugin->mTactic = mTactic;
         plugin->mAutotuneM = mAutotuneM;
         plugin->mMaxLockWorkspaceBytes = mMaxLockWorkspaceBytes;
+        plugin->mGatedSilu = mGatedSilu;
         return plugin;
     }
     catch (std::exception const& e)
@@ -217,7 +223,7 @@ int32_t Int4GroupwiseGemmPluginV2::getOutputShapes(DimsExprs const* inputs, [[ma
 {
     try
     {
-        assert(nbInputs == 3);
+        assert(nbInputs == (mGatedSilu != 0 ? 5 : 3));
         assert(nbOutputs == 1);
         if (inputs[0].nbDims != 2 && inputs[0].nbDims != 3)
         {
@@ -242,10 +248,29 @@ bool Int4GroupwiseGemmPluginV2::supportsFormatCombination(int32_t pos, DynamicPl
 {
     try
     {
-        assert(nbInputs == 3 && nbOutputs == 1);
+        assert(nbInputs == (mGatedSilu != 0 ? 5 : 3) && nbOutputs == 1);
         assert(pos < (nbInputs + nbOutputs));
         auto const& tensorDesc = inOut[pos].desc;
         bool status{true};
+
+        if (mGatedSilu != 0 && pos >= 3)
+        {
+            if (pos == 3)
+            {
+                // up: same contract as the gate (input 0).
+                bool const supportedRank = tensorDesc.dims.nbDims == 2 || tensorDesc.dims.nbDims == 3;
+                return tensorDesc.type == DataType::kHALF && tensorDesc.format == PluginFormat::kLINEAR && supportedRank
+                    && tensorDesc.dims.d[tensorDesc.dims.nbDims - 1] == mGemmK;
+            }
+            if (pos == 4)
+            {
+                return tensorDesc.type == DataType::kINT32 && tensorDesc.format == PluginFormat::kLINEAR
+                    && tensorDesc.dims.nbDims == 1 && tensorDesc.dims.d[0] == mGemmK;
+            }
+            bool const supportedRank = tensorDesc.dims.nbDims == 2 || tensorDesc.dims.nbDims == 3;
+            return tensorDesc.type == DataType::kHALF && tensorDesc.format == PluginFormat::kLINEAR && supportedRank
+                && tensorDesc.dims.d[tensorDesc.dims.nbDims - 1] == mGemmN;
+        }
 
         switch (pos)
         {
@@ -322,8 +347,14 @@ int32_t Int4GroupwiseGemmPluginV2::configurePlugin(DynamicPluginTensorDesc const
 }
 
 size_t Int4GroupwiseGemmPluginV2::getWorkspaceSize([[maybe_unused]] DynamicPluginTensorDesc const* inputs,
-    int32_t /* nbInputs */, DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
+    int32_t nbInputs, DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
+    // Gated input: the FP16 paths (decode-size launches, or W4A8 switched off) need the product SiLU(gate) * up as a tensor.
+    if (mGatedSilu != 0 && inputs != nullptr && nbInputs >= 1 && inputs[0].max.nbDims >= 2)
+    {
+        int64_t const maxRows = leadingVolume(inputs[0].max);
+        return maxRows > 0 ? static_cast<size_t>(maxRows) * static_cast<size_t>(mGemmK) * sizeof(half) : 0;
+    }
     return 0;
 }
 
@@ -386,6 +417,27 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             return -1;
         }
 
+        // Gated input (mGatedSilu): the activation is SiLU(inputs[0]) * inputs[3], gathered by inputs[4]. The W4A8 path below
+        // quantises it straight from the two operands; every other path reads the FP16 product from the workspace.
+        void const* activation = inputs[0];
+        bool gatedPending = mGatedSilu != 0;
+        auto const materializeGated = [&]() -> bool {
+            if (!gatedPending)
+            {
+                return true;
+            }
+            if (workspace == nullptr)
+            {
+                LOG_ERROR("Int4GroupwiseGemmPluginV2: gated input needs a workspace");
+                return false;
+            }
+            kernel::launchSiluMulGather(static_cast<half const*>(inputs[0]), static_cast<half const*>(inputs[3]),
+                static_cast<int32_t const*>(inputs[4]), static_cast<half*>(workspace), M, mGemmK, stream);
+            activation = workspace;
+            gatedPending = false;
+            return true;
+        };
+
         // Decode regime: route small M to the CUDA-core GEMV. At small M the GEMM's
         // tensor-core MMA underfills its M rows, so the GEMV is the better compute
         // path. It reads the SAME fragment weight buffer (input[1]), so there is no
@@ -401,7 +453,11 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         }();
         if (M >= 1 && M <= kGemvDispatchMaxM && cuteDslInt4GemvSupported(M) && cuteDslInt4GemvLoadModules())
         {
-            return cuteDslInt4GemvLaunch(M, inputs[0], inputs[1], inputs[2], outputs[0], mGemmN, mGemmK, stream);
+            if (!materializeGated())
+            {
+                return -1;
+            }
+            return cuteDslInt4GemvLaunch(M, activation, inputs[1], inputs[2], outputs[0], mGemmN, mGemmK, stream);
         }
 #endif
 
@@ -463,11 +519,19 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             }
             auto* aInt8 = static_cast<int8_t*>(scratch);
             auto* aScale = reinterpret_cast<float*>(aInt8 + static_cast<size_t>(M) * mGemmK);
-            kernel::launchQuantizeRowsInt8Permuted(
-                static_cast<half const*>(inputs[0]), aInt8, aScale, M, mGemmK, stream);
+            if (gatedPending)
+            {
+                kernel::launchQuantizeRowsInt8PermutedSiluMul(static_cast<half const*>(inputs[0]),
+                    static_cast<half const*>(inputs[3]), static_cast<int32_t const*>(inputs[4]), aInt8, aScale, M, mGemmK,
+                    stream);
+            }
+            else
+            {
+                kernel::launchQuantizeRowsInt8Permuted(static_cast<half const*>(activation), aInt8, aScale, M, mGemmK, stream);
+            }
             return cuteDslInt4W4A8Launch(64, aInt8, aScale, inputs[1], inputs[2], outputs[0], M, mGemmN, mGemmK, stream);
         }
-        if (!cuteDslInt4GemmLoadModules())
+        if (!cuteDslInt4GemmLoadModules() || !materializeGated())
         {
             return -1;
         }
@@ -559,7 +623,7 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         }
         // input[1] is the fragment-layout weight buffer (INT8 bytes of the uint32
         // words); pass it straight through as mQW -- no repack, no cache.
-        return cuteDslInt4GemmLaunch(v, inputs[0], inputs[1], inputs[2], outputs[0],
+        return cuteDslInt4GemmLaunch(v, activation, inputs[1], inputs[2], outputs[0],
             (v.splitK > 1) ? mLockWorkspace : nullptr, M, mGemmN, mGemmK, /*swizzle=*/1, stream);
 #else
         return -1;
@@ -693,6 +757,7 @@ PluginFieldCollection const* Int4GroupwiseGemmPluginV2::getFieldsToSerialize() n
     mDataToSerialize.emplace_back("gemm_k", &mGemmK, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("group_size", &mGroupSize, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(kMAX_LOCK_WORKSPACE_BYTES_FIELD, &mMaxLockWorkspaceBytes, PluginFieldType::kINT64, 1);
+    mDataToSerialize.emplace_back(kGATED_SILU_FIELD, &mGatedSilu, PluginFieldType::kINT32, 1);
 
     mFCToSerialize.nbFields = mDataToSerialize.size();
     mFCToSerialize.fields = mDataToSerialize.data();
@@ -708,6 +773,7 @@ Int4GroupwiseGemmPluginV2Creator::Int4GroupwiseGemmPluginV2Creator()
     mPluginAttributes.emplace_back(PluginField("gemm_n", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("gemm_k", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("group_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField(kGATED_SILU_FIELD, nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();

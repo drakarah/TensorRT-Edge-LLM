@@ -195,6 +195,8 @@ private:
     int32_t mGroupSize{};
 
     //! Selected tactic: >0 = cuteDSL variant id (table index + 1); 0 = default.
+    //! 1: the activation is SiLU(input 0) * input 3 gathered by input 4 (int32 [K]); the plugin has five inputs instead of three.
+    int32_t mGatedSilu{0};
     int32_t mTactic{0};
 
     //! Profile opt token count (M = batch*seq), captured in configurePlugin. Used

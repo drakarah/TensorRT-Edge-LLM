@@ -68,6 +68,20 @@ class Linear(Module):
         self.tp_output_segments = tuple(
             int(size) for size in tp_output_segments)
 
+    def plain_descriptor(self):
+        """Weights of this linear when it lowers to one plain projection (no tensor parallelism, adapter or LoRA), else None.
+
+        Lets a caller fuse the projection with its input expression (GatedMLP's fused SiLU product).
+        """
+        if self.has_adapter() or self._uses_lora() or self.cfg.tp_size > 1:
+            return None
+        if not self.tensor_parallel:
+            return self.weight_descriptor()
+        full_descriptor = self._full_descriptor(self.quant_type(), False)
+        return self.weights.shard_linear(full_descriptor, self._tp_mode(),
+                                         self.cfg.tp_size, self.cfg.tp_rank,
+                                         self.tp_output_segments)
+
     def forward(self, hidden_states, rank: Optional[int] = None):
         rank = (self.rank if self.rank is not None else
                 hidden_states.ndim) if rank is None else rank

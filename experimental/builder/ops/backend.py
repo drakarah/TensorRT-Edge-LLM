@@ -1061,6 +1061,22 @@ class Net:
             }, [x, residual, gamma])
         return layer.get_output(0), layer.get_output(1)
 
+    def gated_silu_linear(self,
+                          gate: "trt.ITensor",
+                          up: "trt.ITensor",
+                          linear_weights,
+                          rank: int = 3,
+                          name: str = "") -> "trt.ITensor":
+        """``linear(SiLU(gate) * up)`` with the product fused into an INT4 GEMM plugin; other quantisations decompose."""
+        if (linear_weights.quant_type == quantization.QUANT_INT4_GPTQ
+                and linear_weights.pre_quant_scale is None
+                and self.int4_gemm_plugin_version == 2):
+            return self.int4_linear(gate, linear_weights, rank, name,
+                                    gated_up=up)
+        product = self.elementwise(self.silu(gate), up,
+                                   trt.ElementWiseOperation.PROD)
+        return self.linear_from_weights(product, linear_weights, rank, name)
+
     def layernorm(self, x: "trt.ITensor", weight, bias, eps: float,
                   rank: int) -> "trt.ITensor":
         """Apply LayerNorm over the last tensor axis."""
@@ -1354,10 +1370,24 @@ class Net:
                     x: "trt.ITensor",
                     linear_weights,
                     rank: int = 3,
-                    name: str = "") -> "trt.ITensor":
-        """Lower groupwise INT4 GEMM."""
+                    name: str = "",
+                    gated_up: Optional["trt.ITensor"] = None) -> "trt.ITensor":
+        """Lower groupwise INT4 GEMM.
+
+        With ``gated_up`` the linear's input is ``SiLU(x) * gated_up`` and the
+        plugin computes that product itself (plugin V2, ``gated_silu``): in
+        prefill the product is quantised to INT8 straight from the two
+        operands, and the activation permutation is applied by the plugin
+        instead of a TensorRT gather.
+        """
         if not name:
             raise ValueError("INT4 linear requires a stable module name")
+        if gated_up is not None and (
+                linear_weights.pre_quant_scale is not None
+                or self.int4_gemm_plugin_version != 2):
+            raise ValueError(
+                "gated INT4 linear needs plugin V2 and no pre-quant scale")
+        gated_permutation = None
         if linear_weights.pre_quant_scale is not None:
             shape = [1] * (rank - 1) + [linear_weights.in_features]
             pre_quant = linear_weights.pre_quant_scale
@@ -1386,14 +1416,26 @@ class Net:
                 "int4_ffn",
                 recipe=linear_weights.activation_permutation_recipe,
             )
-            x = self.gather_tensor(x, permutation_tensor, rank - 1)
+            if gated_up is not None:
+                gated_permutation = permutation_tensor
+            else:
+                x = self.gather_tensor(x, permutation_tensor, rank - 1)
             if weight_recipe is not None:
                 weight_recipe = dict(weight_recipe)
                 extra = dict(weight_recipe.get("extra") or {})
                 extra["activation_permutation_engine_name"] = permutation_name
                 weight_recipe["extra"] = extra
         elif permutation is not None:
-            x = self.gather(x, permutation, rank - 1)
+            if gated_up is not None:
+                gated_permutation = self.const(
+                    np.ascontiguousarray(permutation, dtype=np.int32),
+                    "gated_permutation")
+            else:
+                x = self.gather(x, permutation, rank - 1)
+        elif gated_up is not None:
+            gated_permutation = self.const(
+                np.arange(linear_weights.in_features, dtype=np.int32),
+                "gated_permutation")
         weight_value = linear_weights.weight
         if not isinstance(weight_value, ParameterSpec):
             weight_value = weight_value.astype(np.int8, copy=False)
@@ -1413,12 +1455,20 @@ class Net:
         elif rank != 3:
             raise ValueError(
                 f"INT4 linear supports rank 2 or 3, received rank {rank}")
-        output = self.operation(
-            operation_name, {
-                "gemm_n": linear_weights.out_features,
-                "gemm_k": linear_weights.in_features,
-                "group_size": linear_weights.group_size,
-            }, [plugin_input, weight, scales]).get_output(0)
+        attributes = {
+            "gemm_n": linear_weights.out_features,
+            "gemm_k": linear_weights.in_features,
+            "group_size": linear_weights.group_size,
+        }
+        plugin_inputs = [plugin_input, weight, scales]
+        if gated_up is not None:
+            up_input = self._unwrap(gated_up)
+            if rank == 2:
+                up_input = self.unsqueeze(up_input, 0, rank)
+            attributes["gated_silu"] = 1
+            plugin_inputs += [up_input, gated_permutation]
+        output = self.operation(operation_name, attributes,
+                                plugin_inputs).get_output(0)
         if rank == 2:
             output = self.squeeze(output, 0, 3)
         return self._add_bias(output,

@@ -33,5 +33,19 @@ namespace kernel
 void launchQuantizeRowsInt8Permuted(
     half const* activations, int8_t* out, float* rowScale, int32_t M, int32_t K, cudaStream_t stream);
 
+//! Largest K of the row kernels in this file (one FP16 row is staged in static shared memory).
+constexpr int32_t kInt4W4A8MaxK{20480};
+
+//! launchQuantizeRowsInt8Permuted over the activation SiLU(gate) * up computed on the fly (the SwiGLU product that feeds a down
+//! projection), so the FP16 product never goes through memory. perm (int32 [K], may be null) is a column gather applied to the
+//! product first: activation[m, j] = product[m, perm[j]]. Rounding points follow TensorRT's decomposed form (sigmoid, gate * sigmoid
+//! and the product each rounded to FP16). K must be a multiple of 128 and at most kInt4W4A8MaxK.
+void launchQuantizeRowsInt8PermutedSiluMul(half const* gate, half const* up, int32_t const* perm, int8_t* out,
+    float* rowScale, int32_t M, int32_t K, cudaStream_t stream);
+
+//! out[m, j] = (SiLU(gate) * up)[m, perm[j]] in FP16 (perm may be null); K a multiple of 8.
+void launchSiluMulGather(
+    half const* gate, half const* up, int32_t const* perm, half* out, int32_t M, int32_t K, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

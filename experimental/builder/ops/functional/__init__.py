@@ -31,7 +31,7 @@ from .core import (
     gather_nd, gather_token_rows, kv_cache_update, layer_norm, linear,
     linear_f32, linear_f32_from_weights, linear_from_weights,
     nvfp4_a16_linear_from_weights, linear_with_weights, matmul, normalization,
-    pad_last_dim, pixel_unshuffle, reduce, reshape, rms_norm, add_rms_norm, rotary_embedding,
+    pad_last_dim, pixel_unshuffle, reduce, reshape, rms_norm, add_rms_norm, gated_silu_linear, rotary_embedding,
     scaled_dot_product_attention, select, shape_of, slice_last_dim, tensor,
     topk, unwrap)
 # isort: on
@@ -93,6 +93,7 @@ __all__ = [
     "reshape",
     "rms_norm",
     "add_rms_norm",
+    "gated_silu_linear",
     "rotary_embedding",
     "scaled_dot_product_attention",
     "select",

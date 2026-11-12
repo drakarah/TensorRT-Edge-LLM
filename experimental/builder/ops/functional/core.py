@@ -184,6 +184,16 @@ def rms_norm(input: Tensor,
                                         weight_before_cast=weight_before_cast))
 
 
+def gated_silu_linear(gate: Tensor,
+                      up: Tensor,
+                      weights,
+                      rank: int,
+                      name: str = "") -> Tensor:
+    """``linear(SiLU(gate) * up)``; INT4 GPTQ weights fuse the product into the GEMM plugin."""
+    return tensor(current_net().gated_silu_linear(gate, up, weights, rank,
+                                                  name))
+
+
 def add_rms_norm(input: Tensor,
                  residual: Tensor,
                  weight,
