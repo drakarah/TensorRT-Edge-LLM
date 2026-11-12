@@ -104,6 +104,10 @@ private:
     bool buildTreeVerifyInputs(DecodingInferenceContext& context);
     bool runBaseVerification(DecodingInferenceContext& context);
     bool runV2Acceptance(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
+    //! Debug dumps for offline tree-acceptance studies (EDGELLM_DFLASH2_DUMP=<file>): proposal candidates per round and
+    //! the accepted tokens. Off unless the variable is set; synchronises the stream when on.
+    void dumpV2Proposal(DecodingInferenceContext& context);
+    void dumpV2Accepted(DecodingInferenceContext& context, int32_t maxAcceptLength);
     bool executeBaseVerification(DecodingInferenceContext& context, int32_t verifySize);
     void reshapeBaseVerificationForCapture(int32_t batchSize, int32_t verifySize, bool includeTreeMetadata);
     void prepareLinearBaseVerificationMetadata(int32_t batchSize, int32_t verifySize, cudaStream_t stream);

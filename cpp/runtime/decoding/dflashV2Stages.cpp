@@ -45,6 +45,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -337,7 +339,80 @@ bool DFlashDecoder::runV2Acceptance(DecodingInferenceContext& context, int32_t v
             mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.stateIndices, context.stream);
     }
 
+    dumpV2Accepted(context, maxAcceptLength);
     return true;
+}
+
+namespace
+{
+FILE* v2DumpFile()
+{
+    static FILE* file = []() -> FILE* {
+        char const* path = std::getenv("EDGELLM_DFLASH2_DUMP");
+        return (path != nullptr && path[0] != '\0') ? std::fopen(path, "a") : nullptr;
+    }();
+    return file;
+}
+
+template <typename T>
+std::vector<T> copyToHost(Tensor const& tensor, size_t count, cudaStream_t stream)
+{
+    std::vector<T> host(count);
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.rawPointer(), count * sizeof(T), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return host;
+}
+} // namespace
+
+void DFlashDecoder::dumpV2Proposal(DecodingInferenceContext& context)
+{
+    FILE* file = v2DumpFile();
+    if (file == nullptr || context.activeBatchSize != 1)
+    {
+        return;
+    }
+    size_t const len = static_cast<size_t>(mBlockDraft.proposalLen);
+    size_t const topK = static_cast<size_t>(mRuntime.deployment.draft->specSelectorTopK);
+    auto const anchor = copyToHost<int32_t>(mLastAcceptedTokens, 1, context.stream);
+    auto const chain = copyToHost<int32_t>(mDraftTokenIds, len, context.stream);
+    auto const ids = copyToHost<int32_t>(mProposalSupportIds, len * topK, context.stream);
+    auto const unary = copyToHost<float>(mProposalUnaryValues, len * topK, context.stream);
+    std::fprintf(file, "{\"t\":\"P\",\"anchor\":%d,\"chain\":[", anchor[0]);
+    for (size_t i = 0; i < len; ++i)
+    {
+        std::fprintf(file, "%s%d", i ? "," : "", chain[i]);
+    }
+    std::fprintf(file, "],\"ids\":[");
+    for (size_t i = 0; i < len * topK; ++i)
+    {
+        std::fprintf(file, "%s%d", i ? "," : "", ids[i]);
+    }
+    std::fprintf(file, "],\"unary\":[");
+    for (size_t i = 0; i < len * topK; ++i)
+    {
+        std::fprintf(file, "%s%.4f", i ? "," : "", unary[i]);
+    }
+    std::fprintf(file, "]}\n");
+    std::fflush(file);
+}
+
+void DFlashDecoder::dumpV2Accepted(DecodingInferenceContext& context, int32_t maxAcceptLength)
+{
+    FILE* file = v2DumpFile();
+    if (file == nullptr || context.activeBatchSize != 1)
+    {
+        return;
+    }
+    auto const length = copyToHost<int32_t>(mAcceptLength, 1, context.stream);
+    int32_t const n = std::min(length[0], maxAcceptLength);
+    auto const tokens = copyToHost<int32_t>(mAcceptedTokenIds, static_cast<size_t>(std::max(n, 0)), context.stream);
+    std::fprintf(file, "{\"t\":\"A\",\"n\":%d,\"tokens\":[", n);
+    for (int32_t i = 0; i < n; ++i)
+    {
+        std::fprintf(file, "%s%d", i ? "," : "", tokens[static_cast<size_t>(i)]);
+    }
+    std::fprintf(file, "]}\n");
+    std::fflush(file);
 }
 
 } // namespace rt

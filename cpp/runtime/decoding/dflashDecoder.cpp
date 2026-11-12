@@ -516,6 +516,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
         kernel::launchDFlash2CandidateSelector(mProposalSupportIds, mProposalUnaryValues, mProposalProjectedHidden,
             mLastAcceptedTokens, mSelectorPredecessorCodebook, mSelectorSuccessorCodebook, mProposalUniforms,
             mSamplingTemperatures, mProposalGreedyMask, mDraftTokenIds, mProposalSupportProbs, context.stream);
+        dumpV2Proposal(context);
     }
 
     // Step 6: Commit per-batch delta lengths to the draft cache manager.
