@@ -29,6 +29,10 @@
 #include <cstdlib>
 #include <mma.h>
 
+#ifndef EDGELLM_GDN_REPLAY_MIN_BLOCKS
+#define EDGELLM_GDN_REPLAY_MIN_BLOCKS 2
+#endif
+
 namespace trt_edgellm
 {
 namespace kernel
@@ -1118,7 +1122,7 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedKernel(Mt
 // in the shared-memory kernel, and there is no shared-memory traffic for the state. Per column the arithmetic (scale,
 // ordered partial sums, shuffle order, rank-1 update) is the same sequence as treeReplayCommitBatchedKernel, so the
 // result is bit-identical.
-__global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedRegKernel(MtpLayerInfo const* __restrict__ infos,
+__global__ void __launch_bounds__(kNUM_THREADS, EDGELLM_GDN_REPLAY_MIN_BLOCKS) treeReplayCommitBatchedRegKernel(MtpLayerInfo const* __restrict__ infos,
     size_t stashBatchStrideBytes, int32_t const* __restrict__ acceptedIndices,
     int32_t const* __restrict__ acceptLengths, int32_t const* __restrict__ stateIndices, int32_t residentPoolRows,
     int32_t maxAcceptLen, int32_t numNodes, int32_t H, int32_t HV)
