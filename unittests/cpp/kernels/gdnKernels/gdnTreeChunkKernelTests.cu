@@ -903,6 +903,51 @@ TEST(GdnTreeChunkReplayTest, RegisterKernelIsBitIdenticalToSharedMemoryKernel)
 
 //! Timing at the engine's geometry (48 layers, 16 key heads, 48 value heads, batch 1). Disabled by default:
 //! ./unitTestKernelsMisc --gtest_also_run_disabled_tests --gtest_filter='*ReplayCommitTiming*'
+// Verify (prep + apply) at the served Qwen3.8 shape, one layer per call: run with --gtest_also_run_disabled_tests, or
+// under ncu with -k regex:treeVerifyChunkPrep.
+TEST(GdnTreeChunkVerifyTimingTest, DISABLED_VerifyTiming)
+{
+    for (int32_t nodes : {8, 16})
+    {
+        ChunkProblem p{};
+        p.batch = 1;
+        p.numNodes = nodes;
+        p.h = 16;
+        p.hv = 48;
+        p.addInvalidNode = false;
+        p.generate(/*seed=*/77);
+        float const scale = 1.f / std::sqrt(static_cast<float>(kDk));
+        DeviceRun dev;
+        dev.run(p, scale, true);
+        for (int32_t warm = 0; warm < 5; ++warm)
+        {
+            ASSERT_EQ(gdnTreeVerifyChunk(dev.dH0, dev.dQ, dev.dK, dev.dV, dev.dA, dev.dB, dev.dALog, dev.dDtBias,
+                          dev.dMasks, dev.dO, dev.dStash, dev.rowBytes, dev.batch, nodes, dev.h, dev.hv, scale, true,
+                          nullptr),
+                cudaSuccess);
+        }
+        cudaEvent_t t0, t1;
+        cudaEventCreate(&t0);
+        cudaEventCreate(&t1);
+        constexpr int32_t kIters = 200;
+        cudaEventRecord(t0);
+        for (int32_t i = 0; i < kIters; ++i)
+        {
+            ASSERT_EQ(gdnTreeVerifyChunk(dev.dH0, dev.dQ, dev.dK, dev.dV, dev.dA, dev.dB, dev.dALog, dev.dDtBias,
+                          dev.dMasks, dev.dO, dev.dStash, dev.rowBytes, dev.batch, nodes, dev.h, dev.hv, scale, true,
+                          nullptr),
+                cudaSuccess);
+        }
+        cudaEventRecord(t1);
+        cudaEventSynchronize(t1);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, t0, t1);
+        std::printf("verify nodes=%d hv=48 h=16: %.1f us per layer call (prep + apply)\n", nodes, ms * 1000.f / kIters);
+        cudaEventDestroy(t0);
+        cudaEventDestroy(t1);
+    }
+}
+
 TEST(GdnTreeChunkReplayTest, DISABLED_ReplayCommitTiming)
 {
     for (int32_t accepted : {1, 3, 5, 8})

@@ -273,12 +273,27 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeVerifyChunkPrepKernel(__half
         h0Valid = residentRow >= 0 && residentRow < statePoolRows;
         h0Row = residentRow;
     }
-    for (int32_t idx = tid; idx < kTILE_K * kTILE_K; idx += kNUM_THREADS)
+    // float4 loads, all issued before the first use (16 per thread), then converted and stored as 4 halves: the
+    // scalar loop this replaces serialised on each load (about a quarter of the kernel's stall samples).
     {
-        int32_t const row = idx / kTILE_K;
-        int32_t const col = idx % kTILE_K;
-        sH0h[prepWmmaSwizzleK(row) * kPREP_WMMA_SMEM_STRIDE + col]
-            = h0Valid ? __float2half(h0[(h0Row * HV + iHv) * kTILE_K * kTILE_K + idx]) : __float2half(0.F);
+        constexpr int32_t kVec4PerThread = kTILE_K * kTILE_K / 4 / kNUM_THREADS; // 16
+        float4 const* hSrc = reinterpret_cast<float4 const*>(h0 + (h0Row * HV + iHv) * kTILE_K * kTILE_K);
+        float4 buf[kVec4PerThread];
+#pragma unroll
+        for (int32_t i = 0; i < kVec4PerThread; ++i)
+        {
+            buf[i] = h0Valid ? hSrc[tid + i * kNUM_THREADS] : make_float4(0.F, 0.F, 0.F, 0.F);
+        }
+#pragma unroll
+        for (int32_t i = 0; i < kVec4PerThread; ++i)
+        {
+            int32_t const idx4 = tid + i * kNUM_THREADS; // float4 index in the 128x128 tile
+            int32_t const row = idx4 / (kTILE_K / 4);
+            int32_t const col = (idx4 % (kTILE_K / 4)) * 4;
+            __half2* dst = reinterpret_cast<__half2*>(&sH0h[prepWmmaSwizzleK(row) * kPREP_WMMA_SMEM_STRIDE + col]);
+            dst[0] = __floats2half2_rn(buf[i].x, buf[i].y);
+            dst[1] = __floats2half2_rn(buf[i].z, buf[i].w);
+        }
     }
     __syncthreads();
 
