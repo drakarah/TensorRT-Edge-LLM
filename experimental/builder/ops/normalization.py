@@ -37,12 +37,24 @@ class RMSNorm(Module):
         self.rank = rank
         self.unit_offset = unit_offset
 
-    def forward(self, hidden_states, rank: Optional[int] = None):
+    def _weight(self):
         weight = (self.weights.fp16_parameter(self.key("weight"))
                   if self.ctx.backend == "edgellm" and not self.unit_offset
                   else self.weights.f16(self.key("weight")))
         if self.unit_offset:
             weight = weight + np.float16(1.0)
+        return weight
+
+    def add_forward(self, hidden_states, residual):
+        """Return ``(hidden_states + residual, norm(hidden_states + residual))`` from one fused plugin kernel."""
+        return F.add_rms_norm(hidden_states,
+                              residual,
+                              self._weight(),
+                              self.eps,
+                              weight_before_cast=self.unit_offset)
+
+    def forward(self, hidden_states, rank: Optional[int] = None):
+        weight = self._weight()
         return F.rms_norm(
             hidden_states,
             weight,

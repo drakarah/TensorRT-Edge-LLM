@@ -192,6 +192,7 @@ edgellm_add_unit_test(
   cpp/kernels/preprocessKernels
   cpp/kernels/talkerMLPKernels
   cpp/kernels/gdnKernels
+  cpp/kernels/addRmsNorm
   cpp/kernels/int4GroupwiseGemmKernels
   cpp/kernels/kvCacheUtilKernels
   cpp/kernels/multiDeviceKernels

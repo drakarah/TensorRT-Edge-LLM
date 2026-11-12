@@ -14,6 +14,7 @@
 # limitations under the License.
 """Qwen3.5 checkpoint-direct graph."""
 
+import os
 import logging
 from typing import Dict
 
@@ -48,6 +49,11 @@ class Qwen3_5DecoderLayer(Module):
                                  ctx.cfg.rms_norm_eps,
                                  unit_offset=True)
         self.mlp = GatedMLP(ctx, self.key("mlp"))
+        self.fused_add_norm = os.environ.get(
+            "EDGELLM_BUILDER_FUSED_ADD_RMSNORM", "0") == "1"
+        self.pre_normalized = None  # set by the model loop from the previous layer
+        self.next_input_norm = None  # the next layer's input norm, set by the model
+        self.next_normalized = None
         if layer_type == config.LAYER_GDN:
             self.mixer = GatedDeltaNet(ctx, self.key("linear_attn"))
         elif layer_type == config.LAYER_ATTN:
@@ -68,7 +74,13 @@ class Qwen3_5DecoderLayer(Module):
                 tree_depths=None,
                 valid_tree_counts=None,
                 collect_intermediate=False):
-        normalized = self.input_norm(hidden_states)
+        # Fused residual add + RMSNorm (EDGELLM_BUILDER_FUSED_ADD_RMSNORM=1): the previous layer hands over this layer's
+        # normalized input (it fused its last residual add with our input norm), and each add below is fused with the norm
+        # that follows it.
+        normalized = self.pre_normalized
+        self.pre_normalized = None
+        if normalized is None:
+            normalized = self.input_norm(hidden_states)
         if self.layer_type == config.LAYER_GDN:
             states = self.mixer(normalized, conv_state, recurrent_state,
                                 ragged, tree_parent_ids, tree_depths,
@@ -80,9 +92,19 @@ class Qwen3_5DecoderLayer(Module):
                                         ragged, attention_mask,
                                         attention_pos_id, tree_parent_ids,
                                         tree_depths, valid_tree_counts)
-        hidden_states = hidden_states + mixed
-        feed_forward = self.mlp(self.post_norm(hidden_states))
-        hidden_states = hidden_states + feed_forward
+        if self.fused_add_norm:
+            hidden_states, post_normalized = self.post_norm.add_forward(
+                hidden_states, mixed)
+        else:
+            hidden_states = hidden_states + mixed
+            post_normalized = self.post_norm(hidden_states)
+        feed_forward = self.mlp(post_normalized)
+        self.next_normalized = None
+        if self.fused_add_norm and self.next_input_norm is not None:
+            hidden_states, self.next_normalized = (
+                self.next_input_norm.add_forward(hidden_states, feed_forward))
+        else:
+            hidden_states = hidden_states + feed_forward
         return hidden_states, present
 
 
@@ -97,6 +119,8 @@ class Qwen3_5ForCausalLM(NetworkModule):
                                 index)
             for index, layer_type in enumerate(ctx.cfg.layer_types)
         ]
+        for layer, following in zip(self.layers, self.layers[1:]):
+            layer.next_input_norm = following.input_norm
         self.norm = RMSNorm(ctx,
                             "model.norm",
                             ctx.cfg.rms_norm_eps,
@@ -221,6 +245,10 @@ class Qwen3_5ForCausalLM(NetworkModule):
             else:
                 hidden_states, _ = layer(hidden_states, ragged)
             all_hidden_states.append(hidden_states)
+            if layer.next_normalized is not None:
+                self.layers[len(all_hidden_states)].pre_normalized = (
+                    layer.next_normalized)
+                layer.next_normalized = None
         hidden_states = self.norm(hidden_states)
         selected = F.gather_token_rows(hidden_states, ragged.logits_indices)
         logits = F.cast(self.lm_head(selected), trt.float32)

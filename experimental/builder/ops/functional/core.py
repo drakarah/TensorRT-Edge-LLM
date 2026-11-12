@@ -184,6 +184,17 @@ def rms_norm(input: Tensor,
                                         weight_before_cast=weight_before_cast))
 
 
+def add_rms_norm(input: Tensor,
+                 residual: Tensor,
+                 weight,
+                 eps: float,
+                 weight_before_cast: bool = False):
+    """Fused residual add and RMSNorm; returns ``(sum, normalized)``."""
+    total, normalized = current_net().add_rmsnorm(
+        input, residual, weight, eps, weight_before_cast=weight_before_cast)
+    return tensor(total), tensor(normalized)
+
+
 def layer_norm(input: Tensor, weight: np.ndarray, bias: np.ndarray, eps: float,
                rank: int) -> Tensor:
     return tensor(current_net().layernorm(input, weight, bias, eps, rank))

@@ -58,6 +58,7 @@ _PLUGIN_RESOURCE_DTYPES = frozenset(("U8", "F8_E4M3"))
 _OPERATION_CREATORS = {
     "all_reduce": "AllReducePlugin",
     "fused_nvfp4_gemm_all_reduce": "FusedNvfp4GemmAllReducePlugin",
+    "add_rms_norm": "AddRmsNormPlugin",
     "attention": "AttentionPlugin",
     "dflash_target_cache_update": "DFlashTargetKVCacheUpdate",
     "dflash2_grouped_dynamic_conv": "DFlash2GroupedDynamicConvPlugin",
@@ -1032,6 +1033,33 @@ class Net:
         if w is None:
             w = self.const(weight.astype(np.float16).reshape(wshape), "rmsw")
         return self.elementwise(normed16, w, trt.ElementWiseOperation.PROD)
+
+    def add_rmsnorm(self,
+                    x: "trt.ITensor",
+                    residual: "trt.ITensor",
+                    weight,
+                    eps: float,
+                    weight_before_cast: bool = False):
+        """Fused ``sum = x + residual`` and ``RMSNorm(sum)`` in one plugin kernel.
+
+        Returns ``(sum, normalized)``. Same arithmetic as ``elementwise SUM``
+        followed by :meth:`rmsnorm` (FP16 add, FP32 mean and division, gamma
+        before or after the FP16 cast), one launch and one pass over memory
+        instead of TensorRT's two fused elementwise kernels.
+        """
+        if isinstance(weight, CheckpointParameter):
+            gamma = self.parameter(weight.name, weight.value, "fp16",
+                                   weight.recipe)
+        else:
+            gamma = self.const(
+                np.ascontiguousarray(weight, dtype=np.float16).reshape(-1),
+                "rmsw")
+        layer = self.operation(
+            "add_rms_norm", {
+                "rms_norm_eps": np.float32(eps),
+                "weight_before_cast": np.int32(1 if weight_before_cast else 0),
+            }, [x, residual, gamma])
+        return layer.get_output(0), layer.get_output(1)
 
     def layernorm(self, x: "trt.ITensor", weight, bias, eps: float,
                   rank: int) -> "trt.ITensor":
