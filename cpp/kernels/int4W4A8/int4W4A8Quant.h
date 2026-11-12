@@ -29,7 +29,7 @@ namespace kernel
 //! Per-row symmetric INT8 quantisation of FP16 activations for the W4A8 GEMM (int4_int8_gemm_ampere.py).
 //! out[m, 32 c + q] holds activation column 32 c + r(q), the column permutation that lets the INT8 A fragments
 //! meet the weight nibbles of the repacked INT4 buffer; rowScale[m] = absmax / 127. K must be a multiple of 128
-//! and at most 16384.
+//! and at most 20480.
 void launchQuantizeRowsInt8Permuted(
     half const* activations, int8_t* out, float* rowScale, int32_t M, int32_t K, cudaStream_t stream);
 

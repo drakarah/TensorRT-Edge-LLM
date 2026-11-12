@@ -24,7 +24,7 @@ namespace kernel
 namespace
 {
 constexpr int32_t kThreads = 256;
-constexpr int32_t kMaxK = 16384;
+constexpr int32_t kMaxK = 20480; // 40 KiB of row staging; the static shared-memory limit is 48 KiB
 
 // One CTA per row. The row is staged in shared memory (FP16), reduced to its absmax, then written as INT8 four bytes at a time in the
 // permuted column order: output quad i4 = 4 consecutive positions q..q+3 of 32-block c, q = 4 * (i4 % 8), half h = (i4 % 8) / 4,

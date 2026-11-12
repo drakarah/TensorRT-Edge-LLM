@@ -232,6 +232,11 @@ class Int4Int8GemmAmpere:
 
         atom_lay_m, atom_lay_n, atom_lay_k = self.atom_layout_mnk
         self.num_threads = atom_lay_m * atom_lay_n * atom_lay_k * 32
+        # The repacked weight buffer is indexed by the thread's position along N only (atom_lay_n warps of 32 lanes). With atom_lay_m > 1
+        # (a taller CTA tile with more warps) the warps stacked along M read the same weight words: thread t uses word column
+        # (warp // atom_lay_m) * 32 + lane, and only the first b_threads threads stage the weight tile.
+        self.b_threads = atom_lay_n * atom_lay_k * 32
+        self.atom_lay_m = atom_lay_m
         self.bM, self.bN, self.bK = self.cta_tiler  # bK counts logical K (64); A lives in a 16-bit view with bK // 2 columns
         self.bKv = self.bK // 2
         self.a_tiler = (self.bM, self.bN, self.bKv)
@@ -885,7 +890,7 @@ class Int4Int8GemmAmpere:
         gB_off = cute.domain_offset((base_row, Int32(0)), mQW)
         gB = cute.make_tensor(
             gB_off.iterator.align(16),
-            cute.make_layout((kn, self.num_threads), stride=(self.num_threads, 1)),
+            cute.make_layout((kn, self.b_threads), stride=(self.b_threads, 1)),
         )
         # Dest: the same (word, thread) view into this stage of the word-major
         # smem buffer (word stride num_threads, thread stride 1) -- matching the
@@ -893,16 +898,25 @@ class Int4Int8GemmAmpere:
         sB_off = cute.domain_offset((Int32(0), Int32(0), Int32(0), stage), sB_bytes)
         sB_stage = cute.make_tensor(
             sB_off.iterator.align(16),
-            cute.make_layout((kn, self.num_threads), stride=(self.num_threads, 1)),
+            cute.make_layout((kn, self.b_threads), stride=(self.b_threads, 1)),
         )
 
         tiled_copy_b = self._make_b_async_copy()
-        thr = tiled_copy_b.get_slice(tidx)
-        cute.copy(
-            tiled_copy_b,
-            thr.partition_S(gB),
-            thr.partition_D(sB_stage),
-        )
+        if self.b_threads == self.num_threads:
+            thr = tiled_copy_b.get_slice(tidx)
+            cute.copy(
+                tiled_copy_b,
+                thr.partition_S(gB),
+                thr.partition_D(sB_stage),
+            )
+        else:
+            if tidx < Int32(self.b_threads):
+                thr = tiled_copy_b.get_slice(tidx)
+                cute.copy(
+                    tiled_copy_b,
+                    thr.partition_S(gB),
+                    thr.partition_D(sB_stage),
+                )
 
     def _make_b_async_copy(self) -> cute.TiledCopy:
         # cp.async tiled copy for the (word, thread) B slab, both sides
@@ -913,8 +927,8 @@ class Int4Int8GemmAmpere:
         # vectorizes A's row-major K axis) applied to the column axis here.
         copy_bits = 128
         copy_elems = copy_bits // self.b_smem_dtype.width  # 4 uint32 per copy
-        col_groups = self.num_threads // copy_elems        # thread groups on cols
-        if self.num_threads % copy_elems != 0:
+        col_groups = self.b_threads // copy_elems        # thread groups on cols
+        if self.b_threads % copy_elems != 0:
             raise ValueError("num_threads must be divisible by 4 for 128b cp.async")
         atom = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(
@@ -923,7 +937,7 @@ class Int4Int8GemmAmpere:
             self.b_smem_dtype,
             num_bits_per_copy=copy_bits,
         )
-        word_threads = self.num_threads // col_groups
+        word_threads = self.b_threads // col_groups
         thread_layout = cute.make_layout(
             (word_threads, col_groups), stride=(col_groups, 1)
         )
@@ -941,6 +955,8 @@ class Int4Int8GemmAmpere:
         # One INT8 k32 step = two repacked 16-wide k-blocks (2 * k_step, 2 * k_step + 1): the first fills B register 0 of every N8
         # group, the second register 1. Group g_lo comes from the low half of the word, g_hi from word >> 8.
         tidx, _, _ = cute.arch.thread_idx()
+        if self.atom_lay_m > 1:
+            tidx = (tidx // Int32(32 * self.atom_lay_m)) * Int32(32) + (tidx % Int32(32))
         tCrB_u32 = cute.recast_tensor(tCrB, Uint32)
         for p in range(self.n_pairs):
             word0 = sB_bytes[tidx, Int32(2) * k_step, Int32(p), stage]
@@ -1048,7 +1064,7 @@ class Int4Int8GemmAmpere:
         # contiguous in the global repacked buffer -- so the cp.async staging
         # can use 128-bit (16 B) transactions.  ``_load_b_fragment_from_smem``
         # indexes this tensor logically, so the stride change is transparent.
-        t, kb, np_, st = self.num_threads, self.k_blocks, self.n_pairs, self.num_stages
+        t, kb, np_, st = self.b_threads, self.k_blocks, self.n_pairs, self.num_stages
         kn = kb * np_
         return cute.make_layout(
             (t, kb, np_, st),

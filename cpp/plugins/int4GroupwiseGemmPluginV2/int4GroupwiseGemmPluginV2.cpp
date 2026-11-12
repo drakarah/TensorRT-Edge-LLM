@@ -412,7 +412,7 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             return value != nullptr ? std::atoi(value) : 0;
         }();
         // Per-op filter (the error of the INT8 activations is concentrated in ops with outlier-heavy inputs, METRICS 52):
-        // W4A8 only for GEMMs with K <= EDGELLM_INT4_W4A8_MAX_K (default 16384) and N >= EDGELLM_INT4_W4A8_MIN_N (default 0).
+        // W4A8 only for GEMMs with K <= EDGELLM_INT4_W4A8_MAX_K (default 16384, hard limit 20480: the row quantiser stages one row in shared memory) and N >= EDGELLM_INT4_W4A8_MIN_N (default 0).
         static int32_t const kW4A8MaxK = []() {
             char const* value = std::getenv("EDGELLM_INT4_W4A8_MAX_K");
             return value != nullptr ? std::atoi(value) : 16384;
@@ -435,7 +435,7 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             char const* value = std::getenv("EDGELLM_INT4_W4A8_SKIP_N");
             return value != nullptr ? std::atoi(value) : 0;
         }();
-        if (kW4A8MinM > 0 && M >= kW4A8MinM && mGemmK % 128 == 0 && mGemmK <= std::min(kW4A8MaxK, 16384)
+        if (kW4A8MinM > 0 && M >= kW4A8MinM && mGemmK % 128 == 0 && mGemmK <= std::min(kW4A8MaxK, 20480)
             && mGemmN >= kW4A8MinN && mGemmN <= kW4A8MaxN && (kW4A8OnlyN == 0 || mGemmN == kW4A8OnlyN)
             && (kW4A8SkipN == 0 || mGemmN != kW4A8SkipN) && cuteDslInt4W4A8LoadModules())
         {
