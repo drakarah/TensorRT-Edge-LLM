@@ -29,6 +29,12 @@
 #include <cstdlib>
 #include <mma.h>
 
+#ifndef EDGELLM_GDN_REPLAY_TILE_DEFAULT
+#define EDGELLM_GDN_REPLAY_TILE_DEFAULT 32
+#endif
+#ifndef EDGELLM_GDN_REPLAY_MIN_BLOCKS32
+#define EDGELLM_GDN_REPLAY_MIN_BLOCKS32 4
+#endif
 #ifndef EDGELLM_GDN_REPLAY_MIN_BLOCKS
 #define EDGELLM_GDN_REPLAY_MIN_BLOCKS 2
 #endif
@@ -1137,12 +1143,14 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedKernel(Mt
 // in the shared-memory kernel, and there is no shared-memory traffic for the state. Per column the arithmetic (scale,
 // ordered partial sums, shuffle order, rank-1 update) is the same sequence as treeReplayCommitBatchedKernel, so the
 // result is bit-identical.
-__global__ void __launch_bounds__(kNUM_THREADS, EDGELLM_GDN_REPLAY_MIN_BLOCKS) treeReplayCommitBatchedRegKernel(MtpLayerInfo const* __restrict__ infos,
+template <int32_t kTILE_V>
+__global__ void __launch_bounds__(kTILE_V * 4, kTILE_V == 64 ? EDGELLM_GDN_REPLAY_MIN_BLOCKS : EDGELLM_GDN_REPLAY_MIN_BLOCKS32)
+    treeReplayCommitBatchedRegKernel(MtpLayerInfo const* __restrict__ infos,
     size_t stashBatchStrideBytes, int32_t const* __restrict__ acceptedIndices,
     int32_t const* __restrict__ acceptLengths, int32_t const* __restrict__ stateIndices, int32_t residentPoolRows,
     int32_t maxAcceptLen, int32_t numNodes, int32_t H, int32_t HV)
 {
-    constexpr int32_t kTILE_V{64};
+    constexpr int32_t kTHREADS{kTILE_V * 4}; // 8 columns per warp, 4 threads per row segment
     constexpr int32_t kROWS_PER_THREAD{kTILE_K / 8}; // 16
 
     int32_t const layer = blockIdx.y;
@@ -1209,7 +1217,7 @@ __global__ void __launch_bounds__(kNUM_THREADS, EDGELLM_GDN_REPLAY_MIN_BLOCKS) t
         int32_t const node = acceptedIndices[static_cast<int64_t>(iN) * maxAcceptLen + i];
         char const* cell = nodeBase + static_cast<size_t>(node) * so.nodeBytes;
         float const* kSrc = reinterpret_cast<float const*>(cell + so.kNorm) + static_cast<size_t>(iH) * kTILE_K;
-        for (int32_t kk = tid; kk < kTILE_K; kk += kNUM_THREADS)
+        for (int32_t kk = tid; kk < kTILE_K; kk += kTHREADS)
         {
             sKvec[i * kTILE_K + kk] = kSrc[kk];
         }
@@ -1426,9 +1434,22 @@ cudaError_t gdnTreeReplayCommitBatched(MtpLayerInfo const* deviceLayerInfos, int
     }
     else
     {
-        dim3 const grid(batch * hv, numLayers, kTILE_K / 64);
-        treeReplayCommitBatchedRegKernel<<<grid, kNUM_THREADS, 0, stream>>>(deviceLayerInfos, stashBatchStrideBytes,
-            acceptedIndices, acceptLengths, stateIndices, residentPoolRows, maxAcceptLen, numNodes, h, hv);
+        // EDGELLM_GDN_REPLAY_TILE selects the column tile per CTA: 64 (256 threads, 32 state registers each) or 32
+        // (128 threads, 16 state registers each, twice the CTAs).
+        char const* const tileEnv = std::getenv("EDGELLM_GDN_REPLAY_TILE");
+        int32_t const tile = tileEnv != nullptr ? std::atoi(tileEnv) : EDGELLM_GDN_REPLAY_TILE_DEFAULT;
+        if (tile == 32)
+        {
+            dim3 const grid(batch * hv, numLayers, kTILE_K / 32);
+            treeReplayCommitBatchedRegKernel<32><<<grid, 128, 0, stream>>>(deviceLayerInfos, stashBatchStrideBytes,
+                acceptedIndices, acceptLengths, stateIndices, residentPoolRows, maxAcceptLen, numNodes, h, hv);
+        }
+        else
+        {
+            dim3 const grid(batch * hv, numLayers, kTILE_K / 64);
+            treeReplayCommitBatchedRegKernel<64><<<grid, 256, 0, stream>>>(deviceLayerInfos, stashBatchStrideBytes,
+                acceptedIndices, acceptLengths, stateIndices, residentPoolRows, maxAcceptLen, numNodes, h, hv);
+        }
     }
     cudaError_t const launchErr = gdnTreeTraceLaunch("treeReplayCommitBatched");
 

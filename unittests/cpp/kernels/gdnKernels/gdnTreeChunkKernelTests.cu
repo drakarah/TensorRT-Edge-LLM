@@ -889,13 +889,21 @@ TEST(GdnTreeChunkReplayTest, RegisterKernelIsBitIdenticalToSharedMemoryKernel)
         std::vector<float> const shared = downloadVec(harness.dState, harness.hostState.size());
         harness.resetState();
         ASSERT_EQ(setenv("EDGELLM_GDN_REPLAY_V1", "0", 1), 0);
-        ASSERT_EQ(harness.commit(), cudaSuccess);
-        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-        std::vector<float> const registers = downloadVec(harness.dState, harness.hostState.size());
+        for (char const* tile : {"64", "32"})
+        {
+            harness.resetState();
+            ASSERT_EQ(setenv("EDGELLM_GDN_REPLAY_TILE", tile, 1), 0);
+            ASSERT_EQ(harness.commit(), cudaSuccess);
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+            std::vector<float> const registers = downloadVec(harness.dState, harness.hostState.size());
+            ASSERT_EQ(shared.size(), registers.size());
+            EXPECT_EQ(std::memcmp(shared.data(), registers.data(), shared.size() * sizeof(float)), 0)
+                << "register kernel (tile " << tile << ") differs from the shared-memory kernel for accepted length "
+                << accepted;
+        }
+        unsetenv("EDGELLM_GDN_REPLAY_TILE");
         unsetenv("EDGELLM_GDN_REPLAY_V1");
-        ASSERT_EQ(shared.size(), registers.size());
-        EXPECT_EQ(std::memcmp(shared.data(), registers.data(), shared.size() * sizeof(float)), 0)
-            << "register kernel differs from the shared-memory kernel for accepted length " << accepted;
+        std::vector<float> const registers = shared;
         EXPECT_NE(std::memcmp(shared.data(), harness.hostState.data(), shared.size() * sizeof(float)), 0)
             << "replay left the state unchanged for accepted length " << accepted;
     }
@@ -954,9 +962,10 @@ TEST(GdnTreeChunkReplayTest, DISABLED_ReplayCommitTiming)
     {
         ReplayHarness harness;
         harness.setup(/*numLayers=*/48, /*kH=*/16, /*kHv=*/48, /*numNodes=*/16, accepted);
-        for (char const* mode : {"1", "0"})
+        for (char const* mode : {"1", "0", "t32"})
         {
-            ASSERT_EQ(setenv("EDGELLM_GDN_REPLAY_V1", mode, 1), 0);
+            ASSERT_EQ(setenv("EDGELLM_GDN_REPLAY_V1", std::string(mode) == "1" ? "1" : "0", 1), 0);
+            ASSERT_EQ(setenv("EDGELLM_GDN_REPLAY_TILE", std::string(mode) == "t32" ? "32" : "64", 1), 0);
             for (int32_t warm = 0; warm < 5; ++warm)
             {
                 ASSERT_EQ(harness.commit(), cudaSuccess);
@@ -975,7 +984,7 @@ TEST(GdnTreeChunkReplayTest, DISABLED_ReplayCommitTiming)
             float ms = 0.f;
             cudaEventElapsedTime(&ms, t0, t1);
             std::printf("replay commit accepted=%d kernel=%s: %.3f ms per call (48 layers)\n", accepted,
-                std::string(mode) == "1" ? "shared-memory" : "registers   ", ms / kIters);
+                std::string(mode) == "1" ? "shared-memory" : std::string(mode) == "0" ? "registers-64" : "registers-32", ms / kIters);
             cudaEventDestroy(t0);
             cudaEventDestroy(t1);
         }
