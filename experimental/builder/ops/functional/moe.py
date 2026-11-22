@@ -42,6 +42,7 @@ class MoeActivation(IntEnum):
     SWIGLU = 2
     RELU2 = 4
     GEGLU = 5
+    SOFTCAP_SWIGLU = 6
 
 
 class MoeRouting(IntEnum):
@@ -174,8 +175,21 @@ def nvfp4_a16_moe(router_logits: Tensor, hidden_states: Tensor,
                   activation_type: MoeActivation, n_group: int,
                   topk_group: int, norm_topk_prob: int,
                   routed_scaling_factor: float, routing_mode: MoeRouting, *,
-                  weight_prefix: str) -> Tensor:
-    """Run weight-only NVFP4 MoE with FP16 activations."""
+                  weight_prefix: str,
+                  gate_softcap: float = 0.0,
+                  up_softcap: float = 0.0) -> Tensor:
+    """Run weight-only NVFP4 MoE with FP16 activations.
+
+    ``gate_softcap`` and ``up_softcap`` apply to ``SOFTCAP_SWIGLU`` only and
+    are not emitted for the other activations.
+    """
+    extra = {}
+    if activation_type == MoeActivation.SOFTCAP_SWIGLU:
+        if not (gate_softcap > 0.0 and up_softcap > 0.0):
+            raise ValueError("SOFTCAP_SWIGLU requires positive gate_softcap and up_softcap")
+        extra = {"gate_softcap": gate_softcap, "up_softcap": up_softcap}
+    elif gate_softcap or up_softcap:
+        raise ValueError("gate_softcap and up_softcap apply to SOFTCAP_SWIGLU only")
     _validate_token_layout(router_logits, hidden_states)
     order = [
         ("fc1_qweights", np.int8),
@@ -203,7 +217,8 @@ def nvfp4_a16_moe(router_logits: Tensor, hidden_states: Tensor,
                      norm_topk_prob=norm_topk_prob,
                      routed_scaling_factor=routed_scaling_factor,
                      routing_mode=int(routing_mode),
-                     max_routed_rows=_MAX_ROUTED_ROWS_AUTO)
+                     max_routed_rows=_MAX_ROUTED_ROWS_AUTO,
+                     **extra)
 
 
 def nvfp4_moe(router_logits: Tensor,

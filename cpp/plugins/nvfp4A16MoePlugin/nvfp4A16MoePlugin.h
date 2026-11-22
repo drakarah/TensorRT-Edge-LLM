@@ -43,7 +43,8 @@ class Nvfp4A16MoePlugin : public nvinfer1::IPluginV3,
 public:
     Nvfp4A16MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize,
         int32_t moeInterSize, int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb,
-        float routedScalingFactor, int32_t routingMode, int32_t maxRoutedRows);
+        float routedScalingFactor, int32_t routingMode, int32_t maxRoutedRows, float gateSoftcap = 0.0F,
+        float upSoftcap = 0.0F);
 
     Nvfp4A16MoePlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
@@ -104,6 +105,8 @@ private:
     float mRoutedScalingFactor{};
     int32_t mRoutingMode{};
     int32_t mMaxRoutedRows{}; //!< Padded Marlin routed-row capacity.
+    float mGateSoftcap{};     //!< Optional gate soft cap, softcapped SwiGLU only.
+    float mUpSoftcap{};       //!< Optional up soft cap, softcapped SwiGLU only.
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize{};
