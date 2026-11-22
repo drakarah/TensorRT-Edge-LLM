@@ -135,8 +135,24 @@ def int4_moe(router_logits: Tensor,
              *,
              weight_prefix: str,
              weight_bindings: dict,
-             zero_point_offset: int = 1) -> Tensor:
-    """Run GPTQ-Marlin mixture-of-experts."""
+             zero_point_offset: int = 1,
+             gate_softcap: float = 0.0,
+             up_softcap: float = 0.0) -> Tensor:
+    """Run GPTQ-Marlin mixture-of-experts.
+
+    Positive ``gate_softcap`` and ``up_softcap`` (given together) select the
+    softcapped SwiGLU activation.
+    """
+    if (gate_softcap
+            > 0.0) != (up_softcap
+                       > 0.0) or gate_softcap < 0.0 or up_softcap < 0.0:
+        raise ValueError(
+            "gate_softcap and up_softcap must be given together and be positive"
+        )
+    extra = ({
+        "gate_softcap": gate_softcap,
+        "up_softcap": up_softcap
+    } if gate_softcap > 0.0 else {})
     _validate_token_layout(router_logits, hidden_states)
 
     inputs = [
@@ -166,7 +182,8 @@ def int4_moe(router_logits: Tensor,
                      hidden_size=hidden_size,
                      moe_inter_size=moe_inter_size,
                      activation_type=0,
-                     quantization_group_size=group_size)
+                     quantization_group_size=group_size,
+                     **extra)
 
 
 def nvfp4_a16_moe(router_logits: Tensor,

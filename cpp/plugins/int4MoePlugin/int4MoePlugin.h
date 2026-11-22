@@ -202,12 +202,14 @@ private:
     int32_t mHiddenSize{};
     int32_t mMoeInterSize{};
     nvinfer1::ActivationType mActivationType{};
+    float mGateSoftcap{0.0F}; //!< Both caps positive: softcapped SwiGLU instead of SwiGLU.
+    float mUpSoftcap{0.0F};
     int32_t mQuantizationGroupSize{};
     int32_t mStageExperts{0};
     int32_t mTokenTile{0};
     int32_t* mStats{nullptr}; // device, [2][numExperts] selection counters (EDGELLM_MOE_STATS)
-    // EDGELLM_MOE_CACHE_SLOTS=<n>: per-layer device cache of the n most recently used experts (decode steps of <= 4 tokens);
-    // allocated at the first enqueue, outside graph capture.
+    // EDGELLM_MOE_CACHE_SLOTS=<n>: per-layer device cache of the n most recently used experts (decode steps of <= 4
+    // tokens); allocated at the first enqueue, outside graph capture.
     int32_t mCacheSlots{-1}; // -1 = env not read yet
     bool mCacheReady{false};
     void* mCacheMem{nullptr};

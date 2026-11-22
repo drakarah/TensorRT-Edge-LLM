@@ -39,6 +39,43 @@ def _f32(weights, name: str) -> np.ndarray:
     return np.ascontiguousarray(weights.f32(name), dtype=np.float32)
 
 
+_E2M1_LEVELS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+
+def _round_nvfp4(x: torch.Tensor):
+    """FP32 [R, C] -> NVFP4 (packed bytes [R, C/2], E4M3 block scales [R, C/16] as uint8, per-matrix multiplier)."""
+    rows, cols = x.shape
+    amax = x.abs().max().clamp_min(1e-30)
+    multiplier = amax / (6.0 * 448.0)
+    blocks = x.view(rows, cols // 16, 16)
+    scale = (blocks.abs().amax(-1, keepdim=True) / 6.0 / multiplier).clamp(max=448.0).to(torch.float8_e4m3fn)
+    scaled = (blocks / (scale.float() * multiplier).clamp_min(1e-30)).abs().clamp(max=6.0)
+    index = (scaled.unsqueeze(-1) - _E2M1_LEVELS).abs().argmin(-1)
+    code = (index + 8 * ((blocks < 0) & (index > 0)).long()).to(torch.uint8).view(rows, cols)
+    return (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous(), scale.view(torch.uint8).view(rows, cols // 16), multiplier
+
+
+def _expert_nvfp4(weights, name: str):
+    """Per-expert NVFP4 tensors (uint8 [E, R, C/2], uint8 [E, R, C/16], float32 [E]) of one fused expert matrix.
+
+    NVFP4 layers pass through unchanged. MXFP8 layers (no amax tensor) are dequantized and rounded to NVFP4.
+    """
+    raw = torch.from_numpy(np.ascontiguousarray(weights.array(name)).view(np.uint8))
+    scale = torch.from_numpy(np.ascontiguousarray(weights.array(name + "_scale")).view(np.uint8))
+    if weights.has(name + "_amax"):
+        multiplier = _f32(weights, name + "_amax") / _f32(weights, name + "_outer_scale_denominator")
+        return raw, scale, torch.from_numpy(multiplier.astype(np.float32))
+    experts, rows, cols = raw.shape
+    packed = torch.empty(experts, rows, cols // 2, dtype=torch.uint8)
+    block_scale = torch.empty(experts, rows, cols // 16, dtype=torch.uint8)
+    multiplier = torch.empty(experts, dtype=torch.float32)
+    for i in range(experts):
+        dense = (raw[i].view(torch.float8_e4m3fn).float().view(rows, cols // 32, 32) *
+                 torch.exp2(scale[i].float() - 127.0)[..., None]).view(rows, cols)
+        packed[i], block_scale[i], multiplier[i] = _round_nvfp4(dense)
+    return packed, block_scale, multiplier
+
+
 def rms_unweighted(x, eps: float = _EPS):
     return x / ((x * x).mean(-1, keepdim=True) + eps).sqrt()
 
@@ -180,35 +217,22 @@ class Inkling2Layer(Module):
             repack_nvfp4_a16_marlin_gated_moe_experts
         w = ctx.weights
         text = ctx.cfg.raw_component
-        e, inter = int(text["n_routed_experts"]), int(
-            text["intermediate_size"])
+        e, inter = int(text["n_routed_experts"]), int(text["intermediate_size"])
         padded = ((inter + 127) // 128) * 128
         base = self.key("mlp.experts")
-        w13 = torch.from_numpy(
-            np.ascontiguousarray(w.array(base + ".w13_weight")).view(np.uint8))
-        s13 = torch.from_numpy(
-            np.ascontiguousarray(w.array(base + ".w13_weight_scale")).view(
-                np.uint8))
-        w2 = torch.from_numpy(
-            np.ascontiguousarray(w.array(base + ".w2_weight")).view(np.uint8))
-        s2 = torch.from_numpy(
-            np.ascontiguousarray(w.array(base + ".w2_weight_scale")).view(
-                np.uint8))
-        g13 = _f32(w, base + ".w13_weight_amax") / _f32(
-            w, base + ".w13_weight_outer_scale_denominator")
-        g2 = _f32(w, base + ".w2_weight_amax") / _f32(
-            w, base + ".w2_weight_outer_scale_denominator")
+        w13, s13, g13 = _expert_nvfp4(w, base + ".w13_weight")
+        w2, s2, g2 = _expert_nvfp4(w, base + ".w2_weight")
         gp, gs, gg, up, us, ug, dp, ds, dg = ([] for _ in range(9))
         for i in range(e):
             gp.append(w13[i, 0::2])
             up.append(w13[i, 1::2])
             gs.append(s13[i, 0::2])
             us.append(s13[i, 1::2])
-            gg.append(torch.tensor(g13[i], dtype=torch.float32))
-            ug.append(torch.tensor(g13[i], dtype=torch.float32))
+            gg.append(g13[i])
+            ug.append(g13[i])
             dp.append(w2[i])
             ds.append(s2[i])
-            dg.append(torch.tensor(g2[i], dtype=torch.float32))
+            dg.append(g2[i])
         fc1q, fc1s, fc1g, fc2q, fc2s, fc2g = repack_nvfp4_a16_marlin_gated_moe_experts(
             gp, gs, gg, up, us, ug, dp, ds, dg, padded)
         packed = {

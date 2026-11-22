@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cmath>
 #include "int4MoePlugin.h"
 
 #include "common/checkMacros.h"
@@ -1145,6 +1146,14 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
         {
             mQuantizationGroupSize = *static_cast<int32_t const*>(fc->fields[i].data);
         }
+        else if (fieldName == "gate_softcap")
+        {
+            mGateSoftcap = *static_cast<float const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "up_softcap")
+        {
+            mUpSoftcap = *static_cast<float const*>(fc->fields[i].data);
+        }
         else if (fieldName == "stage_experts")
         {
             mStageExperts = *static_cast<int32_t const*>(fc->fields[i].data);
@@ -1162,6 +1171,14 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
     {
         LOG_ERROR("Int4MoePlugin supports SiLU (type 0) and GeGLU (type 5), got type %d",
             static_cast<int32_t>(mActivationType));
+    }
+    bool const capGate = mGateSoftcap != 0.0F;
+    bool const capUp = mUpSoftcap != 0.0F;
+    bool const capsValid = std::isfinite(mGateSoftcap) && mGateSoftcap > 0.0F && std::isfinite(mUpSoftcap) && mUpSoftcap > 0.0F;
+    if (capGate != capUp || (capGate && (!capsValid || mActivationType == kACTIVATION_GEGLU)))
+    {
+        throw std::invalid_argument(
+            "Int4MoePlugin: gate_softcap and up_softcap must be given together, finite and positive, and apply to SwiGLU only");
     }
 }
 
@@ -1586,7 +1603,7 @@ bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
     size_t const inter = static_cast<size_t>(mMoeInterSize);
     size_t const n1 = 2 * inter;
     size_t const expected[4] = {(hidden / 16) * 2 * n1 * 4, (hidden / 128) * n1 * 2, (inter / 16) * 2 * hidden * 4, (inter / 128) * hidden * 2};
-    bool ok = mActivationType != kACTIVATION_GEGLU
+    bool ok = mActivationType != kACTIVATION_GEGLU && mGateSoftcap <= 0.0F && mUpSoftcap <= 0.0F
         && cpumiss::shapeSupported(mHiddenSize, mMoeInterSize, mQuantizationGroupSize, kernel::kCpuMissMaxHidden);
     for (int32_t i = 0; i < 4; ++i)
     {
@@ -1683,6 +1700,8 @@ IPluginV3* Int4MoePlugin::clone() noexcept
     {
         auto* plugin = new Int4MoePlugin(
             mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType, mQuantizationGroupSize);
+        plugin->mGateSoftcap = mGateSoftcap;
+        plugin->mUpSoftcap = mUpSoftcap;
         plugin->setPluginNamespace(mNamespace.c_str());
         plugin->setStageExperts(mStageExperts);
         plugin->setTokenTile(mTokenTile);
@@ -2389,11 +2408,13 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor activationOutputTensor(
             activationOutputPtr, {tileSlots, mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
+        bool const softcapped = mGateSoftcap > 0.0F && mUpSoftcap > 0.0F;
         int32_t const kernelActivationType = (mActivationType == kACTIVATION_GEGLU)
             ? trt_edgellm::kernel::MoeActivationType::kMoeGeGlu
-            : trt_edgellm::kernel::MoeActivationType::kMoeSwiGlu;
-        moeActivation(
-            gateUpOutputTensor, activationOutputTensor, tileSlots, mMoeInterSize, kernelActivationType, stream);
+            : (softcapped ? trt_edgellm::kernel::MoeActivationType::kMoeSoftcapSwiGlu
+                          : trt_edgellm::kernel::MoeActivationType::kMoeSwiGlu);
+        moeActivation(gateUpOutputTensor, activationOutputTensor, tileSlots, mMoeInterSize, kernelActivationType, stream,
+            mGateSoftcap, mUpSoftcap);
         CUDA_CHECK(cudaGetLastError());
 
         // ==================== Step 5: Down Projection (Marlin INT4 GEMM) ====================
@@ -2487,6 +2508,8 @@ PluginFieldCollection const* Int4MoePlugin::getFieldsToSerialize() noexcept
         mDataToSerialize.emplace_back("quantization_group_size", &mQuantizationGroupSize, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("stage_experts", &mStageExperts, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("token_tile", &mTokenTile, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("gate_softcap", &mGateSoftcap, PluginFieldType::kFLOAT32, 1);
+        mDataToSerialize.emplace_back("up_softcap", &mUpSoftcap, PluginFieldType::kFLOAT32, 1);
 
         mFCToSerialize.nbFields = mDataToSerialize.size();
         mFCToSerialize.fields = mDataToSerialize.data();
@@ -2513,6 +2536,8 @@ Int4MoePluginCreator::Int4MoePluginCreator()
     mPluginAttributes.emplace_back(PluginField("quantization_group_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("stage_experts", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("token_tile", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("gate_softcap", nullptr, PluginFieldType::kFLOAT32, 1));
+    mPluginAttributes.emplace_back(PluginField("up_softcap", nullptr, PluginFieldType::kFLOAT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();

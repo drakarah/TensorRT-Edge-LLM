@@ -737,6 +737,118 @@ def test_int4_fp16_swiglu_preserves_legacy_rounding(hidden_shape):
     assert not bool(torch.any(actual_bits == final_round_only_bits))
 
 
+def _int4_softcap_fields(caps, activation_type=0):
+    fields = [
+        pf_int32("num_experts", 2),
+        pf_int32("top_k", 1),
+        pf_int32("hidden_size", 128),
+        pf_int32("moe_inter_size", 64),
+        pf_int32("activation_type", activation_type),
+        pf_int32("quantization_group_size", 64),
+    ]
+    for name, value in caps:
+        fields.append(pf_float32(name, value))
+    return fields
+
+
+def _int4_softcap_specs(num_tokens):
+    num_experts, hidden_size, inter, group = 2, 128, 64, 64
+    return [
+        ("router_logits", trt.float32, (num_tokens, num_experts)),
+        ("hidden_states", trt.float16, (num_tokens, hidden_size)),
+        ("fc_gate_up_qweights", trt.int8, (num_experts, hidden_size // 16,
+                                           16 * inter)),
+        ("fc_gate_up_scales", trt.float16, (num_experts, hidden_size // group,
+                                            2 * inter)),
+        ("fc_down_qweights", trt.int8, (num_experts, inter // 16,
+                                        8 * hidden_size)),
+        ("fc_down_scales", trt.float16, (num_experts, inter // group,
+                                         hidden_size)),
+    ]
+
+
+def _build_int4_softcap(num_tokens, caps, activation_type=0):
+    specs = _int4_softcap_specs(num_tokens)
+    runner = PluginRunner()
+    runner.build(input_specs=specs,
+                 output_names=["output"],
+                 plugin_name=_INT4_PLUGIN_NAME,
+                 plugin_version=_PLUGIN_VERSION,
+                 plugin_fields=_int4_softcap_fields(caps, activation_type),
+                 profiles={
+                     name: (shape, shape, shape)
+                     for name, _, shape in specs
+                 },
+                 expect_unsupported=True)
+    return runner, specs
+
+
+@pytest.mark.parametrize("num_tokens", [1, 9], ids=["t1", "t9"])
+@pytest.mark.parametrize(
+    "gate,up", [(0.5, 0.5), (3.0, 20.0), (-3.0, 10.0), (10.0, 30.0),
+                (-20.0, -30.0), (0.0, 5.0)],
+    ids=["small", "mid", "neg_gate", "saturated", "both_neg", "zero_gate"])
+def test_int4_softcap_swiglu_matches_reference(num_tokens, gate, up):
+    """Single expert channel carries (gate, up); the down projection sums the activations of all channels."""
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("The four-stage Marlin kernel requires SM80 or newer")
+    gate_cap, up_cap = 4.0, 25.0
+    runner, specs = _build_int4_softcap(num_tokens,
+                                        [("gate_softcap", gate_cap),
+                                         ("up_softcap", up_cap)])
+    hidden_states = torch.zeros((num_tokens, 128),
+                                dtype=torch.float16,
+                                device="cuda")
+    hidden_states[..., 0] = 1.0
+    packed_positive_one = -103  # code 9 in both nibbles: +1 times the channel scale
+    qw1 = torch.full(specs[2][2],
+                     packed_positive_one,
+                     dtype=torch.int8,
+                     device="cuda")
+    qw2 = torch.full(specs[4][2],
+                     packed_positive_one,
+                     dtype=torch.int8,
+                     device="cuda")
+    scales1 = torch.zeros(specs[3][2], dtype=torch.float16, device="cuda")
+    scales1[:, 0, 0] = gate
+    scales1[:, 0, 64] = up
+    scales2 = torch.ones(specs[5][2], dtype=torch.float16, device="cuda")
+    router = torch.full((num_tokens, 2), -10.0, device="cuda")
+    router[:, 0] = 10.0
+    actual = torch.empty_like(hidden_states)
+    runner.execute({
+        "router_logits": router,
+        "hidden_states": hidden_states,
+        "fc_gate_up_qweights": qw1,
+        "fc_gate_up_scales": scales1,
+        "fc_down_qweights": qw2,
+        "fc_down_scales": scales2,
+        "output": actual,
+    })
+    g = float(torch.tensor(gate).half())
+    u = float(torch.tensor(up).half())
+    expected = (gate_cap * torch.tanh(torch.tensor(g / gate_cap)) *
+                torch.sigmoid(torch.tensor(g)) * up_cap *
+                torch.tanh(torch.tensor(u / up_cap))).item()
+    got = actual.float().cpu()
+    assert bool(torch.isfinite(got).all())
+    assert abs(got.max().item() - got.min().item()) < 1e-6, "all outputs equal"
+    assert abs(got[0, 0].item() - expected) <= 3e-3 * abs(expected) + 2e-3
+
+
+@pytest.mark.parametrize(
+    "caps,activation",
+    [([("gate_softcap", 4.0)], 0), ([("up_softcap", 25.0)], 0),
+     ([("gate_softcap", -4.0), ("up_softcap", 25.0)], 0),
+     ([("gate_softcap", 4.0), ("up_softcap", float("nan"))], 0),
+     ([("gate_softcap", float("inf")), ("up_softcap", 25.0)], 0),
+     ([("gate_softcap", 4.0), ("up_softcap", 25.0)], 5)],
+    ids=["gate_only", "up_only", "negative", "nan", "inf", "with_geglu"])
+def test_int4_softcap_rejects_invalid_attributes(caps, activation):
+    with pytest.raises(PluginUnsupportedError):
+        _build_int4_softcap(8, caps, activation)
+
+
 def test_int4_rejects_rank3_hidden_states():
     num_experts = 1
     hidden_size = 128
