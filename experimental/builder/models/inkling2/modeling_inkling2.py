@@ -392,6 +392,9 @@ class Inkling2ForCausalLM(NetworkModule):
                                (-1, conv_channels, rc.CONV_KERNEL))
                 for i in range(self.visits)
             ],
+            "rope":
+            self.add_input("rope_rotary_cos_sin", trt.float32,
+                           (-1, cfg.rotary_dim)),
             "recurrent_states": [
                 self.add_input(f"recurrent_state_{i}", trt.float32,
                                (-1, ) + rc.RECURRENT_SHAPE)
@@ -409,6 +412,10 @@ class Inkling2ForCausalLM(NetworkModule):
         present_conv: List = [None] * self.visits
         present_rec: List = [None] * self.visits
 
+        # The runtime always binds a rope table; the model has no rotary embedding, so tie it to a dummy output.
+        keep_rope = io["rope"].reshape([-1]).sum(0, keepdim=True).reshape(
+            [1, 1, 1, 1]) * 0.0
+
         def run_layer(l, h, bs, messages):
             v = visit[0]
             visit[0] += 1
@@ -416,7 +423,7 @@ class Inkling2ForCausalLM(NetworkModule):
             new, kv, conv = layer(h, bs, messages, io["past_key_values"][v],
                                   io["conv_states"][v], ragged)
             present_kv[v], present_conv[v] = kv, conv
-            present_rec[v] = io["recurrent_states"][v] + 0.0
+            present_rec[v] = io["recurrent_states"][v] + keep_rope
             if layer.boundary:
                 bs = bs + [h]
             return new, bs
