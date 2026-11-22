@@ -1152,6 +1152,10 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
         {
             mQuantizationGroupSize = *static_cast<int32_t const*>(fc->fields[i].data);
         }
+        else if (fieldName == "weight_format")
+        {
+            mWeightFormat = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
         else if (fieldName == "gate_softcap")
         {
             mGateSoftcap = *static_cast<float const*>(fc->fields[i].data);
@@ -1177,6 +1181,14 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
     {
         LOG_ERROR("Int4MoePlugin supports SiLU (type 0) and GeGLU (type 5), got type %d",
             static_cast<int32_t>(mActivationType));
+    }
+    if (mWeightFormat != kWeightFormatInt4 && mWeightFormat != kWeightFormatNvfp4)
+    {
+        throw std::invalid_argument("Int4MoePlugin: weight_format must be 0 (GPTQ/AWQ INT4) or 1 (NVFP4)");
+    }
+    if (mWeightFormat == kWeightFormatNvfp4 && mQuantizationGroupSize != 16)
+    {
+        throw std::invalid_argument("Int4MoePlugin: NVFP4 weights use blocks of 16 (quantization_group_size 16)");
     }
     bool const capGate = mGateSoftcap != 0.0F;
     bool const capUp = mUpSoftcap != 0.0F;
@@ -1845,6 +1857,7 @@ IPluginV3* Int4MoePlugin::clone() noexcept
             mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType, mQuantizationGroupSize);
         plugin->mGateSoftcap = mGateSoftcap;
         plugin->mUpSoftcap = mUpSoftcap;
+        plugin->mWeightFormat = mWeightFormat;
         plugin->setPluginNamespace(mNamespace.c_str());
         plugin->setStageExperts(mStageExperts);
         plugin->setTokenTile(mTokenTile);
@@ -1894,7 +1907,7 @@ int32_t Int4MoePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs
     [[maybe_unused]] DimsExprs const* shapeInputs, [[maybe_unused]] int32_t nbShapeInputs, DimsExprs* outputs,
     int32_t nbOutputs, [[maybe_unused]] IExprBuilder& exprBuilder) noexcept
 {
-    if (inputs == nullptr || outputs == nullptr || nbInputs != 6 || nbOutputs != 1 || inputs[1].nbDims != 2)
+    if (inputs == nullptr || outputs == nullptr || nbInputs != inputCount() || nbOutputs != 1 || inputs[1].nbDims != 2)
     {
         return -1;
     }
@@ -1907,6 +1920,20 @@ int32_t Int4MoePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs
 }
 
 bool Int4MoePlugin::supportsFormatCombination(
+    int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+{
+    bool const ok = supportsFormatCombinationImpl(pos, inOut, nbInputs, nbOutputs);
+    if (!ok && std::getenv("EDGELLM_DEBUG_PLUGIN_FORMATS") != nullptr && pos >= 0 && pos < nbInputs + nbOutputs)
+    {
+        auto const& d = inOut[pos].desc;
+        LOG_WARNING("Int4MoePlugin %s: position %d rejected: type %d format %d dims [%ld, %ld, %ld] (nbDims %d)", mLayerName.c_str(), pos,
+            static_cast<int>(d.type), static_cast<int>(d.format), static_cast<long>(d.dims.d[0]), static_cast<long>(d.dims.nbDims > 1 ? d.dims.d[1] : -1),
+            static_cast<long>(d.dims.nbDims > 2 ? d.dims.d[2] : -1), d.dims.nbDims);
+    }
+    return ok;
+}
+
+bool Int4MoePlugin::supportsFormatCombinationImpl(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     auto checkHiddenStates = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
@@ -1957,7 +1984,9 @@ bool Int4MoePlugin::supportsFormatCombination(
     // gate_up scales: [E, hiddenSize/quantization_group_size, 2*moeInterSize]
     auto checkFcGateUpScales = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        status &= tensorDesc.type == DataType::kHALF;
+        // NVFP4 block scales are E4M3 bytes, bound as INT8 or (to keep the network free of INT8 tensors) as INT32 words
+        bool const words = mWeightFormat == kWeightFormatNvfp4 && tensorDesc.type == DataType::kINT32;
+        status &= words || tensorDesc.type == (mWeightFormat == kWeightFormatNvfp4 ? DataType::kINT8 : DataType::kHALF);
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 3;
         auto const tensorDim = tensorDesc.dims;
@@ -1965,7 +1994,7 @@ bool Int4MoePlugin::supportsFormatCombination(
         {
             status &= tensorDim.d[0] == mNumExperts;
             status &= tensorDim.d[1] == mHiddenSize / mQuantizationGroupSize;
-            status &= tensorDim.d[2] == 2 * mMoeInterSize; // Fused gate+up
+            status &= tensorDim.d[2] == (words ? 2 * mMoeInterSize / 4 : 2 * mMoeInterSize); // Fused gate+up
         }
         return status;
     };
@@ -1989,7 +2018,8 @@ bool Int4MoePlugin::supportsFormatCombination(
     // down scales: [E, moeInterSize/quantization_group_size, hiddenSize]
     auto checkFcDownScales = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        status &= tensorDesc.type == DataType::kHALF;
+        bool const words = mWeightFormat == kWeightFormatNvfp4 && tensorDesc.type == DataType::kINT32;
+        status &= words || tensorDesc.type == (mWeightFormat == kWeightFormatNvfp4 ? DataType::kINT8 : DataType::kHALF);
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 3;
         auto const tensorDim = tensorDesc.dims;
@@ -1997,16 +2027,31 @@ bool Int4MoePlugin::supportsFormatCombination(
         {
             status &= tensorDim.d[0] == mNumExperts;
             status &= tensorDim.d[1] == mMoeInterSize / mQuantizationGroupSize;
-            status &= tensorDim.d[2] == mHiddenSize;
+            status &= tensorDim.d[2] == (words ? mHiddenSize / 4 : mHiddenSize);
         }
         return status;
     };
 
-    assert(nbInputs == 6 && nbOutputs == 1);
+    assert(nbInputs == inputCount() && nbOutputs == 1);
     assert(pos < (nbInputs + nbOutputs));
 
     auto const& tensorDesc = inOut[pos].desc;
 
+    // NVFP4 weights take two more inputs (the per-expert global scales of FC1 and FC2) between the scales and the output.
+    auto checkGlobalScales = [this](nvinfer1::PluginTensorDesc const& desc) {
+        return desc.type == DataType::kHALF && desc.format == TensorFormat::kLINEAR && desc.dims.nbDims == 1
+            && desc.dims.d[0] == mNumExperts;
+    };
+    if (mWeightFormat == kWeightFormatNvfp4 && pos >= 6)
+    {
+        switch (pos)
+        {
+        case 6:
+        case 7: return checkGlobalScales(tensorDesc);
+        case 8: return checkHiddenStates(tensorDesc);
+        default: return false;
+        }
+    }
     switch (pos)
     {
     case 0: return checkRouterLogits(tensorDesc);
@@ -2023,7 +2068,7 @@ bool Int4MoePlugin::supportsFormatCombination(
 int32_t Int4MoePlugin::configurePlugin(
     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    if (in == nullptr || out == nullptr || nbInputs != 6 || nbOutputs != 1)
+    if (in == nullptr || out == nullptr || nbInputs != inputCount() || nbOutputs != 1)
     {
         return -1;
     }
@@ -2050,7 +2095,7 @@ int32_t Int4MoePlugin::configurePlugin(
 size_t Int4MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
     [[maybe_unused]] DynamicPluginTensorDesc const* outputs, [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
-    if (inputs == nullptr || outputs == nullptr || nbInputs != 6 || nbOutputs != 1)
+    if (inputs == nullptr || outputs == nullptr || nbInputs != inputCount() || nbOutputs != 1)
     {
         return 0;
     }
@@ -2087,7 +2132,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             LOG_ERROR("Int4MoePlugin: enqueue received a null descriptor or buffer");
             return -1;
         }
-        for (int32_t index = 0; index < 6; ++index)
+        for (int32_t index = 0; index < inputCount(); ++index)
         {
             if (inputs[index] == nullptr)
             {
@@ -2272,17 +2317,27 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         }
 
         // Weights arrive as INT8 (view of Marlin int32-packed); Marlin expects INT32
+        // the NVFP4 kernel wants the packed width as 2 * outDim words for both projections (the AWQ entry point takes the
+        // gate-up width as written here)
         rt::Tensor gateUpQWeightsTensor(const_cast<void*>(weightPtrs[0]),
-            rt::Coords{mNumExperts, mHiddenSize / 16, 2 * mMoeInterSize}, rt::DeviceType::kGPU, DataType::kINT32);
+            rt::Coords{mNumExperts, mHiddenSize / 16, (mWeightFormat == kWeightFormatNvfp4 ? 4 : 2) * mMoeInterSize},
+            rt::DeviceType::kGPU, DataType::kINT32);
 
-        rt::Tensor gateUpScalesTensor(
-            const_cast<void*>(weightPtrs[1]), rt::Coords{inputDesc[3].dims}, rt::DeviceType::kGPU, inputDesc[3].type);
+        bool const fp4 = mWeightFormat == kWeightFormatNvfp4;
+        rt::Tensor gateUpScalesTensor = fp4
+            ? rt::Tensor(const_cast<void*>(weightPtrs[1]), rt::Coords{mNumExperts, mHiddenSize / 16, 2 * mMoeInterSize},
+                rt::DeviceType::kGPU, DataType::kINT8)
+            : rt::Tensor(const_cast<void*>(weightPtrs[1]), rt::Coords{inputDesc[3].dims}, rt::DeviceType::kGPU,
+                inputDesc[3].type);
 
         rt::Tensor downQWeightsTensor(const_cast<void*>(weightPtrs[2]),
             rt::Coords{mNumExperts, mMoeInterSize / 16, 2 * mHiddenSize}, rt::DeviceType::kGPU, DataType::kINT32);
 
-        rt::Tensor downScalesTensor(
-            const_cast<void*>(weightPtrs[3]), rt::Coords{inputDesc[5].dims}, rt::DeviceType::kGPU, inputDesc[5].type);
+        rt::Tensor downScalesTensor = fp4
+            ? rt::Tensor(const_cast<void*>(weightPtrs[3]), rt::Coords{mNumExperts, mMoeInterSize / 16, mHiddenSize},
+                rt::DeviceType::kGPU, DataType::kINT8)
+            : rt::Tensor(const_cast<void*>(weightPtrs[3]), rt::Coords{inputDesc[5].dims}, rt::DeviceType::kGPU,
+                inputDesc[5].type);
 
         rt::Tensor outputTensor(outputs[0], rt::Coords{outputDesc[0].dims}, rt::DeviceType::kGPU, outputDesc[0].type);
 
@@ -2382,7 +2437,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         }
         CUDA_CHECK(cudaGetLastError());
 
-        bool const cpuMiss = useCache && cpuMissFromEnv() && numTokens <= kernel::kCpuMissMaxTokens
+        bool const cpuMiss = useCache && mWeightFormat == kWeightFormatInt4 && cpuMissFromEnv() && numTokens <= kernel::kCpuMissMaxTokens
             && numTokens * mTopK <= kernel::kCpuMissMaxSlots && tileTokens == numTokens && prepareCpuMiss(inputs);
         if (useCache && hostRoundTripProbeFromEnv())
         {
@@ -2474,6 +2529,10 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
 
         // Chunked prefill (EDGELLM_MOE_PREFILL_CHUNK): the same GEMM once per chunk of experts, weights from the ring, routing arrays sliced per chunk.
         // phase 0 = gate-up, 1 = down; the weight tensors are the chunk's slice with the chunk's expert count as leading dimension.
+        if (mWeightFormat == kWeightFormatNvfp4 && (chunkMode || routedMode))
+        {
+            throw std::runtime_error("Int4MoePlugin: chunked expert prefill is not available for NVFP4 weights");
+        }
         auto runChunkedGemm = [&](int32_t phase, rt::Tensor const& gemmInput, rt::Tensor& gemmOutput, int64_t kTile, int64_t nOut,
                                   nvinfer1::PluginTensorDesc const& scalesDesc, rt::Tensor const& gemmTopkWeights, int64_t gemmTopK,
                                   bool mulTopkWeights)
@@ -2541,9 +2600,19 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         }
         else
         {
-            moeAwqW4A16MarlinGemm(hiddenStates2D, gateUpOutputTensor, gateUpQWeightsTensor, gateUpScalesTensor,
-                sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsFlatTensor,
-                marlinWorkspaceTensor, moeBlockSize, mTopK, false, stream);
+            if (mWeightFormat == kWeightFormatNvfp4)
+            {
+                rt::Tensor fc1Global(const_cast<void*>(inputs[6]), {mNumExperts}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+                moeNvfp4A16MarlinGemm(hiddenStates2D, gateUpOutputTensor, gateUpQWeightsTensor, gateUpScalesTensor, fc1Global,
+                    sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsFlatTensor,
+                    marlinWorkspaceTensor, moeBlockSize, mTopK, false, stream);
+            }
+            else
+            {
+                moeAwqW4A16MarlinGemm(hiddenStates2D, gateUpOutputTensor, gateUpQWeightsTensor, gateUpScalesTensor,
+                    sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsFlatTensor,
+                    marlinWorkspaceTensor, moeBlockSize, mTopK, false, stream);
+            }
         }
         CUDA_CHECK(cudaGetLastError());
 
@@ -2577,9 +2646,19 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         }
         else
         {
-            moeAwqW4A16MarlinGemm(activationOutputTensor, downOutputTensor, downQWeightsTensor, downScalesTensor,
-                sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsPaddedTensor,
-                marlinWorkspaceTensor, moeBlockSize, 1, true, stream);
+            if (mWeightFormat == kWeightFormatNvfp4)
+            {
+                rt::Tensor fc2Global(const_cast<void*>(inputs[7]), {mNumExperts}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+                moeNvfp4A16MarlinGemm(activationOutputTensor, downOutputTensor, downQWeightsTensor, downScalesTensor, fc2Global,
+                    sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsPaddedTensor,
+                    marlinWorkspaceTensor, moeBlockSize, 1, true, stream);
+            }
+            else
+            {
+                moeAwqW4A16MarlinGemm(activationOutputTensor, downOutputTensor, downQWeightsTensor, downScalesTensor,
+                    sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsPaddedTensor,
+                    marlinWorkspaceTensor, moeBlockSize, 1, true, stream);
+            }
         }
         CUDA_CHECK(cudaGetLastError());
 
@@ -2613,7 +2692,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
 int32_t Int4MoePlugin::onShapeChange(
     PluginTensorDesc const* in, int32_t nbInputs, PluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    if (in == nullptr || out == nullptr || nbInputs != 6 || nbOutputs != 1)
+    if (in == nullptr || out == nullptr || nbInputs != inputCount() || nbOutputs != 1)
     {
         return -1;
     }
@@ -2651,6 +2730,7 @@ PluginFieldCollection const* Int4MoePlugin::getFieldsToSerialize() noexcept
         mDataToSerialize.emplace_back("quantization_group_size", &mQuantizationGroupSize, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("stage_experts", &mStageExperts, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("token_tile", &mTokenTile, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("weight_format", &mWeightFormat, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("gate_softcap", &mGateSoftcap, PluginFieldType::kFLOAT32, 1);
         mDataToSerialize.emplace_back("up_softcap", &mUpSoftcap, PluginFieldType::kFLOAT32, 1);
 
@@ -2679,6 +2759,7 @@ Int4MoePluginCreator::Int4MoePluginCreator()
     mPluginAttributes.emplace_back(PluginField("quantization_group_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("stage_experts", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("token_tile", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("weight_format", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("gate_softcap", nullptr, PluginFieldType::kFLOAT32, 1));
     mPluginAttributes.emplace_back(PluginField("up_softcap", nullptr, PluginFieldType::kFLOAT32, 1));
 

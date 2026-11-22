@@ -238,7 +238,8 @@ class Inkling2Layer(Module):
             _f32(w, self.key("mlp.gate.weight")).T)
         self.router_bias = _f32(w, self.key("mlp.gate.bias"))
         self.int4 = w.has(self.key("mlp.experts.0.gate_proj.qweight"))
-        if not self.int4:
+        self.nvfp4_off = w.has(self.key("mlp.experts.fc1_qweights"))
+        if not self.int4 and not self.nvfp4_off:
             self.moe_weights, self.moe_inter = self._pack_experts(ctx)
 
     def _pack_experts(self, ctx):
@@ -370,9 +371,45 @@ class Inkling2Layer(Module):
                             packed_dtype=np.int32)
         return routed * float(text["route_scale"])
 
+    def _nvfp4_offload_moe(self, logits, hidden16):
+        """Marlin NVFP4 experts from the sidecar, host-resident like the INT4 ones (Int4MoePlugin weight_format 1)."""
+        cfg, w = self.cfg, self.ctx.weights
+        text = cfg.raw_component
+        base = self.key("mlp.experts")
+        experts = int(text["n_routed_experts"])
+        specs = lambda: weight_conversion.nvfp4_expert_specs(w, base)
+
+        def materialize():
+            return {
+                engine: w.array(f"{base}.{stored}")
+                for engine, stored, _ in weight_conversion._NVFP4_TENSORS
+            }
+
+        moe_weights = w.parameter_value("int4_moe", base, specs, materialize)
+        inter = int(moe_weights["fc_down_scales"].shape[1]) * 16
+        encoded = encode_routing(logits, self.router_bias, 8)
+        routed = F.int4_moe(encoded,
+                            hidden16,
+                            moe_weights,
+                            experts,
+                            8,
+                            self.hidden,
+                            inter,
+                            16,
+                            weight_prefix=base,
+                            weight_bindings=weight_conversion.nvfp4_expert_bindings(w, base),
+                            gate_softcap=float(text["mlp_gate_softcap"]),
+                            up_softcap=float(text["mlp_up_softcap"]),
+                            packed_dtype=np.int32,
+                            weight_format="nvfp4")
+        return routed * float(text["route_scale"])
+
     def moe(self, x32, conv_state, ragged):
         logits = _matmul_const(x32, self.router_w, "router_w")
         hidden16 = x32.cast(trt.float16)
+        if self.nvfp4_off:
+            routed = self._nvfp4_offload_moe(logits, hidden16)
+            return self._moe_conv(routed, conv_state, ragged)
         if self.int4:
             routed = self._int4_moe(logits, hidden16)
             return self._moe_conv(routed, conv_state, ragged)
@@ -561,7 +598,8 @@ class Inkling2ForCausalLM(NetworkModule):
         selected = F.gather_token_rows(normed, ragged.logits_indices)
         logits = self.lm_head(selected).cast(trt.float32)
         logits = self.softcap * (logits / self.softcap).tanh()
-        padded = int(self.cfg.vocab_size)
+        padded = int(
+            self.ctx.weights.parameter_spec("model.llm.unembed.weight").shape[0])
         unpadded = int(self.cfg.raw_component.get("unpadded_vocab_size", padded))
         if unpadded < padded:
             # the unembedding is padded beyond the tokenizer's ids; those rows are untrained and must never be sampled

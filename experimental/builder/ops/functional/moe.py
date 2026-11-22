@@ -138,8 +138,13 @@ def int4_moe(router_logits: Tensor,
              zero_point_offset: int = 1,
              gate_softcap: float = 0.0,
              up_softcap: float = 0.0,
-             packed_dtype=np.int8) -> Tensor:
+             packed_dtype=np.int8,
+             weight_format: str = "int4") -> Tensor:
     """Run GPTQ-Marlin mixture-of-experts.
+
+    ``weight_format`` "nvfp4" takes Marlin-packed NVFP4 experts instead: E4M3 block scales (bound as int32 words) and the
+    two per-expert global scales (``fc1_global_scales`` / ``fc2_global_scales`` entries of ``weights`` and
+    ``weight_bindings``), group size 16.
 
     ``packed_dtype`` (int8 or int32) is the element type of the packed weight inputs; int32 keeps the
     network free of INT8 tensors, which TensorRT refuses to combine with FP8 Q/DQ.
@@ -158,6 +163,7 @@ def int4_moe(router_logits: Tensor,
         "up_softcap": up_softcap
     } if gate_softcap > 0.0 else {})
     _validate_token_layout(router_logits, hidden_states)
+    scale_dtype = packed_dtype if weight_format == "nvfp4" else np.float16
 
     inputs = [
         router_logits,
@@ -167,7 +173,7 @@ def int4_moe(router_logits: Tensor,
                   "int4_moe",
                   recipe=weight_bindings["fc_gate_up_qweights"]),
         parameter(weight_prefix + ".fc_gate_up_scales",
-                  _parameter_value(weights["fc_gate_up_scales"], np.float16),
+                  _parameter_value(weights["fc_gate_up_scales"], scale_dtype),
                   "int4_moe",
                   recipe=weight_bindings["fc_gate_up_scales"]),
         parameter(weight_prefix + ".fc_down_qweights",
@@ -175,10 +181,20 @@ def int4_moe(router_logits: Tensor,
                   "int4_moe",
                   recipe=weight_bindings["fc_down_qweights"]),
         parameter(weight_prefix + ".fc_down_scales",
-                  _parameter_value(weights["fc_down_scales"], np.float16),
+                  _parameter_value(weights["fc_down_scales"], scale_dtype),
                   "int4_moe",
                   recipe=weight_bindings["fc_down_scales"]),
     ]
+    if weight_format == "nvfp4":
+        for name in ("fc1_global_scales", "fc2_global_scales"):
+            inputs.append(
+                parameter(weight_prefix + "." + name,
+                          _parameter_value(weights[name], np.float16),
+                          "int4_moe",
+                          recipe=weight_bindings[name]))
+        extra["weight_format"] = 1
+    elif weight_format != "int4":
+        raise ValueError(f"unknown expert weight format {weight_format!r}")
     return operation("int4_moe",
                      inputs,
                      num_experts=num_experts,

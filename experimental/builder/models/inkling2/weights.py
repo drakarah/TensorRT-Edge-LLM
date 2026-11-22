@@ -106,3 +106,29 @@ def int4_expert_specs(weights, experts_prefix: str, num_experts: int) -> dict:
         ParameterSpec((num_experts, down_scales.shape[0], down_output_size),
                       np.float16),
     }
+
+
+_NVFP4_TENSORS = (("fc_gate_up_qweights", "fc1_qweights", np.int32),
+                  ("fc_gate_up_scales", "fc1_scales", np.int32),
+                  ("fc_down_qweights", "fc2_qweights", np.int32),
+                  ("fc_down_scales", "fc2_scales", np.int32),
+                  ("fc1_global_scales", "fc1_global_scales", np.float16),
+                  ("fc2_global_scales", "fc2_global_scales", np.float16))
+
+
+def nvfp4_expert_specs(weights, experts_prefix: str) -> dict:
+    """Describe the Marlin-packed NVFP4 sidecar tensors of one layer (int32 words, fp16 global scales)."""
+    return {
+        engine: weights.parameter_spec(f"{experts_prefix}.{stored}", dtype)
+        for engine, stored, dtype in _NVFP4_TENSORS
+    }
+
+
+def nvfp4_expert_bindings(weights, experts_prefix: str) -> dict:
+    """Identity bindings: the runtime copies each sidecar tensor as it is."""
+    return {
+        engine:
+        weights.checkpoint_binding([f"{experts_prefix}.{stored}"], "plugin",
+                                   "identity")
+        for engine, stored, _ in _NVFP4_TENSORS
+    }

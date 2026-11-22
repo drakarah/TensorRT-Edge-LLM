@@ -122,6 +122,8 @@ public:
     bool supportsFormatCombination(int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
         int32_t nbOutputs) noexcept override;
 
+    bool supportsFormatCombinationImpl(int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept;
+
     //! @brief Configure plugin with tensor descriptions
     //! @param in Input tensor descriptors
     //! @param nbInputs Number of inputs
@@ -206,6 +208,14 @@ private:
     float mGateSoftcap{0.0F}; //!< Both caps positive: softcapped SwiGLU instead of SwiGLU.
     float mUpSoftcap{0.0F};
     int32_t mQuantizationGroupSize{};
+    // Weight format of the expert tensors: INT4 (GPTQ/AWQ Marlin) or NVFP4 (E2M1 + E4M3 block scales + per-expert global scales).
+    static constexpr int32_t kWeightFormatInt4{0};
+    static constexpr int32_t kWeightFormatNvfp4{1};
+    int32_t mWeightFormat{kWeightFormatInt4};
+    int32_t inputCount() const noexcept
+    {
+        return mWeightFormat == kWeightFormatNvfp4 ? 8 : 6;
+    }
     int32_t mStageExperts{0};
     int32_t mTokenTile{0};
     int32_t* mStats{nullptr}; // device, [2][numExperts] selection counters (EDGELLM_MOE_STATS)
