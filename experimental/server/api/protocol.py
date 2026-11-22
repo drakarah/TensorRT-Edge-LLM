@@ -179,6 +179,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if effort in ("none", "off", "disabled", "false"):
             self.enable_thinking = False
             self.reasoning_effort = None
+        elif effort and os.environ.get("EDGELLM_REASONING_EFFORT_PASSTHROUGH") == "1":
+            # templates that know the OpenAI level names themselves (Inkling 2: minimal..max or a number in [0, 0.99])
+            self.reasoning_effort = effort
         elif effort:
             self.reasoning_effort = {
                 "minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh",

@@ -721,8 +721,11 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         if (char const* mb = std::getenv("EDGELLM_SWA_PREFIX_CACHE_MB"); mb != nullptr && std::atoll(mb) > 0)
         {
             size_t const budget = static_cast<size_t>(std::atoll(mb)) << 20;
-            mSwaPrefixCache = std::make_unique<SwaPrefixCache>(
-                mSharedResources->cacheManagers[0]->getKVCacheManager(), *mSharedResources->kvPageTables[0], budget);
+            mSwaPrefixCache = std::make_unique<SwaPrefixCache>(mSharedResources->cacheManagers[0]->getKVCacheManager(),
+                *mSharedResources->kvPageTables[0], budget,
+                mBaseExecutor != nullptr && mDeployment.base.numLinearAttnLayers > 0
+                    ? &mSharedResources->cacheManagers[0]->getMambaCacheManager()
+                    : nullptr);
             LOG_INFO("Bounded-SWA prefix cache enabled: %zu MiB of pinned host memory.", budget >> 20);
         }
     }
@@ -2424,7 +2427,9 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         if (std::optional<SwaPrefixCache::Hit> const hit = mSwaPrefixCache->lookup(fullPrompt))
         {
             // Reuse hit.length - 1 tokens so the last cached token is recomputed, as the legacy system-prompt cache does.
-            int32_t const restoreLength = hit->length - 1;
+            // A snapshot with recurrent/convolution state is exact at hit.length (the lookup only returns strict
+            // prefixes, so the prompt still has tokens left), and that state cannot be rewound by one token.
+            int32_t const restoreLength = mSwaPrefixCache->hasStates() ? hit->length : hit->length - 1;
             if (restoreLength > 0 && managedRequest->prepareSwaPrefill({restoreLength}, false))
             {
                 mSwaPrefixCache->restore(*hit, context.residentRefs.at(0).slot, restoreLength,
@@ -2440,6 +2445,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
                 check::check(mHostReuseKVCacheLengths.reshape({1}), "Tensor reshape failed");
                 mHostReuseKVCacheLengths.dataPointer<int32_t>()[0] = restoreLength;
                 mSharedResources->cacheManagers[0]->resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+                mSwaPrefixCache->restoreStates(*hit, context.residentRefs.at(0).slot, context.stream);
                 if (decodingStrategy.isSpeculative())
                 {
                     decodingStrategy.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);

@@ -35,6 +35,7 @@ namespace rt
 
 class KVCacheManager;
 class KVPageTable;
+class MambaCacheManager;
 
 //! Host-resident snapshots of the KV state a bounded-SWA sequence has at fixed token boundaries, so a later request
 //! that starts with the same tokens can skip their prefill. A snapshot holds the pages of the full-capacity layers for
@@ -49,7 +50,10 @@ public:
         void const* handle{};
     };
 
-    SwaPrefixCache(KVCacheManager& kvCache, KVPageTable const& basePageTable, size_t budgetBytes);
+    //! `states` (optional) is the resident recurrent/convolution state pool of a hybrid model: a snapshot then also holds
+    //! the slot's rows, restored with restoreStates once the runtime has reset the slot for the new request.
+    SwaPrefixCache(KVCacheManager& kvCache, KVPageTable const& basePageTable, size_t budgetBytes,
+        MambaCacheManager* states = nullptr);
     ~SwaPrefixCache() noexcept;
     SwaPrefixCache(SwaPrefixCache const&) = delete;
     SwaPrefixCache& operator=(SwaPrefixCache const&) = delete;
@@ -65,6 +69,13 @@ public:
     //! in `state` (the manager has mapped them for `restoreLength`). Ordered on `stream`.
     void restore(Hit const& hit, int32_t slot, int32_t restoreLength, SwaKVCacheState const& state, cudaStream_t stream);
 
+    //! Writes the snapshot's recurrent/convolution rows into `slot` (no-op for a model without such state). Ordered on
+    //! `stream`; call after the slot has been reset for the request.
+    void restoreStates(Hit const& hit, int32_t slot, cudaStream_t stream);
+
+    //! True when snapshots carry recurrent/convolution state, so a hit restores exactly `Hit::length` tokens.
+    bool hasStates() const noexcept;
+
     size_t usedBytes() const noexcept;
     int64_t hits() const noexcept;
     int64_t lookups() const noexcept;
@@ -74,6 +85,7 @@ private:
     void evictFor(size_t bytes);
 
     KVCacheManager& mKvCache;
+    MambaCacheManager* mStates;
     KVPageTable const& mBasePageTable;
     size_t const mBudgetBytes;
     size_t mUsedBytes{};

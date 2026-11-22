@@ -239,6 +239,166 @@ class MuseGlimmerStreamingReasoningParser:
         self._buffer = ""
 
 
+_INKLING_MESSAGE = "<|message_model|>"
+_INKLING_THINKING = "<|content_thinking|>"
+_INKLING_TEXT = "<|content_text|>"
+_INKLING_TOOL = "<|content_invoke_tool_json|>"
+_INKLING_END = "<|end_message|>"
+_INKLING_EOS = "<|content_model_end_sampling|>"
+_INKLING_KINDS = {
+    _INKLING_THINKING: "thinking",
+    _INKLING_TEXT: "content",
+    _INKLING_TOOL: "tool",
+}
+_INKLING_MARKERS = (_INKLING_MESSAGE, _INKLING_END, _INKLING_EOS,
+                    *_INKLING_KINDS)
+
+
+def _inkling_tool_block(header: str, body: str) -> str:
+    """Rewrite one Inkling tool message as the ``<tool_call>`` block the generic tool parser reads."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return body
+    if not isinstance(payload, dict):
+        return body
+    name = payload.get("name") or header.strip()
+    arguments = payload.get("args", payload.get("arguments", {}))
+    return "<tool_call>" + json.dumps({
+        "name": name,
+        "arguments": arguments
+    }) + "</tool_call>"
+
+
+class InklingStreamingReasoningParser:
+    """Split Inkling 2's message stream into reasoning, content and tool-call blocks.
+
+    The model writes ``<|message_model|>[name]<|content_KIND|>body<|end_message|>`` messages (KIND thinking, text or
+    invoke_tool_json) and ends with ``<|content_model_end_sampling|>``. Thinking bodies become reasoning, text bodies
+    content, and tool bodies are re-emitted as ``<tool_call>`` blocks inside the content stream. The decoded text must
+    keep the special tokens (the server does that whenever a reasoning parser is active).
+    """
+
+    def __init__(self) -> None:
+        self._state = "header"  # header | thinking | content | tool
+        self._buffer = ""
+        self._header = ""
+        self._tool_body = ""
+
+    @staticmethod
+    def _held(buffer: str) -> int:
+        """Length of a buffer suffix that may still grow into a marker."""
+        longest = 0
+        for marker in _INKLING_MARKERS:
+            for size in range(min(len(marker) - 1, len(buffer)), 0, -1):
+                if buffer.endswith(marker[:size]):
+                    longest = max(longest, size)
+                    break
+        return longest
+
+    def _next_marker(self, markers: Tuple[str, ...]) -> Tuple[int, str]:
+        best, found = -1, ""
+        for marker in markers:
+            index = self._buffer.find(marker)
+            if index >= 0 and (best < 0 or index < best):
+                best, found = index, marker
+        return best, found
+
+    def feed(self, text: str) -> Iterable[ReasoningDelta]:
+        self._buffer += text
+        yield from self._drain(final=False)
+
+    def _drain(self, *, final: bool) -> Iterable[ReasoningDelta]:
+        while self._buffer:
+            if self._state == "header":
+                index, marker = self._next_marker(
+                    (_INKLING_MESSAGE, *_INKLING_KINDS, _INKLING_EOS,
+                     _INKLING_END))
+                if index < 0:
+                    if not final:
+                        return
+                    # no marker at all: text the model wrote without a header
+                    yield ReasoningDelta("content", self._buffer)
+                    self._buffer = ""
+                    return
+                before = self._buffer[:index]
+                self._buffer = self._buffer[index + len(marker):]
+                if marker in _INKLING_KINDS:
+                    self._header = before
+                    self._state = _INKLING_KINDS[marker]
+                    self._tool_body = ""
+                elif before.strip() and marker != _INKLING_MESSAGE:
+                    yield ReasoningDelta("content", before)
+                continue
+            if self._state == "tool":
+                index = self._buffer.find(_INKLING_END)
+                if index < 0:
+                    self._tool_body += self._buffer
+                    self._buffer = ""
+                    if final and self._tool_body:
+                        yield ReasoningDelta(
+                            "content",
+                            _inkling_tool_block(self._header, self._tool_body))
+                        self._tool_body = ""
+                    return
+                self._tool_body += self._buffer[:index]
+                self._buffer = self._buffer[index + len(_INKLING_END):]
+                yield ReasoningDelta(
+                    "content",
+                    _inkling_tool_block(self._header, self._tool_body))
+                self._tool_body = ""
+                self._header = ""
+                self._state = "header"
+                continue
+            field = "reasoning" if self._state == "thinking" else "content"
+            index, marker = self._next_marker((_INKLING_END, _INKLING_EOS))
+            if index >= 0:
+                if index:
+                    yield ReasoningDelta(field, self._buffer[:index])
+                self._buffer = self._buffer[index + len(marker):]
+                self._state = "header"
+                self._header = ""
+                continue
+            hold = 0 if final else self._held(self._buffer)
+            emit = self._buffer[:len(self._buffer) - hold]
+            self._buffer = self._buffer[len(self._buffer) - hold:]
+            if emit:
+                yield ReasoningDelta(field, emit)
+            return
+
+    def flush(self) -> Iterable[ReasoningDelta]:
+        yield from self._drain(final=True)
+        if self._tool_body:
+            yield ReasoningDelta(
+                "content", _inkling_tool_block(self._header, self._tool_body))
+            self._tool_body = ""
+        self._buffer = ""
+
+
+class InklingReasoningParser(ReasoningParser):
+    """Whole-text front end of InklingStreamingReasoningParser."""
+
+    def __init__(self) -> None:
+        super().__init__(_INKLING_THINKING, _INKLING_END, always_enabled=True)
+
+    def extract(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+        parser = InklingStreamingReasoningParser()
+        reasoning: List[str] = []
+        content: List[str] = []
+        for delta in list(parser.feed(text)) + list(parser.flush()):
+            (reasoning if delta.field == "reasoning" else content).append(
+                delta.text)
+        return ("".join(reasoning) or None), ("".join(content) or None)
+
+    def stream(
+            self,
+            *,
+            allow_implicit: bool = True
+    ) -> "InklingStreamingReasoningParser":
+        del allow_implicit
+        return InklingStreamingReasoningParser()
+
+
 class ReasoningParserRegistry:
     """Resolve explicit parser names or infer one from model metadata.
 
@@ -254,6 +414,7 @@ class ReasoningParserRegistry:
             "qwen3": thinking,
             "deepseek_r1": thinking,
             "muse_glimmer": MuseGlimmerReasoningParser(),
+            "inkling": InklingReasoningParser(),
             "nemotron": thinking,
         }
 
@@ -277,6 +438,8 @@ class ReasoningParserRegistry:
         identifiers = _model_identifiers(model_dir)
         if any("muse_glimmer" in value for value in identifiers):
             return "muse_glimmer"
+        if any("inkling" in value for value in identifiers):
+            return "inkling"
         if any("nemotron" in value for value in identifiers):
             return "nemotron"
         if any("deepseek" in value for value in identifiers):
