@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <gtest/gtest.h>
 #include <limits>
 #include <numeric>
@@ -245,7 +246,7 @@ struct Result
 };
 
 //! Runs the kernel for one step, updating the host pool image with the appended rows first (for the reference).
-Result run(Case const& c, Data const& d, Pool pool)
+Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false)
 {
     int32_t const nTok = d.slots;
     half* dq = upload(toHalf(d.q));
@@ -257,7 +258,22 @@ Result run(Case const& c, Data const& d, Pool pool)
     float* dqs = upload(d.qScale);
     float* drs = upload(d.relScale);
     float* dproj = upload(d.proj);
-    half* dpool = upload(toHalf(pool.host));
+    // FP8 pools hold one byte per element (E4M3); the host image is rounded through it.
+    std::vector<uint8_t> poolBytes;
+    half* dpool = nullptr;
+    if (fp8)
+    {
+        poolBytes.resize(pool.host.size());
+        for (size_t i = 0; i < pool.host.size(); ++i)
+        {
+            poolBytes[i] = __nv_fp8_e4m3(pool.host[i]).__x;
+        }
+        dpool = reinterpret_cast<half*>(upload(poolBytes));
+    }
+    else
+    {
+        dpool = upload(toHalf(pool.host));
+    }
     int32_t* doff = upload(d.offsets);
     int32_t* dlen = upload(d.lengths);
     int32_t* dpast = upload(d.past);
@@ -277,6 +293,7 @@ Result run(Case const& c, Data const& d, Pool pool)
     p.relExtent = c.extent;
     p.window = c.window;
     p.maxPagesPerSeq = c.maxPages;
+    p.kvFp8 = fp8 ? 1 : 0;
     p.scaling = c.scaling;
     p.logAlpha = c.alpha;
     p.logNFloor = c.nFloor;
@@ -297,12 +314,26 @@ Result run(Case const& c, Data const& d, Pool pool)
     {
         r.out[i] = h2f(hout[i]);
     }
-    std::vector<half> hpool(pool.host.size());
-    CUDA_CHECK(cudaMemcpy(hpool.data(), dpool, hpool.size() * sizeof(half), cudaMemcpyDeviceToHost));
     r.pool = pool;
-    for (size_t i = 0; i < hpool.size(); ++i)
+    if (fp8)
     {
-        r.pool.host[i] = h2f(hpool[i]);
+        std::vector<uint8_t> bytes(pool.host.size());
+        CUDA_CHECK(cudaMemcpy(bytes.data(), dpool, bytes.size(), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < bytes.size(); ++i)
+        {
+            __nv_fp8_e4m3 v;
+            v.__x = bytes[i];
+            r.pool.host[i] = static_cast<float>(v);
+        }
+    }
+    else
+    {
+        std::vector<half> hpool(pool.host.size());
+        CUDA_CHECK(cudaMemcpy(hpool.data(), dpool, hpool.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < hpool.size(); ++i)
+        {
+            r.pool.host[i] = h2f(hpool[i]);
+        }
     }
     for (void* ptr :
         {(void*) dq, (void*) drel, (void*) dsink, (void*) dgate, (void*) dk, (void*) dv, (void*) dqs, (void*) drs,
@@ -650,4 +681,97 @@ TEST(Inkling2Attention, PartiallyUnmappedAppendSkipsOnlyTheUnmappedRows)
     {
         ASSERT_EQ(r.pool.host[i], kSentinel);
     }
+}
+
+//! Rounds every cached and new K/V value to the E4M3 grid, so an FP16 pool and an FP8 pool hold identical numbers.
+void roundKvToFp8(Data& d, Pool& pool)
+{
+    auto rnd = [](float& x) { x = static_cast<float>(__nv_fp8_e4m3(x)); };
+    for (auto& x : d.k)
+    {
+        rnd(x);
+    }
+    for (auto& x : d.v)
+    {
+        rnd(x);
+    }
+    for (auto& x : pool.host)
+    {
+        if (x != kSentinel)
+        {
+            rnd(x);
+        }
+    }
+}
+
+void expectFp8MatchesFp16(Case const& c, Data& d, Pool pool)
+{
+    roundKvToFp8(d, pool);
+    Result ref = run(c, d, pool, false);
+    Result got = run(c, d, pool, true);
+    ASSERT_EQ(ref.out.size(), got.out.size());
+    for (size_t i = 0; i < ref.out.size(); ++i)
+    {
+        ASSERT_TRUE(std::isfinite(got.out[i]));
+        ASSERT_NEAR(got.out[i], ref.out[i], 2e-3F + 2e-3F * std::fabs(ref.out[i])) << "output element " << i;
+    }
+    // the appended rows are the FP8 image of the (already grid-aligned) inputs; untouched rows keep the sentinel
+    // (the sentinel 77 is itself not exactly on the grid; compare the FP8 round-trip)
+    for (size_t i = 0; i < ref.pool.host.size(); ++i)
+    {
+        float const expected = ref.pool.host[i] == kSentinel ? static_cast<float>(__nv_fp8_e4m3(kSentinel)) : ref.pool.host[i];
+        ASSERT_EQ(got.pool.host[i], expected) << "pool element " << i;
+    }
+}
+
+TEST(Inkling2Attention, Fp8KvPoolMatchesFp16OnTheSameGridValuesPrefill)
+{
+    Case c;
+    c.nh = 24;
+    c.nkv = 8;
+    c.maxPages = 3;
+    c.numPages = 8;
+    Data d = makeData(c, {0}, {150}, 0, 41);
+    expectFp8MatchesFp16(c, d, newPool(c));
+}
+
+TEST(Inkling2Attention, Fp8KvPoolMatchesFp16DecodeWithHistoryAndWindow)
+{
+    Case c;
+    c.window = 100;
+    c.maxPages = 8;
+    c.numPages = 20;
+    Data d = makeData(c, {600}, {1}, 0, 43);
+    unmapLeadingPages(c, d, 3);
+    Pool pool = poolWithHistory(c, d, {600}, 44);
+    expectFp8MatchesFp16(c, d, pool);
+}
+
+TEST(Inkling2Attention, Fp8KvSaturatesInsteadOfOverflowing)
+{
+    // |value| far above the E4M3 range (448) is clamped, never NaN/Inf
+    Case c;
+    c.maxPages = 2;
+    c.numPages = 4;
+    Data d = makeData(c, {0}, {2}, 0, 45);
+    for (auto& x : d.k)
+    {
+        x = 5000.0F;
+    }
+    for (auto& x : d.v)
+    {
+        x = -5000.0F;
+    }
+    Result got = run(c, d, newPool(c), true);
+    for (float v : got.out)
+    {
+        ASSERT_TRUE(std::isfinite(v));
+    }
+    bool sawMax = false;
+    for (float v : got.pool.host)
+    {
+        sawMax = sawMax || std::fabs(v) == 448.0F;
+        ASSERT_TRUE(std::isfinite(v));
+    }
+    EXPECT_TRUE(sawMax);
 }

@@ -211,13 +211,13 @@ bool Inkling2AttentionPlugin::supportsFormatCombination(
     case kQScale:
     case kRelScale: return linear(d, DataType::kFLOAT, 1);
     case kRelProjT: return linear(d, DataType::kFLOAT, 2);
-    case kPastKv: return linear(d, DataType::kHALF, 5);
+    case kPastKv: return linear(d, DataType::kHALF, 5) || linear(d, DataType::kFP8, 5);
     case kQueryStartOffsets:
     case kQueryLengths:
     case kPastLengths: return linear(d, DataType::kINT32, 1);
     case kPageTable: return linear(d, DataType::kINT32, 3);
     case kNumInputs + kOutAttention: return linear(d, DataType::kHALF, 2);
-    case kNumInputs + kOutKv: return linear(d, DataType::kHALF, 5);
+    case kNumInputs + kOutKv: return linear(d, inOut[kPastKv].desc.type, 5);
     default: return false;
     }
 }
@@ -298,6 +298,7 @@ int32_t Inkling2AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
     params.relExtent = mRelExtent;
     params.window = mWindow;
     params.maxPagesPerSeq = inputDesc[kPageTable].dims.d[2];
+    params.kvFp8 = inputDesc[kPastKv].type == DataType::kFP8 ? 1 : 0;
     params.scaling = mScaling;
     params.logAlpha = mLogAlpha;
     params.logNFloor = mLogNFloor;
@@ -313,7 +314,7 @@ int32_t Inkling2AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
         return -1;
     }
     // The KV pool is aliased: the plugin reads and writes the output buffer, which is the input buffer.
-    auto* kvPool = static_cast<half*>(outputs[kOutKv]);
+    void* kvPool = outputs[kOutKv];
     kernel::launchInkling2Attention(params, static_cast<half const*>(inputs[kQLin]),
         static_cast<half const*>(inputs[kRelLin]), static_cast<half const*>(inputs[kSinkLin]),
         static_cast<half const*>(inputs[kGateLin]), static_cast<float const*>(inputs[kQScale]),

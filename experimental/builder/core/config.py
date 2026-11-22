@@ -269,7 +269,10 @@ class DeviceConfig:
 
     @property
     def kv_cache_dtype(self) -> str:
-        return "fp8" if self.kv_cache_quant == "fp8" else "fp16"
+        # a checkpoint without per-layer KV scales can still ask for a unit-scale FP8 cache with kv_cache_dtype: "fp8"
+        fp8 = (self.kv_cache_quant == "fp8"
+               or self.raw_component.get("kv_cache_dtype") == "fp8")
+        return "fp8" if fp8 else "fp16"
 
     @property
     def uses_dual_rope(self) -> bool:

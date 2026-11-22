@@ -18,6 +18,7 @@
 #include "inkling2AttentionKernels.h"
 
 #include <cmath>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 namespace trt_edgellm
@@ -63,8 +64,36 @@ __device__ __forceinline__ bool locateToken(int32_t t, int32_t const* offsets, i
     return local >= 0 && local < lengths[seq];
 }
 
+//! KV pool element access: FP16, or FP8 E4M3 (unit scale, saturating) for the long-context cache.
+__device__ __forceinline__ void loadKv4(half const* p, float (&f)[4])
+{
+    uint2 const r = *reinterpret_cast<uint2 const*>(p);
+    half2 const* h = reinterpret_cast<half2 const*>(&r);
+    float2 const a = __half22float2(h[0]), b = __half22float2(h[1]);
+    f[0] = a.x, f[1] = a.y, f[2] = b.x, f[3] = b.y;
+}
+
+__device__ __forceinline__ void loadKv4(__nv_fp8_e4m3 const* p, float (&f)[4])
+{
+    uint32_t const r = *reinterpret_cast<uint32_t const*>(p);
+    __nv_fp8x2_e4m3 const* h = reinterpret_cast<__nv_fp8x2_e4m3 const*>(&r);
+    float2 const a = static_cast<float2>(h[0]), b = static_cast<float2>(h[1]);
+    f[0] = a.x, f[1] = a.y, f[2] = b.x, f[3] = b.y;
+}
+
+__device__ __forceinline__ void storeKv(half* p, half v)
+{
+    *p = v;
+}
+
+__device__ __forceinline__ void storeKv(__nv_fp8_e4m3* p, half v)
+{
+    *p = __nv_fp8_e4m3(__half2float(v));
+}
+
+template <typename KvT>
 __global__ void appendKernel(Inkling2AttentionParams p, half const* __restrict__ kNew, half const* __restrict__ vNew,
-    half* __restrict__ kvPool, int32_t const* __restrict__ offsets, int32_t const* __restrict__ lengths,
+    KvT* __restrict__ kvPool, int32_t const* __restrict__ offsets, int32_t const* __restrict__ lengths,
     int32_t const* __restrict__ past, int32_t const* __restrict__ pageTable)
 {
     int32_t const t = blockIdx.x;
@@ -86,18 +115,19 @@ __global__ void appendKernel(Inkling2AttentionParams p, half const* __restrict__
     int64_t const vDst = int64_t(vPage) * pageElems + (pos % kInkling2TokensPerPage) * rowElems;
     for (int64_t i = threadIdx.x; i < rowElems; i += blockDim.x)
     {
-        kvPool[kDst + i] = kNew[int64_t(t) * rowElems + i];
-        kvPool[vDst + i] = vNew[int64_t(t) * rowElems + i];
+        storeKv(kvPool + kDst + i, kNew[int64_t(t) * rowElems + i]);
+        storeKv(kvPool + vDst + i, vNew[int64_t(t) * rowElems + i]);
     }
 }
 
 //! One block (4 warps) per (query token, query head). Each warp walks a strided subset of the keys with an online
 //! softmax over four head-dim elements per lane; the warps merge through shared memory and the zero-value sink joins
 //! the denominator.
+template <typename KvT>
 __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restrict__ qLin,
     half const* __restrict__ relLin, half const* __restrict__ sinkLin, half const* __restrict__ gateLin,
     float const* __restrict__ qScale, float const* __restrict__ relScale, float const* __restrict__ relProjT,
-    half const* __restrict__ kvPool, int32_t const* __restrict__ offsets, int32_t const* __restrict__ lengths,
+    KvT const* __restrict__ kvPool, int32_t const* __restrict__ offsets, int32_t const* __restrict__ lengths,
     int32_t const* __restrict__ past, int32_t const* __restrict__ pageTable, half* __restrict__ out)
 {
     int32_t const t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -151,14 +181,13 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
         {
             continue; // unmapped logical page: no key (never inside a live window)
         }
-        uint2 const kr = *reinterpret_cast<uint2 const*>(kvPool + int64_t(kPage) * pageElems + inPage);
-        half2 const* k2 = reinterpret_cast<half2 const*>(&kr);
+        float kf[4];
+        loadKv4(kvPool + int64_t(kPage) * pageElems + inPage, kf);
         float dot = 0.F;
 #pragma unroll
-        for (int32_t i = 0; i < 2; ++i)
+        for (int32_t i = 0; i < 4; ++i)
         {
-            float2 const f = __half22float2(k2[i]);
-            dot += q[2 * i] * f.x + q[2 * i + 1] * f.y;
+            dot += q[i] * kf[i];
         }
         dot = warpSum(dot);
         int32_t const dist = qpos - s;
@@ -170,14 +199,12 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
         float const score = dot * p.scaling + bias;
         float const mNew = fmaxf(m, score);
         float const corr = __expf(m - mNew), e = __expf(score - mNew);
-        uint2 const vr = *reinterpret_cast<uint2 const*>(kvPool + int64_t(vPage) * pageElems + inPage);
-        half2 const* v2 = reinterpret_cast<half2 const*>(&vr);
+        float vf[4];
+        loadKv4(kvPool + int64_t(vPage) * pageElems + inPage, vf);
 #pragma unroll
-        for (int32_t i = 0; i < 2; ++i)
+        for (int32_t i = 0; i < 4; ++i)
         {
-            float2 const f = __half22float2(v2[i]);
-            acc[2 * i] = acc[2 * i] * corr + e * f.x;
-            acc[2 * i + 1] = acc[2 * i + 1] * corr + e * f.y;
+            acc[i] = acc[i] * corr + e * vf[i];
         }
         l = l * corr + e;
         m = mNew;
@@ -229,19 +256,38 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
 }
 } // namespace
 
+template <typename KvT>
+static void launchTyped(Inkling2AttentionParams const& params, half const* qLin, half const* relLin, half const* sinkLin,
+    half const* gateLin, float const* qScale, float const* relScale, float const* relProjT, half const* kNew,
+    half const* vNew, KvT* kvPool, int32_t const* queryStartOffsets, int32_t const* queryLengths,
+    int32_t const* pastLengths, int32_t const* pageTable, half* out, cudaStream_t stream)
+{
+    appendKernel<KvT><<<params.numTokens, 128, 0, stream>>>(
+        params, kNew, vNew, kvPool, queryStartOffsets, queryLengths, pastLengths, pageTable);
+    attentionKernel<KvT><<<dim3(params.numTokens, params.numQHeads), kThreads, 0, stream>>>(params, qLin, relLin,
+        sinkLin, gateLin, qScale, relScale, relProjT, kvPool, queryStartOffsets, queryLengths, pastLengths, pageTable,
+        out);
+}
+
 void launchInkling2Attention(Inkling2AttentionParams const& params, half const* qLin, half const* relLin,
     half const* sinkLin, half const* gateLin, float const* qScale, float const* relScale, float const* relProjT,
-    half const* kNew, half const* vNew, half* kvPool, int32_t const* queryStartOffsets, int32_t const* queryLengths,
+    half const* kNew, half const* vNew, void* kvPool, int32_t const* queryStartOffsets, int32_t const* queryLengths,
     int32_t const* pastLengths, int32_t const* pageTable, half* out, cudaStream_t stream)
 {
     if (params.numTokens <= 0)
     {
         return;
     }
-    appendKernel<<<params.numTokens, 128, 0, stream>>>(
-        params, kNew, vNew, kvPool, queryStartOffsets, queryLengths, pastLengths, pageTable);
-    attentionKernel<<<dim3(params.numTokens, params.numQHeads), kThreads, 0, stream>>>(params, qLin, relLin, sinkLin,
-        gateLin, qScale, relScale, relProjT, kvPool, queryStartOffsets, queryLengths, pastLengths, pageTable, out);
+    if (params.kvFp8 != 0)
+    {
+        launchTyped(params, qLin, relLin, sinkLin, gateLin, qScale, relScale, relProjT, kNew, vNew,
+            static_cast<__nv_fp8_e4m3*>(kvPool), queryStartOffsets, queryLengths, pastLengths, pageTable, out, stream);
+    }
+    else
+    {
+        launchTyped(params, qLin, relLin, sinkLin, gateLin, qScale, relScale, relProjT, kNew, vNew,
+            static_cast<half*>(kvPool), queryStartOffsets, queryLengths, pastLengths, pageTable, out, stream);
+    }
 }
 
 } // namespace kernel

@@ -480,12 +480,13 @@ class Inkling2ForCausalLM(NetworkModule):
     def input_tensors(self) -> Dict[str, object]:
         cfg = self.cfg
         conv_channels = rc.conv_channels(cfg)
+        kv_dtype = trt.DataType.FP8 if cfg.kv_cache_dtype == "fp8" else trt.float16
         result = {
             "inputs_embeds":
             self.add_input("inputs_embeds", trt.float16,
                            (-1, cfg.hidden_size)),
             "past_key_values": [
-                self.add_input(f"past_key_values_{i}", trt.float16,
+                self.add_input(f"past_key_values_{i}", kv_dtype,
                                (2, -1, F.KV_PAGE_SIZE, cfg.num_key_value_heads,
                                 cfg.head_dim)) for i in range(self.visits)
             ],
