@@ -74,7 +74,10 @@ def int4_expert_bindings(weights, experts_prefix: str, num_experts: int,
 
 
 def int4_expert_specs(weights, experts_prefix: str, num_experts: int) -> dict:
-    """Describe the final Marlin MoE buffers without loading provider tensors."""
+    """Describe the final Marlin MoE buffers without loading provider tensors.
+
+    The packed weights are int32 words (the plugin also takes them as int8 bytes): TensorRT refuses INT8 tensors
+    in a network with FP8 Q/DQ, and UInt8 is not a plugin format."""
     gate_qweight = weights.parameter_spec(
         f"{experts_prefix}.0.gate_proj.qweight", np.int32)
     gate_scales = weights.parameter_spec(
@@ -89,16 +92,16 @@ def int4_expert_specs(weights, experts_prefix: str, num_experts: int) -> dict:
     down_output_size = down_qweight.shape[1]
     return {
         "fc_gate_up_qweights":
-        ParameterSpec((num_experts, hidden_size // 16, 16 * intermediate_size),
-                      np.int8),
+        ParameterSpec((num_experts, hidden_size // 16, 4 * intermediate_size),
+                      np.int32),
         "fc_gate_up_scales":
         ParameterSpec(
             (num_experts, gate_scales.shape[0], 2 * intermediate_size),
             np.float16),
         "fc_down_qweights":
         ParameterSpec(
-            (num_experts, down_input_size // 16, 8 * down_output_size),
-            np.int8),
+            (num_experts, down_input_size // 16, 2 * down_output_size),
+            np.int32),
         "fc_down_scales":
         ParameterSpec((num_experts, down_scales.shape[0], down_output_size),
                       np.float16),

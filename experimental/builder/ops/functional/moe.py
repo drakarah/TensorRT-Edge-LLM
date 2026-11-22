@@ -137,8 +137,12 @@ def int4_moe(router_logits: Tensor,
              weight_bindings: dict,
              zero_point_offset: int = 1,
              gate_softcap: float = 0.0,
-             up_softcap: float = 0.0) -> Tensor:
+             up_softcap: float = 0.0,
+             packed_dtype=np.int8) -> Tensor:
     """Run GPTQ-Marlin mixture-of-experts.
+
+    ``packed_dtype`` (int8 or int32) is the element type of the packed weight inputs; int32 keeps the
+    network free of INT8 tensors, which TensorRT refuses to combine with FP8 Q/DQ.
 
     Positive ``gate_softcap`` and ``up_softcap`` (given together) select the
     softcapped SwiGLU activation.
@@ -159,7 +163,7 @@ def int4_moe(router_logits: Tensor,
         router_logits,
         hidden_states,
         parameter(weight_prefix + ".fc_gate_up_qweights",
-                  _parameter_value(weights["fc_gate_up_qweights"], np.int8),
+                  _parameter_value(weights["fc_gate_up_qweights"], packed_dtype),
                   "int4_moe",
                   recipe=weight_bindings["fc_gate_up_qweights"]),
         parameter(weight_prefix + ".fc_gate_up_scales",
@@ -167,7 +171,7 @@ def int4_moe(router_logits: Tensor,
                   "int4_moe",
                   recipe=weight_bindings["fc_gate_up_scales"]),
         parameter(weight_prefix + ".fc_down_qweights",
-                  _parameter_value(weights["fc_down_qweights"], np.int8),
+                  _parameter_value(weights["fc_down_qweights"], packed_dtype),
                   "int4_moe",
                   recipe=weight_bindings["fc_down_qweights"]),
         parameter(weight_prefix + ".fc_down_scales",

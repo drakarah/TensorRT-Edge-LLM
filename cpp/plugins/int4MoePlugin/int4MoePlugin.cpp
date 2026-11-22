@@ -141,6 +141,12 @@ int32_t tokenTileFromEnv()
 }
 
 //! Bytes of one staged layer: the four per-expert weight / scale tensors (inputs 2..5), 256-byte aligned each.
+//! Element size of the expert weight inputs: int8 (packed Marlin bytes), int32 (the same bytes viewed as words) or fp16 (scales).
+size_t expertElementBytes(nvinfer1::DataType type) noexcept
+{
+    return type == nvinfer1::DataType::kHALF ? 2 : (type == nvinfer1::DataType::kINT32 ? 4 : 1);
+}
+
 size_t stagedExpertBytes(nvinfer1::Dims const* const dims[4], nvinfer1::DataType const types[4]) noexcept
 {
     size_t total = 0;
@@ -1351,7 +1357,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                     {
                         bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
                     }
-                    bytes *= inputDesc[2 + i].type == DataType::kHALF ? 2 : 1;
+                    bytes *= expertElementBytes(inputDesc[2 + i].type);
                     perSlot += bytes / mNumExperts + 256;
                     layerBytes += (bytes + 255) & ~static_cast<size_t>(255);
                 }
@@ -1365,7 +1371,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                         {
                             bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
                         }
-                        bpe[i] = bytes * (inputDesc[2 + i].type == DataType::kHALF ? 2 : 1) / mNumExperts;
+                        bpe[i] = bytes * expertElementBytes(inputDesc[2 + i].type) / mNumExperts;
                     }
                     routedring::RoutedExpertRing::get().reserve(bpe, mNumExperts, routedChunkFromEnv(), routedRingFromEnv());
                 }
@@ -1379,7 +1385,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                         {
                             bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
                         }
-                        bpe[i] = bytes * (inputDesc[2 + i].type == DataType::kHALF ? 2 : 1) / mNumExperts;
+                        bpe[i] = bytes * expertElementBytes(inputDesc[2 + i].type) / mNumExperts;
                     }
                     ExpertChunkRing::get().reserve(bpe, mNumExperts, prefillChunkFromEnv());
                 }
@@ -1439,7 +1445,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
         {
             bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
         }
-        bytes *= inputDesc[2 + i].type == DataType::kHALF ? 2 : 1;
+        bytes *= expertElementBytes(inputDesc[2 + i].type);
         mCacheBytesPerExpert[i] = bytes / mNumExperts;
         if (mCacheBytesPerExpert[i] % 16 != 0)
         {
@@ -1882,7 +1888,7 @@ bool Int4MoePlugin::supportsFormatCombination(
     // gate_up: N=2*moeInterSize, so int32 last dim = 2*N = 4*moeInterSize; int8 = 16*moeInterSize
     auto checkFcGateUpQWeights = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        status &= tensorDesc.type == DataType::kINT8;
+        status &= tensorDesc.type == DataType::kINT8 || tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 3;
         auto const tensorDim = tensorDesc.dims;
@@ -1891,7 +1897,7 @@ bool Int4MoePlugin::supportsFormatCombination(
         {
             status &= tensorDim.d[0] == mNumExperts;
             status &= tensorDim.d[1] == mHiddenSize / 16;
-            status &= tensorDim.d[2] == expectedLastDim;
+            status &= tensorDim.d[2] == (tensorDesc.type == DataType::kINT32 ? expectedLastDim / 4 : expectedLastDim);
         }
         return status;
     };
@@ -1915,7 +1921,7 @@ bool Int4MoePlugin::supportsFormatCombination(
     // down: [E, K//16, 2*N*4] for GEMM input K=moeInterSize, output N=hiddenSize
     auto checkFcDownQWeights = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        status &= tensorDesc.type == DataType::kINT8;
+        status &= tensorDesc.type == DataType::kINT8 || tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 3;
         auto const tensorDim = tensorDesc.dims;
@@ -1923,7 +1929,7 @@ bool Int4MoePlugin::supportsFormatCombination(
         {
             status &= tensorDim.d[0] == mNumExperts;
             status &= tensorDim.d[1] == mMoeInterSize / 16;
-            status &= tensorDim.d[2] == (2 * mHiddenSize) * 4; // int8 view of int32
+            status &= tensorDim.d[2] == (tensorDesc.type == DataType::kINT32 ? 2 * mHiddenSize : (2 * mHiddenSize) * 4); // int8 view of int32
         }
         return status;
     };
@@ -2091,7 +2097,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             {
                 bytes *= static_cast<size_t>(inputDesc[2 + i].dims.d[d]);
             }
-            tensorBytes[i] = bytes * (inputDesc[2 + i].type == DataType::kHALF ? 2 : 1);
+            tensorBytes[i] = bytes * expertElementBytes(inputDesc[2 + i].type);
         }
         // decode steps served by the expert cache never stage
         bool const cacheStep = stageNow && numTokens <= 4 && ensureExpertCache(inputDesc, inputs[2]) && numTokens * mTopK <= mCacheSlots;

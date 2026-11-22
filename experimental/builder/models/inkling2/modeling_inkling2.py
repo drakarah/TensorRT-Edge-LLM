@@ -332,6 +332,9 @@ class Inkling2Layer(Module):
         text = cfg.raw_component
         base = self.key("mlp.experts")
         experts = int(text["n_routed_experts"])
+        # the group size comes from the tensors: with mixed-precision checkpoints cfg.group_size is the dense linears' one
+        group_size = self.hidden // int(
+            w.parameter_spec(f"{base}.0.gate_proj.scales", np.float16).shape[0])
 
         def materialize():
 
@@ -340,14 +343,14 @@ class Inkling2Layer(Module):
                 return (w.array(name + ".qweight"), w.array(name + ".qzeros"),
                         w.array(name + ".scales"))
 
-            return prepare_gated_int4_weights(self.ctx, load)
+            return prepare_gated_int4_weights(self.ctx, load, group_size)
 
         moe_weights = w.parameter_value(
             "int4_moe", base,
             lambda: weight_conversion.int4_expert_specs(w, base, experts),
             materialize)
         bindings = weight_conversion.int4_expert_bindings(
-            w, base, experts, cfg.group_size, cfg.quant.gptq_zero_point_offset)
+            w, base, experts, group_size, cfg.quant.gptq_zero_point_offset)
         encoded = encode_routing(logits, self.router_bias, 8)
         routed = F.int4_moe(encoded,
                             hidden16,
@@ -356,12 +359,13 @@ class Inkling2Layer(Module):
                             8,
                             self.hidden,
                             int(text["intermediate_size"]),
-                            cfg.group_size,
+                            group_size,
                             weight_prefix=base,
                             weight_bindings=bindings,
                             zero_point_offset=cfg.quant.gptq_zero_point_offset,
                             gate_softcap=float(text["mlp_gate_softcap"]),
-                            up_softcap=float(text["mlp_up_softcap"]))
+                            up_softcap=float(text["mlp_up_softcap"]),
+                            packed_dtype=np.int32)
         return routed * float(text["route_scale"])
 
     def moe(self, x32, conv_state, ragged):
