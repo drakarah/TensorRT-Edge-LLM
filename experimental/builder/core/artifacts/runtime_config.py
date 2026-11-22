@@ -221,14 +221,14 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
         out["kv_layer_configs"] = kv_cfgs
 
     bounded_capacity = (checked_bounded_capacity(cfg, args)
-                        if cfg.kv_bounded_entries else 0)
+                        if getattr(cfg, "kv_bounded_entries", ()) else 0)
     if bounded_capacity:
         ordinal = 0
         for entry, layer_type in zip(out["kv_layer_configs"],
                                      out["layer_types"]):
             if layer_type != "attention":
                 continue
-            if ordinal in cfg.kv_bounded_entries:
+            if ordinal in getattr(cfg, "kv_bounded_entries", ()):
                 entry["kv_cache_capacity"] = bounded_capacity
             ordinal += 1
 

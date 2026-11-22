@@ -655,8 +655,8 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
         max_sequences, args.max_kv_cache_capacity)
     bounded_capacity = (ragged.bounded_swa_capacity(
         cfg.kv_bounded_window, args.max_input_len, args.max_kv_cache_capacity)
-                        if cfg.kv_bounded_entries else 0)
-    bounded_entries = (frozenset(cfg.kv_bounded_entries)
+                        if getattr(cfg, "kv_bounded_entries", ()) else 0)
+    bounded_entries = (frozenset(getattr(cfg, "kv_bounded_entries", ()))
                        if bounded_capacity else frozenset())
     swa_pages = (ragged.swa_pool_pages(max_sequences, bounded_capacity)
                  if bounded_capacity else 0)
