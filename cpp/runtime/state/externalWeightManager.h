@@ -100,6 +100,7 @@ private:
     // resource. Individual tensors below are stable, non-owning views into this
     // storage.
     Tensor mWeightStorage{};
+    Tensor mHostWeightStorage{}; // pinned-host arena for checkpoint bindings kept off the device
     std::vector<Tensor> mWeights{};
     std::vector<Tensor> mHostWeights{}; // pinned-host owners of sidecar tensors the engine reads over PCIe
     std::vector<Tensor> mPluginResourceTensors{};
