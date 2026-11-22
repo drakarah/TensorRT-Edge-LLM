@@ -1899,8 +1899,15 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
 
 ReasoningBudget LLMRankRuntime::makeReasoningBudget(LLMGenerationRequest const& request)
 {
-    int32_t const startId = reasoningStartMarkers(*mTokenizer)[1];
-    int32_t const endId = reasoningEndMarkers(*mTokenizer)[1];
+    int32_t startId = reasoningStartMarkers(*mTokenizer)[1];
+    int32_t endId = reasoningEndMarkers(*mTokenizer)[1];
+    if (startId < 0 || endId < 0)
+    {
+        // Inkling 2: a thinking message opens with <|content_thinking|> and closes with <|end_message|>, after which the model
+        // opens the answer message itself (the grammar gate keeps its own markers: it must not wait for this end token)
+        startId = static_cast<int32_t>(mTokenizer->getTokenId("<|content_thinking|>"));
+        endId = static_cast<int32_t>(mTokenizer->getTokenId("<|end_message|>"));
+    }
     if (startId < 0 || endId < 0)
     {
         LOG_ERROR("The tokenizer has no think start/end tokens, so a reasoning budget cannot be applied.");
