@@ -19,6 +19,7 @@ without exposing that choice to model definitions.
 """
 
 from enum import IntEnum
+from typing import Optional
 
 import numpy as np
 
@@ -139,8 +140,13 @@ def int4_moe(router_logits: Tensor,
              gate_softcap: float = 0.0,
              up_softcap: float = 0.0,
              packed_dtype=np.int8,
-             weight_format: str = "int4") -> Tensor:
+             weight_format: str = "int4",
+             route_bias: Optional[Tensor] = None) -> Tensor:
     """Run GPTQ-Marlin mixture-of-experts.
+
+    ``route_bias`` (FP32 [num_experts], a tensor) switches the plugin to Inkling 2 routing: ``router_logits`` are then
+    the raw FP32 router outputs, the experts are chosen by ``sigmoid(logits) + route_bias`` (plus the optional residency
+    preference of EDGELLM_MOE_ROUTE_BIAS) and weighted by their normalised sigmoid scores.
 
     ``weight_format`` "nvfp4" takes Marlin-packed NVFP4 experts instead: E4M3 block scales (bound as int32 words) and the
     two per-expert global scales (``fc1_global_scales`` / ``fc2_global_scales`` entries of ``weights`` and
@@ -195,6 +201,9 @@ def int4_moe(router_logits: Tensor,
         extra["weight_format"] = 1
     elif weight_format != "int4":
         raise ValueError(f"unknown expert weight format {weight_format!r}")
+    if route_bias is not None:
+        inputs.append(route_bias)
+        extra["route_mode"] = 1
     return operation("int4_moe",
                      inputs,
                      num_experts=num_experts,

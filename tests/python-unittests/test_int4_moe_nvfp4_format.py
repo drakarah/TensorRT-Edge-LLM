@@ -44,8 +44,9 @@ def require_plugin_test_dependencies(request):
     pytest.skip(reason)
 
 
-def _fields(case, weight_format=1, group=16):
+def _fields(case, weight_format=1, group=16, route_mode=0):
     return [
+        pf_int32("route_mode", route_mode),
         pf_int32("num_experts", case.num_experts),
         pf_int32("top_k", case.top_k),
         pf_int32("hidden_size", case.hidden_size),
@@ -58,7 +59,7 @@ def _fields(case, weight_format=1, group=16):
     ]
 
 
-def _specs(case, words: bool):
+def _specs(case, words: bool, route: bool = False):
     e, h, i = case.num_experts, case.hidden_size, case.moe_inter_size
     qtype = trt.int32 if words else trt.int8
     div = 4 if words else 1
@@ -71,7 +72,7 @@ def _specs(case, words: bool):
         ("fc_down_scales", qtype, (e, i // 16, h // div)),
         ("fc1_global_scales", trt.float16, (e, )),
         ("fc2_global_scales", trt.float16, (e, )),
-    ]
+    ] + ([("route_bias", trt.float32, (e, ))] if route else [])
 
 
 def _profiles(specs):
@@ -85,9 +86,9 @@ def _profiles(specs):
     return profiles
 
 
-def _build(case, words=False, **kw):
+def _build(case, words=False, route=False, **kw):
     runner = PluginRunner()
-    specs = _specs(case, words)
+    specs = _specs(case, words, route)
     runner.build(input_specs=specs,
                  output_names=["output"],
                  plugin_name="Int4MoePlugin",
@@ -162,3 +163,48 @@ def test_nvfp4_rejects_missing_global_scale_inputs():
     with pytest.raises((PluginUnsupportedError, RuntimeError)):
         runner.build(input_specs=specs, output_names=["output"], plugin_name="Int4MoePlugin", plugin_version="1",
                      plugin_fields=_fields(case), profiles=_profiles(specs), expect_unsupported=True)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 3, 9, _MAX_SEQUENCE_LENGTH], ids=lambda n: f"T{n}")
+def test_plugin_side_sigmoid_routing_matches_the_reference(num_tokens):
+    """route_mode 1: the plugin takes the raw router logits and the selection bias and routes like Inkling 2 itself."""
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("The Marlin kernels need SM80 or newer")
+    case = _INKLING_CASE
+    fixture = _make_qwen_fixture(torch.float16, case)
+    runner = _build(case, words=True, route=True, route_mode=1)
+    dense = _reference_dense_weights(fixture)
+    packed = {k: v.to("cuda").contiguous() for k, v in fixture.packed_inputs.items()}
+    for key in ("fc1_qweights", "fc1_block_scales", "fc2_qweights", "fc2_block_scales"):
+        packed[key] = packed[key].view(torch.int32)
+    generator = torch.Generator().manual_seed(900 + num_tokens)
+    hidden = (torch.randn((num_tokens, case.hidden_size), generator=generator) * 0.25).half().cuda()
+    router = torch.randn((num_tokens, case.num_experts), generator=generator).cuda()
+    bias = (torch.randn((case.num_experts, ), generator=generator) * 0.01).cuda()
+    expected = _moe_reference(fixture, hidden, router, bias, dense)
+    actual = torch.empty_like(hidden)
+    runner.execute({
+        "router_logits": router,
+        "hidden_states": hidden,
+        "fc_gate_up_qweights": packed["fc1_qweights"],
+        "fc_gate_up_scales": packed["fc1_block_scales"],
+        "fc_down_qweights": packed["fc2_qweights"],
+        "fc_down_scales": packed["fc2_block_scales"],
+        "fc1_global_scales": packed["fc1_global_scales"],
+        "fc2_global_scales": packed["fc2_global_scales"],
+        "route_bias": bias,
+        "output": actual,
+    })
+    assert bool(torch.isfinite(actual.float()).all())
+    assert_close(f"plugin routing T={num_tokens}", expected, actual * case.routed_scaling_factor, atol=0.05, rtol=0.02,
+                 cos_threshold=0.99)
+
+
+def test_sigmoid_routing_rejects_missing_bias_input_and_bad_mode():
+    case = _INKLING_CASE
+    for kw, route in (({"route_mode": 1}, False), ({"route_mode": 2}, True)):
+        specs = _specs(case, False, route)
+        runner = PluginRunner()
+        with pytest.raises((PluginUnsupportedError, RuntimeError)):
+            runner.build(input_specs=specs, output_names=["output"], plugin_name="Int4MoePlugin", plugin_version="1",
+                         plugin_fields=_fields(case, **kw), profiles=_profiles(specs), expect_unsupported=True)

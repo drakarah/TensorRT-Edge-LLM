@@ -193,6 +193,17 @@ bool prefillFromCacheFromEnv()
 //! EDGELLM_MOE_CACHE_BIAS=<beta> (lossy, decode only; default 0.5, measured on Qwen3.6 only, set 0 for exact routing): the router prefers experts that are resident in the per-layer GPU expert cache by adding beta to their
 //! logits before the top-k selection (combine weights stay the softmax of the original logits over the selected experts). Default 0.5 when unset; EDGELLM_MOE_CACHE_BIAS=0 gives exact routing.
 //! beta 0.5: ~65% fewer cache misses for +0.09% perplexity, beta 1: 85% fewer for +1.5% (METRICS R25ar/R25av, Qwen3.6).
+//! EDGELLM_MOE_ROUTE_BIAS=<beta> (lossy, decode steps only, route_mode 1; default 0 = exact routing): the sigmoid-routing score of an expert that is
+//! resident in the layer's GPU expert cache gets beta added before the top-k selection (the combine weights stay the plain scores).
+float routeBiasFromEnv()
+{
+    static float const beta = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_ROUTE_BIAS");
+        return v != nullptr ? std::max(0.0f, static_cast<float>(std::atof(v))) : 0.0f;
+    }();
+    return beta;
+}
+
 float cacheBiasFromEnv()
 {
     static float const beta = []() {
@@ -1156,6 +1167,10 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
         {
             mWeightFormat = *static_cast<int32_t const*>(fc->fields[i].data);
         }
+        else if (fieldName == "route_mode")
+        {
+            mRouteMode = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
         else if (fieldName == "gate_softcap")
         {
             mGateSoftcap = *static_cast<float const*>(fc->fields[i].data);
@@ -1181,6 +1196,10 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
     {
         LOG_ERROR("Int4MoePlugin supports SiLU (type 0) and GeGLU (type 5), got type %d",
             static_cast<int32_t>(mActivationType));
+    }
+    if (mRouteMode != kRouteModeSoftmax && mRouteMode != kRouteModeSigmoidBias)
+    {
+        throw std::invalid_argument("Int4MoePlugin: route_mode must be 0 (softmax top-k of the router logits) or 1 (sigmoid scores with a selection bias input)");
     }
     if (mWeightFormat != kWeightFormatInt4 && mWeightFormat != kWeightFormatNvfp4)
     {
@@ -1858,6 +1877,7 @@ IPluginV3* Int4MoePlugin::clone() noexcept
         plugin->mGateSoftcap = mGateSoftcap;
         plugin->mUpSoftcap = mUpSoftcap;
         plugin->mWeightFormat = mWeightFormat;
+        plugin->mRouteMode = mRouteMode;
         plugin->setPluginNamespace(mNamespace.c_str());
         plugin->setStageExperts(mStageExperts);
         plugin->setTokenTile(mTokenTile);
@@ -2042,15 +2062,18 @@ bool Int4MoePlugin::supportsFormatCombinationImpl(
         return desc.type == DataType::kHALF && desc.format == TensorFormat::kLINEAR && desc.dims.nbDims == 1
             && desc.dims.d[0] == mNumExperts;
     };
-    if (mWeightFormat == kWeightFormatNvfp4 && pos >= 6)
+    if (pos == nbInputs)
     {
-        switch (pos)
-        {
-        case 6:
-        case 7: return checkGlobalScales(tensorDesc);
-        case 8: return checkHiddenStates(tensorDesc);
-        default: return false;
-        }
+        return checkHiddenStates(tensorDesc); // the output
+    }
+    if (mRouteMode == kRouteModeSigmoidBias && pos == nbInputs - 1)
+    {
+        return tensorDesc.type == DataType::kFLOAT && tensorDesc.format == TensorFormat::kLINEAR && tensorDesc.dims.nbDims == 1
+            && tensorDesc.dims.d[0] == mNumExperts;
+    }
+    if (mWeightFormat == kWeightFormatNvfp4 && (pos == 6 || pos == 7))
+    {
+        return checkGlobalScales(tensorDesc);
     }
     switch (pos)
     {
@@ -2418,7 +2441,23 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor topkIndicesTensor(
             topkIndicesPtr, {numTokens, mTopK}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
-        if (useCache && (cacheBiasFromEnv() > 0.0f || tailSkipFromEnv() > 0) && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
+        if (mRouteMode == kRouteModeSigmoidBias)
+        {
+            if (mTopK > kernel::kRouterMaxTopK || inputDesc[0].type != nvinfer1::DataType::kFLOAT)
+            {
+                LOG_ERROR("Int4MoePlugin %s: sigmoid routing needs FP32 logits and top-k <= %d", mLayerName.c_str(), kernel::kRouterMaxTopK);
+                return -1;
+            }
+            kernel::ExpertCacheState routeState{};
+            if (useCache)
+            {
+                routeState = kernel::ExpertCacheState{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
+                    mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
+            }
+            kernel::launchSigmoidBiasTopk(static_cast<float const*>(inputs[0]), static_cast<float const*>(inputs[inputCount() - 1]), numTokens,
+                mNumExperts, mTopK, useCache ? routeBiasFromEnv() : 0.0f, useCache ? &routeState : nullptr, topkIndicesPtr, topkWeightsPtr, stream);
+        }
+        else if (useCache && (cacheBiasFromEnv() > 0.0f || tailSkipFromEnv() > 0) && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
         {
             kernel::ExpertCacheState const biasState{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
                 mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
@@ -2731,6 +2770,7 @@ PluginFieldCollection const* Int4MoePlugin::getFieldsToSerialize() noexcept
         mDataToSerialize.emplace_back("stage_experts", &mStageExperts, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("token_tile", &mTokenTile, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("weight_format", &mWeightFormat, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("route_mode", &mRouteMode, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("gate_softcap", &mGateSoftcap, PluginFieldType::kFLOAT32, 1);
         mDataToSerialize.emplace_back("up_softcap", &mUpSoftcap, PluginFieldType::kFLOAT32, 1);
 
@@ -2760,6 +2800,7 @@ Int4MoePluginCreator::Int4MoePluginCreator()
     mPluginAttributes.emplace_back(PluginField("stage_experts", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("token_tile", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("weight_format", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("route_mode", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("gate_softcap", nullptr, PluginFieldType::kFLOAT32, 1));
     mPluginAttributes.emplace_back(PluginField("up_softcap", nullptr, PluginFieldType::kFLOAT32, 1));
 

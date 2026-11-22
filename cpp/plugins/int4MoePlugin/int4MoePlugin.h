@@ -212,9 +212,14 @@ private:
     static constexpr int32_t kWeightFormatInt4{0};
     static constexpr int32_t kWeightFormatNvfp4{1};
     int32_t mWeightFormat{kWeightFormatInt4};
+    // Routing: softmax top-k over the router logits (0), or Inkling 2's sigmoid scores with a selection bias (an extra last
+    // input, FP32 [numExperts]) and an optional preference for experts resident in the cache (1).
+    static constexpr int32_t kRouteModeSoftmax{0};
+    static constexpr int32_t kRouteModeSigmoidBias{1};
+    int32_t mRouteMode{kRouteModeSoftmax};
     int32_t inputCount() const noexcept
     {
-        return mWeightFormat == kWeightFormatNvfp4 ? 8 : 6;
+        return (mWeightFormat == kWeightFormatNvfp4 ? 8 : 6) + (mRouteMode == kRouteModeSigmoidBias ? 1 : 0);
     }
     int32_t mStageExperts{0};
     int32_t mTokenTile{0};

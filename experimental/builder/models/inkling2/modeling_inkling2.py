@@ -20,6 +20,7 @@ convolutions and the experts run in FP16. Each visit of a layer owns paged-KV en
 
 import logging
 import math
+import os
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -354,7 +355,7 @@ class Inkling2Layer(Module):
             materialize)
         bindings = weight_conversion.int4_expert_bindings(
             w, base, experts, group_size, cfg.quant.gptq_zero_point_offset)
-        encoded = encode_routing(logits, self.router_bias, 8)
+        encoded, route_bias = self._route(logits)
         routed = F.int4_moe(encoded,
                             hidden16,
                             moe_weights,
@@ -363,6 +364,7 @@ class Inkling2Layer(Module):
                             self.hidden,
                             int(text["intermediate_size"]),
                             group_size,
+                            route_bias=route_bias,
                             weight_prefix=base,
                             weight_bindings=bindings,
                             zero_point_offset=cfg.quant.gptq_zero_point_offset,
@@ -370,6 +372,14 @@ class Inkling2Layer(Module):
                             up_softcap=float(text["mlp_up_softcap"]),
                             packed_dtype=np.int32)
         return routed * float(text["route_scale"])
+
+    def _route(self, logits):
+        """(router input of the plugin, selection bias or None): the plugin does Inkling 2's routing itself unless
+        EDGELLM_INKLING_GRAPH_ROUTING=1 asks for the encoded-logits graph."""
+        if os.environ.get("EDGELLM_INKLING_GRAPH_ROUTING") == "1":
+            return encode_routing(logits, self.router_bias, 8), None
+        return logits, F.constant(
+            self.router_bias.astype(np.float32).reshape(-1), "router_bias")
 
     def _nvfp4_offload_moe(self, logits, hidden16):
         """Marlin NVFP4 experts from the sidecar, host-resident like the INT4 ones (Int4MoePlugin weight_format 1)."""
@@ -387,7 +397,7 @@ class Inkling2Layer(Module):
 
         moe_weights = w.parameter_value("int4_moe", base, specs, materialize)
         inter = int(moe_weights["fc_down_scales"].shape[1]) * 16
-        encoded = encode_routing(logits, self.router_bias, 8)
+        encoded, route_bias = self._route(logits)
         routed = F.int4_moe(encoded,
                             hidden16,
                             moe_weights,
@@ -396,6 +406,7 @@ class Inkling2Layer(Module):
                             self.hidden,
                             inter,
                             16,
+                            route_bias=route_bias,
                             weight_prefix=base,
                             weight_bindings=weight_conversion.nvfp4_expert_bindings(w, base),
                             gate_softcap=float(text["mlp_gate_softcap"]),
