@@ -26,8 +26,8 @@ namespace kernel
 namespace
 {
 //! Sequence and local index of slot t; false when t is padding.
-__device__ __forceinline__ bool locate(int32_t t, int32_t const* offsets, int32_t const* lengths, int32_t batchSize,
-    int32_t& seq, int32_t& local)
+__device__ __forceinline__ bool locate(
+    int32_t t, int32_t const* offsets, int32_t const* lengths, int32_t batchSize, int32_t& seq, int32_t& local)
 {
     seq = 0;
     while (seq + 1 < batchSize && t >= offsets[seq + 1])
@@ -67,7 +67,8 @@ __global__ void shortConvKernel(Inkling2ShortConvParams p, half const* __restric
         }
         else if (row >= 0 && row < p.stateRows)
         {
-            xv = __half2float(state[(int64_t(row) * p.stateStride + p.stateOffset + c) * p.kernelSize + (p.kernelSize - 1 - (j - local))]);
+            xv = __half2float(state[(int64_t(row) * p.stateStride + p.stateOffset + c) * p.kernelSize
+                + (p.kernelSize - 1 - (j - local))]);
         }
         else
         {

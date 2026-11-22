@@ -78,8 +78,8 @@ class MoeCase:
 
     @property
     def fc1_out_dim(self) -> int:
-        return (2 * self.moe_inter_size if self.activation_type in
-                (2, 6) else self.moe_inter_size)
+        return (2 * self.moe_inter_size
+                if self.activation_type in (2, 6) else self.moe_inter_size)
 
     @property
     def routed_row_capacity(self) -> int:
@@ -338,11 +338,11 @@ def _moe_reference(fixture: MoeFixture, hidden_states: "torch.Tensor",
             up = (expert_input @ dense_weights["up"][expert_id].T
                   ).to(activation_dtype).to(torch.float32)
             if case.activation_type == 6:
-                activated = (case.gate_softcap *
-                             torch.tanh(gate / case.gate_softcap) *
-                             torch.sigmoid(gate) * case.up_softcap *
-                             torch.tanh(up / case.up_softcap)).to(
-                                 activation_dtype).to(torch.float32)
+                activated = (
+                    case.gate_softcap * torch.tanh(gate / case.gate_softcap) *
+                    torch.sigmoid(gate) * case.up_softcap *
+                    torch.tanh(up / case.up_softcap)).to(activation_dtype).to(
+                        torch.float32)
                 activated_gate = None
             else:
                 activated_gate = torch.nn.functional.silu(gate)
@@ -466,15 +466,15 @@ def _build_runner(case: MoeCase,
         plugin_case = replace(case,
                               max_routed_rows=max_tokens * case.top_k +
                               case.num_experts * (32 - 1))
-    runner.build(input_specs=input_specs,
-                 output_names=["output"],
-                 plugin_name=_PLUGIN_NAME,
-                 plugin_version=_PLUGIN_VERSION,
-                 plugin_fields=(_plugin_fields(plugin_case)
-                                if fields_override is None else
-                                fields_override(_plugin_fields(plugin_case))),
-                 profiles=_profiles(case, input_specs),
-                 expect_unsupported=expect_unsupported)
+    runner.build(
+        input_specs=input_specs,
+        output_names=["output"],
+        plugin_name=_PLUGIN_NAME,
+        plugin_version=_PLUGIN_VERSION,
+        plugin_fields=(_plugin_fields(plugin_case) if fields_override is None
+                       else fields_override(_plugin_fields(plugin_case))),
+        profiles=_profiles(case, input_specs),
+        expect_unsupported=expect_unsupported)
     return runner
 
 
@@ -569,13 +569,14 @@ def test_inkling_sigmoid_softcap_swiglu_token_count_boundary_dynamic_engine(
 
 @pytest.mark.parametrize("activation_dtype_name", ["bfloat16", "float16"],
                          ids=["bf16", "fp16"])
-@pytest.mark.parametrize(
-    "caps",
-    [(0.0, 25.0), (4.0, 0.0), (-4.0, 25.0), (4.0, -25.0),
-     (float("nan"), 25.0), (4.0, float("nan")),
-     (float("inf"), 25.0), (4.0, float("inf"))],
-    ids=["gate0", "up0", "gate_neg", "up_neg", "gate_nan", "up_nan",
-         "gate_inf", "up_inf"])
+@pytest.mark.parametrize("caps", [(0.0, 25.0), (4.0, 0.0), (-4.0, 25.0),
+                                  (4.0, -25.0), (float("nan"), 25.0),
+                                  (4.0, float("nan")), (float("inf"), 25.0),
+                                  (4.0, float("inf"))],
+                         ids=[
+                             "gate0", "up0", "gate_neg", "up_neg", "gate_nan",
+                             "up_nan", "gate_inf", "up_inf"
+                         ])
 def test_softcap_swiglu_rejects_invalid_caps(activation_dtype_name, caps):
     case = replace(_INKLING_CASE, gate_softcap=caps[0], up_softcap=caps[1])
     with pytest.raises(PluginUnsupportedError):
@@ -585,6 +586,7 @@ def test_softcap_swiglu_rejects_invalid_caps(activation_dtype_name, caps):
 
 
 def test_softcap_swiglu_rejects_missing_caps():
+
     def drop_caps(fields):
         return [f for f in fields if "softcap" not in f.name]
 
@@ -603,15 +605,14 @@ def test_softcap_swiglu_rejects_inter_size_not_divisible_by_64():
 
 
 def test_softcap_attributes_are_ignored_by_plain_swiglu():
+
     def add_caps(fields):
         return fields + [
             pf_float32("gate_softcap", -1.0),
             pf_float32("up_softcap", 0.0)
         ]
 
-    runner = _build_runner(_QWEN_CASE,
-                           trt.float16,
-                           fields_override=add_caps)
+    runner = _build_runner(_QWEN_CASE, trt.float16, fields_override=add_caps)
     assert runner.engine is not None
 
 

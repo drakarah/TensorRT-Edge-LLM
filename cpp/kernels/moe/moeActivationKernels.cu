@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
-#include <cmath>
 #include "common/checkMacros.h"
 #include "common/stringUtils.h"
 #include "moeActivationKernels.h"
+#include <cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -312,7 +312,8 @@ void moeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t numToken
 {
     check::check(activationType == MoeActivationType::kMoeSwiGlu || activationType == MoeActivationType::kMoeRelu2
             || activationType == MoeActivationType::kMoeGeGlu || activationType == MoeActivationType::kMoeSoftcapSwiGlu,
-        fmtstr("Unsupported MoE activation type %d; expected %d (SwiGLU), %d (ReLU2), %d (GeGLU), or %d (softcapped SwiGLU)",
+        fmtstr("Unsupported MoE activation type %d; expected %d (SwiGLU), %d (ReLU2), %d (GeGLU), or %d (softcapped "
+               "SwiGLU)",
             activationType, MoeActivationType::kMoeSwiGlu, MoeActivationType::kMoeRelu2, MoeActivationType::kMoeGeGlu,
             MoeActivationType::kMoeSoftcapSwiGlu));
     if (activationType == MoeActivationType::kMoeSoftcapSwiGlu)
@@ -321,8 +322,8 @@ void moeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t numToken
             "softcapped SwiGLU requires finite positive gate and up soft caps");
     }
 
-    bool const isGated = (activationType == MoeActivationType::kMoeSwiGlu || activationType == MoeActivationType::kMoeGeGlu
-        || activationType == MoeActivationType::kMoeSoftcapSwiGlu);
+    bool const isGated = (activationType == MoeActivationType::kMoeSwiGlu
+        || activationType == MoeActivationType::kMoeGeGlu || activationType == MoeActivationType::kMoeSoftcapSwiGlu);
     auto const inputShape = input.getShape();
     auto const outputShape = output.getShape();
     int64_t const expectedInputDim = isGated ? kGatedInputMultiplier * intermediateDim : intermediateDim;

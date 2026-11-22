@@ -170,7 +170,7 @@ void expectMatchesReference(std::vector<float> const& input, std::vector<float> 
             double const g = toF(fromF<T>(input[t * inDim + j]));
             double const u = gated ? toF(fromF<T>(input[t * inDim + inter + j])) : 0.0;
             double want = type == MoeActivationType::kMoeRelu2 ? std::pow(std::max(g, 0.0), 2.0)
-                                                                : refElement(type, g, u, gateCap, upCap);
+                                                               : refElement(type, g, u, gateCap, upCap);
             double const have = got[t * inter + j];
             if (std::isnan(want))
             {
@@ -295,7 +295,7 @@ TYPED_TEST(MoeActivationTyped, SoftcapSwiGluInfinitiesAndNaN)
     double const capUp1 = 25.0 * std::tanh(1.0 / 25.0), capGate1 = 4.0 * std::tanh(1.0 / 4.0);
     double const sig1 = 1.0 / (1.0 + std::exp(-1.0));
     EXPECT_NEAR(got[0], 4.0 * 1.0 * capUp1, 2e-2 * 4.0 * capUp1); // gate +inf: cap * 1 * sigmoid 1
-    EXPECT_EQ(got[1], 0.0F);                                    // gate -inf: sigmoid 0 (the product is -0)
+    EXPECT_EQ(got[1], 0.0F);                                      // gate -inf: sigmoid 0 (the product is -0)
     EXPECT_NEAR(got[2], capGate1 * sig1 * 25.0, 2e-2 * capGate1 * sig1 * 25.0);
     EXPECT_NEAR(got[3], -capGate1 * sig1 * 25.0, 2e-2 * capGate1 * sig1 * 25.0);
     EXPECT_TRUE(std::isnan(got[4])) << "NaN gate must propagate";

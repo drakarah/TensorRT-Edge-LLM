@@ -282,7 +282,8 @@ Result run(Case const& c, Data const& d, Pool pool)
     p.logNFloor = c.nFloor;
     p.qClip = c.qClip;
     p.relClip = c.relClip;
-    launchInkling2Attention(p, dq, drel, dsink, dgate, dqs, drs, dproj, dk, dv, dpool, doff, dlen, dpast, dtab, dout, nullptr);
+    launchInkling2Attention(
+        p, dq, drel, dsink, dgate, dqs, drs, dproj, dk, dv, dpool, doff, dlen, dpast, dtab, dout, nullptr);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     Result r;
@@ -303,9 +304,9 @@ Result run(Case const& c, Data const& d, Pool pool)
     {
         r.pool.host[i] = h2f(hpool[i]);
     }
-    for (void* ptr : {(void*) dq, (void*) drel, (void*) dsink, (void*) dgate, (void*) dk, (void*) dv, (void*) dqs,
-             (void*) drs, (void*) dproj, (void*) dpool, (void*) doff, (void*) dlen, (void*) dpast, (void*) dtab,
-             (void*) dout})
+    for (void* ptr :
+        {(void*) dq, (void*) drel, (void*) dsink, (void*) dgate, (void*) dk, (void*) dv, (void*) dqs, (void*) drs,
+            (void*) dproj, (void*) dpool, (void*) doff, (void*) dlen, (void*) dpast, (void*) dtab, (void*) dout})
     {
         CUDA_CHECK(cudaFree(ptr));
     }
@@ -419,7 +420,8 @@ TEST(Inkling2Attention, PrefillFullAttentionOnInklingHeadCounts)
 TEST(Inkling2Attention, SlidingWindowAndExtentBoundaries)
 {
     // window and extent chosen so the relative bias stops exactly at, one before and one after the window edge
-    for (auto [window, extent] : {std::pair<int32_t, int32_t>{20, 20}, {20, 19}, {20, 21}, {1, 8}, {130, 64}, {128, 128}})
+    for (auto [window, extent] :
+        {std::pair<int32_t, int32_t>{20, 20}, {20, 19}, {20, 21}, {1, 8}, {130, 64}, {128, 128}})
     {
         Case c;
         c.window = window;

@@ -231,7 +231,8 @@ void runStep(Cfg const& c, std::vector<Stream> const& streams, std::vector<float
                     int32_t const base = st.first[b];
                     for (int32_t i = 0; i < base; ++i)
                     {
-                        std::fill(trimmed.x.begin() + size_t(i) * c.channels, trimmed.x.begin() + size_t(i + 1) * c.channels, 0.0F);
+                        std::fill(trimmed.x.begin() + size_t(i) * c.channels,
+                            trimmed.x.begin() + size_t(i + 1) * c.channels, 0.0F);
                     }
                     want = refOut(c, trimmed, taps, st.first[b] + local, ch);
                 }
@@ -248,8 +249,10 @@ void runStep(Cfg const& c, std::vector<Stream> const& streams, std::vector<float
             {
                 int32_t const idx = st.counts[b] - (k - 1) + m;
                 size_t const at = (size_t(st.rows[b]) * c.stateChannels + c.stateOffset + ch) * k + m;
-                float const want = idx >= 0 ? streams[b].x[size_t(st.first[b] + idx) * c.channels + ch]
-                                            : __half2float(before[(size_t(st.rows[b]) * c.stateChannels + c.stateOffset + ch) * k + (st.counts[b] + m)]);
+                float const want = idx >= 0
+                    ? streams[b].x[size_t(st.first[b] + idx) * c.channels + ch]
+                    : __half2float(
+                          before[(size_t(st.rows[b]) * c.stateChannels + c.stateOffset + ch) * k + (st.counts[b] + m)]);
                 ASSERT_EQ(__half2float(state[at]), want) << "row " << st.rows[b] << " ch " << ch << " slot " << m;
                 expectChanged[at] = true;
             }
@@ -385,7 +388,8 @@ TEST(Inkling2ShortConv, LargeAndZeroInputsStayFinite)
     std::vector<Stream> streams{makeStream(c, 10, 14)};
     for (int32_t t : {2, 3, 4})
     {
-        std::fill(streams[0].x.begin() + size_t(t) * c.channels, streams[0].x.begin() + size_t(t + 1) * c.channels, 0.0F);
+        std::fill(
+            streams[0].x.begin() + size_t(t) * c.channels, streams[0].x.begin() + size_t(t + 1) * c.channels, 0.0F);
     }
     std::fill(streams[0].x.begin() + size_t(6) * c.channels, streams[0].x.begin() + size_t(7) * c.channels, 3.0e3F);
     std::fill(streams[0].x.begin() + size_t(7) * c.channels, streams[0].x.begin() + size_t(8) * c.channels, -3.0e3F);

@@ -169,12 +169,20 @@ def int4_moe(router_logits: Tensor,
                      quantization_group_size=group_size)
 
 
-def nvfp4_a16_moe(router_logits: Tensor, hidden_states: Tensor,
-                  moe_weights: dict, num_experts: int, top_k: int,
-                  hidden_size: int, moe_inter_size: int,
-                  activation_type: MoeActivation, n_group: int,
-                  topk_group: int, norm_topk_prob: int,
-                  routed_scaling_factor: float, routing_mode: MoeRouting, *,
+def nvfp4_a16_moe(router_logits: Tensor,
+                  hidden_states: Tensor,
+                  moe_weights: dict,
+                  num_experts: int,
+                  top_k: int,
+                  hidden_size: int,
+                  moe_inter_size: int,
+                  activation_type: MoeActivation,
+                  n_group: int,
+                  topk_group: int,
+                  norm_topk_prob: int,
+                  routed_scaling_factor: float,
+                  routing_mode: MoeRouting,
+                  *,
                   weight_prefix: str,
                   gate_softcap: float = 0.0,
                   up_softcap: float = 0.0) -> Tensor:
@@ -186,10 +194,12 @@ def nvfp4_a16_moe(router_logits: Tensor, hidden_states: Tensor,
     extra = {}
     if activation_type == MoeActivation.SOFTCAP_SWIGLU:
         if not (gate_softcap > 0.0 and up_softcap > 0.0):
-            raise ValueError("SOFTCAP_SWIGLU requires positive gate_softcap and up_softcap")
+            raise ValueError(
+                "SOFTCAP_SWIGLU requires positive gate_softcap and up_softcap")
         extra = {"gate_softcap": gate_softcap, "up_softcap": up_softcap}
     elif gate_softcap or up_softcap:
-        raise ValueError("gate_softcap and up_softcap apply to SOFTCAP_SWIGLU only")
+        raise ValueError(
+            "gate_softcap and up_softcap apply to SOFTCAP_SWIGLU only")
     _validate_token_layout(router_logits, hidden_states)
     order = [
         ("fc1_qweights", np.int8),

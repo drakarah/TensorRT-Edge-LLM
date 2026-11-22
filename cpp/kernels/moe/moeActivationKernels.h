@@ -43,7 +43,8 @@ enum MoeActivationType : int32_t
  * - kMoeRelu2: ReLU2. The input is [numTokens, intermediateDim].
  * - kMoeGeGlu: GeGLU. The input is [numTokens, 2 * intermediateDim], with all gate values followed by all up values.
  * - kMoeSoftcapSwiGlu: softcapped SwiGLU, the same layout as SwiGLU:
- *   out = gateCap * tanh(gate / gateCap) * sigmoid(gate) * upCap * tanh(up / upCap), computed in FP32. Both caps must be positive.
+ *   out = gateCap * tanh(gate / gateCap) * sigmoid(gate) * upCap * tanh(up / upCap), computed in FP32. Both caps must
+ * be positive.
  *
  * FP16 and BF16 support all activation types. The input and output data types must match.
  *

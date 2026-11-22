@@ -136,11 +136,12 @@ def _reference(cfg: Cfg, q_lin, rel_lin, sink, gate, q_scale, rel_scale,
     nh, nkv = cfg.num_q_heads, cfg.num_kv_heads
     total = keys.shape[0]
     pos = torch.arange(first_pos, first_pos + n, dtype=torch.float32)
-    log_scale = (torch.ones(n) if cfg.window > 0 else
-                 1 + cfg.log_alpha * torch.log(
+    log_scale = (torch.ones(n) if cfg.window > 0 else 1 +
+                 cfg.log_alpha * torch.log(
                      ((pos + 1) / cfg.log_n_floor).clamp(min=1.0)))
-    q = _l2clip(q_lin.view(n, nh, HEAD_DIM) * q_scale.view(nh, HEAD_DIM),
-                cfg.q_clip) * log_scale[:, None, None]
+    q = _l2clip(
+        q_lin.view(n, nh, HEAD_DIM) * q_scale.view(nh, HEAD_DIM),
+        cfg.q_clip) * log_scale[:, None, None]
     rs = _l2clip(
         rel_lin.view(n, nh, REL_DIM) * rel_scale.view(nh, REL_DIM),
         cfg.rel_clip) * log_scale[:, None, None]
@@ -240,8 +241,8 @@ def _run_step(runner: PluginRunner,
         for b in range(batch):
             n = counts[b]
             src = getattr(seqs[b], name)
-            out[offsets[b]:offsets[b] + n] = src[first[b]:first[b] + n].reshape(
-                n, cols)
+            out[offsets[b]:offsets[b] + n] = src[first[b]:first[b] +
+                                                 n].reshape(n, cols)
         return out.to(dtype).cuda().contiguous()
 
     tensors = {
@@ -315,8 +316,8 @@ def _check_pool(cfg: Cfg, pool, table, seqs, upto, used_pages):
     untouched = [p for p in range(cfg.num_pages) if p not in set(used_pages)]
     for plane in (0, 1):
         for page in untouched:
-            assert bool((pool[plane, page] == SENTINEL).all()
-                        ), f"page {page} plane {plane} was written"
+            assert bool((pool[plane, page] == SENTINEL
+                         ).all()), f"page {page} plane {plane} was written"
 
 
 @pytest.mark.parametrize("window,extent", [(0, 64), (0, 300), (20, 20),
@@ -478,8 +479,8 @@ def test_engine_serialization_round_trip_keeps_attributes():
                          ids=[
                              "heads_not_multiple", "zero_kv_heads",
                              "zero_extent", "negative_window", "zero_scaling",
-                             "nan_scaling", "negative_q_clip",
-                             "inf_rel_clip", "zero_log_floor"
+                             "nan_scaling", "negative_q_clip", "inf_rel_clip",
+                             "zero_log_floor"
                          ])
 def test_invalid_attributes_are_rejected(change):
     cfg = replace(Cfg(), **change)
@@ -502,10 +503,10 @@ def test_shape_mismatches_are_rejected():
     def with_shape(name, shape):
         return [(n, d, shape if n == name else s) for n, d, s in base]
 
-    wrong_head_dim = with_shape(
-        "past_kv", (2, cfg.num_pages, PAGE, cfg.num_kv_heads, 64))
-    wrong_page = with_shape(
-        "past_kv", (2, cfg.num_pages, 64, cfg.num_kv_heads, HEAD_DIM))
+    wrong_head_dim = with_shape("past_kv",
+                                (2, cfg.num_pages, PAGE, cfg.num_kv_heads, 64))
+    wrong_page = with_shape("past_kv",
+                            (2, cfg.num_pages, 64, cfg.num_kv_heads, HEAD_DIM))
     wrong_kv_heads = with_shape(
         "past_kv", (2, cfg.num_pages, PAGE, cfg.num_kv_heads + 1, HEAD_DIM))
     wrong_rel = with_shape("rel_proj_t", (cfg.rel_extent + 1, REL_DIM))

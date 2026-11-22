@@ -97,7 +97,7 @@ constexpr int32_t kNbPluginFields{11};
 int32_t getFc1OutDim(int32_t moeInterSize, int32_t activationType)
 {
     return (activationType == kActivationSwiGlu || activationType == kActivationSoftcapSwiGlu) ? 2 * moeInterSize
-                                                                                                 : moeInterSize;
+                                                                                               : moeInterSize;
 }
 
 bool getTokenCount(Dims const& hidden, int32_t hiddenSize, int64_t& tokenCount) noexcept

@@ -76,7 +76,8 @@ Inkling2ShortConvPlugin::Inkling2ShortConvPlugin(
         || (groups > 0 && channels % groups != 0))
     {
         throw std::invalid_argument(
-            "Inkling2ShortConvPlugin: channels must be positive, kernel_size in [2, 8], groups >= 0 and dividing channels");
+            "Inkling2ShortConvPlugin: channels must be positive, kernel_size in [2, 8], groups >= 0 and dividing "
+            "channels");
     }
     if (!std::isfinite(scale) || scale <= 0.F)
     {
@@ -172,7 +173,8 @@ int32_t Inkling2ShortConvPlugin::getOutputShapes(DimsExprs const* inputs, int32_
 bool Inkling2ShortConvPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
-    if (inOut == nullptr || nbInputs != numInputs() || nbOutputs != kNumOutputs || pos < 0 || pos >= nbInputs + nbOutputs)
+    if (inOut == nullptr || nbInputs != numInputs() || nbOutputs != kNumOutputs || pos < 0
+        || pos >= nbInputs + nbOutputs)
     {
         return false;
     }
@@ -207,7 +209,8 @@ int32_t Inkling2ShortConvPlugin::configurePlugin(
     }
     Dims const& state = in[kState].desc.dims;
     bool ok = in[kX].desc.dims.d[1] == mChannels && in[kTaps].desc.dims.d[0] == mChannels
-        && in[kTaps].desc.dims.d[1] == mKernelSize && state.d[1] >= mStateOffset + mChannels && state.d[2] == mKernelSize;
+        && in[kTaps].desc.dims.d[1] == mKernelSize && state.d[1] >= mStateOffset + mChannels
+        && state.d[2] == mKernelSize;
     if (mGroups > 0)
     {
         ok = ok && in[kDyn].desc.dims.d[1] == mGroups * mKernelSize;
@@ -229,8 +232,7 @@ size_t Inkling2ShortConvPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* 
 int32_t Inkling2ShortConvPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* /* outputDesc */,
     void const* const* inputs, void* const* outputs, void* /* workspace */, cudaStream_t stream) noexcept
 {
-    if (inputDesc == nullptr || inputs == nullptr || outputs == nullptr || outputs[kOutY] == nullptr
-        || outputs[kOutState] == nullptr)
+    if (inputDesc == nullptr || inputs == nullptr || outputs == nullptr || outputs[kOutY] == nullptr)
     {
         LOG_ERROR("Inkling2ShortConvPlugin: null descriptors or buffers");
         return -1;
@@ -256,15 +258,17 @@ int32_t Inkling2ShortConvPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
     if (inputDesc[kQueryStartOffsets].dims.d[0] != params.batchSize + 1
         || inputDesc[kQueryLengths].dims.d[0] != params.batchSize)
     {
-        LOG_ERROR("Inkling2ShortConvPlugin: query_start_offsets needs batch + 1 entries, query_lengths one per sequence");
+        LOG_ERROR(
+            "Inkling2ShortConvPlugin: query_start_offsets needs batch + 1 entries, query_lengths one per sequence");
         return -1;
     }
-    // The state is aliased: read and written through the output binding.
+    // Read and written in place through the input binding: the state is a resident pool, and the convolutions of one
+    // visit share it over disjoint channel ranges.
     kernel::launchInkling2ShortConv(params, static_cast<half const*>(inputs[kX]),
         static_cast<float const*>(inputs[kTaps]), mGroups > 0 ? static_cast<half const*>(inputs[kDyn]) : nullptr,
-        static_cast<half*>(outputs[kOutState]), static_cast<int32_t const*>(inputs[kQueryStartOffsets]),
-        static_cast<int32_t const*>(inputs[kQueryLengths]), static_cast<int32_t const*>(inputs[kStateIndices]),
-        static_cast<half*>(outputs[kOutY]), stream);
+        const_cast<half*>(static_cast<half const*>(inputs[kState])),
+        static_cast<int32_t const*>(inputs[kQueryStartOffsets]), static_cast<int32_t const*>(inputs[kQueryLengths]),
+        static_cast<int32_t const*>(inputs[kStateIndices]), static_cast<half*>(outputs[kOutY]), stream);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 

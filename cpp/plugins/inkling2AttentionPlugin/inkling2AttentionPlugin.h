@@ -26,13 +26,15 @@ namespace trt_edgellm::plugins
 {
 
 //! Inkling 2 attention visit with a relative-position bias, a per-token sink, query/relative L2 clips, optional
-//! log-length query scaling and a sigmoid output gate, over the runtime's paged KV pool. K/V rows are appended in place.
+//! log-length query scaling and a sigmoid output gate, over the runtime's paged KV pool. K/V rows are appended in
+//! place.
 //!
 //! Inputs: q_lin [T, nh*128], rel_lin [T, nh*16], sink_lin [T, nh], gate_lin [T, nh*128], k_new [T, nkv*128],
 //! v_new [T, nkv*128] (FP16); q_scale [nh*128], rel_scale [nh*16], rel_proj_t [rel_extent, 16] (FP32);
-//! past_kv [2, pages, 128, nkv, 128] (FP16); query_start_offsets [B+1], query_lengths [B], past_lengths [B], kv_page_table [B, 2, maxPages] (INT32).
-//! Token slots of sequence b are [query_start_offsets[b], query_start_offsets[b+1]); only the first query_lengths[b] are real.
-//! Outputs: attention [T, nh*128] (FP16), present_kv (aliases past_kv).
+//! past_kv [2, pages, 128, nkv, 128] (FP16); query_start_offsets [B+1], query_lengths [B], past_lengths [B],
+//! kv_page_table [B, 2, maxPages] (INT32). Token slots of sequence b are [query_start_offsets[b],
+//! query_start_offsets[b+1]); only the first query_lengths[b] are real. Outputs: attention [T, nh*128] (FP16),
+//! present_kv (aliases past_kv).
 class Inkling2AttentionPlugin : public nvinfer1::IPluginV3,
                                 public nvinfer1::IPluginV3OneCore,
                                 public nvinfer1::IPluginV3OneBuild,

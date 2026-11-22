@@ -105,7 +105,8 @@ Inkling2AttentionPlugin::Inkling2AttentionPlugin(std::string const& name, int32_
     if (!std::isfinite(scaling) || scaling <= 0.F || !std::isfinite(qClip) || qClip <= 0.F || !std::isfinite(relClip)
         || relClip <= 0.F || !std::isfinite(logAlpha) || !std::isfinite(logNFloor) || logNFloor <= 0.F)
     {
-        throw std::invalid_argument("Inkling2AttentionPlugin: scaling, clips and log_n_floor must be finite and positive");
+        throw std::invalid_argument(
+            "Inkling2AttentionPlugin: scaling, clips and log_n_floor must be finite and positive");
     }
 }
 
@@ -126,8 +127,8 @@ IPluginV3* Inkling2AttentionPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Inkling2AttentionPlugin(
-            mLayerName, mNumQHeads, mNumKVHeads, mRelExtent, mWindow, mLogAlpha, mLogNFloor, mQClip, mRelClip, mScaling);
+        auto* plugin = new Inkling2AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mRelExtent, mWindow, mLogAlpha,
+            mLogNFloor, mQClip, mRelClip, mScaling);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -193,7 +194,8 @@ int32_t Inkling2AttentionPlugin::getOutputShapes(DimsExprs const* inputs, int32_
 bool Inkling2AttentionPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
-    if (inOut == nullptr || nbInputs != kNumInputs || nbOutputs != kNumOutputs || pos < 0 || pos >= nbInputs + nbOutputs)
+    if (inOut == nullptr || nbInputs != kNumInputs || nbOutputs != kNumOutputs || pos < 0
+        || pos >= nbInputs + nbOutputs)
     {
         return false;
     }
@@ -229,17 +231,34 @@ int32_t Inkling2AttentionPlugin::configurePlugin(
         return -1;
     }
     Dims const& kv = in[kPastKv].desc.dims;
-    bool const staticOk = kv.nbDims == 5 && kv.d[0] == 2 && kv.d[2] == kTokensPerPage && kv.d[3] == mNumKVHeads
-        && kv.d[4] == kHeadDim && in[kQLin].desc.dims.d[1] == mNumQHeads * kHeadDim
-        && in[kRelLin].desc.dims.d[1] == mNumQHeads * kRelDim && in[kSinkLin].desc.dims.d[1] == mNumQHeads
-        && in[kGateLin].desc.dims.d[1] == mNumQHeads * kHeadDim && in[kKNew].desc.dims.d[1] == mNumKVHeads * kHeadDim
-        && in[kVNew].desc.dims.d[1] == mNumKVHeads * kHeadDim && in[kQScale].desc.dims.d[0] == mNumQHeads * kHeadDim
-        && in[kRelScale].desc.dims.d[0] == mNumQHeads * kRelDim && in[kRelProjT].desc.dims.d[0] == mRelExtent
-        && in[kRelProjT].desc.dims.d[1] == kRelDim && in[kPageTable].desc.dims.d[1] == 2;
-    if (!staticOk)
+    struct Check
     {
-        LOG_ERROR("Inkling2AttentionPlugin: tensor shapes do not match the configured heads, extent and 128-token pages");
-        return -1;
+        char const* what;
+        bool ok;
+    };
+    Check const checks[] = {
+        {"past_kv must be [2, pages, 128, num_kv_heads, 128]",
+            kv.nbDims == 5 && kv.d[0] == 2 && kv.d[2] == kTokensPerPage && kv.d[3] == mNumKVHeads
+                && kv.d[4] == kHeadDim},
+        {"q_lin width must be num_q_heads * 128", in[kQLin].desc.dims.d[1] == mNumQHeads * kHeadDim},
+        {"rel_lin width must be num_q_heads * 16", in[kRelLin].desc.dims.d[1] == mNumQHeads * kRelDim},
+        {"sink_lin width must be num_q_heads", in[kSinkLin].desc.dims.d[1] == mNumQHeads},
+        {"gate_lin width must be num_q_heads * 128", in[kGateLin].desc.dims.d[1] == mNumQHeads * kHeadDim},
+        {"k_new width must be num_kv_heads * 128", in[kKNew].desc.dims.d[1] == mNumKVHeads * kHeadDim},
+        {"v_new width must be num_kv_heads * 128", in[kVNew].desc.dims.d[1] == mNumKVHeads * kHeadDim},
+        {"q_scale must have num_q_heads * 128 entries", in[kQScale].desc.dims.d[0] == mNumQHeads * kHeadDim},
+        {"rel_scale must have num_q_heads * 16 entries", in[kRelScale].desc.dims.d[0] == mNumQHeads * kRelDim},
+        {"rel_proj_t must be [rel_extent, 16]",
+            in[kRelProjT].desc.dims.d[0] == mRelExtent && in[kRelProjT].desc.dims.d[1] == kRelDim},
+        {"kv_page_table must be [batch, 2, pages]", in[kPageTable].desc.dims.d[1] == 2},
+    };
+    for (Check const& check : checks)
+    {
+        if (!check.ok)
+        {
+            LOG_ERROR("Inkling2AttentionPlugin: %s", check.what);
+            return -1;
+        }
     }
     return 0;
 }
@@ -284,10 +303,13 @@ int32_t Inkling2AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
     params.logNFloor = mLogNFloor;
     params.qClip = mQClip;
     params.relClip = mRelClip;
-    if (inputDesc[kQueryStartOffsets].dims.d[0] != params.batchSize + 1 || inputDesc[kQueryLengths].dims.d[0] != params.batchSize
+    if (inputDesc[kQueryStartOffsets].dims.d[0] != params.batchSize + 1
+        || inputDesc[kQueryLengths].dims.d[0] != params.batchSize
         || inputDesc[kPageTable].dims.d[0] != params.batchSize)
     {
-        LOG_ERROR("Inkling2AttentionPlugin: query_start_offsets needs batch + 1 entries, query_lengths and the page table one per sequence");
+        LOG_ERROR(
+            "Inkling2AttentionPlugin: query_start_offsets needs batch + 1 entries, query_lengths and the page table "
+            "one per sequence");
         return -1;
     }
     // The KV pool is aliased: the plugin reads and writes the output buffer, which is the input buffer.
@@ -298,8 +320,8 @@ int32_t Inkling2AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
         static_cast<float const*>(inputs[kRelScale]), static_cast<float const*>(inputs[kRelProjT]),
         static_cast<half const*>(inputs[kKNew]), static_cast<half const*>(inputs[kVNew]), kvPool,
         static_cast<int32_t const*>(inputs[kQueryStartOffsets]), static_cast<int32_t const*>(inputs[kQueryLengths]),
-        static_cast<int32_t const*>(inputs[kPastLengths]),
-        static_cast<int32_t const*>(inputs[kPageTable]), static_cast<half*>(outputs[kOutAttention]), stream);
+        static_cast<int32_t const*>(inputs[kPastLengths]), static_cast<int32_t const*>(inputs[kPageTable]),
+        static_cast<half*>(outputs[kOutAttention]), stream);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 

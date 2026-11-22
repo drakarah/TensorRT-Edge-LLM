@@ -71,8 +71,8 @@ def _specs(cfg: Cfg):
     specs = [
         ("x", trt.float16, (-1, cfg.channels)),
         ("taps", trt.float32, (cfg.channels, cfg.kernel_size)),
-        ("state", trt.float16,
-         (cfg.state_rows, cfg.state_channels, cfg.kernel_size)),
+        ("state", trt.float16, (cfg.state_rows, cfg.state_channels,
+                                cfg.kernel_size)),
         ("query_start_offsets", trt.int32, (cfg.batch + 1, )),
         ("query_lengths", trt.int32, (cfg.batch, )),
         ("state_indices", trt.int32, (cfg.batch, )),
@@ -113,8 +113,9 @@ class Stream:
         g = torch.Generator().manual_seed(seed)
         self.x = (torch.randn(total, cfg.channels, generator=g) *
                   2.0).half().float()
-        self.dyn = (torch.randn(total, max(cfg.groups, 1) * cfg.kernel_size,
-                                generator=g) * 0.3).half().float()
+        self.dyn = (torch.randn(
+            total, max(cfg.groups, 1) * cfg.kernel_size, generator=g) *
+                    0.3).half().float()
 
 
 def _taps(cfg: Cfg, seed=3):
@@ -175,8 +176,7 @@ def _run(runner,
         "present_state": state,
         "query_start_offsets": torch.tensor(offsets, dtype=torch.int32).cuda(),
         "query_lengths": torch.tensor(counts, dtype=torch.int32).cuda(),
-        "state_indices": torch.tensor(state_indices,
-                                      dtype=torch.int32).cuda(),
+        "state_indices": torch.tensor(state_indices, dtype=torch.int32).cuda(),
     }
     if cfg.groups:
         tensors["dyn"] = dyn.half().cuda()
@@ -207,10 +207,9 @@ def _check_state(cfg, streams, state, lengths, rows, untouched_slot=True):
             continue
         for m in range(k - 1):
             idx = lengths[b] - (k - 1) + m
-            want = streams[b].x[idx] if idx >= 0 else torch.zeros(
-                cfg.channels)
-            got = state[row, cfg.state_offset:cfg.state_offset +
-                        cfg.channels, m].float().cpu()
+            want = streams[b].x[idx] if idx >= 0 else torch.zeros(cfg.channels)
+            got = state[row, cfg.state_offset:cfg.state_offset + cfg.channels,
+                        m].float().cpu()
             assert torch.equal(got, want), f"row {row} slot {m}"
 
 
@@ -272,8 +271,8 @@ def test_batch_with_permuted_state_rows_padding_and_empty_sequence():
     _check("batch1", cfg, streams, taps, first, counts, y, offsets)
     pad = y[offsets[1] + counts[1]:offsets[2]].float()
     assert bool((pad == 0).all()), "padding slots must be zero"
-    assert bool((y[offsets[2]:offsets[3]].float() == 0).all()
-                ), "an empty sequence produces only padding"
+    assert bool((y[offsets[2]:offsets[3]].float() == 0
+                 ).all()), "an empty sequence produces only padding"
     _check_state(cfg, streams, state, counts, rows)
     assert bool((state[3] == SENTINEL).all()) and bool(
         (state[5] == SENTINEL).all())
@@ -292,7 +291,8 @@ def test_batch_with_permuted_state_rows_padding_and_empty_sequence():
     _check_state(cfg, streams, state, [9, 8, 6], rows)
 
 
-def test_state_channels_beyond_the_conv_channels_and_unused_slot_are_untouched():
+def test_state_channels_beyond_the_conv_channels_and_unused_slot_are_untouched(
+):
     cfg = Cfg(channels=32, state_channels=96)
     runner = _build(cfg)
     stream = Stream(cfg, 30, 7)
@@ -301,8 +301,8 @@ def test_state_channels_beyond_the_conv_channels_and_unused_slot_are_untouched()
     state[:, cfg.channels:, :] = SENTINEL
     state[:, :, cfg.kernel_size - 1] = SENTINEL
     for first, count in [(0, 11), (11, 1), (12, 9)]:
-        y, offsets = _run(runner, cfg, [stream], state, taps, [first],
-                          [count], [1])
+        y, offsets = _run(runner, cfg, [stream], state, taps, [first], [count],
+                          [1])
         _check(f"step@{first}", cfg, [stream], taps, [first], [count], y,
                offsets)
     assert bool((state[:, cfg.channels:, :] == SENTINEL).all())
@@ -348,8 +348,8 @@ def test_extreme_and_signed_zero_inputs_stay_finite_and_exact():
     assert bool(torch.isfinite(y.float()).cpu()[finite].all())
     assert_close("extreme",
                  torch.where(finite, ref, torch.zeros(())).half().cuda(),
-                 torch.where(finite.cuda(), y, torch.zeros((),
-                                                           dtype=y.dtype).cuda()),
+                 torch.where(finite.cuda(), y,
+                             torch.zeros((), dtype=y.dtype).cuda()),
                  atol=1.0,
                  rtol=2e-3,
                  cos_threshold=0.9999)
@@ -456,10 +456,10 @@ def test_shape_and_input_count_mismatches_are_rejected():
 
     cases = [
         with_shape("taps", (cfg.channels, cfg.kernel_size + 1)),
-        with_shape("state", (cfg.state_rows, cfg.state_channels,
-                             cfg.kernel_size + 1)),
-        with_shape("state", (cfg.state_rows, cfg.channels - 1,
-                             cfg.kernel_size)),
+        with_shape("state",
+                   (cfg.state_rows, cfg.state_channels, cfg.kernel_size + 1)),
+        with_shape("state",
+                   (cfg.state_rows, cfg.channels - 1, cfg.kernel_size)),
         with_shape("dyn", (-1, cfg.groups * cfg.kernel_size + 1)),
         base[:-1],  # groups > 0 but no dynamic taps input
     ]
@@ -468,16 +468,13 @@ def test_shape_and_input_count_mismatches_are_rejected():
             _build(cfg, expect_unsupported=True, specs=specs)
     with pytest.raises(PluginUnsupportedError):
         # dynamic taps supplied to a static plugin
-        _build(Cfg(),
-               expect_unsupported=True,
-               specs=_specs(Cfg(groups=4)))
+        _build(Cfg(), expect_unsupported=True, specs=_specs(Cfg(groups=4)))
 
 
 def test_wrong_data_types_are_rejected():
     cfg = Cfg()
     for name, dtype in (("x", trt.float32), ("taps", trt.float16),
                         ("state", trt.float32), ("query_lengths", trt.int64)):
-        specs = [(n, dtype if n == name else d, s)
-                 for n, d, s in _specs(cfg)]
+        specs = [(n, dtype if n == name else d, s) for n, d, s in _specs(cfg)]
         with pytest.raises(PluginUnsupportedError):
             _build(cfg, expect_unsupported=True, specs=specs)

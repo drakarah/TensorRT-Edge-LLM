@@ -76,9 +76,10 @@ __global__ void appendKernel(Inkling2AttentionParams p, half const* __restrict__
     int64_t const rowElems = int64_t(p.numKVHeads) * kInkling2HeadDim;
     int64_t const pageElems = int64_t(kInkling2TokensPerPage) * rowElems;
     int32_t const* table = pageTable + int64_t(seq) * 2 * p.maxPagesPerSeq;
-    int64_t const kDst = int64_t(table[pos / kInkling2TokensPerPage]) * pageElems + (pos % kInkling2TokensPerPage) * rowElems;
-    int64_t const vDst
-        = int64_t(table[p.maxPagesPerSeq + pos / kInkling2TokensPerPage]) * pageElems + (pos % kInkling2TokensPerPage) * rowElems;
+    int64_t const kDst
+        = int64_t(table[pos / kInkling2TokensPerPage]) * pageElems + (pos % kInkling2TokensPerPage) * rowElems;
+    int64_t const vDst = int64_t(table[p.maxPagesPerSeq + pos / kInkling2TokensPerPage]) * pageElems
+        + (pos % kInkling2TokensPerPage) * rowElems;
     for (int64_t i = threadIdx.x; i < rowElems; i += blockDim.x)
     {
         kvPool[kDst + i] = kNew[int64_t(t) * rowElems + i];
@@ -89,11 +90,11 @@ __global__ void appendKernel(Inkling2AttentionParams p, half const* __restrict__
 //! One block (4 warps) per (query token, query head). Each warp walks a strided subset of the keys with an online
 //! softmax over four head-dim elements per lane; the warps merge through shared memory and the zero-value sink joins
 //! the denominator.
-__global__ void attentionKernel(Inkling2AttentionParams p, half const* __restrict__ qLin, half const* __restrict__ relLin,
-    half const* __restrict__ sinkLin, half const* __restrict__ gateLin, float const* __restrict__ qScale,
-    float const* __restrict__ relScale, float const* __restrict__ relProjT, half const* __restrict__ kvPool,
-    int32_t const* __restrict__ offsets, int32_t const* __restrict__ lengths, int32_t const* __restrict__ past,
-    int32_t const* __restrict__ pageTable, half* __restrict__ out)
+__global__ void attentionKernel(Inkling2AttentionParams p, half const* __restrict__ qLin,
+    half const* __restrict__ relLin, half const* __restrict__ sinkLin, half const* __restrict__ gateLin,
+    float const* __restrict__ qScale, float const* __restrict__ relScale, float const* __restrict__ relProjT,
+    half const* __restrict__ kvPool, int32_t const* __restrict__ offsets, int32_t const* __restrict__ lengths,
+    int32_t const* __restrict__ past, int32_t const* __restrict__ pageTable, half* __restrict__ out)
 {
     int32_t const t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     int32_t seq, qpos;
@@ -117,7 +118,8 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
     for (int32_t i = 0; i < 4; ++i)
     {
         int32_t const d = lane * 4 + i;
-        q[i] = __half2float(qLin[(int64_t(t) * p.numQHeads + h) * kInkling2HeadDim + d]) * qScale[h * kInkling2HeadDim + d];
+        q[i] = __half2float(qLin[(int64_t(t) * p.numQHeads + h) * kInkling2HeadDim + d])
+            * qScale[h * kInkling2HeadDim + d];
         ss += q[i] * q[i];
     }
     ss = warpSum(ss);
@@ -129,7 +131,8 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
     }
 
     int32_t const j = lane & 15;
-    float rs = __half2float(relLin[(int64_t(t) * p.numQHeads + h) * kInkling2RelDim + j]) * relScale[h * kInkling2RelDim + j];
+    float rs = __half2float(relLin[(int64_t(t) * p.numQHeads + h) * kInkling2RelDim + j])
+        * relScale[h * kInkling2RelDim + j];
     float const rss = halfWarpSum(rs * rs);
     rs *= fminf(p.relClip / (sqrtf(rss) + 1e-6F), 1.F) * logScale;
 
@@ -137,9 +140,10 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
     float m = -INFINITY, l = 0.F, acc[4] = {0.F, 0.F, 0.F, 0.F};
     for (int32_t s = lo + w; s <= qpos; s += kWarps)
     {
-        int64_t const inPage = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * kInkling2HeadDim + lane * 4;
-        uint2 const kr = *reinterpret_cast<uint2 const*>(
-            kvPool + int64_t(table[s / kInkling2TokensPerPage]) * pageElems + inPage);
+        int64_t const inPage
+            = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * kInkling2HeadDim + lane * 4;
+        uint2 const kr
+            = *reinterpret_cast<uint2 const*>(kvPool + int64_t(table[s / kInkling2TokensPerPage]) * pageElems + inPage);
         half2 const* k2 = reinterpret_cast<half2 const*>(&kr);
         float dot = 0.F;
 #pragma unroll
