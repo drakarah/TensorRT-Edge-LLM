@@ -263,14 +263,19 @@ int32_t Inkling2AttentionPlugin::configurePlugin(
     return 0;
 }
 
-size_t Inkling2AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */, int32_t /* nbInputs */,
+size_t Inkling2AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
     DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
-    return 0;
+    if (inputs == nullptr || nbInputs != kNumInputs || inputs[kQLin].max.nbDims != 2)
+    {
+        return 0;
+    }
+    // partial results of the key splits of the tiled attention kernels
+    return kernel::inkling2AttentionWorkspaceBytes(inputs[kQLin].max.d[0], mNumQHeads);
 }
 
 int32_t Inkling2AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* /* outputDesc */,
-    void const* const* inputs, void* const* outputs, void* /* workspace */, cudaStream_t stream) noexcept
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     if (inputDesc == nullptr || inputs == nullptr || outputs == nullptr || outputs[kOutAttention] == nullptr)
     {
@@ -322,7 +327,8 @@ int32_t Inkling2AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
         static_cast<half const*>(inputs[kKNew]), static_cast<half const*>(inputs[kVNew]), kvPool,
         static_cast<int32_t const*>(inputs[kQueryStartOffsets]), static_cast<int32_t const*>(inputs[kQueryLengths]),
         static_cast<int32_t const*>(inputs[kPastLengths]), static_cast<int32_t const*>(inputs[kPageTable]),
-        static_cast<half*>(outputs[kOutAttention]), stream);
+        static_cast<half*>(outputs[kOutAttention]), workspace,
+        workspace != nullptr ? kernel::inkling2AttentionWorkspaceBytes(params.numTokens, mNumQHeads) : 0, stream);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 

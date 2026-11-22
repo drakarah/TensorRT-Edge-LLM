@@ -285,6 +285,15 @@ Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false)
     {
         CUDA_CHECK(cudaMemcpy(dout, junk.data(), junk.size() * sizeof(half), cudaMemcpyHostToDevice));
     }
+    // INKLING2_LEGACY=1 runs the simple kernel (the reference implementation), otherwise the tiled kernels
+    bool const legacy = std::getenv("INKLING2_LEGACY") != nullptr;
+    size_t const wsBytes = legacy ? 0 : inkling2AttentionWorkspaceBytes(nTok, c.nh);
+    void* dws = nullptr;
+    if (wsBytes > 0)
+    {
+        CUDA_CHECK(cudaMalloc(&dws, wsBytes));
+        CUDA_CHECK(cudaMemset(dws, 0xFF, wsBytes)); // garbage the kernels must fully overwrite where they read
+    }
     Inkling2AttentionParams p{};
     p.numTokens = nTok;
     p.batchSize = c.batch;
@@ -300,7 +309,7 @@ Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false)
     p.qClip = c.qClip;
     p.relClip = c.relClip;
     launchInkling2Attention(
-        p, dq, drel, dsink, dgate, dqs, drs, dproj, dk, dv, dpool, doff, dlen, dpast, dtab, dout, nullptr);
+        p, dq, drel, dsink, dgate, dqs, drs, dproj, dk, dv, dpool, doff, dlen, dpast, dtab, dout, dws, wsBytes, nullptr);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     Result r;
@@ -337,9 +346,12 @@ Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false)
     }
     for (void* ptr :
         {(void*) dq, (void*) drel, (void*) dsink, (void*) dgate, (void*) dk, (void*) dv, (void*) dqs, (void*) drs,
-            (void*) dproj, (void*) dpool, (void*) doff, (void*) dlen, (void*) dpast, (void*) dtab, (void*) dout})
+            (void*) dproj, (void*) dpool, (void*) doff, (void*) dlen, (void*) dpast, (void*) dtab, (void*) dout, dws})
     {
-        CUDA_CHECK(cudaFree(ptr));
+        if (ptr != nullptr)
+        {
+            CUDA_CHECK(cudaFree(ptr));
+        }
     }
     return r;
 }
@@ -774,4 +786,153 @@ TEST(Inkling2Attention, Fp8KvSaturatesInsteadOfOverflowing)
         ASSERT_TRUE(std::isfinite(v));
     }
     EXPECT_TRUE(sawMax);
+}
+
+
+TEST(Inkling2Attention, GroupSizesAndKeySplits)
+{
+    // GQA group 1, 2, 3, 4, 8 (query tile 24, 12, 8, 6, 3) with a decode step deep enough for several key splits
+    for (auto [nh, nkv] : {std::pair<int32_t, int32_t>{4, 4}, {4, 2}, {6, 2}, {8, 2}, {8, 1}})
+    {
+        Case c;
+        c.nh = nh;
+        c.nkv = nkv;
+        c.maxPages = 30;
+        c.numPages = 60;
+        Data d = makeData(c, {3000}, {1}, 0, 51 + nh);
+        Pool pool = poolWithHistory(c, d, {3000}, 52);
+        expectMatches(c, d, pool);
+    }
+}
+
+TEST(Inkling2Attention, ChunkSpanningSeveralQueryTilesAndKeyTiles)
+{
+    // 70 new tokens (several 8-token tiles, the last one partial) over 200 cached tokens, full attention and window
+    for (int32_t window : {0, 90})
+    {
+        Case c;
+        c.window = window;
+        c.maxPages = 4;
+        c.numPages = 10;
+        Data d = makeData(c, {200}, {70}, 0, 53);
+        Pool pool = poolWithHistory(c, d, {200}, 54);
+        expectMatches(c, d, pool);
+    }
+}
+
+TEST(Inkling2Attention, TiledKernelAgreesWithTheLegacyKernel)
+{
+    // same data through both kernels (the harness picks by INKLING2_LEGACY; compare via two runs of the helper)
+    Case c;
+    c.nh = 24;
+    c.nkv = 8;
+    c.window = 100;
+    c.maxPages = 8;
+    c.numPages = 20;
+    Data d = makeData(c, {600}, {5}, 0, 55);
+    unmapLeadingPages(c, d, 3);
+    Pool pool = poolWithHistory(c, d, {600}, 56);
+    setenv("INKLING2_LEGACY", "1", 1);
+    Result legacy = run(c, d, pool);
+    unsetenv("INKLING2_LEGACY");
+    Result tiled = run(c, d, pool);
+    ASSERT_EQ(legacy.out.size(), tiled.out.size());
+    for (size_t i = 0; i < legacy.out.size(); ++i)
+    {
+        ASSERT_NEAR(legacy.out[i], tiled.out[i], 2e-3F + 2e-3F * std::fabs(legacy.out[i])) << "element " << i;
+    }
+}
+
+//! Timing of the legacy and the tiled kernels at long context (numbers only, nothing is asserted).
+TEST(Inkling2AttentionBench, LongContextTiming)
+{
+    struct Shape
+    {
+        char const* name;
+        int32_t tokens, past, window;
+    };
+    for (Shape const& shape : {Shape{"decode  96K full", 1, 96000, 0}, Shape{"decode  96K window1024", 1, 96000, 1024},
+             Shape{"prefill 1024 @50K full", 1024, 50000, 0}, Shape{"prefill 1024 @50K window1024", 1024, 50000, 1024}})
+    {
+        int32_t const nh = 24, nkv = 8, maxPages = (shape.past + shape.tokens + 127) / 128 + 1;
+        int32_t const numPages = maxPages;
+        size_t const poolElems = size_t(2) * numPages * kPage * nkv * kHd;
+        half* pool{};
+        CUDA_CHECK(cudaMalloc(&pool, poolElems * sizeof(half)));
+        CUDA_CHECK(cudaMemset(pool, 0x3c, poolElems * sizeof(half)));
+        std::vector<int32_t> table(2 * maxPages);
+        for (int32_t i = 0; i < maxPages; ++i)
+        {
+            table[i] = i;
+            table[maxPages + i] = i + numPages;
+        }
+        std::vector<int32_t> offsets{0, shape.tokens}, lengths{shape.tokens}, past{shape.past};
+        auto* dtab = upload(table);
+        auto* doff = upload(offsets);
+        auto* dlen = upload(lengths);
+        auto* dpast = upload(past);
+        size_t const nTok = shape.tokens;
+        half *dq, *drel, *dsink, *dgate, *dk, *dv, *dout;
+        CUDA_CHECK(cudaMalloc(&dq, nTok * nh * kHd * 2));
+        CUDA_CHECK(cudaMalloc(&dgate, nTok * nh * kHd * 2));
+        CUDA_CHECK(cudaMalloc(&dout, nTok * nh * kHd * 2));
+        CUDA_CHECK(cudaMalloc(&drel, nTok * nh * kRd * 2));
+        CUDA_CHECK(cudaMalloc(&dsink, nTok * nh * 2));
+        CUDA_CHECK(cudaMalloc(&dk, nTok * nkv * kHd * 2));
+        CUDA_CHECK(cudaMalloc(&dv, nTok * nkv * kHd * 2));
+        for (half* x : {dq, dgate, drel, dsink, dk, dv})
+        {
+            CUDA_CHECK(cudaMemset(x, 0x2e, nTok * 2));
+        }
+        std::vector<float> ones(size_t(nh) * kHd, 1.0F), proj(size_t(1024) * kRd, 0.1F);
+        float* dqs = upload(ones);
+        float* drs = upload(ones);
+        float* dproj = upload(proj);
+        Inkling2AttentionParams p{};
+        p.numTokens = shape.tokens;
+        p.batchSize = 1;
+        p.numQHeads = nh;
+        p.numKVHeads = nkv;
+        p.relExtent = 1024;
+        p.window = shape.window;
+        p.maxPagesPerSeq = maxPages;
+        p.scaling = 1.0F / std::sqrt(128.0F);
+        p.logAlpha = 0.1F;
+        p.logNFloor = 16.0F;
+        p.qClip = 22.6F;
+        p.relClip = 8.0F;
+        size_t const wsBytes = inkling2AttentionWorkspaceBytes(shape.tokens, nh);
+        void* dws{};
+        CUDA_CHECK(cudaMalloc(&dws, wsBytes));
+        cudaEvent_t a, b;
+        CUDA_CHECK(cudaEventCreate(&a));
+        CUDA_CHECK(cudaEventCreate(&b));
+        for (bool tiled : {false, true})
+        {
+            auto launch = [&]()
+            {
+                launchInkling2Attention(p, dq, drel, dsink, dgate, dqs, drs, dproj, dk, dv, pool, doff, dlen, dpast,
+                    dtab, dout, tiled ? dws : nullptr, tiled ? wsBytes : 0, nullptr);
+            };
+            launch();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            int32_t const iters = shape.tokens > 1 ? 3 : 20;
+            CUDA_CHECK(cudaEventRecord(a));
+            for (int32_t i = 0; i < iters; ++i)
+            {
+                launch();
+            }
+            CUDA_CHECK(cudaEventRecord(b));
+            CUDA_CHECK(cudaEventSynchronize(b));
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+            printf("BENCH %-30s %-6s %9.3f ms\n", shape.name, tiled ? "tiled" : "legacy", ms / iters);
+        }
+        for (void* ptr : {(void*) pool, (void*) dtab, (void*) doff, (void*) dlen, (void*) dpast, (void*) dq,
+                 (void*) dgate, (void*) dout, (void*) drel, (void*) dsink, (void*) dk, (void*) dv, (void*) dqs,
+                 (void*) drs, (void*) dproj, dws})
+        {
+            CUDA_CHECK(cudaFree(ptr));
+        }
+    }
 }

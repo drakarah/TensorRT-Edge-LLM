@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
@@ -60,7 +61,12 @@ struct Inkling2AttentionParams
 void launchInkling2Attention(Inkling2AttentionParams const& params, half const* qLin, half const* relLin,
     half const* sinkLin, half const* gateLin, float const* qScale, float const* relScale, float const* relProjT,
     half const* kNew, half const* vNew, void* kvPool, int32_t const* queryStartOffsets, int32_t const* queryLengths,
-    int32_t const* pastLengths, int32_t const* pageTable, half* out, cudaStream_t stream);
+    int32_t const* pastLengths, int32_t const* pageTable, half* out, void* workspace, size_t workspaceBytes,
+    cudaStream_t stream);
+
+//! Workspace the tiled kernels need for up to maxTokens token slots (partial results of the key splits). With a null
+//! workspace the launch uses the simple one-block-per-(token, head) kernel.
+size_t inkling2AttentionWorkspaceBytes(int64_t maxTokens, int32_t numQHeads);
 
 } // namespace kernel
 } // namespace trt_edgellm
