@@ -29,7 +29,9 @@ import torch
 from ...ops import (Linear, Module, NetworkModule, RaggedDecoderInputs,
                     add_ragged_decoder_inputs)
 from ...ops import functional as F
+from ...ops.moe import prepare_gated_int4_weights
 from . import runtime_config as rc
+from . import weights as weight_conversion
 
 LOGGER = logging.getLogger("builder.inkling2")
 _EPS = 1e-6
@@ -48,11 +50,16 @@ def _round_nvfp4(x: torch.Tensor):
     amax = x.abs().max().clamp_min(1e-30)
     multiplier = amax / (6.0 * 448.0)
     blocks = x.view(rows, cols // 16, 16)
-    scale = (blocks.abs().amax(-1, keepdim=True) / 6.0 / multiplier).clamp(max=448.0).to(torch.float8_e4m3fn)
-    scaled = (blocks / (scale.float() * multiplier).clamp_min(1e-30)).abs().clamp(max=6.0)
+    scale = (blocks.abs().amax(-1, keepdim=True) / 6.0 /
+             multiplier).clamp(max=448.0).to(torch.float8_e4m3fn)
+    scaled = (blocks /
+              (scale.float() * multiplier).clamp_min(1e-30)).abs().clamp(
+                  max=6.0)
     index = (scaled.unsqueeze(-1) - _E2M1_LEVELS).abs().argmin(-1)
-    code = (index + 8 * ((blocks < 0) & (index > 0)).long()).to(torch.uint8).view(rows, cols)
-    return (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous(), scale.view(torch.uint8).view(rows, cols // 16), multiplier
+    code = (index + 8 * ((blocks < 0) & (index > 0)).long()).to(
+        torch.uint8).view(rows, cols)
+    return (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous(), scale.view(
+        torch.uint8).view(rows, cols // 16), multiplier
 
 
 def _expert_nvfp4(weights, name: str):
@@ -60,20 +67,39 @@ def _expert_nvfp4(weights, name: str):
 
     NVFP4 layers pass through unchanged. MXFP8 layers (no amax tensor) are dequantized and rounded to NVFP4.
     """
-    raw = torch.from_numpy(np.ascontiguousarray(weights.array(name)).view(np.uint8))
-    scale = torch.from_numpy(np.ascontiguousarray(weights.array(name + "_scale")).view(np.uint8))
+    raw = torch.from_numpy(
+        np.ascontiguousarray(weights.array(name)).view(np.uint8))
+    scale = torch.from_numpy(
+        np.ascontiguousarray(weights.array(name + "_scale")).view(np.uint8))
     if weights.has(name + "_amax"):
-        multiplier = _f32(weights, name + "_amax") / _f32(weights, name + "_outer_scale_denominator")
+        multiplier = _f32(weights, name + "_amax") / _f32(
+            weights, name + "_outer_scale_denominator")
         return raw, scale, torch.from_numpy(multiplier.astype(np.float32))
     experts, rows, cols = raw.shape
     packed = torch.empty(experts, rows, cols // 2, dtype=torch.uint8)
     block_scale = torch.empty(experts, rows, cols // 16, dtype=torch.uint8)
     multiplier = torch.empty(experts, dtype=torch.float32)
     for i in range(experts):
-        dense = (raw[i].view(torch.float8_e4m3fn).float().view(rows, cols // 32, 32) *
-                 torch.exp2(scale[i].float() - 127.0)[..., None]).view(rows, cols)
+        dense = (raw[i].view(torch.float8_e4m3fn).float().view(
+            rows, cols // 32, 32) *
+                 torch.exp2(scale[i].float() - 127.0)[..., None]).view(
+                     rows, cols)
         packed[i], block_scale[i], multiplier[i] = _round_nvfp4(dense)
     return packed, block_scale, multiplier
+
+
+def encode_routing(logits, bias: np.ndarray, top_k: int):
+    """FP32 router logits [T, E] -> logits for a softmax top-k router that selects by sigmoid + bias and weights by sigmoid.
+
+    Selected experts get +30 so the softmax renormalizes the plain scores over exactly the chosen set.
+    """
+    score = logits.sigmoid().maximum(1e-30)
+    biased = score + F.constant(
+        bias.reshape(1, -1).astype(np.float32), "router_bias")
+    values, _ = F.topk(biased, top_k, 1)
+    kth = values.reduce(trt.ReduceOperation.MIN, values._reduce_dims(1), True)
+    selected = ((biased - kth + 1e-6) * 1e6).minimum(1.0).maximum(0.0)
+    return score.log() + selected * 30.0
 
 
 def rms_unweighted(x, eps: float = _EPS):
@@ -210,14 +236,17 @@ class Inkling2Layer(Module):
         self.router_w = np.ascontiguousarray(
             _f32(w, self.key("mlp.gate.weight")).T)
         self.router_bias = _f32(w, self.key("mlp.gate.bias"))
-        self.moe_weights, self.moe_inter = self._pack_experts(ctx)
+        self.int4 = w.has(self.key("mlp.experts.0.gate_proj.qweight"))
+        if not self.int4:
+            self.moe_weights, self.moe_inter = self._pack_experts(ctx)
 
     def _pack_experts(self, ctx):
         from tensorrt_edgellm.checkpoint.repacking import \
             repack_nvfp4_a16_marlin_gated_moe_experts
         w = ctx.weights
         text = ctx.cfg.raw_component
-        e, inter = int(text["n_routed_experts"]), int(text["intermediate_size"])
+        e, inter = int(text["n_routed_experts"]), int(
+            text["intermediate_size"])
         padded = ((inter + 127) // 128) * 128
         base = self.key("mlp.experts")
         w13, s13, g13 = _expert_nvfp4(w, base + ".w13_weight")
@@ -298,9 +327,49 @@ class Inkling2Layer(Module):
                                        2 * kv_ch)
         return out.cast(trt.float32), present_kv, state_in
 
+    def _int4_moe(self, logits, hidden16):
+        cfg, w = self.cfg, self.ctx.weights
+        text = cfg.raw_component
+        base = self.key("mlp.experts")
+        experts = int(text["n_routed_experts"])
+
+        def materialize():
+
+            def load(expert, projection):
+                name = f"{base}.{expert}.{projection}"
+                return (w.array(name + ".qweight"), w.array(name + ".qzeros"),
+                        w.array(name + ".scales"))
+
+            return prepare_gated_int4_weights(self.ctx, load)
+
+        moe_weights = w.parameter_value(
+            "int4_moe", base,
+            lambda: weight_conversion.int4_expert_specs(w, base, experts),
+            materialize)
+        bindings = weight_conversion.int4_expert_bindings(
+            w, base, experts, cfg.group_size, cfg.quant.gptq_zero_point_offset)
+        encoded = encode_routing(logits, self.router_bias, 8)
+        routed = F.int4_moe(encoded,
+                            hidden16,
+                            moe_weights,
+                            experts,
+                            8,
+                            self.hidden,
+                            int(text["intermediate_size"]),
+                            cfg.group_size,
+                            weight_prefix=base,
+                            weight_bindings=bindings,
+                            zero_point_offset=cfg.quant.gptq_zero_point_offset,
+                            gate_softcap=float(text["mlp_gate_softcap"]),
+                            up_softcap=float(text["mlp_up_softcap"]))
+        return routed * float(text["route_scale"])
+
     def moe(self, x32, conv_state, ragged):
         logits = _matmul_const(x32, self.router_w, "router_w")
         hidden16 = x32.cast(trt.float16)
+        if self.int4:
+            routed = self._int4_moe(logits, hidden16)
+            return self._moe_conv(routed, conv_state, ragged)
         routed = F.nvfp4_a16_moe(
             logits,
             hidden16,
@@ -318,6 +387,9 @@ class Inkling2Layer(Module):
             weight_prefix=self.key("mlp.experts"),
             gate_softcap=float(self.cfg.raw_component["mlp_gate_softcap"]),
             up_softcap=float(self.cfg.raw_component["mlp_up_softcap"]))
+        return self._moe_conv(routed, conv_state, ragged)
+
+    def _moe_conv(self, routed, conv_state, ragged):
         out, conv_state = F.inkling2_short_conv(
             routed, F.constant(self.mlp_taps, "mlp_taps"), conv_state, ragged,
             self.hidden, 4, 1.0 / math.sqrt(5.0), None, 0,
