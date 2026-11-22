@@ -1272,11 +1272,11 @@ Int4MoePlugin::~Int4MoePlugin() noexcept
     {
         cudaFree(mStats);
     }
-    if (mCacheMem != nullptr)
+    if (mCacheMem != nullptr && !mCacheShared)
     {
         cudaFree(mCacheMem);
     }
-    if (mCacheState != nullptr)
+    if (mCacheState != nullptr && !mCacheShared)
     {
         cudaFree(mCacheState);
         if (mCpuAdmit != nullptr)
@@ -1286,7 +1286,48 @@ Int4MoePlugin::~Int4MoePlugin() noexcept
     }
 }
 
-bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc) noexcept
+namespace
+{
+//! One device expert cache that several plugin instances reading the same weights use together (EDGELLM_MOE_CACHE_SHARE=1).
+struct SharedCacheBlock
+{
+    void* mem{nullptr};
+    int32_t* state{nullptr};
+    uint8_t* tensors[4]{};
+    int32_t slots{0};
+    ~SharedCacheBlock()
+    {
+        if (mem != nullptr)
+        {
+            cudaFree(mem);
+        }
+        if (state != nullptr)
+        {
+            cudaFree(state);
+        }
+    }
+};
+
+std::mutex& sharedCacheMutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+std::map<void const*, std::weak_ptr<SharedCacheBlock>>& sharedCaches()
+{
+    static std::map<void const*, std::weak_ptr<SharedCacheBlock>> caches;
+    return caches;
+}
+
+bool cacheShareFromEnv()
+{
+    static bool const on = []() { char const* v = std::getenv("EDGELLM_MOE_CACHE_SHARE"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+} // namespace
+
+bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc, void const* weightPtr) noexcept
 {
     if (mCacheSlots < 0)
     {
@@ -1360,7 +1401,12 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                 }
                 char const* reserveEnv = std::getenv("EDGELLM_MOE_CACHE_RESERVE_MB");
                 size_t const reserve = (reserveEnv != nullptr ? static_cast<size_t>(std::atoi(reserveEnv)) : 250) << 20;
-                size_t const layers = std::max<size_t>(1, moeLayerCount());
+                size_t layers = std::max<size_t>(1, moeLayerCount());
+                // EDGELLM_MOE_CACHE_LAYERS=<n>: number of distinct caches the budget is split over (with sharing, fewer than plugin instances)
+                if (char const* layersEnv = std::getenv("EDGELLM_MOE_CACHE_LAYERS"))
+                {
+                    layers = std::max<size_t>(1, static_cast<size_t>(std::atoll(layersEnv)));
+                }
                 size_t const fit = freeBytes > reserve ? (freeBytes - reserve) / (layers * perSlot) : 0;
                 autoSlots = static_cast<int32_t>(std::min<size_t>(fit, static_cast<size_t>(mNumExperts)));
                 if (autoSlots < static_cast<int32_t>(mTopK))
@@ -1406,6 +1452,28 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
         total += (mCacheBytesPerExpert[i] * mCacheSlots + 255) & ~static_cast<size_t>(255);
     }
     size_t const stateInts = mNumExperts + 2 * static_cast<size_t>(mCacheSlots) + 1 + 1 + 2 * mCacheSlots + 3;
+    bool const share = cacheShareFromEnv() && weightPtr != nullptr;
+    if (share)
+    {
+        std::lock_guard<std::mutex> lock(sharedCacheMutex());
+        auto it = sharedCaches().find(weightPtr);
+        std::shared_ptr<SharedCacheBlock> block = it != sharedCaches().end() ? it->second.lock() : nullptr;
+        if (block && block->slots == mCacheSlots)
+        {
+            mCacheHold = block;
+            mCacheShared = true;
+            mCacheMem = block->mem;
+            mCacheState = block->state;
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                mCacheTensors[i] = block->tensors[i];
+            }
+            mCacheTally = mCacheState + stateInts - 3;
+            mCacheReady = true;
+            LOG_INFO("Int4MoePlugin %s: shares the expert cache of an earlier pass (%d slots)", mLayerName.c_str(), mCacheSlots);
+            return true;
+        }
+    }
     if (cudaMalloc(&mCacheMem, total) != cudaSuccess || cudaMalloc(reinterpret_cast<void**>(&mCacheState), stateInts * 4) != cudaSuccess)
     {
         cudaGetLastError();
@@ -1430,6 +1498,23 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
         cudaMemset(mCpuAdmit, 0, (static_cast<size_t>(mNumExperts) + 1) * sizeof(int32_t));
     }
     PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
+    if (share)
+    {
+        // the block owns the allocation from here on; a shared cache is never resized (borrowers would keep stale pointers)
+        auto block = std::make_shared<SharedCacheBlock>();
+        block->mem = mCacheMem;
+        block->state = mCacheState;
+        block->slots = mCacheSlots;
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            block->tensors[i] = mCacheTensors[i];
+        }
+        mCacheHold = block;
+        mCacheShared = true;
+        std::lock_guard<std::mutex> lock(sharedCacheMutex());
+        sharedCaches()[weightPtr] = block;
+    }
+    else
     {
         std::lock_guard<std::mutex> lock(gLiveCacheMutex);
         liveCachePlugins().push_back(this);
@@ -2009,7 +2094,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             tensorBytes[i] = bytes * (inputDesc[2 + i].type == DataType::kHALF ? 2 : 1);
         }
         // decode steps served by the expert cache never stage
-        bool const cacheStep = stageNow && numTokens <= 4 && ensureExpertCache(inputDesc) && numTokens * mTopK <= mCacheSlots;
+        bool const cacheStep = stageNow && numTokens <= 4 && ensureExpertCache(inputDesc, inputs[2]) && numTokens * mTopK <= mCacheSlots;
         auto pfResult = PrefillExpertPrefetcher::Result::kNone;
         uint8_t* privatePtrs[4]{};
         static int32_t const chunkExperts = prefillChunkFromEnv();

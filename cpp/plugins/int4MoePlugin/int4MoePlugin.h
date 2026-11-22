@@ -19,6 +19,7 @@
 
 #include <NvInferRuntime.h>
 #include <atomic>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -217,7 +218,10 @@ private:
     size_t mCacheBytesPerExpert[4]{};
     int32_t* mCacheState{nullptr}; // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S], tally[3]
     std::atomic<int32_t*> mCacheTally{nullptr};
-    bool ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc) noexcept;
+    // EDGELLM_MOE_CACHE_SHARE=1: plugin instances that read the same expert weights (the repeated passes of a looped layer) use one cache.
+    bool mCacheShared{false};
+    std::shared_ptr<void> mCacheHold;
+    bool ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc, void const* weightPtr) noexcept;
 
 public:
     //! Device bytes the cache holds per slot (the four tensors); 0 while no cache is allocated.
