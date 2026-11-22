@@ -323,6 +323,10 @@ Pool expectedPool(Case const& c, Data const& d, Pool pool)
             int32_t const t = d.offsets[b] + i, pos = d.past[b] + i;
             int32_t const kPageIdx = d.table[(size_t(b) * 2) * c.maxPages + pos / kPage];
             int32_t const vPageIdx = d.table[(size_t(b) * 2 + 1) * c.maxPages + pos / kPage];
+            if (kPageIdx < 0 || vPageIdx < 0)
+            {
+                continue; // unmapped logical page: the kernel writes nothing
+            }
             for (int32_t hd = 0; hd < c.nkv; ++hd)
             {
                 for (int32_t x = 0; x < kHd; ++x)
@@ -391,6 +395,10 @@ Pool poolWithHistory(Case const& c, Data& d, std::vector<int32_t> const& past, u
             int32_t const kPageIdx = d.table[(size_t(b) * 2) * c.maxPages + pos / kPage];
             int32_t const vPageIdx = d.table[(size_t(b) * 2 + 1) * c.maxPages + pos / kPage];
             auto kk = normal(size_t(c.nkv) * kHd, 1.5F, gen), vv = normal(size_t(c.nkv) * kHd, 1.0F, gen);
+            if (kPageIdx < 0 || vPageIdx < 0)
+            {
+                continue;
+            }
             for (int32_t hd = 0; hd < c.nkv; ++hd)
             {
                 for (int32_t x = 0; x < kHd; ++x)
@@ -564,5 +572,82 @@ TEST(Inkling2Attention, NaNInOneTokenStaysInThatToken)
         {
             EXPECT_TRUE(anyNaN);
         }
+    }
+}
+
+//! Marks the logical pages [0, firstMapped) of every sequence as unmapped (-1), the way bounded window storage does.
+void unmapLeadingPages(Case const& c, Data& d, int32_t firstMapped)
+{
+    for (int32_t b = 0; b < c.batch; ++b)
+    {
+        for (int32_t p = 0; p < firstMapped; ++p)
+        {
+            d.table[(size_t(b) * 2 + 0) * c.maxPages + p] = -1;
+            d.table[(size_t(b) * 2 + 1) * c.maxPages + p] = -1;
+        }
+    }
+}
+
+TEST(Inkling2Attention, UnmappedPagesOutsideTheWindowAreNeverRead)
+{
+    // window 100 at position 600: the live keys sit in pages 3 and 4, pages 0-2 are unmapped (-1)
+    Case c;
+    c.window = 100;
+    c.maxPages = 8;
+    c.numPages = 20;
+    Data d = makeData(c, {600}, {1}, 0, 31);
+    unmapLeadingPages(c, d, 3);
+    Pool pool = poolWithHistory(c, d, {600}, 32);
+    expectMatches(c, d, pool);
+}
+
+TEST(Inkling2Attention, WindowPrefillChunkOverUnmappedHistory)
+{
+    // a 70-token chunk after 400 cached tokens; window 64 reaches back into page 2 only
+    Case c;
+    c.window = 64;
+    c.maxPages = 8;
+    c.numPages = 20;
+    Data d = makeData(c, {400}, {70}, 0, 33);
+    unmapLeadingPages(c, d, 2);
+    Pool pool = poolWithHistory(c, d, {400}, 34);
+    expectMatches(c, d, pool);
+}
+
+TEST(Inkling2Attention, FullyUnmappedTableWritesNothingAndStaysFinite)
+{
+    // graph-capture warmup: the sparse table holds -1 everywhere
+    Case c;
+    c.window = 64;
+    c.maxPages = 4;
+    c.numPages = 6;
+    Data d = makeData(c, {0}, {3}, 0, 35);
+    unmapLeadingPages(c, d, c.maxPages);
+    Pool before = newPool(c);
+    Result r = run(c, d, before);
+    for (size_t i = 0; i < before.host.size(); ++i)
+    {
+        ASSERT_EQ(r.pool.host[i], kSentinel) << "pool element " << i << " was written through an unmapped page";
+    }
+    for (float v : r.out)
+    {
+        ASSERT_TRUE(std::isfinite(v));
+    }
+}
+
+TEST(Inkling2Attention, PartiallyUnmappedAppendSkipsOnlyTheUnmappedRows)
+{
+    // a decode token whose own page is unmapped is not written; its neighbours in mapped pages are
+    Case c;
+    c.window = 0;
+    c.maxPages = 4;
+    c.numPages = 8;
+    Data d = makeData(c, {0}, {2}, 0, 37);
+    unmapLeadingPages(c, d, 1); // page 0 unmapped, both tokens live in page 0
+    Pool before = newPool(c);
+    Result r = run(c, d, before);
+    for (size_t i = 0; i < before.host.size(); ++i)
+    {
+        ASSERT_EQ(r.pool.host[i], kSentinel);
     }
 }

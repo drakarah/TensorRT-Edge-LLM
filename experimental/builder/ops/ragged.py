@@ -62,6 +62,7 @@ def add_ragged_decoder_inputs(
     *,
     include_logits_indices: bool = True,
     include_swa: bool = False,
+    swa_mode_dtype=trt.int8,
 ) -> RaggedDecoderInputs:
     """Declare decoder bindings through ``NetworkModule.add_input``."""
 
@@ -84,6 +85,6 @@ def add_ragged_decoder_inputs(
         # Bounded sliding-window storage: the sparse window table and the shape-only mode selector ([1] bounded, [0] full)
         swa_kv_page_table=(add_input("swa_kv_page_table", trt.int32,
                                      (-1, 2, -1)) if include_swa else None),
-        swa_kv_cache_mode=(add_input("swa_kv_cache_mode", trt.int8,
+        swa_kv_cache_mode=(add_input("swa_kv_cache_mode", swa_mode_dtype,
                                      (-1, )) if include_swa else None),
     )

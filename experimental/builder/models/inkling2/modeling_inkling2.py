@@ -508,7 +508,8 @@ class Inkling2ForCausalLM(NetworkModule):
             self.ctx.args.max_kv_cache_capacity) > 0
         result.update(
             add_ragged_decoder_inputs(self.add_input,
-                                      include_swa=bounded).as_dict())
+                                      include_swa=bounded,
+                                      swa_mode_dtype=trt.int32).as_dict())
         return result
 
     def forward(self, **io):

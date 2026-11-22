@@ -76,10 +76,14 @@ __global__ void appendKernel(Inkling2AttentionParams p, half const* __restrict__
     int64_t const rowElems = int64_t(p.numKVHeads) * kInkling2HeadDim;
     int64_t const pageElems = int64_t(kInkling2TokensPerPage) * rowElems;
     int32_t const* table = pageTable + int64_t(seq) * 2 * p.maxPagesPerSeq;
-    int64_t const kDst
-        = int64_t(table[pos / kInkling2TokensPerPage]) * pageElems + (pos % kInkling2TokensPerPage) * rowElems;
-    int64_t const vDst = int64_t(table[p.maxPagesPerSeq + pos / kInkling2TokensPerPage]) * pageElems
-        + (pos % kInkling2TokensPerPage) * rowElems;
+    // A negative page id is an unmapped logical page (bounded window storage, graph-capture warmup): nothing to write.
+    int32_t const kPage = table[pos / kInkling2TokensPerPage], vPage = table[p.maxPagesPerSeq + pos / kInkling2TokensPerPage];
+    if (kPage < 0 || vPage < 0)
+    {
+        return;
+    }
+    int64_t const kDst = int64_t(kPage) * pageElems + (pos % kInkling2TokensPerPage) * rowElems;
+    int64_t const vDst = int64_t(vPage) * pageElems + (pos % kInkling2TokensPerPage) * rowElems;
     for (int64_t i = threadIdx.x; i < rowElems; i += blockDim.x)
     {
         kvPool[kDst + i] = kNew[int64_t(t) * rowElems + i];
@@ -142,8 +146,12 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
     {
         int64_t const inPage
             = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * kInkling2HeadDim + lane * 4;
-        uint2 const kr
-            = *reinterpret_cast<uint2 const*>(kvPool + int64_t(table[s / kInkling2TokensPerPage]) * pageElems + inPage);
+        int32_t const kPage = table[s / kInkling2TokensPerPage], vPage = table[p.maxPagesPerSeq + s / kInkling2TokensPerPage];
+        if (kPage < 0 || vPage < 0)
+        {
+            continue; // unmapped logical page: no key (never inside a live window)
+        }
+        uint2 const kr = *reinterpret_cast<uint2 const*>(kvPool + int64_t(kPage) * pageElems + inPage);
         half2 const* k2 = reinterpret_cast<half2 const*>(&kr);
         float dot = 0.F;
 #pragma unroll
@@ -162,8 +170,7 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
         float const score = dot * p.scaling + bias;
         float const mNew = fmaxf(m, score);
         float const corr = __expf(m - mNew), e = __expf(score - mNew);
-        uint2 const vr = *reinterpret_cast<uint2 const*>(
-            kvPool + int64_t(table[p.maxPagesPerSeq + s / kInkling2TokensPerPage]) * pageElems + inPage);
+        uint2 const vr = *reinterpret_cast<uint2 const*>(kvPool + int64_t(vPage) * pageElems + inPage);
         half2 const* v2 = reinterpret_cast<half2 const*>(&vr);
 #pragma unroll
         for (int32_t i = 0; i < 2; ++i)
