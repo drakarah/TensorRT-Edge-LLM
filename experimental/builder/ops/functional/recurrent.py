@@ -156,3 +156,37 @@ def update_ssm_state(
                      use_spec_verify_state=int(use_intermediate),
                      use_ddtree=int(use_ddtree),
                      time_step_limit=[0.0, float("inf")])
+
+
+def inkling2_short_conv(
+    x: Tensor,
+    taps: Tensor,
+    conv_state: Tensor,
+    ragged: RaggedDecoderInputs,
+    channels: int,
+    kernel_size: int,
+    scale: float,
+    dynamic_taps: Optional[Tensor] = None,
+    groups: int = 0,
+) -> Tuple[Tensor, Tensor]:
+    """Run one Inkling 2 short convolution with residual and return output plus present state.
+
+    ``taps`` is [channels, kernel_size] FP32 with lag 0 (the current token) first.
+    ``dynamic_taps`` [tokens, groups * kernel_size] adds per-token taps shared
+    by ``channels / groups`` consecutive channels.
+    """
+    if (dynamic_taps is None) != (groups == 0):
+        raise ValueError("dynamic_taps and groups must be given together")
+    inputs = [
+        x, taps, conv_state, ragged.query_start_offsets, ragged.query_lengths,
+        ragged.state_indices
+    ]
+    if dynamic_taps is not None:
+        inputs.append(dynamic_taps)
+    return operation("inkling2_short_conv",
+                     inputs,
+                     output_count=2,
+                     channels=channels,
+                     kernel_size=kernel_size,
+                     groups=groups,
+                     scale=scale)
