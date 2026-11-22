@@ -220,6 +220,8 @@ private:
     std::atomic<int32_t*> mCacheTally{nullptr};
     // EDGELLM_MOE_CACHE_SHARE=1: plugin instances that read the same expert weights (the repeated passes of a looped layer) use one cache.
     bool mCacheShared{false};
+    bool mCacheOwner{false}; //!< the shared cache's owner: the instance resized by release/growth requests
+    void syncSharedUsers() noexcept;
     std::shared_ptr<void> mCacheHold;
     bool ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc, void const* weightPtr) noexcept;
 

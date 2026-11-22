@@ -560,7 +560,15 @@ class Inkling2ForCausalLM(NetworkModule):
         normed = rms_weighted(final, self.norm).cast(trt.float16)
         selected = F.gather_token_rows(normed, ragged.logits_indices)
         logits = self.lm_head(selected).cast(trt.float32)
-        outputs = {"logits": self.softcap * (logits / self.softcap).tanh()}
+        logits = self.softcap * (logits / self.softcap).tanh()
+        padded = int(self.cfg.vocab_size)
+        unpadded = int(self.cfg.raw_component.get("unpadded_vocab_size", padded))
+        if unpadded < padded:
+            # the unembedding is padded beyond the tokenizer's ids; those rows are untrained and must never be sampled
+            mask = np.zeros((1, padded), np.float32)
+            mask[:, unpadded:] = -30000.0
+            logits = logits + F.constant(mask, "vocab_pad_mask")
+        outputs = {"logits": logits}
         for i in range(self.visits):
             outputs[f"present_key_values_{i}"] = present_kv[i]
             outputs[f"present_conv_state_{i}"] = present_conv[i]

@@ -1266,32 +1266,6 @@ void unregisterLiveCache(Int4MoePlugin* plugin)
 }
 } // namespace
 
-Int4MoePlugin::~Int4MoePlugin() noexcept
-{
-    unregisterLiveCache(this);
-    if (mStatsThread.joinable())
-    {
-        mStatsStop = true;
-        mStatsThread.join();
-    }
-    if (mStats != nullptr)
-    {
-        cudaFree(mStats);
-    }
-    if (mCacheMem != nullptr && !mCacheShared)
-    {
-        cudaFree(mCacheMem);
-    }
-    if (mCacheState != nullptr && !mCacheShared)
-    {
-        cudaFree(mCacheState);
-        if (mCpuAdmit != nullptr)
-        {
-            cudaFree(mCpuAdmit);
-        }
-    }
-}
-
 namespace
 {
 //! One device expert cache that several plugin instances reading the same weights use together (EDGELLM_MOE_CACHE_SHARE=1).
@@ -1301,6 +1275,7 @@ struct SharedCacheBlock
     int32_t* state{nullptr};
     uint8_t* tensors[4]{};
     int32_t slots{0};
+    std::vector<Int4MoePlugin*> users; //!< instances using the block (the first one is the owner that resizes it)
     ~SharedCacheBlock()
     {
         if (mem != nullptr)
@@ -1332,6 +1307,39 @@ bool cacheShareFromEnv()
     return on;
 }
 } // namespace
+
+Int4MoePlugin::~Int4MoePlugin() noexcept
+{
+    unregisterLiveCache(this);
+    if (mCacheShared && mCacheHold)
+    {
+        std::lock_guard<std::mutex> lock(sharedCacheMutex());
+        auto& users = static_cast<SharedCacheBlock*>(mCacheHold.get())->users;
+        users.erase(std::remove(users.begin(), users.end(), this), users.end());
+    }
+    if (mStatsThread.joinable())
+    {
+        mStatsStop = true;
+        mStatsThread.join();
+    }
+    if (mStats != nullptr)
+    {
+        cudaFree(mStats);
+    }
+    if (mCacheMem != nullptr && !mCacheShared)
+    {
+        cudaFree(mCacheMem);
+    }
+    if (mCacheState != nullptr && !mCacheShared)
+    {
+        cudaFree(mCacheState);
+        if (mCpuAdmit != nullptr)
+        {
+            cudaFree(mCpuAdmit);
+        }
+    }
+}
+
 
 bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc, void const* weightPtr) noexcept
 {
@@ -1468,6 +1476,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
         {
             mCacheHold = block;
             mCacheShared = true;
+            block->users.push_back(this);
             mCacheMem = block->mem;
             mCacheState = block->state;
             for (int32_t i = 0; i < 4; ++i)
@@ -1517,8 +1526,15 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
         }
         mCacheHold = block;
         mCacheShared = true;
-        std::lock_guard<std::mutex> lock(sharedCacheMutex());
-        sharedCaches()[weightPtr] = block;
+        mCacheOwner = true;
+        {
+            std::lock_guard<std::mutex> lock(sharedCacheMutex());
+            block->users.push_back(this);
+            sharedCaches()[weightPtr] = block;
+        }
+        // the owner is the instance a release or growth request resizes; its borrowers follow (syncSharedUsers)
+        std::lock_guard<std::mutex> liveLock(gLiveCacheMutex);
+        liveCachePlugins().push_back(this);
     }
     else
     {
@@ -1668,6 +1684,7 @@ int64_t Int4MoePlugin::resizeExpertCache(int32_t newSlots) noexcept
         }
         mCacheTally = mCacheState + state.size() - 3;
         PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
+        syncSharedUsers();
         return static_cast<int64_t>(oldTotal) - static_cast<int64_t>(total + state.size() * 4);
     }
 
@@ -1676,7 +1693,42 @@ int64_t Int4MoePlugin::resizeExpertCache(int32_t newSlots) noexcept
     mCacheReady = false;
     mCacheSlots = 0;
     PrefillExpertPrefetcher::get().unregisterCache(layerIdFromName(mLayerName));
+    syncSharedUsers();
     return static_cast<int64_t>(oldTotal);
+}
+
+//! After the owner of a shared cache resized (or lost) it, every instance that shares it takes over the new buffers.
+void Int4MoePlugin::syncSharedUsers() noexcept
+{
+    if (!mCacheShared || !mCacheOwner || !mCacheHold)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(sharedCacheMutex());
+    auto* block = static_cast<SharedCacheBlock*>(mCacheHold.get());
+    block->mem = mCacheMem;
+    block->state = mCacheState;
+    block->slots = mCacheSlots;
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        block->tensors[i] = mCacheTensors[i];
+    }
+    for (Int4MoePlugin* user : block->users)
+    {
+        if (user == this)
+        {
+            continue;
+        }
+        user->mCacheMem = mCacheMem;
+        user->mCacheState = mCacheState;
+        user->mCacheSlots = mCacheSlots;
+        user->mCacheReady = mCacheReady;
+        user->mCacheTally = mCacheTally.load();
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            user->mCacheTensors[i] = mCacheTensors[i];
+        }
+    }
 }
 
 bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
