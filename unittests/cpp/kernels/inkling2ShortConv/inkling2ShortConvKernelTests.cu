@@ -40,7 +40,7 @@ constexpr float kSentinel = 55.0F;
 
 struct Cfg
 {
-    int32_t channels = 40, kernelSize = 4, groups = 0, stateChannels = 40, stateRows = 4;
+    int32_t channels = 40, kernelSize = 4, groups = 0, stateChannels = 40, stateRows = 4, stateOffset = 0;
     float scale = 0.4472136F;
 };
 
@@ -180,6 +180,7 @@ void runStep(Cfg const& c, std::vector<Stream> const& streams, std::vector<float
     p.batchSize = batch;
     p.channels = c.channels;
     p.stateStride = c.stateChannels;
+    p.stateOffset = c.stateOffset;
     p.stateRows = c.stateRows;
     p.kernelSize = c.kernelSize;
     p.groups = c.groups;
@@ -246,9 +247,9 @@ void runStep(Cfg const& c, std::vector<Stream> const& streams, std::vector<float
             for (int32_t m = 0; m < k - 1; ++m)
             {
                 int32_t const idx = st.counts[b] - (k - 1) + m;
-                size_t const at = (size_t(st.rows[b]) * c.stateChannels + ch) * k + m;
+                size_t const at = (size_t(st.rows[b]) * c.stateChannels + c.stateOffset + ch) * k + m;
                 float const want = idx >= 0 ? streams[b].x[size_t(st.first[b] + idx) * c.channels + ch]
-                                            : __half2float(before[(size_t(st.rows[b]) * c.stateChannels + ch) * k + (st.counts[b] + m)]);
+                                            : __half2float(before[(size_t(st.rows[b]) * c.stateChannels + c.stateOffset + ch) * k + (st.counts[b] + m)]);
                 ASSERT_EQ(__half2float(state[at]), want) << "row " << st.rows[b] << " ch " << ch << " slot " << m;
                 expectChanged[at] = true;
             }
@@ -436,6 +437,7 @@ TEST(Inkling2ShortConv, NaNInOneInputOnlyAffectsTheNextKernelSizeOutputs)
     p.batchSize = 1;
     p.channels = c.channels;
     p.stateStride = c.stateChannels;
+    p.stateOffset = c.stateOffset;
     p.stateRows = c.stateRows;
     p.kernelSize = c.kernelSize;
     p.groups = 0;
@@ -457,5 +459,42 @@ TEST(Inkling2ShortConv, NaNInOneInputOnlyAffectsTheNextKernelSizeOutputs)
     for (void* ptr : {(void*) dx, (void*) dtaps, (void*) dstate, (void*) doff, (void*) dlen, (void*) drows, (void*) dy})
     {
         CUDA_CHECK(cudaFree(ptr));
+    }
+}
+
+TEST(Inkling2ShortConv, ConvolutionsSharingOneStateRowUseDisjointChannelRanges)
+{
+    // Four convolutions of different widths thread one state tensor, as one Inkling visit does.
+    Cfg base;
+    base.stateChannels = 96;
+    base.stateRows = 3;
+    base.scale = 0.4F;
+    auto state = zeroState(base);
+    struct Part
+    {
+        int32_t channels, offset, groups;
+    };
+    std::vector<Part> parts{{24, 0, 0}, {24, 24, 4}, {48, 48, 0}};
+    std::vector<std::vector<Stream>> streams;
+    std::vector<std::vector<float>> taps;
+    std::vector<Cfg> cfgs;
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+        Cfg c = base;
+        c.channels = parts[i].channels;
+        c.stateOffset = parts[i].offset;
+        c.groups = parts[i].groups;
+        cfgs.push_back(c);
+        streams.push_back({makeStream(c, 50, 100 + uint32_t(i))});
+        taps.push_back(makeTaps(c, 200 + uint32_t(i)));
+    }
+    int32_t first = 0;
+    for (int32_t count : {5, 1, 1, 9, 2, 12})
+    {
+        for (size_t i = 0; i < parts.size(); ++i)
+        {
+            runStep(cfgs[i], streams[i], taps[i], state, Step{{first}, {count}, {1}, 0});
+        }
+        first += count;
     }
 }

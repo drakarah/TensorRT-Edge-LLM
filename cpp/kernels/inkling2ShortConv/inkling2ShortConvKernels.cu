@@ -67,7 +67,7 @@ __global__ void shortConvKernel(Inkling2ShortConvParams p, half const* __restric
         }
         else if (row >= 0 && row < p.stateRows)
         {
-            xv = __half2float(state[(int64_t(row) * p.stateStride + c) * p.kernelSize + (p.kernelSize - 1 - (j - local))]);
+            xv = __half2float(state[(int64_t(row) * p.stateStride + p.stateOffset + c) * p.kernelSize + (p.kernelSize - 1 - (j - local))]);
         }
         else
         {
@@ -102,7 +102,7 @@ __global__ void stateUpdateKernel(Inkling2ShortConvParams p, half const* __restr
     }
     int32_t const slots = p.kernelSize - 1;
     half old[kInkling2MaxConvKernel], next[kInkling2MaxConvKernel];
-    half* rowPtr = state + (int64_t(row) * p.stateStride + c) * p.kernelSize;
+    half* rowPtr = state + (int64_t(row) * p.stateStride + p.stateOffset + c) * p.kernelSize;
     for (int32_t m = 0; m < slots; ++m)
     {
         old[m] = rowPtr[m];

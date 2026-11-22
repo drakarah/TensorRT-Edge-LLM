@@ -55,6 +55,7 @@ class Cfg:
     batch: int = 1
     state_rows: int = 4
     state_channels: int = 64
+    state_offset: int = 0
 
     def fields(self):
         return [
@@ -62,6 +63,7 @@ class Cfg:
             pf_int32("kernel_size", self.kernel_size),
             pf_int32("groups", self.groups),
             pf_float32("scale", self.scale),
+            pf_int32("state_offset", self.state_offset),
         ]
 
 
@@ -207,7 +209,8 @@ def _check_state(cfg, streams, state, lengths, rows, untouched_slot=True):
             idx = lengths[b] - (k - 1) + m
             want = streams[b].x[idx] if idx >= 0 else torch.zeros(
                 cfg.channels)
-            got = state[row, :cfg.channels, m].float().cpu()
+            got = state[row, cfg.state_offset:cfg.state_offset +
+                        cfg.channels, m].float().cpu()
             assert torch.equal(got, want), f"row {row} slot {m}"
 
 
@@ -368,7 +371,36 @@ def test_engine_serialization_round_trip_keeps_attributes():
     _check("round-trip", cfg, [stream], taps, [0], [12], y, offsets)
 
 
+def test_convolutions_sharing_one_state_row_use_disjoint_channel_ranges():
+    base = Cfg(state_channels=96, state_rows=3, scale=0.4)
+    parts = [(24, 0, 0), (24, 24, 4), (48, 48, 0)]
+    cfgs = [
+        replace(base, channels=ch, state_offset=off, groups=g)
+        for ch, off, g in parts
+    ]
+    runners = [_build(c) for c in cfgs]
+    streams = [Stream(c, 50, 30 + i) for i, c in enumerate(cfgs)]
+    taps = [_taps(c, 40 + i) for i, c in enumerate(cfgs)]
+    state = _new_state(base)
+    first = 0
+    for count in [5, 1, 1, 9, 2, 12]:
+        for i, c in enumerate(cfgs):
+            y, offsets = _run(runners[i], c, [streams[i]], state, taps[i],
+                              [first], [count], [1])
+            _check(f"part{i}@{first}", c, [streams[i]], taps[i], [first],
+                   [count], y, offsets)
+        first += count
+    for i, c in enumerate(cfgs):
+        _check_state(c, [streams[i]], state, [first], [1])
+
+
 @pytest.mark.parametrize("change", [
+    {
+        "state_offset": -1
+    },
+    {
+        "state_offset": 1
+    },
     {
         "channels": 0
     },
@@ -395,6 +427,7 @@ def test_engine_serialization_round_trip_keeps_attributes():
     },
 ],
                          ids=[
+                             "negative_offset", "offset_beyond_state",
                              "zero_channels", "kernel1", "kernel9",
                              "negative_groups", "groups_not_dividing",
                              "zero_scale", "nan_scale", "inf_scale"

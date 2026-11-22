@@ -28,7 +28,7 @@ namespace trt_edgellm::plugins
 //! Inkling 2 short convolution with a residual, static taps plus optional per-token dynamic taps, over a rolling
 //! per-sequence state that is updated in place.
 //!
-//! Inputs: x [T, C], taps [C, k] (FP32, lag 0 = current token), state [rows, stateC >= C, k], query_start_offsets [B+1],
+//! Inputs: x [T, C], taps [C, k] (FP32, lag 0 = current token), state [rows, stateC >= state_offset + C, k], query_start_offsets [B+1],
 //! query_lengths [B], state_indices [B], and dyn [T, groups * k] when groups > 0 (FP16 except taps and the metadata).
 //! Outputs: y [T, C], present_state (aliases state). y = scale * (sum_j (taps + dyn) * x[t - j] + x[t]).
 class Inkling2ShortConvPlugin : public nvinfer1::IPluginV3,
@@ -38,7 +38,7 @@ class Inkling2ShortConvPlugin : public nvinfer1::IPluginV3,
 {
 public:
     Inkling2ShortConvPlugin(
-        std::string const& name, int32_t channels, int32_t kernelSize, int32_t groups, float scale);
+        std::string const& name, int32_t channels, int32_t kernelSize, int32_t groups, float scale, int32_t stateOffset);
 
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
     nvinfer1::IPluginV3* clone() noexcept override;
@@ -76,6 +76,7 @@ private:
     int32_t mKernelSize;
     int32_t mGroups;
     float mScale;
+    int32_t mStateOffset;
     std::vector<nvinfer1::PluginField> mData;
     nvinfer1::PluginFieldCollection mFields{};
 };

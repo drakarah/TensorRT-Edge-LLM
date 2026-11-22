@@ -60,13 +60,18 @@ bool linear(PluginTensorDesc const& d, DataType type, int32_t rank)
 REGISTER_TENSORRT_PLUGIN(Inkling2ShortConvPluginCreator);
 
 Inkling2ShortConvPlugin::Inkling2ShortConvPlugin(
-    std::string const& name, int32_t channels, int32_t kernelSize, int32_t groups, float scale)
+    std::string const& name, int32_t channels, int32_t kernelSize, int32_t groups, float scale, int32_t stateOffset)
     : mLayerName(name)
     , mChannels(channels)
     , mKernelSize(kernelSize)
     , mGroups(groups)
     , mScale(scale)
+    , mStateOffset(stateOffset)
 {
+    if (stateOffset < 0)
+    {
+        throw std::invalid_argument("Inkling2ShortConvPlugin: state_offset must be non-negative");
+    }
     if (channels <= 0 || kernelSize < 2 || kernelSize > kernel::kInkling2MaxConvKernel || groups < 0
         || (groups > 0 && channels % groups != 0))
     {
@@ -101,7 +106,7 @@ IPluginV3* Inkling2ShortConvPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Inkling2ShortConvPlugin(mLayerName, mChannels, mKernelSize, mGroups, mScale);
+        auto* plugin = new Inkling2ShortConvPlugin(mLayerName, mChannels, mKernelSize, mGroups, mScale, mStateOffset);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -202,7 +207,7 @@ int32_t Inkling2ShortConvPlugin::configurePlugin(
     }
     Dims const& state = in[kState].desc.dims;
     bool ok = in[kX].desc.dims.d[1] == mChannels && in[kTaps].desc.dims.d[0] == mChannels
-        && in[kTaps].desc.dims.d[1] == mKernelSize && state.d[1] >= mChannels && state.d[2] == mKernelSize;
+        && in[kTaps].desc.dims.d[1] == mKernelSize && state.d[1] >= mStateOffset + mChannels && state.d[2] == mKernelSize;
     if (mGroups > 0)
     {
         ok = ok && in[kDyn].desc.dims.d[1] == mGroups * mKernelSize;
@@ -243,6 +248,7 @@ int32_t Inkling2ShortConvPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
     params.batchSize = inputDesc[kStateIndices].dims.d[0];
     params.channels = mChannels;
     params.stateStride = inputDesc[kState].dims.d[1];
+    params.stateOffset = mStateOffset;
     params.stateRows = inputDesc[kState].dims.d[0];
     params.kernelSize = mKernelSize;
     params.groups = mGroups;
@@ -279,6 +285,7 @@ PluginFieldCollection const* Inkling2ShortConvPlugin::getFieldsToSerialize() noe
     mData.emplace_back("channels", &mChannels, PluginFieldType::kINT32, 1);
     mData.emplace_back("kernel_size", &mKernelSize, PluginFieldType::kINT32, 1);
     mData.emplace_back("groups", &mGroups, PluginFieldType::kINT32, 1);
+    mData.emplace_back("state_offset", &mStateOffset, PluginFieldType::kINT32, 1);
     mData.emplace_back("scale", &mScale, PluginFieldType::kFLOAT32, 1);
     mFields.nbFields = static_cast<int32_t>(mData.size());
     mFields.fields = mData.data();
@@ -292,7 +299,7 @@ Inkling2ShortConvPluginCreator::Inkling2ShortConvPluginCreator()
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     mAttributes.clear();
-    for (char const* name : {"channels", "kernel_size", "groups"})
+    for (char const* name : {"channels", "kernel_size", "groups", "state_offset"})
     {
         mAttributes.emplace_back(name, nullptr, PluginFieldType::kINT32, 1);
     }
@@ -349,7 +356,7 @@ IPluginV3* Inkling2ShortConvPluginCreator::createPlugin(
                 throw std::invalid_argument(std::string("Inkling2ShortConvPlugin: duplicate attribute ") + field.name);
             }
         }
-        if (byName.size() != 4)
+        if (byName.size() != 5)
         {
             throw std::invalid_argument("Inkling2ShortConvPlugin: unknown or missing attributes");
         }
@@ -367,7 +374,7 @@ IPluginV3* Inkling2ShortConvPluginCreator::createPlugin(
             throw std::invalid_argument("Inkling2ShortConvPlugin: missing FLOAT32 attribute scale");
         }
         auto* plugin = new Inkling2ShortConvPlugin(name, intField("channels"), intField("kernel_size"),
-            intField("groups"), *static_cast<float const*>(scaleIt->second->data));
+            intField("groups"), *static_cast<float const*>(scaleIt->second->data), intField("state_offset"));
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
