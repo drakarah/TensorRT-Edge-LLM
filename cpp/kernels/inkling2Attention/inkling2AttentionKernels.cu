@@ -19,7 +19,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cuda_fp8.h>
+#include <mma.h>
 #include <cuda_runtime.h>
 
 namespace trt_edgellm
@@ -820,6 +822,285 @@ __global__ void __launch_bounds__(kDecThreads) decodeAttentionKernel(Inkling2Att
     }
 }
 
+
+// ---- Tensor-core version of the tiled kernel for prefill-sized tiles: same structure, the score and value products run as 16x16x16 WMMA
+// (half inputs, fp32 accumulation). Q and the probabilities are rounded to half for the products; rows are padded to 32 for the fragments. ----
+constexpr int32_t kMmaRows = 32; // fragment rows (the 24 query rows padded)
+constexpr int32_t kKLd = kInkling2HeadDim + 8; // K tile and Q leading dimension (multiple of 8 halves)
+constexpr int32_t kPLd = kKeyTile + 8;
+constexpr int32_t kSLd = kKeyTile + 4;
+
+constexpr size_t mmaSmemBytes()
+{
+    return sizeof(half) * (kKeyTile * kKLd + kKeyTile * kInkling2HeadDim + kMmaRows * kKLd + kMmaRows * kPLd)
+        + sizeof(float) * (kMmaRows * kSLd + kMmaRows * kInkling2HeadDim + kMaxRows * kInkling2HeadDim + kMaxRows * kInkling2RelDim + 3 * kMaxRows)
+        + sizeof(int32_t) * 2 * kMaxRows;
+}
+
+template <typename KvT>
+__global__ void __launch_bounds__(kTileThreads) tiledAttentionMmaKernel(Inkling2AttentionParams p, half const* __restrict__ qLin,
+    half const* __restrict__ relLin, float const* __restrict__ qScale, float const* __restrict__ relScale,
+    float const* __restrict__ relProjT, KvT const* __restrict__ kvPool, int32_t const* __restrict__ offsets,
+    int32_t const* __restrict__ lengths, int32_t const* __restrict__ past, int32_t const* __restrict__ pageTable,
+    float* __restrict__ partials, int32_t qTile, int32_t splits)
+{
+    namespace wmma = nvcuda::wmma;
+    extern __shared__ __align__(16) unsigned char smemRaw[];
+    half* Ksm = reinterpret_cast<half*>(smemRaw);
+    half* Vsm = Ksm + kKeyTile * kKLd;
+    half* Qh = Vsm + kKeyTile * kInkling2HeadDim;
+    half* Ph = Qh + kMmaRows * kKLd;
+    float* Ssm = reinterpret_cast<float*>(Ph + kMmaRows * kPLd);
+    float* Tmp = Ssm + kMmaRows * kSLd;
+    float* Oacc = Tmp + kMmaRows * kInkling2HeadDim;
+    float* RSsm = Oacc + kMaxRows * kInkling2HeadDim;
+    float* rowM = RSsm + kMaxRows * kInkling2RelDim;
+    float* rowL = rowM + kMaxRows;
+    float* rowCorr = rowL + kMaxRows;
+    int32_t* rowQpos = reinterpret_cast<int32_t*>(rowCorr + kMaxRows);
+    int32_t* rowLo = rowQpos + kMaxRows;
+
+    int32_t const tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    int32_t tile = blockIdx.x, seq = 0;
+    for (; seq < p.batchSize; ++seq)
+    {
+        int32_t const n = (offsets[seq + 1] - offsets[seq] + qTile - 1) / qTile;
+        if (tile < n)
+        {
+            break;
+        }
+        tile -= n;
+    }
+    if (seq >= p.batchSize)
+    {
+        return;
+    }
+    int32_t const slot0 = offsets[seq] + tile * qTile, slotsEnd = offsets[seq + 1];
+    int32_t const group = p.numQHeads / p.numKVHeads, rows = qTile * group;
+    int32_t const kvh = blockIdx.y, split = blockIdx.z;
+    int64_t const rowElems = int64_t(p.numKVHeads) * kInkling2HeadDim;
+    int64_t const pageElems = int64_t(kInkling2TokensPerPage) * rowElems;
+    int32_t const* table = pageTable + int64_t(seq) * 2 * p.maxPagesPerSeq;
+
+    // zero the padded rows of Q and P, and the running output
+    for (int32_t i = tid; i < kMmaRows * kKLd; i += kTileThreads)
+    {
+        Qh[i] = __float2half(0.F);
+    }
+    for (int32_t i = tid; i < kMmaRows * kPLd; i += kTileThreads)
+    {
+        Ph[i] = __float2half(0.F);
+    }
+    for (int32_t i = tid; i < kMaxRows * kInkling2HeadDim; i += kTileThreads)
+    {
+        Oacc[i] = 0.F;
+    }
+    __syncthreads();
+
+    for (int32_t row = w; row < rows; row += kTileWarps)
+    {
+        int32_t const qi = row / group, h = kvh * group + row % group;
+        int32_t const slot = slot0 + qi, local = slot - offsets[seq];
+        bool const valid = slot < slotsEnd && local < lengths[seq];
+        int32_t const qpos = valid ? past[seq] + local : -1;
+        if (lane == 0)
+        {
+            rowQpos[row] = qpos;
+            rowLo[row] = valid ? (p.window > 0 ? max(0, qpos - p.window + 1) : 0) : 0;
+            rowM[row] = -INFINITY;
+            rowL[row] = 0.F;
+        }
+        if (!valid)
+        {
+            continue;
+        }
+        float const logScale = p.window == 0 ? 1.F + p.logAlpha * logf(fmaxf((qpos + 1.F) / p.logNFloor, 1.F)) : 1.F;
+        float q[4];
+        float ss = 0.F;
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            int32_t const d = lane * 4 + i;
+            q[i] = __half2float(qLin[(int64_t(slot) * p.numQHeads + h) * kInkling2HeadDim + d]) * qScale[h * kInkling2HeadDim + d];
+            ss += q[i] * q[i];
+        }
+        ss = warpSum(ss);
+        float const qFactor = fminf(p.qClip / (sqrtf(ss) + 1e-6F), 1.F) * logScale;
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            Qh[row * kKLd + lane * 4 + i] = __float2half(q[i] * qFactor);
+        }
+        int32_t const j = lane & 15;
+        float rs = __half2float(relLin[(int64_t(slot) * p.numQHeads + h) * kInkling2RelDim + j]) * relScale[h * kInkling2RelDim + j];
+        float const rss = halfWarpSum(rs * rs);
+        rs *= fminf(p.relClip / (sqrtf(rss) + 1e-6F), 1.F) * logScale;
+        if (lane < 16)
+        {
+            RSsm[row * kInkling2RelDim + j] = rs;
+        }
+    }
+    __syncthreads();
+
+    int32_t kLo = INT32_MAX, kHi = -1;
+    for (int32_t row = 0; row < rows; ++row)
+    {
+        if (rowQpos[row] >= 0)
+        {
+            kLo = min(kLo, rowLo[row]);
+            kHi = max(kHi, rowQpos[row]);
+        }
+    }
+    int32_t const nTiles = kHi >= kLo ? (kHi - kLo + kKeyTile) / kKeyTile : 0;
+    int32_t const perSplit = (nTiles + splits - 1) / splits;
+    int32_t const tBegin = min(nTiles, split * perSplit), tEnd = min(nTiles, tBegin + perSplit);
+
+    for (int32_t ti = tBegin; ti < tEnd; ++ti)
+    {
+        int32_t const keyBase = kLo + ti * kKeyTile;
+        for (int32_t item = tid; item < kKeyTile * 16; item += kTileThreads)
+        {
+            int32_t const key = item >> 4, part = item & 15;
+            int32_t const s = keyBase + key;
+            bool valid = s <= kHi;
+            int32_t kPage = 0, vPage = 0;
+            if (valid)
+            {
+                kPage = table[s / kInkling2TokensPerPage];
+                vPage = table[p.maxPagesPerSeq + s / kInkling2TokensPerPage];
+                valid = kPage >= 0 && vPage >= 0;
+            }
+            int64_t const inPage = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * kInkling2HeadDim;
+            stageRow(Ksm + key * kKLd, kvPool + int64_t(kPage) * pageElems + inPage, valid, part);
+            stageRow(Vsm + key * kInkling2HeadDim, kvPool + int64_t(vPage) * pageElems + inPage, valid, part);
+        }
+        __syncthreads();
+
+        // S = Q K^T: warp w owns the 16x16 tile (w / 4, w % 4)
+        {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+            wmma::fill_fragment(c, 0.F);
+            int32_t const mi = w >> 2, ni = w & 3;
+#pragma unroll
+            for (int32_t k = 0; k < kInkling2HeadDim / 16; ++k)
+            {
+                wmma::load_matrix_sync(a, Qh + mi * 16 * kKLd + k * 16, kKLd);
+                wmma::load_matrix_sync(b, Ksm + ni * 16 * kKLd + k * 16, kKLd);
+                wmma::mma_sync(c, a, b, c);
+            }
+            wmma::store_matrix_sync(Ssm + mi * 16 * kSLd + ni * 16, c, kSLd, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // scale, relative bias and masks
+        for (int32_t e = tid; e < rows * kKeyTile; e += kTileThreads)
+        {
+            int32_t const row = e / kKeyTile, kj = e % kKeyTile;
+            int32_t const s = keyBase + kj, qpos = rowQpos[row];
+            float score = -INFINITY;
+            bool mapped = s <= kHi;
+            if (mapped)
+            {
+                mapped = table[s / kInkling2TokensPerPage] >= 0 && table[p.maxPagesPerSeq + s / kInkling2TokensPerPage] >= 0;
+            }
+            if (mapped && qpos >= 0 && s <= qpos && s >= rowLo[row])
+            {
+                int32_t const dist = qpos - s;
+                float bias = 0.F;
+                if (dist < p.relExtent)
+                {
+                    float const* rp = relProjT + int64_t(dist) * kInkling2RelDim;
+                    float const* rsr = RSsm + row * kInkling2RelDim;
+#pragma unroll
+                    for (int32_t jj = 0; jj < kInkling2RelDim; jj += 4)
+                    {
+                        float4 const a4 = *reinterpret_cast<float4 const*>(rp + jj);
+                        bias += rsr[jj] * a4.x + rsr[jj + 1] * a4.y + rsr[jj + 2] * a4.z + rsr[jj + 3] * a4.w;
+                    }
+                }
+                score = Ssm[row * kSLd + kj] * p.scaling + bias;
+            }
+            Ssm[row * kSLd + kj] = score;
+        }
+        __syncthreads();
+
+        // online softmax; probabilities go to Ph as half
+        for (int32_t row = w; row < rows; row += kTileWarps)
+        {
+            float v0 = Ssm[row * kSLd + lane], v1 = Ssm[row * kSLd + lane + 32];
+            float tileMax = fmaxf(v0, v1);
+#pragma unroll
+            for (int32_t o = 16; o > 0; o >>= 1)
+            {
+                tileMax = fmaxf(tileMax, __shfl_xor_sync(0xffffffffu, tileMax, o));
+            }
+            float const mOld = rowM[row], lOld = rowL[row];
+            float const mNew = fmaxf(mOld, tileMax);
+            float const corr = mOld == -INFINITY ? 0.F : __expf(mOld - mNew);
+            float const e0 = v0 == -INFINITY ? 0.F : __expf(v0 - mNew), e1 = v1 == -INFINITY ? 0.F : __expf(v1 - mNew);
+            Ph[row * kPLd + lane] = __float2half(e0);
+            Ph[row * kPLd + lane + 32] = __float2half(e1);
+            float const sum = warpSum(e0 + e1);
+            __syncwarp();
+            if (lane == 0)
+            {
+                rowL[row] = lOld * corr + sum;
+                rowM[row] = mNew;
+                rowCorr[row] = corr;
+            }
+        }
+        __syncthreads();
+
+        // Tmp = P V: warp w owns two of the 2 x 8 output tiles
+        {
+#pragma unroll
+            for (int32_t t2 = 0; t2 < 2; ++t2)
+            {
+                int32_t const tileIdx = w * 2 + t2, mi = tileIdx >> 3, ni = tileIdx & 7;
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+                wmma::fill_fragment(c, 0.F);
+#pragma unroll
+                for (int32_t k = 0; k < kKeyTile / 16; ++k)
+                {
+                    wmma::load_matrix_sync(a, Ph + mi * 16 * kPLd + k * 16, kPLd);
+                    wmma::load_matrix_sync(b, Vsm + k * 16 * kInkling2HeadDim + ni * 16, kInkling2HeadDim);
+                    wmma::mma_sync(c, a, b, c);
+                }
+                wmma::store_matrix_sync(Tmp + mi * 16 * kInkling2HeadDim + ni * 16, c, kInkling2HeadDim, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+        for (int32_t e = tid; e < rows * kInkling2HeadDim; e += kTileThreads)
+        {
+            int32_t const row = e / kInkling2HeadDim;
+            Oacc[e] = Oacc[e] * rowCorr[row] + Tmp[e];
+        }
+        __syncthreads();
+    }
+
+    for (int32_t e = tid; e < rows * kInkling2HeadDim; e += kTileThreads)
+    {
+        int32_t const row = e / kInkling2HeadDim, d = e % kInkling2HeadDim;
+        int32_t const slot = slot0 + row / group;
+        if (slot >= slotsEnd)
+        {
+            continue;
+        }
+        int32_t const h = kvh * group + row % group;
+        float* out = partials + ((int64_t(slot) * p.numQHeads + h) * splits + split) * kPartialStride;
+        out[2 + d] = Oacc[e];
+        if (d == 0)
+        {
+            out[0] = rowM[row];
+            out[1] = rowL[row];
+        }
+    }
+}
+
 //! One block per (token slot, query head): merges the key splits, adds the sink to the denominator, applies the gate.
 __global__ void mergeKernel(Inkling2AttentionParams p, half const* __restrict__ sinkLin, half const* __restrict__ gateLin,
     int32_t const* __restrict__ offsets, int32_t const* __restrict__ lengths, int32_t const* __restrict__ past,
@@ -922,9 +1203,27 @@ static void launchTyped(Inkling2AttentionParams const& params, half const* qLin,
     splits = std::min<int64_t>(splits, std::max<int64_t>(1, int64_t(params.maxPagesPerSeq) * kInkling2TokensPerPage / kKeyTile));
     splits = std::min<int64_t>(splits, 32);
     splits = std::max<int64_t>(1, std::min<int64_t>(splits, rowCap / (int64_t(params.numTokens) * params.numQHeads)));
-    tiledAttentionKernel<KvT><<<dim3(tiles, params.numKVHeads, static_cast<unsigned>(splits)), kTileThreads,
-        tiledSmemBytes(), stream>>>(params, qLin, relLin, qScale, relScale, relProjT, kvPool, queryStartOffsets,
-        queryLengths, pastLengths, pageTable, static_cast<float*>(workspace), qTile, static_cast<int32_t>(splits));
+    static bool const useMma = std::getenv("INKLING2_NO_MMA") == nullptr;
+    if (useMma)
+    {
+        static bool const mmaConfigured = []()
+        {
+            cudaFuncSetAttribute(tiledAttentionMmaKernel<half>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mmaSmemBytes()));
+            cudaFuncSetAttribute(tiledAttentionMmaKernel<__nv_fp8_e4m3>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(mmaSmemBytes()));
+            return true;
+        }();
+        static_cast<void>(mmaConfigured);
+        tiledAttentionMmaKernel<KvT><<<dim3(tiles, params.numKVHeads, static_cast<unsigned>(splits)), kTileThreads, mmaSmemBytes(), stream>>>(
+            params, qLin, relLin, qScale, relScale, relProjT, kvPool, queryStartOffsets, queryLengths, pastLengths, pageTable,
+            static_cast<float*>(workspace), qTile, static_cast<int32_t>(splits));
+    }
+    else
+    {
+        tiledAttentionKernel<KvT><<<dim3(tiles, params.numKVHeads, static_cast<unsigned>(splits)), kTileThreads,
+            tiledSmemBytes(), stream>>>(params, qLin, relLin, qScale, relScale, relProjT, kvPool, queryStartOffsets,
+            queryLengths, pastLengths, pageTable, static_cast<float*>(workspace), qTile, static_cast<int32_t>(splits));
+    }
     mergeKernel<<<dim3(params.numTokens, params.numQHeads), kInkling2HeadDim, 0, stream>>>(params, sinkLin, gateLin,
         queryStartOffsets, queryLengths, pastLengths, static_cast<float const*>(workspace),
         static_cast<int32_t>(splits), out);

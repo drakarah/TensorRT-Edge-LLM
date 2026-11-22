@@ -384,7 +384,7 @@ Pool expectedPool(Case const& c, Data const& d, Pool pool)
 }
 
 //! Checks the kernel output for all real tokens and the pool contents (appended rows and untouched sentinels).
-void expectMatches(Case const& c, Data const& d, Pool const& before, double tol = 3e-3)
+void expectMatches(Case const& c, Data const& d, Pool const& before, double tol = 3e-3, double maxErrScale = 0.01)
 {
     Pool expected = expectedPool(c, d, before);
     Result r = run(c, d, before);
@@ -421,7 +421,7 @@ void expectMatches(Case const& c, Data const& d, Pool const& before, double tol 
                 refNorm += ref[i] * ref[i];
             }
             EXPECT_LT(std::sqrt(errNorm / std::max(refNorm, 1e-12)), tol) << "slot " << slot << " relative error";
-            EXPECT_LT(maxErr, 8e-3 + 0.01 * std::sqrt(refNorm / double(c.nh * kHd))) << "slot " << slot;
+            EXPECT_LT(maxErr, 8e-3 + maxErrScale * std::sqrt(refNorm / double(c.nh * kHd))) << "slot " << slot;
         }
     }
 }
@@ -561,8 +561,8 @@ TEST(Inkling2Attention, LogLengthScalingGrowsWithPosition)
 TEST(Inkling2Attention, LargeKeysKeepTheSoftmaxStable)
 {
     Case c;
-    Data d = makeData(c, {0}, {64}, 0, 15, 0.8F, 40.0F); // scores of order 100
-    expectMatches(c, d, newPool(c), 5e-3);
+    Data d = makeData(c, {0}, {64}, 0, 15, 0.8F, 40.0F); // scores of order 100: the tensor-core path rounds q to half (relative 5e-4 of a score of 100)
+    expectMatches(c, d, newPool(c), 5e-3, 0.02);
 }
 
 TEST(Inkling2Attention, ExtremeSinkAndGateValues)
