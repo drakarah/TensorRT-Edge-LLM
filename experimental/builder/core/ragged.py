@@ -62,6 +62,22 @@ def checked_kv_pool_pages(max_num_sequences: int,
     return pages_per_sequence, max_num_sequences * pages_per_sequence
 
 
+def bounded_swa_capacity(window: int, max_input_len: int,
+                         max_kv_cache_capacity: int) -> int:
+    """KV capacity of a bounded sliding-window layer, or 0 when bounding saves nothing.
+
+    A prefill pass keeps its whole chunk mapped next to the window of earlier tokens, hence window + chunk, in pages."""
+    capacity = -(-(int(window) + int(max_input_len)) //
+                 _KV_PAGE_SIZE) * _KV_PAGE_SIZE
+    return capacity if capacity < int(max_kv_cache_capacity) else 0
+
+
+def swa_pool_pages(max_num_sequences: int, capacity: int) -> int:
+    """Pages of the bounded sliding-window pool (the C++ ``computeMinimumSwaPoolPages``)."""
+    retained = -(-int(capacity) // _KV_PAGE_SIZE) + 1
+    return int(max_num_sequences) * (2 * retained + 1)
+
+
 def _role_generation_query_length(args) -> int:
     if args.resolved_spec_role == contracts.SpecRole.DRAFT:
         return _checked_positive_int32(args.max_draft_tree_size,

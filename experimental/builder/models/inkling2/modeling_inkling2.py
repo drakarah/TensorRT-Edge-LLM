@@ -29,6 +29,7 @@ import torch
 from ...ops import (Linear, Module, NetworkModule, RaggedDecoderInputs,
                     add_ragged_decoder_inputs)
 from ...ops import functional as F
+from ...core.ragged import bounded_swa_capacity
 from ...ops.moe import prepare_gated_int4_weights
 from . import runtime_config as rc
 from . import weights as weight_conversion
@@ -318,7 +319,8 @@ class Inkling2Layer(Module):
             F.constant(self.rel_scale, "rel_scale"),
             F.constant(self.rel_proj_t, "rel_proj_t"), past_kv, ragged, nh,
             nkv, self.rel_extent, self.window, self.log_alpha, self.log_floor,
-            self.qk_clip, self.rel_clip, hd**-0.5)
+            self.qk_clip, self.rel_clip, hd**-0.5,
+            bounded=self.window > 0 and ragged.swa_kv_page_table is not None)
         out = self.wo(attn)
         out, _ = F.inkling2_short_conv(out,
                                        F.constant(self.attn_taps, "attn_taps"),
@@ -501,7 +503,12 @@ class Inkling2ForCausalLM(NetworkModule):
                 for i in range(self.visits)
             ],
         }
-        result.update(add_ragged_decoder_inputs(self.add_input).as_dict())
+        bounded = bool(cfg.kv_bounded_entries) and bounded_swa_capacity(
+            cfg.kv_bounded_window, self.ctx.args.max_input_len,
+            self.ctx.args.max_kv_cache_capacity) > 0
+        result.update(
+            add_ragged_decoder_inputs(self.add_input,
+                                      include_swa=bounded).as_dict())
         return result
 
     def forward(self, **io):

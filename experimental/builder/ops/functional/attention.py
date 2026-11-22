@@ -171,15 +171,18 @@ def inkling2_attention(
     q_clip: float,
     rel_clip: float,
     scaling: float,
+    bounded: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Run one Inkling 2 attention visit and return output plus present KV.
 
-    ``window`` 0 selects full attention with log-length query scaling.
+    ``window`` 0 selects full attention with log-length query scaling. ``bounded`` reads the sparse sliding-window
+    page table instead of the full one (the entry then lives in the runtime's bounded window pool).
     """
+    page_table = ragged.swa_kv_page_table if bounded else ragged.kv_page_table
     return operation("inkling2_attention", [
         q_lin, rel_lin, sink_lin, gate_lin, k_new, v_new, q_scale, rel_scale,
         rel_proj_t, past_kv, ragged.query_start_offsets, ragged.query_lengths,
-        ragged.past_lengths, ragged.kv_page_table
+        ragged.past_lengths, page_table
     ],
                      output_count=2,
                      num_q_heads=num_q_heads,

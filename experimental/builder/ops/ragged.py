@@ -34,6 +34,8 @@ class RaggedDecoderInputs:
     execution_phase_marker: Any
     context_sequence_count_carrier: Any
     kv_page_table: Any
+    swa_kv_page_table: Any = None
+    swa_kv_cache_mode: Any = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -46,9 +48,12 @@ class RaggedDecoderInputs:
         """Reconstruct the bundle from flattened network inputs."""
         values = {
             name: inputs[name]
-            for name in cls.__dataclass_fields__ if name != "logits_indices"
+            for name in cls.__dataclass_fields__ if name not in (
+                "logits_indices", "swa_kv_page_table", "swa_kv_cache_mode")
         }
         values["logits_indices"] = inputs.get("logits_indices")
+        values["swa_kv_page_table"] = inputs.get("swa_kv_page_table")
+        values["swa_kv_cache_mode"] = inputs.get("swa_kv_cache_mode")
         return cls(**values)
 
 
@@ -56,6 +61,7 @@ def add_ragged_decoder_inputs(
     add_input: Callable[[str, object, tuple], Any],
     *,
     include_logits_indices: bool = True,
+    include_swa: bool = False,
 ) -> RaggedDecoderInputs:
     """Declare decoder bindings through ``NetworkModule.add_input``."""
 
@@ -75,4 +81,9 @@ def add_ragged_decoder_inputs(
         context_sequence_count_carrier=add_input(
             "context_sequence_count_carrier", trt.int32, (-1, )),
         kv_page_table=add_input("kv_page_table", trt.int32, (-1, 2, -1)),
+        # Bounded sliding-window storage: the sparse window table and the shape-only mode selector ([1] bounded, [0] full)
+        swa_kv_page_table=(add_input("swa_kv_page_table", trt.int32,
+                                     (-1, 2, -1)) if include_swa else None),
+        swa_kv_cache_mode=(add_input("swa_kv_cache_mode", trt.int8,
+                                     (-1, )) if include_swa else None),
     )

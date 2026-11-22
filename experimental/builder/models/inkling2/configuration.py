@@ -35,6 +35,16 @@ def prepare_text_config(config: dict, root: dict,
     # Every visit of a layer owns one paged-KV entry (attention) and one conv-state entry that carries the four short
     # convolutions of the visit (the recurrent-state slot is a dummy of two floats).
     config["layer_types"] = ["full_attention", "linear_attention"] * visits
+    # Visit order: prelude, the core pass by pass, coda. Sliding-window visits live in bounded window storage
+    # (the runtime applies it only when it saves memory at the built context length).
+    core_start, core_end = int(loop["core_start"]), int(loop["core_end"])
+    order = (list(range(core_start)) + list(range(core_start, core_end)) *
+             int(loop["num_passes"]) + list(range(core_end, layers)))
+    local = set(config.get("local_layer_ids", ()))
+    config["kv_bounded_entries"] = [
+        visit for visit, layer in enumerate(order) if layer in local
+    ]
+    config["kv_bounded_window"] = int(config.get("sliding_window_size", 0))
     conv_channels = (
         2 * int(config["num_key_value_heads"]) * int(config["head_dim"]) +
         2 * int(config["hidden_size"]))

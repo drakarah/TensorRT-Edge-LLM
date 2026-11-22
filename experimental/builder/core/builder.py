@@ -653,6 +653,13 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     page_size = KV_PAGE_SIZE
     pages_per_sequence, pool_pages = ragged.checked_kv_pool_pages(
         max_sequences, args.max_kv_cache_capacity)
+    bounded_capacity = (ragged.bounded_swa_capacity(
+        cfg.kv_bounded_window, args.max_input_len, args.max_kv_cache_capacity)
+                        if cfg.kv_bounded_entries else 0)
+    bounded_entries = (frozenset(cfg.kv_bounded_entries)
+                       if bounded_capacity else frozenset())
+    swa_pages = (ragged.swa_pool_pages(max_sequences, bounded_capacity)
+                 if bounded_capacity else 0)
     hidden_size = cfg.hidden_size
     num_kv_heads = cfg.num_key_value_heads
     head_dim = cfg.head_dim
@@ -794,13 +801,22 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
         name = f"past_key_values_{i}"
         layer_heads = fixed_dim(name, 3, num_kv_heads)
         layer_dim = fixed_dim(name, 4, head_dim)
-        pool_shape = (2, pool_pages, page_size, layer_heads, layer_dim)
-        set_profile_shapes(name, ragged.fixed_shape(pool_shape))
+        if i in bounded_entries:
+            # the runtime's profile for a reduced-capacity entry: the window pool, up to the larger of it and the full pool
+            small = min(swa_pages, pool_pages)
+            pages = (small, small, max(swa_pages, pool_pages))
+        else:
+            pages = (pool_pages, ) * 3
+        set_profile_shapes(
+            name,
+            tuple((2, n, page_size, layer_heads, layer_dim) for n in pages))
 
     page_shapes = ((1, 2, pages_per_sequence), (max_sequences, 2,
                                                 pages_per_sequence),
                    (max_sequences, 2, pages_per_sequence))
     set_profile_shapes("kv_page_table", page_shapes)
+    set_profile_shapes("swa_kv_page_table", page_shapes)
+    set_profile_shapes("swa_kv_cache_mode", ((0, ), (1, ), (1, )))
 
     if cfg.mamba_cfg is not None:
         mc = cfg.mamba_cfg
