@@ -62,6 +62,7 @@ _OPERATION_CREATORS = {
     "dflash2_grouped_dynamic_conv": "DFlash2GroupedDynamicConvPlugin",
     "gemma4_attention": "Gemma4AudioAttentionPlugin",
     "inkling2_attention": "Inkling2AttentionPlugin",
+    "inkling2_block_residual": "Inkling2BlockResidualPlugin",
     "inkling2_short_conv": "Inkling2ShortConvPlugin",
     "fp16_moe": "Fp16MoePlugin",
     "fp8_linear": "Fp8LinearPlugin",

@@ -37,6 +37,7 @@ from . import weights as weight_conversion
 
 LOGGER = logging.getLogger("builder.inkling2")
 _EPS = 1e-6
+_FUSED_RESIDUAL = os.environ.get("EDGELLM_INKLING_FUSED_RESIDUAL") == "1"
 
 
 def _f32(weights, name: str) -> np.ndarray:
@@ -127,6 +128,12 @@ def _matmul_const(x, weight_kn: np.ndarray, name: str):
 
 def block_attention_residual(states: List, queries: np.ndarray, hidden: int):
     """Softmax-weighted mix of the (normalized) block states, one output row per query; returns a list of [T, H] tensors."""
+    if _FUSED_RESIDUAL and len(states) <= 8:
+        q_rows = np.ascontiguousarray(queries.reshape(-1, hidden),
+                                      dtype=np.float32)
+        return F.inkling2_block_residual(states,
+                                         F.constant(q_rows, "attn_res_q"),
+                                         q_rows.shape[0], hidden, _EPS)
     stacked = F.concatenate([s.reshape([-1, 1, hidden]) for s in states],
                             dim=1)
     normed = rms_unweighted(stacked)

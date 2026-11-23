@@ -14,7 +14,7 @@
 # limitations under the License.
 """Recurrent and stateful sequence operations."""
 
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 from ..ragged import RaggedDecoderInputs
 from ..tensor import Tensor
@@ -193,3 +193,21 @@ def inkling2_short_conv(
                      groups=groups,
                      scale=scale,
                      state_offset=state_offset)
+
+
+def inkling2_block_residual(states: List[Tensor], queries: Tensor,
+                            num_queries: int, hidden: int,
+                            eps: float) -> List[Tensor]:
+    """Softmax-weighted mix of the RMS-normalised block states for every query row.
+
+    ``states`` are [tokens, hidden] FP32 tensors, ``queries`` is [num_queries, hidden] FP32; returns one
+    [tokens, hidden] FP32 tensor per query.
+    """
+    outputs = operation("inkling2_block_residual",
+                        list(states) + [queries],
+                        output_count=num_queries,
+                        hidden=hidden,
+                        num_states=len(states),
+                        num_queries=num_queries,
+                        eps=eps)
+    return [outputs] if isinstance(outputs, Tensor) else list(outputs)
