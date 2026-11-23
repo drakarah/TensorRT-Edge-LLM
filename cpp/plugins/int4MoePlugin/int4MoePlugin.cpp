@@ -246,6 +246,29 @@ int32_t tailRenormFromEnv()
     return n;
 }
 
+//! EDGELLM_MOE_PREFETCH=<M> (decode steps of <= 4 tokens, engines built with prefetch inputs; default 0 = off): the M best experts of the router logits
+//! predicted for the next visit are filled into its cache on a side stream while the current visit computes. Exact: only the cache contents change.
+int32_t prefetchFromEnv()
+{
+    static int32_t const m = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_PREFETCH");
+        return v != nullptr ? std::clamp(std::atoi(v), 0, 16) : 0;
+    }();
+    return m;
+}
+
+//! The chain of consecutive visits: the event the next visit's side stream waits on, and the side stream itself. Visits are enqueued in execution order.
+struct PrefetchChain
+{
+    cudaEvent_t prev{nullptr};
+    cudaStream_t side{nullptr};
+    static PrefetchChain& get()
+    {
+        static PrefetchChain chain;
+        return chain;
+    }
+};
+
 //! EDGELLM_MOE_CPU_MISS=1 (decode steps of <= 4 tokens served by the expert cache): a routed expert outside the cache is computed on the CPU from the pinned
 //! host copy instead of being copied in. EDGELLM_MOE_CPU_ADMIT=<n> (default 2): the n-th miss of an expert brings it into the cache; 0 never does.
 //! EDGELLM_MOE_CPU_THREADS=<n> (default 8): threads that spin for the work; EDGELLM_MOE_CPU_IDLE_MS=<ms> (default 1000, 0 = never): idle time after which they sleep 1 ms at a time.
@@ -1192,6 +1215,14 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
         {
             mRouteMode = *static_cast<int32_t const*>(fc->fields[i].data);
         }
+        else if (fieldName == "prefetch_self")
+        {
+            mPrefetchSelf = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "prefetch_next")
+        {
+            mPrefetchNext = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
         else if (fieldName == "gate_softcap")
         {
             mGateSoftcap = *static_cast<float const*>(fc->fields[i].data);
@@ -1382,6 +1413,16 @@ Int4MoePlugin::~Int4MoePlugin() noexcept
     {
         cudaFree(mCacheMem);
     }
+    if (mPrefetchIds != nullptr)
+    {
+        cudaFree(mPrefetchIds);
+        cudaFree(mPrefetchWeights);
+    }
+    if (mPrefetchReady != nullptr)
+    {
+        cudaEventDestroy(mPrefetchReady);
+        cudaEventDestroy(mPrefetchDone);
+    }
     if (mCacheState != nullptr && !mCacheShared)
     {
         cudaFree(mCacheState);
@@ -1560,6 +1601,29 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
     cudaMemset(mCacheState + mNumExperts + mCacheSlots, 0, (stateInts - mNumExperts - mCacheSlots) * 4);
     mCacheTally = mCacheState + stateInts - 3;
     mCacheReady = true;
+    if (prefetchFromEnv() > 0 && (mPrefetchSelf != 0 || mPrefetchNext != 0) && mRouteMode == kRouteModeSigmoidBias)
+    {
+        size_t const count = 4 * 16;
+        bool ok = cudaMalloc(reinterpret_cast<void**>(&mPrefetchIds), count * sizeof(int32_t)) == cudaSuccess
+            && cudaMalloc(reinterpret_cast<void**>(&mPrefetchWeights), count * sizeof(float)) == cudaSuccess
+            && cudaEventCreateWithFlags(&mPrefetchReady, cudaEventDisableTiming) == cudaSuccess
+            && cudaEventCreateWithFlags(&mPrefetchDone, cudaEventDisableTiming) == cudaSuccess;
+        PrefetchChain& chain = PrefetchChain::get();
+        if (ok && chain.side == nullptr)
+        {
+            ok = cudaStreamCreateWithFlags(&chain.side, cudaStreamNonBlocking) == cudaSuccess;
+        }
+        if (!ok)
+        {
+            cudaGetLastError();
+            LOG_WARNING("Int4MoePlugin %s: predicted prefetch unavailable (allocation failed)", mLayerName.c_str());
+            if (mPrefetchReady != nullptr)
+            {
+                cudaEventDestroy(mPrefetchReady);
+                mPrefetchReady = nullptr;
+            }
+        }
+    }
     if (cpuMissFromEnv() && cudaMalloc(reinterpret_cast<void**>(&mCpuAdmit), (static_cast<size_t>(mNumExperts) + 1) * sizeof(int32_t)) == cudaSuccess)
     {
         cudaMemset(mCpuAdmit, 0, (static_cast<size_t>(mNumExperts) + 1) * sizeof(int32_t));
@@ -1922,6 +1986,8 @@ IPluginV3* Int4MoePlugin::clone() noexcept
         plugin->mUpSoftcap = mUpSoftcap;
         plugin->mWeightFormat = mWeightFormat;
         plugin->mRouteMode = mRouteMode;
+        plugin->mPrefetchSelf = mPrefetchSelf;
+        plugin->mPrefetchNext = mPrefetchNext;
         plugin->setPluginNamespace(mNamespace.c_str());
         plugin->setStageExperts(mStageExperts);
         plugin->setTokenTile(mTokenTile);
@@ -2118,6 +2184,11 @@ bool Int4MoePlugin::supportsFormatCombinationImpl(
     if (mWeightFormat == kWeightFormatNvfp4 && (pos == 6 || pos == 7))
     {
         return checkGlobalScales(tensorDesc);
+    }
+    if ((mPrefetchSelf != 0 && pos == predSelfIndex()) || (mPrefetchNext != 0 && pos == predNextIndex()))
+    {
+        return tensorDesc.type == DataType::kFLOAT && tensorDesc.format == TensorFormat::kLINEAR && tensorDesc.dims.nbDims == 2
+            && tensorDesc.dims.d[1] == mNumExperts;
     }
     switch (pos)
     {
@@ -2485,6 +2556,36 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor topkIndicesTensor(
             topkIndicesPtr, {numTokens, mTopK}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
+        // Predicted prefetch: this visit's side stream fills the experts predicted from the previous visit's router input, starting when the previous
+        // visit started (its event); the main stream joins just before this visit's own cache lookup. The chain relies on visits being enqueued in order.
+        bool joinPrefetch = false;
+        if (useCache && mRouteMode == kRouteModeSigmoidBias && mPrefetchReady != nullptr && mPrefetchDone != nullptr && prefetchFromEnv() > 0 && numTokens <= 4)
+        {
+            PrefetchChain& chain = PrefetchChain::get();
+            if (mPrefetchSelf != 0 && chain.prev != nullptr && chain.side != nullptr)
+            {
+                int32_t const m = prefetchFromEnv();
+                kernel::ExpertCacheState const prefetchState{mCacheState, mCacheState + mNumExperts, mCacheState + mNumExperts + mCacheSlots,
+                    mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
+                CUDA_CHECK(cudaStreamWaitEvent(chain.side, chain.prev, 0));
+                kernel::launchSigmoidBiasTopk(static_cast<float const*>(inputs[predSelfIndex()]), static_cast<float const*>(inputs[inputCount() - 1]),
+                    numTokens, mNumExperts, m, 0.0F, nullptr, 0, 0, 1e9F, mPrefetchIds, mPrefetchWeights, chain.side);
+                kernel::launchExpertCacheLookup(mPrefetchIds, numTokens * m, mNumExperts, prefetchState, chain.side);
+                kernel::launchExpertCacheFill(prefetchState, stagingCopy, numTokens * m, chain.side);
+                CUDA_CHECK(cudaEventRecord(mPrefetchDone, chain.side));
+                joinPrefetch = true;
+            }
+            if (mPrefetchNext != 0)
+            {
+                CUDA_CHECK(cudaEventRecord(mPrefetchReady, stream));
+                chain.prev = mPrefetchReady;
+            }
+            else
+            {
+                chain.prev = nullptr;
+            }
+        }
+
         if (mRouteMode == kRouteModeSigmoidBias)
         {
             if (mTopK > kernel::kRouterMaxTopK || inputDesc[0].type != nvinfer1::DataType::kFLOAT)
@@ -2539,6 +2640,10 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                 kernel::launchCpuMissDoorbell(topkIndicesPtr, topkWeightsPtr, numTokens, mTopK, mNumExperts,
                     static_cast<half const*>(hiddenStatesTensor.rawPointer()), mHiddenSize, state, mCpuAdmit, cpuMissAdmitFromEnv(),
                     pool.mailboxDevice(), pool.stateDevice(), layerIdFromName(mLayerName), stream);
+            }
+            if (joinPrefetch)
+            {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, mPrefetchDone, 0));
             }
             kernel::launchExpertCacheLookup(topkIndicesPtr, numTokens * mTopK, mNumExperts, state, stream);
             kernel::launchExpertCacheFill(state, stagingCopy, numTokens * mTopK, stream);
@@ -2833,6 +2938,8 @@ PluginFieldCollection const* Int4MoePlugin::getFieldsToSerialize() noexcept
         mDataToSerialize.emplace_back("token_tile", &mTokenTile, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("weight_format", &mWeightFormat, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("route_mode", &mRouteMode, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("prefetch_self", &mPrefetchSelf, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("prefetch_next", &mPrefetchNext, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("gate_softcap", &mGateSoftcap, PluginFieldType::kFLOAT32, 1);
         mDataToSerialize.emplace_back("up_softcap", &mUpSoftcap, PluginFieldType::kFLOAT32, 1);
 
@@ -2863,6 +2970,8 @@ Int4MoePluginCreator::Int4MoePluginCreator()
     mPluginAttributes.emplace_back(PluginField("token_tile", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("weight_format", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("route_mode", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("prefetch_self", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("prefetch_next", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("gate_softcap", nullptr, PluginFieldType::kFLOAT32, 1));
     mPluginAttributes.emplace_back(PluginField("up_softcap", nullptr, PluginFieldType::kFLOAT32, 1));
 

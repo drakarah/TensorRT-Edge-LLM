@@ -217,9 +217,27 @@ private:
     static constexpr int32_t kRouteModeSoftmax{0};
     static constexpr int32_t kRouteModeSigmoidBias{1};
     int32_t mRouteMode{kRouteModeSoftmax};
+    // Predicted prefetch (route_mode 1, decode): with prefetch_self the plugin takes the router logits of THIS visit predicted from the previous visit's router
+    // input (FP32 [tokens, numExperts]) and fills the predicted experts on a side stream while the previous visit computes; with prefetch_next it takes the
+    // prediction made for the NEXT visit (it only orders the graph: the matmul runs before this visit) and publishes an event the next visit's side stream waits on.
+    // Both inputs sit between the weights and the route bias input.
+    int32_t mPrefetchSelf{0};
+    int32_t mPrefetchNext{0};
+    int32_t weightInputCount() const noexcept
+    {
+        return mWeightFormat == kWeightFormatNvfp4 ? 8 : 6;
+    }
+    int32_t predSelfIndex() const noexcept
+    {
+        return weightInputCount();
+    }
+    int32_t predNextIndex() const noexcept
+    {
+        return weightInputCount() + (mPrefetchSelf != 0 ? 1 : 0);
+    }
     int32_t inputCount() const noexcept
     {
-        return (mWeightFormat == kWeightFormatNvfp4 ? 8 : 6) + (mRouteMode == kRouteModeSigmoidBias ? 1 : 0);
+        return weightInputCount() + (mPrefetchSelf != 0 ? 1 : 0) + (mPrefetchNext != 0 ? 1 : 0) + (mRouteMode == kRouteModeSigmoidBias ? 1 : 0);
     }
     int32_t mStageExperts{0};
     int32_t mTokenTile{0};
@@ -262,6 +280,10 @@ public:
     }
 
 private:
+    int32_t* mPrefetchIds{nullptr};      // device [kPrefetchMaxTokens * kPrefetchMaxExperts]: predicted experts of this visit
+    float* mPrefetchWeights{nullptr};    // device, same count: scores of the prediction (unused)
+    cudaEvent_t mPrefetchReady{nullptr}; // recorded when this visit starts (the next visit's side stream waits for it)
+    cudaEvent_t mPrefetchDone{nullptr};  // recorded when this visit's side stream has filled the predicted experts
     int32_t* mCpuAdmit{nullptr}; // device [numExperts + 1]: miss counters and call counter of the CPU miss path
     bool mCpuMissChecked{false};
     bool mCpuMissReady{false};

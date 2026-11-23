@@ -141,12 +141,18 @@ def int4_moe(router_logits: Tensor,
              up_softcap: float = 0.0,
              packed_dtype=np.int8,
              weight_format: str = "int4",
-             route_bias: Optional[Tensor] = None) -> Tensor:
+             route_bias: Optional[Tensor] = None,
+             pred_self: Optional[Tensor] = None,
+             pred_next: Optional[Tensor] = None) -> Tensor:
     """Run GPTQ-Marlin mixture-of-experts.
 
     ``route_bias`` (FP32 [num_experts], a tensor) switches the plugin to Inkling 2 routing: ``router_logits`` are then
     the raw FP32 router outputs, the experts are chosen by ``sigmoid(logits) + route_bias`` (plus the optional residency
     preference of EDGELLM_MOE_ROUTE_BIAS) and weighted by their normalised sigmoid scores.
+
+    ``pred_self`` / ``pred_next`` (FP32 [tokens, num_experts], need ``route_bias``) switch on the predicted prefetch: the router logits of THIS
+    visit predicted from the previous visit's router input, and those of the NEXT visit predicted from this visit's. They are plugin inputs only
+    (decode steps fill the predicted experts of the cache on a side stream); the result does not depend on them.
 
     ``weight_format`` "nvfp4" takes Marlin-packed NVFP4 experts instead: E4M3 block scales (bound as int32 words) and the
     two per-expert global scales (``fc1_global_scales`` / ``fc2_global_scales`` entries of ``weights`` and
@@ -201,6 +207,14 @@ def int4_moe(router_logits: Tensor,
         extra["weight_format"] = 1
     elif weight_format != "int4":
         raise ValueError(f"unknown expert weight format {weight_format!r}")
+    if (pred_self is not None or pred_next is not None) and route_bias is None:
+        raise ValueError("the predicted prefetch needs the plugin's own routing (route_bias)")
+    if pred_self is not None:
+        inputs.append(pred_self)
+        extra["prefetch_self"] = 1
+    if pred_next is not None:
+        inputs.append(pred_next)
+        extra["prefetch_next"] = 1
     if route_bias is not None:
         inputs.append(route_bias)
         extra["route_mode"] = 1

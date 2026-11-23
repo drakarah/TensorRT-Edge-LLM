@@ -381,7 +381,7 @@ class Inkling2Layer(Module):
         return logits, F.constant(
             self.router_bias.astype(np.float32).reshape(-1), "router_bias")
 
-    def _nvfp4_offload_moe(self, logits, hidden16):
+    def _nvfp4_offload_moe(self, logits, hidden16, pred_self=None, pred_next=None):
         """Marlin NVFP4 experts from the sidecar, host-resident like the INT4 ones (Int4MoePlugin weight_format 1)."""
         cfg, w = self.cfg, self.ctx.weights
         text = cfg.raw_component
@@ -407,6 +407,8 @@ class Inkling2Layer(Module):
                             inter,
                             16,
                             route_bias=route_bias,
+                            pred_self=pred_self,
+                            pred_next=pred_next,
                             weight_prefix=base,
                             weight_bindings=weight_conversion.nvfp4_expert_bindings(w, base),
                             gate_softcap=float(text["mlp_gate_softcap"]),
@@ -419,7 +421,12 @@ class Inkling2Layer(Module):
         logits = _matmul_const(x32, self.router_w, "router_w")
         hidden16 = x32.cast(trt.float16)
         if self.nvfp4_off:
-            routed = self._nvfp4_offload_moe(logits, hidden16)
+            # predicted prefetch (EDGELLM_INKLING_PREFETCH=1 at build): this visit's router input run through the NEXT visit's router
+            next_w = getattr(self, "prefetch_next_w", None)
+            pred_next = _matmul_const(x32, next_w, "router_w") if next_w is not None else None
+            pred_self = getattr(self, "prefetch_self_pred", None)
+            self.prefetch_pred_out = pred_next
+            routed = self._nvfp4_offload_moe(logits, hidden16, pred_self, pred_next)
             return self._moe_conv(routed, conv_state, ragged)
         if self.int4:
             routed = self._int4_moe(logits, hidden16)
@@ -573,12 +580,24 @@ class Inkling2ForCausalLM(NetworkModule):
         keep_rope = io["rope"].reshape([-1]).sum(0, keepdim=True).reshape(
             [1, 1, 1, 1]) * 0.0
 
+        order = (list(range(self.core_start)) +
+                 list(range(self.core_start, self.core_end)) * self.passes +
+                 list(range(self.core_end, self.num_layers)))
+        prefetch = os.environ.get("EDGELLM_INKLING_PREFETCH") == "1"
+        carry = [None]
+
         def run_layer(l, h, bs, messages):
             v = visit[0]
             visit[0] += 1
             layer = self.layers[l]
+            if prefetch:
+                layer.prefetch_next_w = (self.layers[order[v + 1]].router_w
+                                         if v + 1 < len(order) else None)
+                layer.prefetch_self_pred = carry[0]
             new, kv, conv = layer(h, bs, messages, io["past_key_values"][v],
                                   io["conv_states"][v], ragged)
+            if prefetch:
+                carry[0] = layer.prefetch_pred_out
             present_kv[v], present_conv[v] = kv, conv
             present_rec[v] = io["recurrent_states"][v] + keep_rope
             if layer.boundary:
