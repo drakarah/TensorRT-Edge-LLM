@@ -404,6 +404,64 @@ TEST(CpuMissKernelTest, Fp4ShapeSupportBounds)
     EXPECT_FALSE(shapeSupportedFp4(8192, 1152, 4096)); // hidden size beyond the mailbox
 }
 
+TEST(CpuMissKernelTest, Fp4VnniGemvStaysWithinTheActivationQuantisationErrorOfTheDenseResult)
+{
+    if (!haveVnni())
+    {
+        GTEST_SKIP() << "needs AVX-VNNI";
+    }
+    using namespace cpuMissFixtureFp4;
+    int32_t const bits = kGlobalBits;
+    float const half = std::ldexp(1.0F + static_cast<float>(bits & 0x3FF) / 1024.0F, ((bits >> 10) & 0x1F) - 15);
+    float const mult = half / 128.0F;
+    QuantisedX16<kMaxK> q;
+    quantiseX16<kMaxK>(kX, kK, q);
+    std::vector<float> out(kN);
+    for (int32_t nt = 0; nt < kN / 64; ++nt)
+    {
+        gemvTileFp4Vnni<kMaxK>(tables(), fp4Tables(), kWeights, 2 * static_cast<size_t>(kN), kScales, static_cast<size_t>(kN), q, nt, mult, out.data() + 64 * nt);
+    }
+    EXPECT_TRUE(allFinite(out));
+    EXPECT_LT(maxRelativeError(out, kY, kN), 2e-2);
+    std::vector<float> fp32(kN);
+    for (int32_t nt = 0; nt < kN / 64; ++nt)
+    {
+        gemvTileFp4(tables(), fp4Tables(), kWeights, 2 * static_cast<size_t>(kN), kScales, static_cast<size_t>(kN), kX, kK, nt, mult, fp32.data() + 64 * nt);
+    }
+    EXPECT_LT(maxRelativeError(out, fp32, kN), 2e-2);
+}
+
+TEST(CpuMissKernelTest, Fp4VnniHandlesAllZeroAndSpikyActivations)
+{
+    if (!haveVnni())
+    {
+        GTEST_SKIP() << "needs AVX-VNNI";
+    }
+    using namespace cpuMissFixtureFp4;
+    float const mult = 0.01F;
+    std::vector<float> zero(kK, 0.0F), spike(kK, 0.0F), negative(kK);
+    spike[0] = 7.0F;
+    spike[kK - 1] = -5.0F;
+    spike[100] = 0.001F;
+    for (int32_t i = 0; i < kK; ++i)
+    {
+        negative[i] = -0.5F - 0.001F * static_cast<float>(i);
+    }
+    for (auto const* x : {&zero, &spike, &negative})
+    {
+        QuantisedX16<kMaxK> q;
+        quantiseX16<kMaxK>(x->data(), kK, q);
+        std::vector<float> got(kN), want(kN);
+        for (int32_t nt = 0; nt < kN / 64; ++nt)
+        {
+            gemvTileFp4Vnni<kMaxK>(tables(), fp4Tables(), kWeights, 2 * static_cast<size_t>(kN), kScales, static_cast<size_t>(kN), q, nt, mult, got.data() + 64 * nt);
+            gemvTileFp4(tables(), fp4Tables(), kWeights, 2 * static_cast<size_t>(kN), kScales, static_cast<size_t>(kN), x->data(), kK, nt, mult, want.data() + 64 * nt);
+        }
+        EXPECT_TRUE(allFinite(got));
+        EXPECT_LT(maxRelativeError(got, want, kN), 3e-2);
+    }
+}
+
 #endif // __x86_64__
 
 TEST(CpuMissShapeTest, AcceptsTheShapesOfQwen3635BAndRejectsWhatTheKernelsCannotRead)

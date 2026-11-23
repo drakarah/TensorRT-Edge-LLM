@@ -315,9 +315,11 @@ private:
         {
             QuantisedX<kernel::kCpuMissMaxHidden> gu[kernel::kCpuMissMaxTokens];
             QuantisedX<1024> dn[kernel::kCpuMissMaxSlots];
+            QuantisedX16<kernel::kCpuMissMaxHidden> gu16[kernel::kCpuMissMaxTokens]; // NVFP4: one activation scale per 16 inputs
+            QuantisedX16<1280> dn16[kernel::kCpuMissMaxSlots];
         };
         thread_local std::unique_ptr<Int8Scratch> scratch;
-        if (mInt8 && !layer.fp4)
+        if (mInt8)
         {
             if (!scratch)
             {
@@ -325,7 +327,14 @@ private:
             }
             for (int32_t tok = 0; tok < tokens; ++tok)
             {
-                quantiseX(xf.data() + static_cast<size_t>(tok) * hidden, hidden, scratch->gu[tok]);
+                if (layer.fp4)
+                {
+                    quantiseX16(xf.data() + static_cast<size_t>(tok) * hidden, hidden, scratch->gu16[tok]);
+                }
+                else
+                {
+                    quantiseX(xf.data() + static_cast<size_t>(tok) * hidden, hidden, scratch->gu[tok]);
+                }
             }
         }
         lap(0);
@@ -343,9 +352,18 @@ private:
                     int32_t const tilesPerHalf = inter / 64;
                     bool const up = tile >= tilesPerHalf;
                     int32_t const nt = up ? tile - tilesPerHalf : tile;
-                    gemvTileFp4(tab, fp4tab, wq + (up ? 2 * static_cast<size_t>(inter) : 0), 4 * static_cast<size_t>(inter),
-                        reinterpret_cast<uint8_t const*>(sq) + (up ? inter : 0), 2 * static_cast<size_t>(inter),
-                        xf.data() + static_cast<size_t>(mb.token[m]) * hidden, hidden, nt, layer.guMult, &mGateUp[m][tile * 64]);
+                    if (mInt8)
+                    {
+                        gemvTileFp4Vnni(tab, fp4tab, wq + (up ? 2 * static_cast<size_t>(inter) : 0), 4 * static_cast<size_t>(inter),
+                            reinterpret_cast<uint8_t const*>(sq) + (up ? inter : 0), 2 * static_cast<size_t>(inter), scratch->gu16[mb.token[m]], nt,
+                            layer.guMult, &mGateUp[m][tile * 64]);
+                    }
+                    else
+                    {
+                        gemvTileFp4(tab, fp4tab, wq + (up ? 2 * static_cast<size_t>(inter) : 0), 4 * static_cast<size_t>(inter),
+                            reinterpret_cast<uint8_t const*>(sq) + (up ? inter : 0), 2 * static_cast<size_t>(inter),
+                            xf.data() + static_cast<size_t>(mb.token[m]) * hidden, hidden, nt, layer.guMult, &mGateUp[m][tile * 64]);
+                    }
                 }
                 else if (mInt8)
                 {
@@ -379,11 +397,18 @@ private:
         lap(3);
         barrier();
         lap(4);
-        if (mInt8 && !layer.fp4)
+        if (mInt8)
         {
             for (int32_t m = 0; m < numMiss; ++m)
             {
-                quantiseX(mAct[m], inter, scratch->dn[m]);
+                if (layer.fp4)
+                {
+                    quantiseX16(mAct[m], inter, scratch->dn16[m]);
+                }
+                else
+                {
+                    quantiseX(mAct[m], inter, scratch->dn[m]);
+                }
             }
         }
         for (int32_t tile = tid; tile < hidden / 64; tile += mThreads)
@@ -400,8 +425,16 @@ private:
                 auto const* sq = reinterpret_cast<uint16_t const*>(layer.dnS + e * layer.dnSBytes);
                 if (layer.fp4)
                 {
-                    gemvTileFp4(tab, fp4tab, wq, 2 * static_cast<size_t>(hidden), reinterpret_cast<uint8_t const*>(sq), static_cast<size_t>(hidden), mAct[m], inter, tile,
-                        layer.dnMult, out);
+                    if (mInt8)
+                    {
+                        gemvTileFp4Vnni(tab, fp4tab, wq, 2 * static_cast<size_t>(hidden), reinterpret_cast<uint8_t const*>(sq), static_cast<size_t>(hidden),
+                            scratch->dn16[m], tile, layer.dnMult, out);
+                    }
+                    else
+                    {
+                        gemvTileFp4(tab, fp4tab, wq, 2 * static_cast<size_t>(hidden), reinterpret_cast<uint8_t const*>(sq), static_cast<size_t>(hidden), mAct[m], inter,
+                            tile, layer.dnMult, out);
+                    }
                 }
                 else if (mInt8)
                 {
