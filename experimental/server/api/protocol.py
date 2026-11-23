@@ -15,6 +15,7 @@
 """Typed OpenAI protocol models supported by the Edge-LLM server."""
 
 import logging
+import math
 import os
 import time
 import uuid
@@ -74,6 +75,22 @@ class AudioGenerationConfig(OpenAIBaseModel):
 
 class ChatAudioConfig(AudioGenerationConfig):
     format: Literal["pcm16"] = "pcm16"
+
+
+_PASSTHROUGH_EFFORT_NAMES = frozenset(("minimal", "low", "medium", "high", "xhigh", "max"))
+
+
+def _passthrough_effort(effort: str) -> str:
+    if effort in _PASSTHROUGH_EFFORT_NAMES:
+        return effort
+    try:
+        value = float(effort)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
+        logger.warning("Unknown reasoning_effort %r, using medium", effort)
+        return "medium"
+    return repr(min(max(value, 0.0), 0.99))
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
@@ -180,8 +197,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             self.enable_thinking = False
             self.reasoning_effort = None
         elif effort and os.environ.get("EDGELLM_REASONING_EFFORT_PASSTHROUGH") == "1":
-            # templates that know the OpenAI level names themselves (Inkling 2: minimal..max or a number in [0, 0.99])
-            self.reasoning_effort = effort
+            # templates that know the OpenAI level names themselves (Inkling 2: minimal..max or a number in [0, 0.99]);
+            # any other word (auto, default, ...) falls back to medium, a number is clamped into the template's range
+            self.reasoning_effort = _passthrough_effort(effort)
         elif effort:
             self.reasoning_effort = {
                 "minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh",

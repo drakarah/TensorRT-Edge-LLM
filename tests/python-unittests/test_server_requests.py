@@ -2056,3 +2056,71 @@ def test_chat_rejects_a_reasoning_budget_below_minus_one(client_and_llm):
     response = client.post("/v1/chat/completions",
                            json={"messages": [{"role": "user", "content": "Hello"}], "reasoning_budget_tokens": -2})
     assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "sent, expected",
+    [
+        ("medium", "medium"),
+        ("max", "max"),
+        ("MEDIUM", "medium"),
+        ("  high  ", "high"),
+        ("auto", "medium"),
+        ("default", "medium"),
+        ("ultra", "medium"),
+        ("0.5", "0.5"),
+        ("0", "0.0"),
+        ("1.5", "0.99"),
+        ("-3", "0.0"),
+        ("nan", "medium"),
+        ("inf", "medium"),
+        ("1e-2", "0.01"),
+    ])
+def test_passthrough_reasoning_effort_never_reaches_the_template_unparseable(
+        client_and_llm, monkeypatch, sent, expected):
+    monkeypatch.setenv("EDGELLM_REASONING_EFFORT_PASSTHROUGH", "1")
+    client, llm = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "reasoning_effort": sent,
+                           })
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.reasoning_effort == expected
+
+
+@pytest.mark.parametrize("sent", ["none", "off", "disabled", "false"])
+def test_passthrough_reasoning_effort_off_values_disable_thinking(
+        client_and_llm, monkeypatch, sent):
+    monkeypatch.setenv("EDGELLM_REASONING_EFFORT_PASSTHROUGH", "1")
+    client, llm = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "reasoning_effort": sent,
+                           })
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.enable_thinking is False
+    assert not llm.last_sampling_params.reasoning_effort
+
+
+def test_without_passthrough_unknown_reasoning_effort_maps_to_medium(
+        client_and_llm, monkeypatch):
+    monkeypatch.delenv("EDGELLM_REASONING_EFFORT_PASSTHROUGH", raising=False)
+    client, llm = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "reasoning_effort": "auto",
+                           })
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.reasoning_effort == "medium"
