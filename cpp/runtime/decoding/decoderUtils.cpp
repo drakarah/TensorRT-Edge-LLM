@@ -28,7 +28,9 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -191,15 +193,61 @@ void directVocabMapToOffsets(std::vector<int32_t>& vocabMap, int32_t baseVocabSi
     }
 }
 
+namespace
+{
+//! EDGELLM_TEACHER_FORCE_FILE=<path> (debug, batch size 1): line r holds the token ids that request r (in the order the requests are issued) is forced to
+//! generate, one per sampled position including the one sampled after the prefill. The logprobs of a step are collected before this override, so they are the
+//! model's distribution given the forced context: a teacher-forced decode-mode evaluation against a reference.
+std::vector<std::vector<int32_t>> const* teacherForcedTokens()
+{
+    static std::vector<std::vector<int32_t>> const* const lines = []() -> std::vector<std::vector<int32_t>> const* {
+        char const* const path = std::getenv("EDGELLM_TEACHER_FORCE_FILE");
+        if (path == nullptr)
+        {
+            return nullptr;
+        }
+        std::ifstream file(path);
+        if (!file.is_open())
+        {
+            throw std::runtime_error(std::string("EDGELLM_TEACHER_FORCE_FILE could not be opened: ") + path);
+        }
+        auto* all = new std::vector<std::vector<int32_t>>();
+        for (std::string line; std::getline(file, line);)
+        {
+            std::istringstream words(line);
+            std::vector<int32_t> ids;
+            for (int32_t id; words >> id;)
+            {
+                ids.push_back(id);
+            }
+            all->push_back(std::move(ids));
+        }
+        return all;
+    }();
+    return lines;
+}
+} // namespace
+
 void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampledTokenIds, int32_t activeBatchSize)
 {
+    static int32_t forcedRequest = -1;
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         if (context.finishedStates[i])
         {
             continue;
         }
-        context.tokenIds[i].push_back(sampledTokenIds[i]);
+        int32_t token = sampledTokenIds[i];
+        if (auto const* forced = teacherForcedTokens(); forced != nullptr && i == 0)
+        {
+            forcedRequest += context.currentGenerateLengths[i] == 0 ? 1 : 0;
+            size_t const index = static_cast<size_t>(context.currentGenerateLengths[i]);
+            if (forcedRequest >= 0 && forcedRequest < static_cast<int32_t>(forced->size()) && index < (*forced)[forcedRequest].size())
+            {
+                token = (*forced)[forcedRequest][index];
+            }
+        }
+        context.tokenIds[i].push_back(token);
         context.currentGenerateLengths[i] += 1;
     }
 }
