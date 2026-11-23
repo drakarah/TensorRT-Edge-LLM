@@ -80,6 +80,7 @@ namespace rt
 
 namespace
 {
+void* moePluginSymbol(char const* name);
 //! Prompt-token spacing of the host prefix snapshots taken between prefill passes (EDGELLM_SWA_PREFIX_CAPTURE_INTERVAL);
 //! 0 snapshots after every pass. Each snapshot re-stores the whole bounded window.
 int32_t swaPrefixCaptureInterval()
@@ -768,6 +769,41 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         static_cast<size_t>(sharedContextMemorySize), static_cast<size_t>(baseContextMemorySize),
         static_cast<size_t>(strategyContextMemorySize), static_cast<size_t>(visionContextMemorySize),
         static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
+
+    // EDGELLM_MOE_EXEC_OVERLAY=1: lend the part of this memory that the decode profile (and every other engine) does not use to the MoE plugin's expert caches. An
+    // engine built for long prefill passes needs a much larger context than a decode step; the caches placed there are invalidated by the plugin at every prefill pass.
+    if (char const* overlay = std::getenv("EDGELLM_MOE_EXEC_OVERLAY"); overlay != nullptr && std::atoi(overlay) != 0 && sharedContextMemorySize > 0)
+    {
+        auto const& baseEngine = mBaseExecutor->getEngine();
+        int64_t smallest = sharedContextMemorySize;
+        for (int32_t profile = 0; profile < baseEngine.getNbOptimizationProfiles(); ++profile)
+        {
+            int64_t const forProfile = static_cast<int64_t>(baseEngine.getDeviceMemorySizeForProfileV2(profile));
+            LOG_INFO("Execution context memory of optimization profile %d: %.1f MiB", profile, forProfile / 1048576.0);
+            smallest = std::min<int64_t>(smallest, forProfile);
+        }
+        constexpr int64_t kAlign = 1 << 20;
+        int64_t const keep = (std::max({smallest, strategyContextMemorySize, visionContextMemorySize, audioContextMemorySize, actionContextMemorySize}) + kAlign - 1)
+            / kAlign * kAlign;
+        int64_t keepBytes = keep;
+        if (char const* keepMb = std::getenv("EDGELLM_MOE_EXEC_OVERLAY_KEEP_MB"); keepMb != nullptr)
+        {
+            keepBytes = std::max<int64_t>(keep, static_cast<int64_t>(std::atoll(keepMb)) * kAlign);
+        }
+        int64_t const lent = sharedContextMemorySize - keepBytes;
+        using RegisterFn = void (*)(void*, int64_t);
+        void* const symbol = moePluginSymbol("edgellmMoeRegisterExecOverlay");
+        if (symbol != nullptr && lent >= (64 << 20))
+        {
+            reinterpret_cast<RegisterFn>(symbol)(static_cast<uint8_t*>(mSharedExecContextMemory.rawPointer()) + keepBytes, lent);
+            LOG_INFO("Lent %.0f MiB of the execution context memory to the MoE expert caches (decode needs %.0f MiB of the %.0f MiB).", lent / 1048576.0,
+                keepBytes / 1048576.0, sharedContextMemorySize / 1048576.0);
+        }
+        else
+        {
+            LOG_INFO("Execution context memory overlay not used (plugin symbol %s, lendable %.0f MiB).", symbol != nullptr ? "found" : "not found", lent / 1048576.0);
+        }
+    }
 
     // Encoder embedding cache — content-addressed GPU cache for ViT/audio encoder outputs.
     if ((mVisionRunner || mAudioRunner) && contextCacheConfig.encoderEmbeddingCacheBudgetBytes > 0)

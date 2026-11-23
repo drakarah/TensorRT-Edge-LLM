@@ -190,6 +190,18 @@ bool prefillFromCacheFromEnv()
     return on;
 }
 
+//! EDGELLM_MOE_RING_FROM_CACHE=1 (default off): the chunk ring copies resident experts from the decode cache as well. Measured slower than plain PCIe copies of every
+//! expert on the 4060 (934 against 1,112 tok/s on an 8K prompt, engine built for 4,096-token passes): the batched small copies and the per-pass snapshot cost more than
+//! the 15% of the bytes they save.
+bool ringFromCacheFromEnv()
+{
+    static bool const on = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_RING_FROM_CACHE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 //! EDGELLM_MOE_CACHE_BIAS=<beta> (lossy, decode only; default 0.5, measured on Qwen3.6 only, set 0 for exact routing): the router prefers experts that are resident in the per-layer GPU expert cache by adding beta to their
 //! logits before the top-k selection (combine weights stay the softmax of the original logits over the selected experts). Default 0.5 when unset; EDGELLM_MOE_CACHE_BIAS=0 gives exact routing.
 //! beta 0.5: ~65% fewer cache misses for +0.09% perplexity, beta 1: 85% fewer for +1.5% (METRICS R25ar/R25av, Qwen3.6).
@@ -613,6 +625,39 @@ public:
         mSnapshotValid = false;
     }
 
+    //! What the chunk ring needs of a layer's decode cache: the slot of every expert (-1 = not resident, host snapshot valid until the next refresh) and the slot-major
+    //! tensors. `refresh` re-reads the slot maps (a pass starts: decode may have changed the caches since; the stream is synchronised). False when unavailable.
+    struct ResidentView
+    {
+        int32_t const* slots{nullptr};
+        uint8_t const* const* tensors{nullptr};
+        size_t const* bytesPerExpert{nullptr};
+        int32_t numExperts{0};
+    };
+
+    bool residentView(int32_t layerId, cudaStream_t stream, bool refresh, ResidentView* out) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (refresh)
+        {
+            mSnapshotValid = false;
+        }
+        if (!snapshotCaches(stream))
+        {
+            return false;
+        }
+        auto const it = mCache.find(layerId);
+        if (it == mCache.end() || it->second.snapshotAt < 0 || it->second.numExperts <= 0)
+        {
+            return false;
+        }
+        out->slots = mSnapshot.data() + static_cast<size_t>(it->second.snapshotAt) * it->second.numExperts;
+        out->tensors = it->second.tensors;
+        out->bytesPerExpert = it->second.bytesPerExpert;
+        out->numExperts = it->second.numExperts;
+        return true;
+    }
+
     //! A decode step (or any non-prefill call) breaks the layer sequence: a prefetch issued for a layer that now will not run must not be consumed.
     void invalidate() noexcept
     {
@@ -857,6 +902,7 @@ public:
             // (single side stream, in order), so reusing their slots is safe
             mQueue.clear();
             mCursorValid = false;
+            mFreshPass = true;
             issue(layerId, phase, chunk, stream);
         }
         issueAhead(stream);
@@ -1021,12 +1067,77 @@ private:
         int32_t const count = std::min(mChunk, mNumExperts - e0);
         int32_t const t0 = phase == 0 ? 0 : 2;
         size_t offset = 0;
+        // experts that the decode cache holds are copied from their slot on the device instead of over PCIe (the cache is not modified during prefill)
+        PrefillExpertPrefetcher::ResidentView view{};
+        bool const fresh = mFreshPass;
+        bool haveView = ringFromCacheFromEnv() && prefillFromCacheFromEnv() && PrefillExpertPrefetcher::get().residentView(layerId, mainStream, mFreshPass, &view)
+            && view.numExperts == mNumExperts;
+        mFreshPass = false;
+        if (fresh)
+        {
+            LOG_DEBUG("Int4MoePlugin chunk ring: pass starts at layer %d, previous pass copied %.1f MiB from the cache and %.1f MiB over PCIe, cache view %s", layerId,
+                mCopiedFromCache / 1048576.0, mCopiedFromHost / 1048576.0, haveView ? "on" : "off");
+            mCopiedFromCache = 0;
+            mCopiedFromHost = 0;
+        }
+        for (int32_t t = 0; t < 2 && haveView; ++t)
+        {
+            haveView = view.bytesPerExpert[t0 + t] == it->second.bpe[t0 + t];
+        }
+        mBatchDst.clear();
+        mBatchSrc.clear();
+        mBatchSize.clear();
         for (int32_t t = 0; t < 2; ++t)
         {
-            size_t const bytes = static_cast<size_t>(count) * it->second.bpe[t0 + t];
-            cudaMemcpyAsync(mBuf[slot] + offset, static_cast<uint8_t const*>(it->second.src[t0 + t]) + static_cast<size_t>(e0) * it->second.bpe[t0 + t], bytes,
-                cudaMemcpyHostToDevice, mSide);
+            size_t const bpe = it->second.bpe[t0 + t];
+            uint8_t* const dst = mBuf[slot] + offset;
+            uint8_t const* const host = static_cast<uint8_t const*>(it->second.src[t0 + t]);
+            if (!haveView)
+            {
+                cudaMemcpyAsync(dst, host + static_cast<size_t>(e0) * bpe, static_cast<size_t>(count) * bpe, cudaMemcpyHostToDevice, mSide);
+                mCopiedFromHost += static_cast<size_t>(count) * bpe;
+            }
+            else
+            {
+                for (int32_t e = 0; e < count;)
+                {
+                    int32_t const cached = view.slots[e0 + e];
+                    if (cached >= 0)
+                    {
+                        mBatchDst.push_back(dst + static_cast<size_t>(e) * bpe);
+                        mBatchSrc.push_back(view.tensors[t0 + t] + static_cast<size_t>(cached) * bpe);
+                        mBatchSize.push_back(bpe);
+                        mCopiedFromCache += bpe;
+                        ++e;
+                        continue;
+                    }
+                    int32_t run = e;
+                    while (run < count && view.slots[e0 + run] < 0)
+                    {
+                        ++run;
+                    }
+                    mBatchDst.push_back(dst + static_cast<size_t>(e) * bpe);
+                    mBatchSrc.push_back(host + static_cast<size_t>(e0 + e) * bpe);
+                    mBatchSize.push_back(static_cast<size_t>(run - e) * bpe);
+                    mCopiedFromHost += static_cast<size_t>(run - e) * bpe;
+                    e = run;
+                }
+            }
             offset = align256(static_cast<size_t>(mChunk) * it->second.bpe[t0]);
+        }
+        if (!mBatchDst.empty())
+        {
+            cudaMemcpyAttributes attrs{};
+            attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+            size_t attrsIdx = 0;
+            if (cudaMemcpyBatchAsync(mBatchDst.data(), mBatchSrc.data(), mBatchSize.data(), mBatchDst.size(), &attrs, &attrsIdx, 1, mSide) != cudaSuccess)
+            {
+                cudaGetLastError();
+                for (size_t k = 0; k < mBatchDst.size(); ++k)
+                {
+                    cudaMemcpyAsync(mBatchDst[k], mBatchSrc[k], mBatchSize[k], cudaMemcpyDefault, mSide);
+                }
+            }
         }
         cudaEventRecord(mCopyDone[slot], mSide);
         mQueue.push_back({layerId, phase, chunk, slot});
@@ -1070,6 +1181,12 @@ private:
     int32_t mCursorPhase{0};
     int32_t mCursorChunk{0};
     bool mCursorValid{false};
+    bool mFreshPass{false};
+    size_t mCopiedFromCache{0};
+    size_t mCopiedFromHost{0};
+    std::vector<void*> mBatchDst;
+    std::vector<void const*> mBatchSrc;
+    std::vector<size_t> mBatchSize;
     bool mReady{false};
     bool mFailed{false};
 };
@@ -1360,16 +1477,59 @@ void unregisterLiveCache(Int4MoePlugin* plugin)
 namespace
 {
 //! One device expert cache that several plugin instances reading the same weights use together (EDGELLM_MOE_CACHE_SHARE=1).
+//! Device memory the runtime lends to the expert caches: the part of its execution-context memory that the decode profile does not use (the prefill profile of an
+//! engine built for long passes needs far more). Caches placed here are invalidated whenever a prefill pass runs, because its activations overwrite them.
+struct ExecOverlay
+{
+    std::mutex mutex;
+    uint8_t* base{nullptr};
+    size_t bytes{0};
+    size_t cursor{0};
+    static ExecOverlay& get()
+    {
+        static ExecOverlay overlay;
+        return overlay;
+    }
+    size_t remaining()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return bytes - cursor;
+    }
+    //! A 256-byte aligned slice of `size` bytes, or null when it does not fit.
+    void* take(size_t size)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        size_t const aligned = (size + 255) & ~static_cast<size_t>(255);
+        if (base == nullptr || cursor + aligned > bytes)
+        {
+            return nullptr;
+        }
+        void* const p = base + cursor;
+        cursor += aligned;
+        return p;
+    }
+};
+
+bool execOverlayFromEnv()
+{
+    static bool const on = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_EXEC_OVERLAY");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 struct SharedCacheBlock
 {
     void* mem{nullptr};
+    bool overlay{false};
     int32_t* state{nullptr};
     uint8_t* tensors[4]{};
     int32_t slots{0};
     std::vector<Int4MoePlugin*> users; //!< instances using the block (the first one is the owner that resizes it)
     ~SharedCacheBlock()
     {
-        if (mem != nullptr)
+        if (mem != nullptr && !overlay)
         {
             cudaFree(mem);
         }
@@ -1417,7 +1577,7 @@ Int4MoePlugin::~Int4MoePlugin() noexcept
     {
         cudaFree(mStats);
     }
-    if (mCacheMem != nullptr && !mCacheShared)
+    if (mCacheMem != nullptr && !mCacheShared && !mCacheOverlay)
     {
         cudaFree(mCacheMem);
     }
@@ -1522,7 +1682,9 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
                 {
                     layers = std::max<size_t>(1, static_cast<size_t>(std::atoll(layersEnv)));
                 }
-                size_t const fit = freeBytes > reserve ? (freeBytes - reserve) / (layers * perSlot) : 0;
+                // the lent execution-context memory holds whole layer caches too, so it counts towards the budget
+                size_t const lent = execOverlayFromEnv() ? ExecOverlay::get().remaining() : 0;
+                size_t const fit = freeBytes + lent > reserve ? (freeBytes + lent - reserve) / (layers * perSlot) : 0;
                 autoSlots = static_cast<int32_t>(std::min<size_t>(fit, static_cast<size_t>(mNumExperts)));
                 if (autoSlots < static_cast<int32_t>(mTopK))
                 {
@@ -1577,6 +1739,7 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
         {
             mCacheHold = block;
             mCacheShared = true;
+            mCacheOverlay = block->overlay;
             block->users.push_back(this);
             mCacheMem = block->mem;
             mCacheState = block->state;
@@ -1586,11 +1749,20 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
             }
             mCacheTally = mCacheState + stateInts - 3;
             mCacheReady = true;
+            if (!mCacheOverlay)
+            {
+                PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
+            }
             LOG_INFO("Int4MoePlugin %s: shares the expert cache of an earlier pass (%d slots)", mLayerName.c_str(), mCacheSlots);
             return true;
         }
     }
-    if (cudaMalloc(&mCacheMem, total) != cudaSuccess || cudaMalloc(reinterpret_cast<void**>(&mCacheState), stateInts * 4) != cudaSuccess)
+    if (execOverlayFromEnv())
+    {
+        mCacheMem = ExecOverlay::get().take(total);
+        mCacheOverlay = mCacheMem != nullptr;
+    }
+    if ((mCacheMem == nullptr && cudaMalloc(&mCacheMem, total) != cudaSuccess) || cudaMalloc(reinterpret_cast<void**>(&mCacheState), stateInts * 4) != cudaSuccess)
     {
         cudaGetLastError();
         LOG_WARNING("Int4MoePlugin %s: expert cache of %d slots not allocated (%zu bytes); using staging", mLayerName.c_str(),
@@ -1636,12 +1808,16 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
     {
         cudaMemset(mCpuAdmit, 0, (static_cast<size_t>(mNumExperts) + 1) * sizeof(int32_t));
     }
-    PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
+    if (!mCacheOverlay)
+    {
+        PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
+    }
     if (share)
     {
         // the block owns the allocation from here on; a shared cache is never resized (borrowers would keep stale pointers)
         auto block = std::make_shared<SharedCacheBlock>();
         block->mem = mCacheMem;
+        block->overlay = mCacheOverlay;
         block->state = mCacheState;
         block->slots = mCacheSlots;
         for (int32_t i = 0; i < 4; ++i)
@@ -1681,9 +1857,9 @@ size_t Int4MoePlugin::cacheBytesPerSlot() const noexcept
 
 int64_t Int4MoePlugin::resizeExpertCache(int32_t newSlots) noexcept
 {
-    if (!mCacheReady || newSlots == mCacheSlots || newSlots < 1 || newSlots > mNumExperts)
+    if (!mCacheReady || newSlots == mCacheSlots || newSlots < 1 || newSlots > mNumExperts || mCacheOverlay)
     {
-        return 0;
+        return 0; // a cache in the lent execution-context memory is never resized: its bytes belong to the runtime
     }
     int32_t const oldSlots = mCacheSlots;
     size_t const experts = static_cast<size_t>(mNumExperts);
@@ -1831,6 +2007,7 @@ void Int4MoePlugin::syncSharedUsers() noexcept
     std::lock_guard<std::mutex> lock(sharedCacheMutex());
     auto* block = static_cast<SharedCacheBlock*>(mCacheHold.get());
     block->mem = mCacheMem;
+    block->overlay = mCacheOverlay;
     block->state = mCacheState;
     block->slots = mCacheSlots;
     for (int32_t i = 0; i < 4; ++i)
@@ -2344,6 +2521,13 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         }
         // decode steps served by the expert cache never stage
         bool const cacheStep = stageNow && numTokens <= 4 && ensureExpertCache(inputDesc, inputs[2]) && numTokens * mTopK <= mCacheSlots;
+        if (mCacheOverlay && mCacheReady && stageNow && !cacheStep && numTokens > 4 && mCacheState != nullptr)
+        {
+            // this pass's activations overwrite the lent memory the cache lives in: forget what it held (slotOf, expertOf, last use, miss list, counters)
+            size_t const stateInts = mNumExperts + 4 * static_cast<size_t>(mCacheSlots) + 5;
+            CUDA_CHECK(cudaMemsetAsync(mCacheState, 0xFF, (static_cast<size_t>(mNumExperts) + mCacheSlots) * 4, stream));
+            CUDA_CHECK(cudaMemsetAsync(mCacheState + mNumExperts + mCacheSlots, 0, (stateInts - mNumExperts - mCacheSlots) * 4, stream));
+        }
         auto pfResult = PrefillExpertPrefetcher::Result::kNone;
         uint8_t* privatePtrs[4]{};
         static int32_t const chunkExperts = prefillChunkFromEnv();
@@ -3174,4 +3358,14 @@ extern "C" __attribute__((visibility("default"))) int64_t edgellmMoeGrowCacheByt
 extern "C" __attribute__((visibility("default"))) int32_t edgellmMoeCacheInfo(int64_t* out, int32_t capacity)
 {
     return trt_edgellm::plugins::liveCacheInfo(out, capacity);
+}
+
+//! The runtime lends the part of its execution-context memory that the decode profile does not use; the expert caches are placed there (EDGELLM_MOE_EXEC_OVERLAY=1).
+extern "C" __attribute__((visibility("default"))) void edgellmMoeRegisterExecOverlay(void* base, int64_t bytes)
+{
+    auto& overlay = trt_edgellm::plugins::ExecOverlay::get();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    overlay.base = static_cast<uint8_t*>(base);
+    overlay.bytes = bytes > 0 ? static_cast<size_t>(bytes) : 0;
+    overlay.cursor = 0;
 }

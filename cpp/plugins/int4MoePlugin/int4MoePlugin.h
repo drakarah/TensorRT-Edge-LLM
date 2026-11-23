@@ -284,6 +284,7 @@ private:
     float* mPrefetchWeights{nullptr};    // device, same count: scores of the prediction (unused)
     cudaEvent_t mPrefetchReady{nullptr}; // recorded when this visit starts (the next visit's side stream waits for it)
     cudaEvent_t mPrefetchDone{nullptr};  // recorded when this visit's side stream has filled the predicted experts
+    bool mCacheOverlay{false};           // the cache arrays live in the runtime's execution-context memory (see edgellmMoeRegisterExecOverlay)
     int32_t* mCpuAdmit{nullptr}; // device [numExperts + 1]: miss counters and call counter of the CPU miss path
     bool mCpuMissChecked{false};
     bool mCpuMissReady{false};
