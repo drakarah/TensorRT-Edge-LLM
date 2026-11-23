@@ -699,7 +699,7 @@ __device__ __forceinline__ float sanitizeRouterLogit(float l)
 // One block of 128 threads per token; the experts live in shared memory and the top-k is taken by repeated block-wide arg-max, like
 // cacheAwareTopkKernel.
 __global__ void sigmoidBiasTopkKernel(float const* logits, float const* selectionBias, int32_t numExperts, int32_t topK, float cacheBias,
-    int32_t const* slotOf, int32_t tailSkip, int32_t tailRenorm, int32_t* topkIndices, float* topkWeights)
+    int32_t const* slotOf, int32_t tailSkip, int32_t tailRenorm, float tailMaxWeight, int32_t* topkIndices, float* topkWeights)
 {
     extern __shared__ float routeSmem[]; // [numExperts] selection values, then [numExperts] scores
     float* selection = routeSmem;
@@ -778,7 +778,7 @@ __global__ void sigmoidBiasTopkKernel(float const* logits, float const* selectio
         float keptSum = 0.0f;
         for (int32_t k = 0; k < topK; ++k)
         {
-            skipped[k] = tailSkip > 0 && k >= tailSkip && slotOf != nullptr && slotOf[chosen[k]] < 0;
+            skipped[k] = tailSkip > 0 && k >= tailSkip && slotOf != nullptr && slotOf[chosen[k]] < 0 && score[chosen[k]] / (sum + 1e-20f) < tailMaxWeight;
             keptSum += skipped[k] ? 0.0f : score[chosen[k]];
         }
         float const denom = (tailRenorm != 0 ? keptSum : sum) + 1e-20f;
@@ -990,10 +990,10 @@ void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExp
 }
 
 void launchSigmoidBiasTopk(float const* logits, float const* selectionBias, int32_t numTokens, int32_t numExperts, int32_t topK, float cacheBias,
-    ExpertCacheState const* cache, int32_t tailSkip, int32_t tailRenorm, int32_t* topkIndices, float* topkWeights, cudaStream_t stream)
+    ExpertCacheState const* cache, int32_t tailSkip, int32_t tailRenorm, float tailMaxWeight, int32_t* topkIndices, float* topkWeights, cudaStream_t stream)
 {
     sigmoidBiasTopkKernel<<<numTokens, 128, 2 * static_cast<size_t>(numExperts) * sizeof(float), stream>>>(logits, selectionBias, numExperts,
-        topK, cacheBias, cache != nullptr ? cache->slotOf : nullptr, tailSkip, tailRenorm, topkIndices, topkWeights);
+        topK, cacheBias, cache != nullptr ? cache->slotOf : nullptr, tailSkip, tailRenorm, tailMaxWeight, topkIndices, topkWeights);
 }
 
 namespace

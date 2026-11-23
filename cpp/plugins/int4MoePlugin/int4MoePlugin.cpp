@@ -225,6 +225,17 @@ int32_t tailSkipFromEnv()
     return n;
 }
 
+//! EDGELLM_MOE_TAIL_MIN_WEIGHT=<w> (sigmoid routing, with EDGELLM_MOE_TAIL_SKIP=N): a tail expert is only skipped when its normalised routing weight is below w
+//! (default 1e9 = every non-resident tail expert is skipped).
+float tailMaxWeightFromEnv()
+{
+    static float const w = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_TAIL_MIN_WEIGHT");
+        return v != nullptr ? static_cast<float>(std::atof(v)) : 1e9F;
+    }();
+    return w;
+}
+
 //! EDGELLM_MOE_TAIL_RENORM=1: the weights of the kept experts are renormalised after a tail skip (sigmoid routing only).
 int32_t tailRenormFromEnv()
 {
@@ -2488,7 +2499,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                     mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
             }
             kernel::launchSigmoidBiasTopk(static_cast<float const*>(inputs[0]), static_cast<float const*>(inputs[inputCount() - 1]), numTokens,
-                mNumExperts, mTopK, useCache ? routeBiasFromEnv() : 0.0f, useCache ? &routeState : nullptr, (useCache && numTokens <= 4) ? tailSkipFromEnv() : 0, tailRenormFromEnv(), topkIndicesPtr, topkWeightsPtr, stream);
+                mNumExperts, mTopK, useCache ? routeBiasFromEnv() : 0.0f, useCache ? &routeState : nullptr, (useCache && numTokens <= 4) ? tailSkipFromEnv() : 0, tailRenormFromEnv(), tailMaxWeightFromEnv(), topkIndicesPtr, topkWeightsPtr, stream);
         }
         else if (useCache && (cacheBiasFromEnv() > 0.0f || tailSkipFromEnv() > 0) && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
         {

@@ -39,7 +39,7 @@ struct Result
 };
 
 Result reference(std::vector<float> const& logits, std::vector<float> const& selectionBias, std::vector<int32_t> const& slotOf, int32_t numTokens,
-    int32_t numExperts, int32_t topK, float cacheBias, int32_t tailSkip, bool renorm)
+    int32_t numExperts, int32_t topK, float cacheBias, int32_t tailSkip, bool renorm, float maxWeight = 1e9F)
 {
     Result out;
     out.ids.resize(static_cast<size_t>(numTokens) * topK);
@@ -61,7 +61,10 @@ Result reference(std::vector<float> const& logits, std::vector<float> const& sel
         for (int32_t k = 0; k < topK; ++k)
         {
             sum += score[order[k]];
-            skipped[k] = tailSkip > 0 && k >= tailSkip && !slotOf.empty() && slotOf[order[k]] < 0;
+        }
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            skipped[k] = tailSkip > 0 && k >= tailSkip && !slotOf.empty() && slotOf[order[k]] < 0 && score[order[k]] / (sum + 1e-20F) < maxWeight;
             kept += skipped[k] ? 0.0F : score[order[k]];
         }
         float const denom = (renorm ? kept : sum) + 1e-20F;
@@ -75,7 +78,7 @@ Result reference(std::vector<float> const& logits, std::vector<float> const& sel
 }
 
 Result run(std::vector<float> const& logits, std::vector<float> const& selectionBias, std::vector<int32_t> const& slotOf, int32_t numTokens, int32_t numExperts,
-    int32_t topK, float cacheBias, int32_t tailSkip, int32_t renorm)
+    int32_t topK, float cacheBias, int32_t tailSkip, int32_t renorm, float maxWeight = 1e9F)
 {
     float *dLogits, *dBias, *dWeights;
     int32_t *dSlotOf = nullptr, *dIds;
@@ -92,7 +95,7 @@ Result run(std::vector<float> const& logits, std::vector<float> const& selection
         CUDA_CHECK(cudaMemcpy(dSlotOf, slotOf.data(), slotOf.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
         cache.slotOf = dSlotOf;
     }
-    launchSigmoidBiasTopk(dLogits, dBias, numTokens, numExperts, topK, cacheBias, slotOf.empty() ? nullptr : &cache, tailSkip, renorm, dIds, dWeights, nullptr);
+    launchSigmoidBiasTopk(dLogits, dBias, numTokens, numExperts, topK, cacheBias, slotOf.empty() ? nullptr : &cache, tailSkip, renorm, maxWeight, dIds, dWeights, nullptr);
     CUDA_CHECK(cudaGetLastError());
     Result out;
     out.ids.resize(static_cast<size_t>(numTokens) * topK);
@@ -208,6 +211,29 @@ TEST(SigmoidBiasTopkTest, TailSkipDropsNonResidentTailExpertsWithoutRenormalisat
             EXPECT_LE(sum, 1.0F + 1e-5F);
         }
     }
+}
+
+TEST(SigmoidBiasTopkTest, TailSkipKeepsNonResidentExpertsAboveTheWeightThreshold)
+{
+    for (float maxWeight : {0.0F, 0.03F, 0.08F, 0.2F})
+    {
+        Case c = makeCase(50, 6, 128, 8, 25);
+        Result got = run(c.logits, c.bias, c.slotOf, 6, 128, 8, 0.0F, 2, 0, maxWeight);
+        expectSame(got, reference(c.logits, c.bias, c.slotOf, 6, 128, 8, 0.0F, 2, false, maxWeight));
+        for (int32_t t = 0; t < 6; ++t)
+        {
+            for (int32_t k = 2; k < 8; ++k)
+            {
+                if (got.weights[t * 8 + k] == 0.0F)
+                {
+                    EXPECT_GT(maxWeight, 0.0F);
+                }
+            }
+        }
+    }
+    // a threshold of zero skips nothing
+    Case c = makeCase(51, 3, 128, 8, 10);
+    expectSame(run(c.logits, c.bias, c.slotOf, 3, 128, 8, 0.0F, 2, 0, 0.0F), reference(c.logits, c.bias, c.slotOf, 3, 128, 8, 0.0F, 0, false));
 }
 
 TEST(SigmoidBiasTopkTest, TailSkipWithRenormalisationKeepsTheMassAtOne)
