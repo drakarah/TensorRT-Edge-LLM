@@ -148,7 +148,7 @@ void launchSigmoidBiasTopk(float const* logits, float const* selectionBias, int3
 //! A host-computed slot is pointed at a resident expert with weight 0. The misses and the layer input are written to the mailbox, then its seq; nothing is
 //! written when every expert is resident.
 void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t numTokens, int32_t topK, int32_t numExperts, half const* hidden,
-    int32_t hiddenSize, ExpertCacheState const& cache, int32_t* admit, int32_t admitThreshold, CpuMissMailbox* mailbox, CpuMissDeviceState* state,
+    int32_t hiddenSize, ExpertCacheState const& cache, int32_t* admit, int32_t admitThreshold, int32_t budget, CpuMissMailbox* mailbox, CpuMissDeviceState* state,
     int32_t layer, cudaStream_t stream);
 
 //! Wait for the host's answer to the last doorbell (no wait when it wrote none) and add it to output [numTokens, hiddenSize].

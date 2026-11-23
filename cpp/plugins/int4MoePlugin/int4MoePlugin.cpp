@@ -284,6 +284,14 @@ int32_t cpuMissAdmitFromEnv()
     return n;
 }
 
+//! EDGELLM_MOE_CPU_BUDGET=<n> (default 0 = no limit): at most n missed experts of one layer visit go to the CPU; the rest are copied over PCIe at the same time,
+//! so both paths work on every visit instead of the CPU taking all of them.
+int32_t cpuMissBudgetFromEnv()
+{
+    static int32_t const n = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_BUDGET"); return v != nullptr ? std::max(0, std::atoi(v)) : 0; }();
+    return n;
+}
+
 int32_t cpuMissThreadsFromEnv()
 {
     static int32_t const n = []() { char const* v = std::getenv("EDGELLM_MOE_CPU_THREADS"); return v != nullptr ? std::clamp(std::atoi(v), 1, 64) : 8; }();
@@ -2638,7 +2646,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             {
                 cpumiss::Pool& pool = cpumiss::Pool::get();
                 kernel::launchCpuMissDoorbell(topkIndicesPtr, topkWeightsPtr, numTokens, mTopK, mNumExperts,
-                    static_cast<half const*>(hiddenStatesTensor.rawPointer()), mHiddenSize, state, mCpuAdmit, cpuMissAdmitFromEnv(),
+                    static_cast<half const*>(hiddenStatesTensor.rawPointer()), mHiddenSize, state, mCpuAdmit, cpuMissAdmitFromEnv(), cpuMissBudgetFromEnv(),
                     pool.mailboxDevice(), pool.stateDevice(), layerIdFromName(mLayerName), stream);
             }
             if (joinPrefetch)

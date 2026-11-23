@@ -1001,7 +1001,7 @@ namespace
 constexpr long long kCpuMissTimeoutCycles = 400000000LL;
 
 __global__ void cpuMissDoorbellKernel(int32_t* topkIndices, float* topkWeights, int32_t numTokens, int32_t topK, int32_t numExperts, half const* hidden,
-    int32_t hiddenSize, int32_t const* slotOf, int32_t const* expertOf, int32_t* admit, int32_t admitThreshold, CpuMissMailbox* mb,
+    int32_t hiddenSize, int32_t const* slotOf, int32_t const* expertOf, int32_t* admit, int32_t admitThreshold, int32_t budget, CpuMissMailbox* mb,
     CpuMissDeviceState* st, int32_t layer)
 {
     __shared__ int32_t count;
@@ -1032,17 +1032,22 @@ __global__ void cpuMissDoorbellKernel(int32_t* topkIndices, float* topkWeights, 
             int32_t const misses = atomicAdd(&admit[id], 1) + 1;
             if (admitThreshold <= 0 || misses < admitThreshold)
             {
+                // at most `budget` misses of a call go to the CPU, the others take the normal fill path in parallel (budget <= 0: no limit)
                 int32_t const p = atomicAdd(&count, 1);
-                mb->expert[p] = id;
-                mb->token[p] = i / topK;
-                mb->weight[p] = topkWeights[i];
-                topkIndices[i] = dummy;
-                topkWeights[i] = 0.0F;
+                if (budget <= 0 || p < budget)
+                {
+                    mb->expert[p] = id;
+                    mb->token[p] = i / topK;
+                    mb->weight[p] = topkWeights[i];
+                    topkIndices[i] = dummy;
+                    topkWeights[i] = 0.0F;
+                }
             }
         }
     }
     __syncthreads();
-    if (count == 0)
+    int32_t const sent = budget > 0 ? min(count, budget) : count;
+    if (sent == 0)
     {
         if (threadIdx.x == 0)
         {
@@ -1059,7 +1064,7 @@ __global__ void cpuMissDoorbellKernel(int32_t* topkIndices, float* topkWeights, 
     if (threadIdx.x == 0)
     {
         mb->layer = layer;
-        mb->numMiss = count;
+        mb->numMiss = sent;
         mb->numTokens = numTokens;
         mb->hidden = hiddenSize;
     }
@@ -1155,11 +1160,11 @@ __global__ void finiteWatchKernel(half const* x, int64_t n, uint32_t* counters)
 } // namespace
 
 void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t numTokens, int32_t topK, int32_t numExperts, half const* hidden,
-    int32_t hiddenSize, ExpertCacheState const& cache, int32_t* admit, int32_t admitThreshold, CpuMissMailbox* mailbox, CpuMissDeviceState* state,
+    int32_t hiddenSize, ExpertCacheState const& cache, int32_t* admit, int32_t admitThreshold, int32_t budget, CpuMissMailbox* mailbox, CpuMissDeviceState* state,
     int32_t layer, cudaStream_t stream)
 {
     cpuMissDoorbellKernel<<<1, 256, 0, stream>>>(topkIndices, topkWeights, numTokens, topK, numExperts, hidden, hiddenSize, cache.slotOf, cache.expertOf,
-        admit, admitThreshold, mailbox, state, layer);
+        admit, admitThreshold, budget, mailbox, state, layer);
 }
 
 void launchCpuMissWaitAdd(half* output, int32_t numTokens, int32_t hiddenSize, CpuMissMailbox* mailbox, CpuMissDeviceState* state, cudaStream_t stream)
