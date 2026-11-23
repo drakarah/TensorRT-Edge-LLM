@@ -557,6 +557,14 @@ private:
     bool synchronizeCancellationStates(DecodingInferenceContext& context);
 
     rt::Tensor mSharedExecContextMemory{}; //!< Shared device memory for all execution contexts
+    bool mExecContextPoisoned{false};
+    bool mExecOverlayActive{false};
+
+    //! EDGELLM_EXEC_POISON_SCAN=1: fill the shared execution context memory with a pattern after prefill and report at the end of the request which
+    //! 1 MiB buckets decode wrote.
+    void invalidateExecOverlay(cudaStream_t stream);
+    void poisonExecContext(cudaStream_t stream);
+    void scanExecContext(cudaStream_t stream);
     int32_t mMaxRuntimeBatchSize{1};       //!< Maximum runtime batch size
 
     DeploymentConfig mDeployment{};                    //!< Parsed base+draft configs + consolidated strategy settings

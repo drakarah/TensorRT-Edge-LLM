@@ -1485,6 +1485,13 @@ struct ExecOverlay
     uint8_t* base{nullptr};
     size_t bytes{0};
     size_t cursor{0};
+    struct CacheStateRef
+    {
+        int32_t* state;
+        int32_t experts;
+        int32_t slots;
+    };
+    std::vector<CacheStateRef> states;
     static ExecOverlay& get()
     {
         static ExecOverlay overlay;
@@ -1494,6 +1501,16 @@ struct ExecOverlay
     {
         std::lock_guard<std::mutex> lock(mutex);
         return bytes - cursor;
+    }
+    void addState(int32_t* state, int32_t experts, int32_t slots)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        states.push_back({state, experts, slots});
+    }
+    void removeState(int32_t* state)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        states.erase(std::remove_if(states.begin(), states.end(), [&](CacheStateRef const& r) { return r.state == state; }), states.end());
     }
     //! A 256-byte aligned slice of `size` bytes, or null when it does not fit.
     void* take(size_t size)
@@ -1535,6 +1552,10 @@ struct SharedCacheBlock
         }
         if (state != nullptr)
         {
+            if (overlay)
+            {
+                ExecOverlay::get().removeState(state);
+            }
             cudaFree(state);
         }
     }
@@ -1593,6 +1614,10 @@ Int4MoePlugin::~Int4MoePlugin() noexcept
     }
     if (mCacheState != nullptr && !mCacheShared)
     {
+        if (mCacheOverlay)
+        {
+            ExecOverlay::get().removeState(mCacheState);
+        }
         cudaFree(mCacheState);
         if (mCpuAdmit != nullptr)
         {
@@ -1808,7 +1833,11 @@ bool Int4MoePlugin::ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDes
     {
         cudaMemset(mCpuAdmit, 0, (static_cast<size_t>(mNumExperts) + 1) * sizeof(int32_t));
     }
-    if (!mCacheOverlay)
+    if (mCacheOverlay)
+    {
+        ExecOverlay::get().addState(mCacheState, mNumExperts, mCacheSlots);
+    }
+    else
     {
         PrefillExpertPrefetcher::get().registerCache(layerIdFromName(mLayerName), mCacheState, mCacheTensors, mCacheBytesPerExpert, mNumExperts);
     }
@@ -3368,4 +3397,18 @@ extern "C" __attribute__((visibility("default"))) void edgellmMoeRegisterExecOve
     overlay.base = static_cast<uint8_t*>(base);
     overlay.bytes = bytes > 0 ? static_cast<size_t>(bytes) : 0;
     overlay.cursor = 0;
+}
+
+//! Called by the runtime once a prefill pass has finished: its activations overwrote the lent memory, so every cache placed there is forgotten.
+extern "C" __attribute__((visibility("default"))) void edgellmMoeInvalidateExecOverlay(void* stream)
+{
+    auto& overlay = trt_edgellm::plugins::ExecOverlay::get();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    for (auto const& ref : overlay.states)
+    {
+        size_t const stateInts = static_cast<size_t>(ref.experts) + 4 * static_cast<size_t>(ref.slots) + 5;
+        size_t const tagInts = static_cast<size_t>(ref.experts) + ref.slots;
+        cudaMemsetAsync(ref.state, 0xFF, tagInts * 4, static_cast<cudaStream_t>(stream));
+        cudaMemsetAsync(ref.state + tagInts, 0, (stateInts - tagInts) * 4, static_cast<cudaStream_t>(stream));
+    }
 }

@@ -796,6 +796,7 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         if (symbol != nullptr && lent >= (64 << 20))
         {
             reinterpret_cast<RegisterFn>(symbol)(static_cast<uint8_t*>(mSharedExecContextMemory.rawPointer()) + keepBytes, lent);
+            mExecOverlayActive = true;
             LOG_INFO("Lent %.0f MiB of the execution context memory to the MoE expert caches (decode needs %.0f MiB of the %.0f MiB).", lent / 1048576.0,
                 keepBytes / 1048576.0, sharedContextMemorySize / 1048576.0);
         }
@@ -813,6 +814,75 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         LOG_INFO("Encoder embedding cache initialized with %zu MiB budget.",
             static_cast<size_t>(budgetBytes / (1024 * 1024)));
     }
+}
+
+namespace
+{
+constexpr uint8_t kExecPoison = 0xA5;
+constexpr int64_t kExecScanBucket = 1 << 20;
+} // namespace
+
+void LLMRankRuntime::invalidateExecOverlay(cudaStream_t stream)
+{
+    if (!mExecOverlayActive)
+    {
+        return;
+    }
+    using InvalidateFn = void (*)(void*);
+    if (void* const symbol = moePluginSymbol("edgellmMoeInvalidateExecOverlay"); symbol != nullptr)
+    {
+        reinterpret_cast<InvalidateFn>(symbol)(stream);
+    }
+}
+
+void LLMRankRuntime::poisonExecContext(cudaStream_t stream)
+{
+    if (mSharedExecContextMemory.isEmpty() || std::getenv("EDGELLM_EXEC_POISON_SCAN") == nullptr)
+    {
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemsetAsync(mSharedExecContextMemory.rawPointer(), kExecPoison, mSharedExecContextMemory.getMemoryCapacity(), stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    mExecContextPoisoned = true;
+}
+
+void LLMRankRuntime::scanExecContext(cudaStream_t stream)
+{
+    if (!mExecContextPoisoned)
+    {
+        return;
+    }
+    mExecContextPoisoned = false;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int64_t const bytes = mSharedExecContextMemory.getMemoryCapacity();
+    std::vector<uint8_t> host(static_cast<size_t>(bytes));
+    CUDA_CHECK(cudaMemcpy(host.data(), mSharedExecContextMemory.rawPointer(), host.size(), cudaMemcpyDeviceToHost));
+    int64_t highest = -1;
+    int64_t touchedBytes = 0;
+    for (int64_t bucket = 0; bucket * kExecScanBucket < bytes; ++bucket)
+    {
+        int64_t const begin = bucket * kExecScanBucket;
+        int64_t const end = std::min(bytes, begin + kExecScanBucket);
+        int64_t changed = 0;
+        int64_t last = -1;
+        for (int64_t i = begin; i < end; ++i)
+        {
+            if (host[static_cast<size_t>(i)] != kExecPoison)
+            {
+                ++changed;
+                last = i;
+            }
+        }
+        if (changed > 0)
+        {
+            LOG_INFO("ExecScan: MiB %ld changed %ld bytes (last at offset %ld)", static_cast<long>(bucket), static_cast<long>(changed), static_cast<long>(last));
+            highest = std::max(highest, last);
+            touchedBytes += changed;
+        }
+    }
+    LOG_INFO("ExecScan: decode changed %ld bytes of %ld, highest offset %ld (%.2f MiB)", static_cast<long>(touchedBytes), static_cast<long>(bytes),
+        static_cast<long>(highest), highest / 1048576.0);
 }
 
 void LLMRankRuntime::ensureLogprobsCapacity(int32_t logprobsRows, int32_t topK)
@@ -1322,6 +1392,8 @@ bool LLMRankRuntime::GenerationSession::performBatchEvictAndSnapshot()
 
 bool LLMRankRuntime::GenerationSession::primeFromPrefill()
 {
+    mRuntime.invalidateExecOverlay(mStream);
+    mRuntime.poisonExecContext(mStream);
 
     // Post-prefill per-iter pipeline:
     //   cancel → decode (emitDelta + stop match) → finalize (EOS/length/stop) → emit
@@ -2668,6 +2740,7 @@ bool LLMRankRuntime::finishGeneration(SteppedGeneration& generation, LLMGenerati
     ManagedKVCacheRequest* const managedRequest = generation.managedRequest();
     bool const enableSpecDecode = generation.enableSpecDecode;
     bool const hasActionRequest = generation.hasActionRequest;
+    scanExecContext(stream);
 
     // Few-layer-validation debug: write the accumulated per-layer logits/KV dump for this request.
     if (context.layerDebugger)
