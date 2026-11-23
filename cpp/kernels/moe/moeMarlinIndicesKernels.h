@@ -141,7 +141,7 @@ void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExp
 //! Inkling 2 router: scores = sigmoid(logits); experts = top-k of scores + selectionBias[e] + cacheBias * [resident in `cache`] (cache may be null);
 //! weights = the plain scores of the chosen experts divided by their sum. Writes expert ids and fp32 weights. topK <= kRouterMaxTopK.
 void launchSigmoidBiasTopk(float const* logits, float const* selectionBias, int32_t numTokens, int32_t numExperts, int32_t topK, float cacheBias,
-    ExpertCacheState const* cache, int32_t* topkIndices, float* topkWeights, cudaStream_t stream);
+    ExpertCacheState const* cache, int32_t tailSkip, int32_t tailRenorm, int32_t* topkIndices, float* topkWeights, cudaStream_t stream);
 
 //! CPU miss path. Run after the router, before the cache lookup. A routed expert that is not in the cache is computed on the host unless its miss counter
 //! (admit[expert], decayed every 256 calls; admit[numExperts] is the call counter) has reached admitThreshold, in which case the normal fill brings it in.

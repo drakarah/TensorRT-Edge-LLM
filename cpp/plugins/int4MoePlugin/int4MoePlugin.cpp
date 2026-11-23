@@ -225,6 +225,16 @@ int32_t tailSkipFromEnv()
     return n;
 }
 
+//! EDGELLM_MOE_TAIL_RENORM=1: the weights of the kept experts are renormalised after a tail skip (sigmoid routing only).
+int32_t tailRenormFromEnv()
+{
+    static int32_t const n = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_TAIL_RENORM");
+        return v != nullptr ? std::atoi(v) : 0;
+    }();
+    return n;
+}
+
 //! EDGELLM_MOE_CPU_MISS=1 (decode steps of <= 4 tokens served by the expert cache): a routed expert outside the cache is computed on the CPU from the pinned
 //! host copy instead of being copied in. EDGELLM_MOE_CPU_ADMIT=<n> (default 2): the n-th miss of an expert brings it into the cache; 0 never does.
 //! EDGELLM_MOE_CPU_THREADS=<n> (default 8): threads that spin for the work; EDGELLM_MOE_CPU_IDLE_MS=<ms> (default 1000, 0 = never): idle time after which they sleep 1 ms at a time.
@@ -2455,7 +2465,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                     mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
             }
             kernel::launchSigmoidBiasTopk(static_cast<float const*>(inputs[0]), static_cast<float const*>(inputs[inputCount() - 1]), numTokens,
-                mNumExperts, mTopK, useCache ? routeBiasFromEnv() : 0.0f, useCache ? &routeState : nullptr, topkIndicesPtr, topkWeightsPtr, stream);
+                mNumExperts, mTopK, useCache ? routeBiasFromEnv() : 0.0f, useCache ? &routeState : nullptr, (useCache && numTokens <= 4) ? tailSkipFromEnv() : 0, tailRenormFromEnv(), topkIndicesPtr, topkWeightsPtr, stream);
         }
         else if (useCache && (cacheBiasFromEnv() > 0.0f || tailSkipFromEnv() > 0) && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
         {
