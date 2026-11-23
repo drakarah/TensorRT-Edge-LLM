@@ -31,11 +31,15 @@ _MIB_FIELDS = {
     "host_snapshot_bytes": "host_snapshot_mib",
     "host_kv_tier_bytes": "host_kv_tier_mib",
     "host_kv_tier_used_bytes": "host_kv_tier_used_mib",
+    "swa_prefix_budget_bytes": "swa_prefix_budget_mib",
+    "swa_prefix_used_bytes": "swa_prefix_used_mib",
 }
 # Fields a binding older than the server may not have; the page then shows the coarse host bar.
 _OPTIONAL_RUNTIME_FIELDS = ("host_expert_weights_bytes", "host_embedding_bytes",
                             "host_snapshot_bytes", "host_kv_tier_bytes",
-                            "host_kv_tier_used_bytes")
+                            "host_kv_tier_used_bytes", "swa_prefix_budget_bytes",
+                            "swa_prefix_used_bytes", "swa_prefix_hits",
+                            "swa_prefix_lookups", "swa_prefix_reused_tokens")
 _RUNTIME_FIELDS = ("kv_growable", "kv_mapped_tokens", "kv_capacity_tokens",
                    "kv_mapped_bytes", "kv_capacity_bytes", "kv_pages_usable",
                    "kv_pages_free", "kv_pages_high_water", "context_records",
@@ -134,6 +138,8 @@ def runtime_memory(llm: Any) -> Optional[Dict[str, Any]]:
         value = getattr(metrics, name, None)
         if value is None and name in _OPTIONAL_RUNTIME_FIELDS:
             continue
+        if name.startswith("swa_prefix_") and value < 0:
+            continue  # the runtime has no prefix cache
         if name in _MIB_FIELDS:
             out[_MIB_FIELDS[name]] = value / _MIB
         else:

@@ -84,19 +84,34 @@ void failSlot(DecodingInferenceContext& context, int32_t slot, char const* what)
 
 std::vector<int32_t> reasoningStartMarkers(Tokenizer const& tokenizer)
 {
+    // Inkling 2 has no <think>: its reasoning message opens with <|content_thinking|>.
+    auto const think = static_cast<int32_t>(tokenizer.getTokenId("<think>"));
     return {static_cast<int32_t>(tokenizer.getTokenId("<|channel>")),
-        static_cast<int32_t>(tokenizer.getTokenId("<think>"))};
+        think >= 0 ? think : static_cast<int32_t>(tokenizer.getTokenId("<|content_thinking|>"))};
 }
 
 std::vector<int32_t> reasoningEndMarkers(Tokenizer const& tokenizer)
 {
+    // Inkling 2: the answer message opens with <|content_text|>. <|end_message|> cannot be the end marker because it
+    // also closes the answer.
+    auto const endThink = static_cast<int32_t>(tokenizer.getTokenId("</think>"));
     return {static_cast<int32_t>(tokenizer.getTokenId("<channel|>")),
-        static_cast<int32_t>(tokenizer.getTokenId("</think>"))};
+        endThink >= 0 ? endThink : static_cast<int32_t>(tokenizer.getTokenId("<|content_text|>"))};
+}
+
+bool answerOpensWithMarker(Tokenizer const& tokenizer)
+{
+    auto const id = [&tokenizer](char const* piece) { return static_cast<int32_t>(tokenizer.getTokenId(piece)); };
+    return id("<think>") < 0 && id("<|channel>") < 0 && id("<|content_text|>") >= 0;
 }
 
 bool reasoningClosedInPrompt(std::vector<int32_t> const& promptTokens, std::vector<int32_t> const& startMarkers,
-    std::vector<int32_t> const& endMarkers, bool thinkingEnabled) noexcept
+    std::vector<int32_t> const& endMarkers, bool thinkingEnabled, bool answerOpensWithMarker) noexcept
 {
+    if (answerOpensWithMarker)
+    {
+        return false;
+    }
     auto const present = [](std::vector<int32_t> const& markers) {
         return std::any_of(markers.begin(), markers.end(), [](int32_t id) { return id >= 0; });
     };

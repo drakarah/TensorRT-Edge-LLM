@@ -818,6 +818,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         }
     }
 
+    refreshMemoryMetrics();
+
     // Encoder embedding cache — content-addressed GPU cache for ViT/audio encoder outputs.
     if ((mVisionRunner || mAudioRunner) && contextCacheConfig.encoderEmbeddingCacheBudgetBytes > 0)
     {
@@ -1138,6 +1140,14 @@ void LLMRankRuntime::refreshMemoryMetrics() noexcept
         metrics.hostEmbeddingBytes = HostMemoryAccounting::bytes(HostMemoryCategory::kEmbeddingTable);
         metrics.hostSnapshotBytes = HostMemoryAccounting::bytes(HostMemoryCategory::kSnapshots);
         metrics.hostKvTierBytes = HostMemoryAccounting::bytes(HostMemoryCategory::kKvTier);
+        if (mSwaPrefixCache != nullptr)
+        {
+            metrics.swaPrefixBudgetBytes = static_cast<int64_t>(mSwaPrefixCache->budgetBytes());
+            metrics.swaPrefixUsedBytes = static_cast<int64_t>(mSwaPrefixCache->usedBytes());
+            metrics.swaPrefixHits = mSwaPrefixCache->hits();
+            metrics.swaPrefixLookups = mSwaPrefixCache->lookups();
+            metrics.swaPrefixReusedTokens = mSwaPrefixCache->reusedTokens();
+        }
         expertCacheInfo(metrics);
         std::lock_guard<std::mutex> lock(mMemoryMetricsMutex);
         mMemoryMetrics = metrics;
@@ -2326,8 +2336,8 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         context.guidedReasoningEnded.assign(static_cast<size_t>(activeBatchSize), 0);
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            context.guidedReasoningEnded[i] = static_cast<int8_t>(reasoningClosedInPrompt(
-                context.rawBatchedInputIds[i], reasoningStartIds, reasoningEndIds, request.enableThinking));
+            context.guidedReasoningEnded[i] = static_cast<int8_t>(reasoningClosedInPrompt(context.rawBatchedInputIds[i],
+                reasoningStartIds, reasoningEndIds, request.enableThinking, answerOpensWithMarker(*mTokenizer)));
         }
 
         mGuidedDecoder.reset();

@@ -30,6 +30,7 @@ from .errors import ServerError
 from .protocol import (ChatCompletionRequest, ModelCard, ModelList,
 
                        SpeechRequest, TranscriptionResponse)
+from ..runtime.memory_stats import runtime_memory
 from .stats_page import PAGE as _STATS_PAGE
 
 try:  # optional profiler annotations (no-ops unless a profiler is attached)
@@ -97,6 +98,23 @@ class _ReleasingStreamingResponse(StreamingResponse):
             self._prepared_stream.release()
 
 
+def _prefix_cache_info(llm) -> Optional[dict]:
+    """Bounded-SWA prefix cache figures (MiB and counters), or None when the runtime has no such cache."""
+    try:
+        runtime = runtime_memory(llm)
+    except Exception:  # a binding older than the server
+        return None
+    if not runtime or "swa_prefix_budget_mib" not in runtime:
+        return None
+    return {
+        "budget_mib": runtime["swa_prefix_budget_mib"],
+        "used_mib": runtime["swa_prefix_used_mib"],
+        "hits": runtime["swa_prefix_hits"],
+        "lookups": runtime["swa_prefix_lookups"],
+        "reused_tokens": runtime["swa_prefix_reused_tokens"],
+    }
+
+
 @router.get("/health")
 async def health(request: Request):
     client = request.app.state.engine_client
@@ -105,6 +123,7 @@ async def health(request: Request):
     getter = getattr(client.llm, "get_scheduling_metrics", None)
     if getter is not None:
         scheduling = getter()
+    prefix_cache = _prefix_cache_info(client.llm)
     return {
         "status": "healthy",
         "model": client.model_name,
@@ -124,7 +143,8 @@ async def health(request: Request):
             "kv_cache_dtype": caps.kv_cache_dtype,
             "speculative_decoding": caps.speculative_decoding,
             "speculative_method": caps.speculative_method,
-            "context_reuse": caps.context_reuse,
+            "context_reuse": caps.context_reuse or prefix_cache is not None,
+            "prefix_cache": prefix_cache,
             "in_flight_batching": caps.in_flight_batching,
         },
     }

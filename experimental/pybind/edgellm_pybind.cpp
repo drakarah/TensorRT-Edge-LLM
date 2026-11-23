@@ -806,7 +806,12 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("host_embedding_bytes", &RuntimeMemoryMetrics::hostEmbeddingBytes)
         .def_readonly("host_snapshot_bytes", &RuntimeMemoryMetrics::hostSnapshotBytes)
         .def_readonly("host_kv_tier_bytes", &RuntimeMemoryMetrics::hostKvTierBytes)
-        .def_readonly("host_kv_tier_used_bytes", &RuntimeMemoryMetrics::hostKvTierUsedBytes);
+        .def_readonly("host_kv_tier_used_bytes", &RuntimeMemoryMetrics::hostKvTierUsedBytes)
+        .def_readonly("swa_prefix_budget_bytes", &RuntimeMemoryMetrics::swaPrefixBudgetBytes)
+        .def_readonly("swa_prefix_used_bytes", &RuntimeMemoryMetrics::swaPrefixUsedBytes)
+        .def_readonly("swa_prefix_hits", &RuntimeMemoryMetrics::swaPrefixHits)
+        .def_readonly("swa_prefix_lookups", &RuntimeMemoryMetrics::swaPrefixLookups)
+        .def_readonly("swa_prefix_reused_tokens", &RuntimeMemoryMetrics::swaPrefixReusedTokens);
 
     py::class_<ContextCacheConfig>(m, "ContextCacheConfig")
         .def(py::init<>())

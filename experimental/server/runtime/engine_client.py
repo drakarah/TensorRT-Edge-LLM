@@ -468,7 +468,13 @@ class EngineClient:
         runtime = getattr(self._llm, "_runtime", None)
         getter = getattr(runtime, "get_context_cache_metrics", None)
         metrics = getter() if getter is not None else None
-        return None if metrics is None else int(metrics.reused_tokens)
+        if metrics is not None:
+            return int(metrics.reused_tokens)
+        # bounded-SWA engines reuse through the prefix cache, which has its own counter
+        memory = getattr(runtime, "get_memory_metrics", None)
+        snapshot = memory() if memory is not None else None
+        reused = getattr(snapshot, "swa_prefix_reused_tokens", -1)
+        return int(reused) if snapshot is not None and reused >= 0 else None
 
     @property
     def llm(self) -> Union[LLM, TTS]:
