@@ -64,6 +64,7 @@ _OPERATION_CREATORS = {
     "inkling2_attention": "Inkling2AttentionPlugin",
     "inkling2_short_conv": "Inkling2ShortConvPlugin",
     "fp16_moe": "Fp16MoePlugin",
+    "fp8_linear": "Fp8LinearPlugin",
     "int4_groupwise_gemm": "Int4GroupwiseGemmPlugin",
     "int4_groupwise_gemm_v2": "Int4GroupwiseGemmPluginV2",
     "int4_moe": "Int4MoePlugin",

@@ -37,6 +37,7 @@ from .core import (
     topk, unwrap)
 # isort: on
 from .distributed import all_reduce
+from .fp8 import fp8_linear
 from .moe import (MoeActivation, MoeRouting, fp16_moe, int4_moe, nvfp4_a16_moe,
                   nvfp4_moe)
 from .recurrent import (causal_conv1d, gated_delta_net, inkling2_short_conv,
@@ -67,6 +68,7 @@ __all__ = [
     "empty_sequence",
     "fourier_features",
     "fp16_moe",
+    "fp8_linear",
     "fused_nvfp4_gemm_all_reduce",
     "gated_delta_net",
     "gather_last_tokens",
