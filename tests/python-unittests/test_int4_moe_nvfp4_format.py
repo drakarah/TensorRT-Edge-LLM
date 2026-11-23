@@ -44,9 +44,11 @@ def require_plugin_test_dependencies(request):
     pytest.skip(reason)
 
 
-def _fields(case, weight_format=1, group=16, route_mode=0):
+def _fields(case, weight_format=1, group=16, route_mode=0, prefetch_self=0, prefetch_next=0):
     return [
         pf_int32("route_mode", route_mode),
+        pf_int32("prefetch_self", prefetch_self),
+        pf_int32("prefetch_next", prefetch_next),
         pf_int32("num_experts", case.num_experts),
         pf_int32("top_k", case.top_k),
         pf_int32("hidden_size", case.hidden_size),
@@ -59,7 +61,7 @@ def _fields(case, weight_format=1, group=16, route_mode=0):
     ]
 
 
-def _specs(case, words: bool, route: bool = False):
+def _specs(case, words: bool, route: bool = False, pred_dtype=trt.float32, pred_experts=None, prefetch=(0, 0)):
     e, h, i = case.num_experts, case.hidden_size, case.moe_inter_size
     qtype = trt.int32 if words else trt.int8
     div = 4 if words else 1
@@ -72,7 +74,9 @@ def _specs(case, words: bool, route: bool = False):
         ("fc_down_scales", qtype, (e, i // 16, h // div)),
         ("fc1_global_scales", trt.float16, (e, )),
         ("fc2_global_scales", trt.float16, (e, )),
-    ] + ([("route_bias", trt.float32, (e, ))] if route else [])
+    ] + ([("pred_self", pred_dtype, (-1, pred_experts or e))] if prefetch[0] else []) + (
+        [("pred_next", pred_dtype, (-1, pred_experts or e))] if prefetch[1] else []) + (
+            [("route_bias", trt.float32, (e, ))] if route else [])
 
 
 def _profiles(specs):
@@ -86,14 +90,14 @@ def _profiles(specs):
     return profiles
 
 
-def _build(case, words=False, route=False, **kw):
+def _build(case, words=False, route=False, prefetch=(0, 0), **kw):
     runner = PluginRunner()
-    specs = _specs(case, words, route)
+    specs = _specs(case, words, route, prefetch=prefetch)
     runner.build(input_specs=specs,
                  output_names=["output"],
                  plugin_name="Int4MoePlugin",
                  plugin_version="1",
-                 plugin_fields=_fields(case, **kw),
+                 plugin_fields=_fields(case, prefetch_self=prefetch[0], prefetch_next=prefetch[1], **kw),
                  profiles=_profiles(specs),
                  expect_unsupported=kw.get("expect_unsupported", False)
                  if False else False)
@@ -208,3 +212,54 @@ def test_sigmoid_routing_rejects_missing_bias_input_and_bad_mode():
         with pytest.raises((PluginUnsupportedError, RuntimeError)):
             runner.build(input_specs=specs, output_names=["output"], plugin_name="Int4MoePlugin", plugin_version="1",
                          plugin_fields=_fields(case, **kw), profiles=_profiles(specs), expect_unsupported=True)
+
+
+@pytest.mark.parametrize("prefetch", [(1, 0), (0, 1), (1, 1)], ids=["self", "next", "both"])
+def test_prefetch_inputs_do_not_change_the_result_while_the_prefetch_is_off(prefetch):
+    """The prediction inputs are ordering inputs: without EDGELLM_MOE_PREFETCH (and without the expert cache) the plugin must produce exactly what it produces without them."""
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("The Marlin kernels need SM80 or newer")
+    case = _INKLING_CASE
+    fixture = _make_qwen_fixture(torch.float16, case)
+    packed = {k: v.to("cuda").contiguous() for k, v in fixture.packed_inputs.items()}
+    for key in ("fc1_qweights", "fc1_block_scales", "fc2_qweights", "fc2_block_scales"):
+        packed[key] = packed[key].view(torch.int32)
+    generator = torch.Generator().manual_seed(77)
+    num_tokens = 3
+    hidden = (torch.randn((num_tokens, case.hidden_size), generator=generator) * 0.25).half().cuda()
+    router = torch.randn((num_tokens, case.num_experts), generator=generator).cuda()
+    bias = (torch.randn((case.num_experts, ), generator=generator) * 0.01).cuda()
+    inputs = {
+        "router_logits": router,
+        "hidden_states": hidden,
+        "fc_gate_up_qweights": packed["fc1_qweights"],
+        "fc_gate_up_scales": packed["fc1_block_scales"],
+        "fc_down_qweights": packed["fc2_qweights"],
+        "fc_down_scales": packed["fc2_block_scales"],
+        "fc1_global_scales": packed["fc1_global_scales"],
+        "fc2_global_scales": packed["fc2_global_scales"],
+        "route_bias": bias,
+    }
+    plain = torch.empty_like(hidden)
+    _build(case, words=True, route=True, route_mode=1).execute({**inputs, "output": plain})
+    with_inputs = torch.empty_like(hidden)
+    # a prediction that points at other experts than the router: it must not leak into the result
+    garbage = torch.randn((num_tokens, case.num_experts), generator=generator).cuda()
+    extra = {}
+    if prefetch[0]:
+        extra["pred_self"] = garbage
+    if prefetch[1]:
+        extra["pred_next"] = garbage.flip(-1).contiguous()
+    _build(case, words=True, route=True, prefetch=prefetch, route_mode=1).execute({**inputs, **extra, "output": with_inputs})
+    assert bool(torch.equal(plain, with_inputs))
+
+
+@pytest.mark.parametrize("bad", ["dtype", "experts"])
+def test_prefetch_inputs_reject_a_wrong_type_or_width(bad):
+    case = _INKLING_CASE
+    kwargs = {"pred_dtype": trt.float16} if bad == "dtype" else {"pred_experts": case.num_experts + 8}
+    specs = _specs(case, True, True, prefetch=(1, 0), **kwargs)
+    runner = PluginRunner()
+    with pytest.raises((PluginUnsupportedError, RuntimeError)):
+        runner.build(input_specs=specs, output_names=["output"], plugin_name="Int4MoePlugin", plugin_version="1",
+                     plugin_fields=_fields(case, route_mode=1, prefetch_self=1), profiles=_profiles(specs), expect_unsupported=True)
