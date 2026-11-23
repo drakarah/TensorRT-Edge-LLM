@@ -1786,9 +1786,14 @@ bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
     size_t const hidden = static_cast<size_t>(mHiddenSize);
     size_t const inter = static_cast<size_t>(mMoeInterSize);
     size_t const n1 = 2 * inter;
-    size_t const expected[4] = {(hidden / 16) * 2 * n1 * 4, (hidden / 128) * n1 * 2, (inter / 16) * 2 * hidden * 4, (inter / 128) * hidden * 2};
-    bool ok = mActivationType != kACTIVATION_GEGLU && mGateSoftcap <= 0.0F && mUpSoftcap <= 0.0F
-        && cpumiss::shapeSupported(mHiddenSize, mMoeInterSize, mQuantizationGroupSize, kernel::kCpuMissMaxHidden);
+    bool const fp4 = mWeightFormat == kWeightFormatNvfp4;
+    // int4: [K/16][2N] int32 words and [K/128][N] fp16 scales; NVFP4: gate | up concatenated (4 * inter words per row), [K/16][N] E4M3 scale bytes
+    size_t const expected[4] = {fp4 ? (hidden / 16) * 4 * inter * 4 : (hidden / 16) * 2 * n1 * 4, fp4 ? (hidden / 16) * n1 : (hidden / 128) * n1 * 2,
+        (inter / 16) * 2 * hidden * 4, fp4 ? (inter / 16) * hidden : (inter / 128) * hidden * 2};
+    bool softcapOk = fp4 || (mGateSoftcap <= 0.0F && mUpSoftcap <= 0.0F);
+    bool ok = mActivationType != kACTIVATION_GEGLU && softcapOk
+        && (fp4 ? cpumiss::shapeSupportedFp4(mHiddenSize, mMoeInterSize, kernel::kCpuMissMaxHidden)
+                : cpumiss::shapeSupported(mHiddenSize, mMoeInterSize, mQuantizationGroupSize, kernel::kCpuMissMaxHidden));
     for (int32_t i = 0; i < 4; ++i)
     {
         ok = ok && mCacheBytesPerExpert[i] == expected[i];
@@ -1838,6 +1843,24 @@ bool Int4MoePlugin::prepareCpuMiss(void const* const* inputs) noexcept
     weights.dnSBytes = mCacheBytesPerExpert[3];
     weights.hidden = mHiddenSize;
     weights.inter = mMoeInterSize;
+    if (fp4)
+    {
+        // the global scales hold multiplier * 2^7 (Marlin's skip-flop factor) and are unified per layer, so the first entry is the layer's
+        half globals[2]{};
+        bool const read = cudaMemcpy(&globals[0], inputs[6], sizeof(half), cudaMemcpyDefault) == cudaSuccess
+            && cudaMemcpy(&globals[1], inputs[7], sizeof(half), cudaMemcpyDefault) == cudaSuccess;
+        cudaGetLastError();
+        if (!read)
+        {
+            mCpuMissReady = false;
+            return false;
+        }
+        weights.fp4 = true;
+        weights.guMult = __half2float(globals[0]) / 128.0F;
+        weights.dnMult = __half2float(globals[1]) / 128.0F;
+        weights.gateCap = mGateSoftcap;
+        weights.upCap = mUpSoftcap;
+    }
     cpumiss::Pool::get().registerLayer(layerId, weights);
     return true;
 }
@@ -2486,7 +2509,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         }
         CUDA_CHECK(cudaGetLastError());
 
-        bool const cpuMiss = useCache && mWeightFormat == kWeightFormatInt4 && cpuMissFromEnv() && numTokens <= kernel::kCpuMissMaxTokens
+        bool const cpuMiss = useCache && cpuMissFromEnv() && numTokens <= kernel::kCpuMissMaxTokens
             && numTokens * mTopK <= kernel::kCpuMissMaxSlots && tileTokens == numTokens && prepareCpuMiss(inputs);
         if (useCache && hostRoundTripProbeFromEnv())
         {
