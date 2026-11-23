@@ -215,3 +215,86 @@ def test_stats_page_draws_the_memory_bars(tmp_path, monkeypatch):
                    "Embedding table", "Reuse snapshots",
                    "Host KV tier, holding sessions", "--s5", "--s6"):
         assert needle in page
+
+
+_SWA = dict(swa_prefix_budget_bytes=6144 * _MIB,
+            swa_prefix_used_bytes=1500 * _MIB,
+            swa_prefix_hits=7,
+            swa_prefix_lookups=9,
+            swa_prefix_reused_tokens=123456)
+
+
+def test_prefix_cache_figures_reach_the_runtime_memory_dict():
+    out = memory_stats.runtime_memory(_llm(_metrics(**_SWA)))
+    assert out["swa_prefix_budget_mib"] == 6144
+    assert out["swa_prefix_used_mib"] == 1500
+    assert out["swa_prefix_hits"] == 7
+    assert out["swa_prefix_lookups"] == 9
+    assert out["swa_prefix_reused_tokens"] == 123456
+
+
+def test_runtime_without_a_prefix_cache_reports_no_prefix_fields():
+    unset = {name: -1 for name in _SWA}
+    out = memory_stats.runtime_memory(_llm(_metrics(**unset)))
+    assert not any(name.startswith("swa_prefix_") for name in out)
+
+
+def test_binding_without_prefix_cache_fields_still_works():
+    out = memory_stats.runtime_memory(_llm(_metrics()))
+    assert out is not None
+    assert not any(name.startswith("swa_prefix_") for name in out)
+
+
+def _health_client(tmp_path, metrics, generic=None):
+    from fastapi.testclient import TestClient
+    llm = _FakeLLM(tmp_path)
+    llm._runtime = types.SimpleNamespace(
+        get_memory_metrics=lambda: metrics,
+        get_context_cache_metrics=lambda: generic)
+    return TestClient(_create_app(llm)), llm
+
+
+def test_health_reports_context_reuse_when_the_prefix_cache_exists(tmp_path):
+    client, _ = _health_client(tmp_path, _metrics(**_SWA))
+    caps = client.get("/health").json()["capabilities"]
+    assert caps["context_reuse"] is True
+    assert caps["prefix_cache"] == {
+        "budget_mib": 6144,
+        "used_mib": 1500,
+        "hits": 7,
+        "lookups": 9,
+        "reused_tokens": 123456
+    }
+
+
+def test_health_without_any_reuse_stays_off(tmp_path):
+    client, _ = _health_client(
+        tmp_path, _metrics(**{name: -1
+                              for name in _SWA}))
+    caps = client.get("/health").json()["capabilities"]
+    assert caps["context_reuse"] is False
+    assert caps["prefix_cache"] is None
+
+
+def test_health_survives_invalid_runtime_metrics(tmp_path):
+    client, _ = _health_client(tmp_path, _metrics(valid=False, **_SWA))
+    caps = client.get("/health").json()["capabilities"]
+    assert caps["context_reuse"] is False
+    assert caps["prefix_cache"] is None
+
+
+def test_reused_tokens_fall_back_to_the_prefix_cache_counter(tmp_path):
+    client, llm = _health_client(tmp_path, _metrics(**_SWA))
+    engine = client.app.state.engine_client
+    assert engine._reused_tokens() == 123456
+    llm._runtime.get_memory_metrics = lambda: _metrics(
+        **{
+            **_SWA, "swa_prefix_reused_tokens": -1
+        })
+    assert engine._reused_tokens() is None
+
+
+def test_generic_context_cache_counter_wins_over_the_prefix_cache(tmp_path):
+    generic = types.SimpleNamespace(reused_tokens=42)
+    client, _ = _health_client(tmp_path, _metrics(**_SWA), generic=generic)
+    assert client.app.state.engine_client._reused_tokens() == 42

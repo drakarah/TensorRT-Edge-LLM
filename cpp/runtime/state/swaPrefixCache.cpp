@@ -112,6 +112,16 @@ int64_t SwaPrefixCache::lookups() const noexcept
     return mLookups;
 }
 
+size_t SwaPrefixCache::budgetBytes() const noexcept
+{
+    return mBudgetBytes;
+}
+
+int64_t SwaPrefixCache::reusedTokens() const noexcept
+{
+    return mReusedTokens;
+}
+
 void SwaPrefixCache::evictFor(size_t bytes)
 {
     while (!mEntries.empty() && mUsedBytes + bytes > mBudgetBytes)
@@ -276,6 +286,7 @@ void SwaPrefixCache::restore(
     auto const* entry = static_cast<Entry const*>(hit.handle);
     ELLM_CHECK(entry != nullptr && restoreLength > 0 && restoreLength <= static_cast<int32_t>(entry->tokens.size()),
         "SwaPrefixCache restore length is outside the snapshot");
+    mReusedTokens += restoreLength;
     int32_t const maxPagesPerSeq = mBasePageTable.maxPagesPerSeq();
     int32_t const restorePages = (restoreLength + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE;
     char const* const host = static_cast<char const*>(entry->host);

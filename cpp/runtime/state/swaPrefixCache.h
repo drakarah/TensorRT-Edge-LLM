@@ -79,6 +79,9 @@ public:
     size_t usedBytes() const noexcept;
     int64_t hits() const noexcept;
     int64_t lookups() const noexcept;
+    size_t budgetBytes() const noexcept;
+    //! Prompt tokens served from snapshots instead of being prefilled, summed over all restores.
+    int64_t reusedTokens() const noexcept;
 
 private:
     struct Entry;
@@ -91,6 +94,7 @@ private:
     size_t mUsedBytes{};
     int64_t mHits{};
     int64_t mLookups{};
+    int64_t mReusedTokens{};
     std::list<std::unique_ptr<Entry>> mEntries; //!< Front = most recently used.
 };
 

@@ -59,6 +59,12 @@ struct RuntimeMemoryMetrics
     int64_t hostSnapshotBytes{};
     int64_t hostKvTierBytes{};
     int64_t hostKvTierUsedBytes{};
+    //! Bounded-SWA prefix cache (host snapshots); -1 when the runtime has none. Reused tokens and lookups are cumulative.
+    int64_t swaPrefixBudgetBytes{-1};
+    int64_t swaPrefixUsedBytes{-1};
+    int64_t swaPrefixHits{-1};
+    int64_t swaPrefixLookups{-1};
+    int64_t swaPrefixReusedTokens{-1};
 };
 
 } // namespace rt

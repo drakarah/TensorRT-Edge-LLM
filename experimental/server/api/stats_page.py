@@ -248,6 +248,13 @@ function renderMemory(mem) {
       const box = document.createElement("div");
       for (const [name, free, cap, col] of snaps) { const holder = document.createElement("div"); const t = document.createElement("div"); stack(t, [{ label: name + " in use", value: cap - free, text: f0(cap - free) + " of " + f0(cap), color: c(col) }, { label: "Free", value: free, text: f0(free), color: c("--grid") }], cap); holder.appendChild(t); box.appendChild(holder); }
       $("#snaps").replaceChildren(box);
+    } else if (r.swa_prefix_budget_mib > 0) {
+      const t = document.createElement("div");
+      const free = r.swa_prefix_budget_mib - r.swa_prefix_used_mib;
+      stack(t, [{ label: "Prefix snapshots in use", value: r.swa_prefix_used_mib, text: mib(r.swa_prefix_used_mib) + " of " + mib(r.swa_prefix_budget_mib), color: c("--s1") }, { label: "Free", value: free, text: mib(free), color: c("--grid") }], r.swa_prefix_budget_mib);
+      const note = document.createElement("div");
+      note.textContent = f0(r.swa_prefix_hits) + " hits of " + f0(r.swa_prefix_lookups) + " lookups, " + f0(r.swa_prefix_reused_tokens) + " prompt tokens reused";
+      $("#snaps").replaceChildren(t, note);
     } else $("#snaps").textContent = "Context reuse is off, or the model has no snapshots.";
   } else for (const id of ["#kv", "#experts", "#snaps"]) $(id).textContent = "Available after the first request.";
   if (h && r && r.host_expert_weights_mib !== undefined) {
