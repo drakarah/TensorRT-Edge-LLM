@@ -21,6 +21,7 @@
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
+#include "common/stringUtils.h"
 #include "common/trtUtils.h"
 #include "profiling/nvtx_wrapper.h"
 #include "runtime/exec/engineExecutor.h"
@@ -380,12 +381,13 @@ bool keepSidecarOnHost(std::string const& file)
     return pattern != nullptr && *pattern != '\0' && file.find(pattern) != std::string::npos;
 }
 
-//! EDGELLM_HOST_CHECKPOINT_WEIGHTS=<substring>: checkpoint bindings whose engine name contains the substring are
-//! materialized into pinned host memory (read over PCIe through UVA) instead of the device weight arena.
+//! EDGELLM_HOST_CHECKPOINT_WEIGHTS=<substring>[,<substring>...]: checkpoint bindings whose engine name contains any of
+//! the substrings are materialized into pinned host memory (read over PCIe through UVA) instead of the device weight
+//! arena.
 bool keepBindingOnHost(std::string const& engineName)
 {
-    char const* pattern = std::getenv("EDGELLM_HOST_CHECKPOINT_WEIGHTS");
-    return pattern != nullptr && *pattern != '\0' && engineName.find(pattern) != std::string::npos;
+    char const* patterns = std::getenv("EDGELLM_HOST_CHECKPOINT_WEIGHTS");
+    return patterns != nullptr && format::containsAnySubstring(engineName, patterns);
 }
 
 void loadSidecars(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, Json const& config,

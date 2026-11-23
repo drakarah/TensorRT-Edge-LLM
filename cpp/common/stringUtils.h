@@ -34,5 +34,10 @@ namespace format
  */
 std::string fmtstr(char const* format, ...);
 
+/**
+ * @brief Whether text contains any of the comma-separated substrings; empty entries never match
+ */
+bool containsAnySubstring(std::string const& text, std::string const& commaSeparatedSubstrings);
+
 } // namespace format
 } // namespace trt_edgellm
