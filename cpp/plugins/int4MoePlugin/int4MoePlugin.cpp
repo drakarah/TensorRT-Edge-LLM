@@ -2601,10 +2601,26 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
 
         // Chunked prefill (EDGELLM_MOE_PREFILL_CHUNK): the same GEMM once per chunk of experts, weights from the ring, routing arrays sliced per chunk.
         // phase 0 = gate-up, 1 = down; the weight tensors are the chunk's slice with the chunk's expert count as leading dimension.
-        if (mWeightFormat == kWeightFormatNvfp4 && (chunkMode || routedMode))
+        bool const fp4Chunks = mWeightFormat == kWeightFormatNvfp4;
+        // NVFP4 chunks: same ring (copies are byte ranges), scales are INT8 [count, K / 16, N] and the per-layer global scale is not chunked
+        auto chunkGemm = [&](rt::Tensor const& gemmInput, rt::Tensor& gemmOutput, rt::Tensor const& chunkWeights, rt::Tensor const& chunkScales,
+                             rt::Tensor const& chunkSortedIds, rt::Tensor const& chunkExpertIds, rt::Tensor const& chunkNumPost,
+                             rt::Tensor const& gemmTopkWeights, rt::Tensor& marlinWorkspace, int64_t gemmTopK, bool mulTopkWeights, int32_t phase)
         {
-            throw std::runtime_error("Int4MoePlugin: chunked expert prefill is not available for NVFP4 weights");
-        }
+            if (fp4Chunks)
+            {
+                // per-layer unified global scale: any chunk-sized prefix is valid
+                rt::Tensor global(const_cast<void*>(inputs[phase == 0 ? 6 : 7]), {chunkWeights.getShape()[0]}, rt::DeviceType::kGPU,
+                    nvinfer1::DataType::kHALF);
+                moeNvfp4A16MarlinGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, global, chunkSortedIds, chunkExpertIds, chunkNumPost,
+                    gemmTopkWeights, marlinWorkspace, moeBlockSize, gemmTopK, mulTopkWeights, stream);
+            }
+            else
+            {
+                moeAwqW4A16MarlinGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, chunkSortedIds, chunkExpertIds, chunkNumPost,
+                    gemmTopkWeights, marlinWorkspace, moeBlockSize, gemmTopK, mulTopkWeights, stream);
+            }
+        };
         auto runChunkedGemm = [&](int32_t phase, rt::Tensor const& gemmInput, rt::Tensor& gemmOutput, int64_t kTile, int64_t nOut,
                                   nvinfer1::PluginTensorDesc const& scalesDesc, rt::Tensor const& gemmTopkWeights, int64_t gemmTopK,
                                   bool mulTopkWeights)
@@ -2625,14 +2641,15 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                     {
                         throw std::runtime_error("routed expert ring: task not available");
                     }
-                    rt::Tensor chunkWeights(base + weightsOffset, rt::Coords{count, kTile, nOut}, rt::DeviceType::kGPU, DataType::kINT32);
-                    rt::Tensor chunkScales(base + scalesOffset, rt::Coords{count, scalesDesc.dims.d[1], scalesDesc.dims.d[2]},
-                        rt::DeviceType::kGPU, scalesDesc.type);
+                    rt::Tensor chunkWeights(base + weightsOffset, rt::Coords{count, kTile, nOut * (fp4Chunks && phase == 0 ? 2 : 1)}, rt::DeviceType::kGPU, DataType::kINT32);
+                    rt::Tensor chunkScales(base + scalesOffset,
+                        fp4Chunks ? rt::Coords{count, kTile, phase == 0 ? nOut : nOut / 2} : rt::Coords{count, scalesDesc.dims.d[1], scalesDesc.dims.d[2]},
+                        rt::DeviceType::kGPU, fp4Chunks ? DataType::kINT8 : scalesDesc.type);
                     rt::Tensor chunkSortedIds(chunkSortedIdsPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
                     rt::Tensor chunkExpertIds(chunkExpertIdsPtr, {tileBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
                     rt::Tensor chunkNumPost(chunkNumPostPtr, {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-                    moeAwqW4A16MarlinGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, chunkSortedIds, chunkExpertIds, chunkNumPost,
-                        gemmTopkWeights, marlinWorkspaceTensor, moeBlockSize, gemmTopK, mulTopkWeights, stream);
+                    chunkGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, chunkSortedIds, chunkExpertIds, chunkNumPost, gemmTopkWeights,
+                        marlinWorkspaceTensor, gemmTopK, mulTopkWeights, phase);
                     CUDA_CHECK(cudaGetLastError());
                     routed.release(stream);
                 }
@@ -2653,14 +2670,15 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                     throw std::runtime_error("expert chunk ring: task not available");
                 }
                 int64_t const count = e1 - e0;
-                rt::Tensor chunkWeights(base + weightsOffset, rt::Coords{count, kTile, nOut}, rt::DeviceType::kGPU, DataType::kINT32);
-                rt::Tensor chunkScales(base + scalesOffset, rt::Coords{count, scalesDesc.dims.d[1], scalesDesc.dims.d[2]}, rt::DeviceType::kGPU,
-                    scalesDesc.type);
+                rt::Tensor chunkWeights(base + weightsOffset, rt::Coords{count, kTile, nOut * (fp4Chunks && phase == 0 ? 2 : 1)}, rt::DeviceType::kGPU, DataType::kINT32);
+                rt::Tensor chunkScales(base + scalesOffset,
+                    fp4Chunks ? rt::Coords{count, kTile, phase == 0 ? nOut : nOut / 2} : rt::Coords{count, scalesDesc.dims.d[1], scalesDesc.dims.d[2]},
+                    rt::DeviceType::kGPU, fp4Chunks ? DataType::kINT8 : scalesDesc.type);
                 rt::Tensor chunkSortedIds(chunkSortedIdsPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
                 rt::Tensor chunkExpertIds(chunkExpertIdsPtr, {tileBlocks}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
                 rt::Tensor chunkNumPost(chunkNumPostPtr, {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-                moeAwqW4A16MarlinGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, chunkSortedIds, chunkExpertIds, chunkNumPost,
-                    gemmTopkWeights, marlinWorkspaceTensor, moeBlockSize, gemmTopK, mulTopkWeights, stream);
+                chunkGemm(gemmInput, gemmOutput, chunkWeights, chunkScales, chunkSortedIds, chunkExpertIds, chunkNumPost, gemmTopkWeights,
+                    marlinWorkspaceTensor, gemmTopK, mulTopkWeights, phase);
                 CUDA_CHECK(cudaGetLastError());
                 ring.release(stream);
             }
