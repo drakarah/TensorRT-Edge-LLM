@@ -2300,8 +2300,8 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         context.guidedReasoningEnded.assign(static_cast<size_t>(activeBatchSize), 0);
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            context.guidedReasoningEnded[i] = static_cast<int8_t>(reasoningClosedInPrompt(
-                context.rawBatchedInputIds[i], reasoningStartIds, reasoningEndIds, request.enableThinking));
+            context.guidedReasoningEnded[i] = static_cast<int8_t>(reasoningClosedInPrompt(context.rawBatchedInputIds[i],
+                reasoningStartIds, reasoningEndIds, request.enableThinking, answerOpensWithMarker(*mTokenizer)));
         }
 
         mGuidedDecoder.reset();

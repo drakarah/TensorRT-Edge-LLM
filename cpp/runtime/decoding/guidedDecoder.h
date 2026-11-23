@@ -252,9 +252,15 @@ std::vector<int32_t> reasoningEndMarkers(Tokenizer const& tokenizer);
  * @param thinkingEnabled Whether the request allows a reasoning phase. When the prompt carries no
  *                        marker, a disabled reasoning phase is closed while an enabled phase may
  *                        still be opened by the model.
+ * @param answerOpensWithMarker The model generates the answer-opening marker itself (see answerOpensWithMarker()):
+ *                        the result is always false.
  */
 bool reasoningClosedInPrompt(std::vector<int32_t> const& promptTokens, std::vector<int32_t> const& startMarkers,
-    std::vector<int32_t> const& endMarkers, bool thinkingEnabled) noexcept;
+    std::vector<int32_t> const& endMarkers, bool thinkingEnabled, bool answerOpensWithMarker = false) noexcept;
+
+//! True for a tokenizer whose model opens the answer itself with its own marker token (Inkling 2: `<|content_text|>`), so
+//! the grammar must wait for that marker whether or not thinking is enabled.
+bool answerOpensWithMarker(Tokenizer const& tokenizer);
 
 /*!
  * @brief Constrain one step's logits to the grammar-legal tokens.

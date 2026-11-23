@@ -438,6 +438,26 @@ TEST(GuidedDecodingReasoningGateTest, ModelWithoutMarkersIsNeverGated)
     EXPECT_FALSE(rt::reasoningClosedInPrompt({-1, 7}, {-1, 100}, {-1, 101}, /*thinkingEnabled=*/true));
 }
 
+//! A model that opens the answer itself (Inkling 2) is gated until that marker is generated, with thinking on or off, and
+//! whatever earlier turns of the prompt contain.
+TEST(GuidedDecodingReasoningGateTest, AnswerOpeningMarkerAlwaysGatesTheGrammar)
+{
+    constexpr int32_t kTHINKING = 200008;
+    constexpr int32_t kCONTENT_TEXT = 200004;
+    std::vector<int32_t> const starts{-1, kTHINKING};
+    std::vector<int32_t> const ends{-1, kCONTENT_TEXT};
+    for (bool const thinking : {false, true})
+    {
+        EXPECT_FALSE(rt::reasoningClosedInPrompt({7, 8, 9}, starts, ends, thinking, /*answerOpensWithMarker=*/true));
+        EXPECT_FALSE(rt::reasoningClosedInPrompt({}, starts, ends, thinking, /*answerOpensWithMarker=*/true));
+        // An earlier assistant answer in the history must not read as a closed block.
+        EXPECT_FALSE(
+            rt::reasoningClosedInPrompt({kTHINKING, 5, kCONTENT_TEXT, 6}, starts, ends, thinking, /*answerOpensWithMarker=*/true));
+    }
+    // Models that do not open the answer themselves keep the marker-or-thinking rule.
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({7, 8}, starts, ends, /*thinkingEnabled=*/false));
+}
+
 // ---------------------------------------------------------------- GuidedDecoder lifecycle
 
 //! A tiny real tokenizer: enough vocabulary to express `{"a":1}` plus an EOS, so the grammar
