@@ -108,6 +108,7 @@ private:
     // resource. Individual tensors below are stable, non-owning views into this
     // storage.
     Tensor mWeightStorage{};
+    Tensor mHostWeightStorage{}; // pinned-host arena for checkpoint bindings kept off the device
     std::vector<Tensor> mWeights{};
     //! engine_name -> binding contract of every materialized checkpoint binding (see findSharedWeight).
     std::unordered_map<std::string, std::string> mBindingContracts{};

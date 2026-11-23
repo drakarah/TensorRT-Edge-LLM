@@ -21,6 +21,7 @@
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "runtime/kvCacheManager.h"
+#include "runtime/mambaCacheManager.h"
 #include "runtime/state/kvPageTable.h"
 
 #include <algorithm>
@@ -39,6 +40,8 @@ struct SwaPrefixCache::Entry
     size_t bytes{};
     std::vector<size_t> layerOffsets;        //!< Per-layer byte offset into `host` (SIZE_MAX: layer not stored).
     int32_t globalPages{};                   //!< Pages per plane held for each full-capacity layer.
+    void* hostStates{};                      //!< Pinned recurrent then convolution rows of the slot, layer by layer.
+    size_t stateBytes{};
 };
 
 namespace
@@ -70,8 +73,10 @@ char* vPagePtr(KVCacheManager const& kv, int32_t layer, int64_t kPage)
 
 } // namespace
 
-SwaPrefixCache::SwaPrefixCache(KVCacheManager& kvCache, KVPageTable const& basePageTable, size_t budgetBytes)
+SwaPrefixCache::SwaPrefixCache(
+    KVCacheManager& kvCache, KVPageTable const& basePageTable, size_t budgetBytes, MambaCacheManager* states)
     : mKvCache(kvCache)
+    , mStates(states != nullptr && states->numLayers() > 0 ? states : nullptr)
     , mBasePageTable(basePageTable)
     , mBudgetBytes(budgetBytes)
 {
@@ -84,6 +89,10 @@ SwaPrefixCache::~SwaPrefixCache() noexcept
         if (entry->host != nullptr)
         {
             cudaFreeHost(entry->host);
+        }
+        if (entry->hostStates != nullptr)
+        {
+            cudaFreeHost(entry->hostStates);
         }
     }
 }
@@ -108,8 +117,12 @@ void SwaPrefixCache::evictFor(size_t bytes)
     while (!mEntries.empty() && mUsedBytes + bytes > mBudgetBytes)
     {
         auto& victim = mEntries.back();
-        mUsedBytes -= victim->bytes;
+        mUsedBytes -= victim->bytes + victim->stateBytes;
         cudaFreeHost(victim->host);
+        if (victim->hostStates != nullptr)
+        {
+            cudaFreeHost(victim->hostStates);
+        }
         mEntries.pop_back();
     }
 }
@@ -153,15 +166,46 @@ void SwaPrefixCache::capture(
         total += 2 * pages * pageBytes(mKvCache, layer);
     }
     entry->bytes = total;
-    if (total > mBudgetBytes)
+    size_t const recurrentRow = mStates != nullptr ? static_cast<size_t>(mStates->getRecurrentState(0).getMemoryCapacity())
+            / static_cast<size_t>(mStates->getConfig().maxBatchSize)
+                                                   : 0;
+    size_t const convRow = mStates != nullptr ? static_cast<size_t>(mStates->getConvState(0).getMemoryCapacity())
+            / static_cast<size_t>(mStates->getConfig().maxBatchSize)
+                                              : 0;
+    entry->stateBytes = mStates != nullptr ? static_cast<size_t>(mStates->numLayers()) * (recurrentRow + convRow) : 0;
+    if (total + entry->stateBytes > mBudgetBytes)
     {
         return;
     }
-    evictFor(total);
-    if (cudaMallocHost(&entry->host, total) != cudaSuccess)
+    evictFor(total + entry->stateBytes);
+    if (entry->stateBytes > 0 && cudaMallocHost(&entry->hostStates, entry->stateBytes) != cudaSuccess)
     {
         static_cast<void>(cudaGetLastError());
         return;
+    }
+    if (cudaMallocHost(&entry->host, total) != cudaSuccess)
+    {
+        static_cast<void>(cudaGetLastError());
+        if (entry->hostStates != nullptr)
+        {
+            cudaFreeHost(entry->hostStates);
+        }
+        return;
+    }
+    if (mStates != nullptr)
+    {
+        char* dst = static_cast<char*>(entry->hostStates);
+        for (int32_t layer = 0; layer < mStates->numLayers(); ++layer)
+        {
+            for (Tensor* tensor : {&mStates->getRecurrentState(layer), &mStates->getConvState(layer)})
+            {
+                size_t const row = static_cast<size_t>(tensor->getMemoryCapacity())
+                    / static_cast<size_t>(mStates->getConfig().maxBatchSize);
+                CUDA_CHECK(cudaMemcpyAsync(dst, static_cast<char*>(tensor->rawPointer()) + static_cast<size_t>(slot) * row, row,
+                    cudaMemcpyDeviceToHost, stream));
+                dst += row;
+            }
+        }
     }
 
     int32_t const maxPagesPerSeq = mBasePageTable.maxPagesPerSeq();
@@ -198,7 +242,7 @@ void SwaPrefixCache::capture(
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    mUsedBytes += total;
+    mUsedBytes += total + entry->stateBytes;
     mEntries.push_front(std::move(entry));
 }
 
@@ -270,6 +314,34 @@ void SwaPrefixCache::restore(
                 CUDA_CHECK(cudaMemcpyAsync(kPagePtr(mKvCache, layer, physical), k, pb, cudaMemcpyHostToDevice, stream));
                 CUDA_CHECK(cudaMemcpyAsync(vPagePtr(mKvCache, layer, physical), k + pb, pb, cudaMemcpyHostToDevice, stream));
             }
+        }
+    }
+}
+
+bool SwaPrefixCache::hasStates() const noexcept
+{
+    return mStates != nullptr;
+}
+
+void SwaPrefixCache::restoreStates(Hit const& hit, int32_t slot, cudaStream_t stream)
+{
+    if (mStates == nullptr)
+    {
+        return;
+    }
+    auto const* entry = static_cast<Entry const*>(hit.handle);
+    ELLM_CHECK(entry != nullptr && entry->hostStates != nullptr, "SwaPrefixCache snapshot holds no recurrent state");
+    ELLM_CHECK(slot >= 0 && slot < mStates->getConfig().maxBatchSize, "SwaPrefixCache restore slot is out of range");
+    char const* src = static_cast<char const*>(entry->hostStates);
+    for (int32_t layer = 0; layer < mStates->numLayers(); ++layer)
+    {
+        for (Tensor* tensor : {&mStates->getRecurrentState(layer), &mStates->getConvState(layer)})
+        {
+            size_t const row = static_cast<size_t>(tensor->getMemoryCapacity())
+                / static_cast<size_t>(mStates->getConfig().maxBatchSize);
+            CUDA_CHECK(cudaMemcpyAsync(
+                static_cast<char*>(tensor->rawPointer()) + static_cast<size_t>(slot) * row, src, row, cudaMemcpyHostToDevice, stream));
+            src += row;
         }
     }
 }

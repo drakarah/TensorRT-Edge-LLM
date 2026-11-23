@@ -1574,8 +1574,10 @@ void validateSwaModeBinding(LLMEngineConfig const& config, EngineExecutor const&
         std::string("Missing SWA mode binding (") + engineLabel + "): expected '" + bindingName + "'.");
     ELLM_CHECK(executor.getEngine().getTensorIOMode(bindingName) == nvinfer1::TensorIOMode::kINPUT,
         std::string("SWA mode binding (") + engineLabel + ") must be an input.");
-    ELLM_CHECK(executor.getBindingDataType(bindingName) == nvinfer1::DataType::kINT8,
-        std::string("SWA mode binding (") + engineLabel + ") must have INT8 dtype.");
+    // Shape-only selector, never read: INT32 is accepted for networks that cannot contain INT8 tensors (FP8 Q/DQ)
+    ELLM_CHECK(executor.getBindingDataType(bindingName) == nvinfer1::DataType::kINT8
+            || executor.getBindingDataType(bindingName) == nvinfer1::DataType::kINT32,
+        std::string("SWA mode binding (") + engineLabel + ") must have INT8 or INT32 dtype.");
 
     int32_t const numProfiles = executor.getEngine().getNbOptimizationProfiles();
     for (int32_t profileIdx = 0; profileIdx < numProfiles; ++profileIdx)

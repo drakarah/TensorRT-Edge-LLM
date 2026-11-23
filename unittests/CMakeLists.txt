@@ -157,6 +157,17 @@ edgellm_add_unit_test(
 
 edgellm_add_unit_test(NAME unitTestKernelsMoe DIRS cpp/kernels/moe)
 
+edgellm_add_unit_test(NAME unitTestKernelsInkling2Attention DIRS
+                      cpp/kernels/inkling2Attention)
+
+edgellm_add_unit_test(NAME unitTestKernelsInkling2ShortConv DIRS
+                      cpp/kernels/inkling2ShortConv)
+
+edgellm_add_unit_test(NAME unitTestKernelsInkling2BlockResidual DIRS
+                      cpp/kernels/inkling2BlockResidual)
+
+edgellm_add_unit_test(NAME unitTestKernelsFp8Linear DIRS cpp/kernels/fp8Linear)
+
 # CuTe DSL AOT wrappers lower extended launches through the runtime's
 # _cudaLaunchKernelEx entry point. Intercept it only when MoE grouped-GEMM
 # artifacts (the NVFP4 MoE group or the Thor NVFP4-A16 MoE group) are linked so

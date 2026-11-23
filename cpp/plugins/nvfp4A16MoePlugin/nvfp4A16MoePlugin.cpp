@@ -71,6 +71,7 @@ constexpr char const* kPluginVersion{"1"};
 
 constexpr int32_t kActivationSwiGlu{2};
 constexpr int32_t kActivationRelu2{4};
+constexpr int32_t kActivationSoftcapSwiGlu{6};
 constexpr int32_t kRoutingSoftmaxTopk{0};
 constexpr int32_t kRoutingSigmoidGroupTopk{1};
 constexpr int32_t kNvfp4GroupSize{16};
@@ -95,7 +96,8 @@ constexpr int32_t kNbPluginFields{11};
 
 int32_t getFc1OutDim(int32_t moeInterSize, int32_t activationType)
 {
-    return activationType == kActivationSwiGlu ? 2 * moeInterSize : moeInterSize;
+    return (activationType == kActivationSwiGlu || activationType == kActivationSoftcapSwiGlu) ? 2 * moeInterSize
+                                                                                               : moeInterSize;
 }
 
 bool getTokenCount(Dims const& hidden, int32_t hiddenSize, int64_t& tokenCount) noexcept
@@ -236,7 +238,7 @@ REGISTER_TENSORRT_PLUGIN(Nvfp4A16MoePluginCreator);
 
 Nvfp4A16MoePlugin::Nvfp4A16MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize,
     int32_t moeInterSize, int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb,
-    float routedScalingFactor, int32_t routingMode, int32_t maxRoutedRows)
+    float routedScalingFactor, int32_t routingMode, int32_t maxRoutedRows, float gateSoftcap, float upSoftcap)
     : mLayerName(name)
     , mNumExperts(numExperts)
     , mTopK(topK)
@@ -249,6 +251,8 @@ Nvfp4A16MoePlugin::Nvfp4A16MoePlugin(std::string const& name, int32_t numExperts
     , mRoutedScalingFactor(routedScalingFactor)
     , mRoutingMode(routingMode)
     , mMaxRoutedRows(maxRoutedRows)
+    , mGateSoftcap(gateSoftcap)
+    , mUpSoftcap(upSoftcap)
 {
     validateAttributes();
 }
@@ -339,6 +343,15 @@ Nvfp4A16MoePlugin::Nvfp4A16MoePlugin(std::string const& name, PluginFieldCollect
         {
             mMaxRoutedRows = readIntField(field, kFieldMaxRoutedRows);
         }
+        else if (fieldName == "gate_softcap" || fieldName == "up_softcap")
+        {
+            // Optional attributes: only softcapped SwiGLU reads them.
+            if (field.type != PluginFieldType::kFLOAT32 || field.length != 1 || field.data == nullptr)
+            {
+                throw std::invalid_argument("Nvfp4A16MoePlugin: " + fieldName + " must be one FLOAT32 value");
+            }
+            (fieldName == "gate_softcap" ? mGateSoftcap : mUpSoftcap) = *static_cast<float const*>(field.data);
+        }
         else
         {
             throw std::invalid_argument("Nvfp4A16MoePlugin: unknown plugin attribute " + fieldName);
@@ -373,8 +386,14 @@ void Nvfp4A16MoePlugin::validateAttributes() const
     {
         throw std::invalid_argument("Nvfp4A16MoePlugin: moe_inter_size must be positive");
     }
-    if (mActivationType == kActivationSwiGlu)
+    if (mActivationType == kActivationSwiGlu || mActivationType == kActivationSoftcapSwiGlu)
     {
+        if (mActivationType == kActivationSoftcapSwiGlu
+            && !(std::isfinite(mGateSoftcap) && mGateSoftcap > 0.0F && std::isfinite(mUpSoftcap) && mUpSoftcap > 0.0F))
+        {
+            throw std::invalid_argument(
+                "Nvfp4A16MoePlugin: softcapped SwiGLU requires finite positive gate_softcap and up_softcap");
+        }
         if (mMoeInterSize % 64 != 0 || mMoeInterSize > std::numeric_limits<int32_t>::max() / 2)
         {
             throw std::invalid_argument(
@@ -446,7 +465,8 @@ IPluginV3* Nvfp4A16MoePlugin::clone() noexcept
     try
     {
         auto* plugin = new Nvfp4A16MoePlugin(mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize,
-            mActivationType, mNGroup, mTopkGroup, mNormTopkProb, mRoutedScalingFactor, mRoutingMode, mMaxRoutedRows);
+            mActivationType, mNGroup, mTopkGroup, mNormTopkProb, mRoutedScalingFactor, mRoutingMode, mMaxRoutedRows,
+            mGateSoftcap, mUpSoftcap);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -929,7 +949,8 @@ int32_t Nvfp4A16MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTens
             activationOutput, {totalSlots, mMoeInterSize}, DeviceType::kGPU, activationDataType);
         {
             NVTX_SCOPED_RANGE(nvtx_activation, "Nvfp4A16MoePlugin::activation", nvtx_colors::GREEN);
-            moeActivation(fc1OutputTensor, activationOutputTensor, totalSlots, mMoeInterSize, mActivationType, stream);
+            moeActivation(fc1OutputTensor, activationOutputTensor, totalSlots, mMoeInterSize, mActivationType, stream,
+                mGateSoftcap, mUpSoftcap);
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -1055,6 +1076,8 @@ PluginFieldCollection const* Nvfp4A16MoePlugin::getFieldsToSerialize() noexcept
         mDataToSerialize.emplace_back("routed_scaling_factor", &mRoutedScalingFactor, PluginFieldType::kFLOAT32, 1);
         mDataToSerialize.emplace_back("routing_mode", &mRoutingMode, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("max_routed_rows", &mMaxRoutedRows, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("gate_softcap", &mGateSoftcap, PluginFieldType::kFLOAT32, 1);
+        mDataToSerialize.emplace_back("up_softcap", &mUpSoftcap, PluginFieldType::kFLOAT32, 1);
         mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
         mFCToSerialize.fields = mDataToSerialize.data();
         return &mFCToSerialize;
@@ -1083,6 +1106,8 @@ Nvfp4A16MoePluginCreator::Nvfp4A16MoePluginCreator()
     mPluginAttributes.emplace_back("routed_scaling_factor", nullptr, PluginFieldType::kFLOAT32, 1);
     mPluginAttributes.emplace_back("routing_mode", nullptr, PluginFieldType::kINT32, 1);
     mPluginAttributes.emplace_back("max_routed_rows", nullptr, PluginFieldType::kINT32, 1);
+    mPluginAttributes.emplace_back("gate_softcap", nullptr, PluginFieldType::kFLOAT32, 1);
+    mPluginAttributes.emplace_back("up_softcap", nullptr, PluginFieldType::kFLOAT32, 1);
 
     mFieldCollection.nbFields = static_cast<int32_t>(mPluginAttributes.size());
     mFieldCollection.fields = mPluginAttributes.data();

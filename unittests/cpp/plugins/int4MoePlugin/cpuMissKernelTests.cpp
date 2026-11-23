@@ -18,6 +18,7 @@
 // The CPU path that computes the experts missing from the GPU cache: int4 weights in the Marlin layout, fp32 or int8 activations, AVX2 / AVX-VNNI.
 // The fixtures are packed by the exporter's own Marlin packer; the reference is the dense float64 product.
 #include "cpuMissFixture.inc"
+#include "cpuMissFixtureFp4.inc"
 #include "cpuMissFixtureMinimal.inc"
 #include "cpuMissFixtureThreeGroups.inc"
 #include "plugins/int4MoePlugin/cpuMissKernel.h"
@@ -356,6 +357,110 @@ TEST(CpuMissKernelTest, DISABLED_Int8PathPropagatesNonFiniteActivations)
     EXPECT_FALSE(allFinite(runInt8(f, x.data())));
 }
 
+
+TEST(CpuMissKernelTest, Fp4GemvMatchesTheDenseFloat64ResultOfTheExportersPacker)
+{
+    if (!haveAvx2())
+    {
+        GTEST_SKIP() << "needs AVX2, FMA and F16C";
+    }
+    using namespace cpuMissFixtureFp4;
+    // the stored global scale is multiplier * 2^7 in fp16 (Marlin's skip-flop factor)
+    int32_t const bits = kGlobalBits;
+    float const half = std::ldexp(1.0F + static_cast<float>(bits & 0x3FF) / 1024.0F, ((bits >> 10) & 0x1F) - 15) * ((bits & 0x8000) != 0 ? -1.0F : 1.0F);
+    float const mult = half / 128.0F; // normal fp16 values only
+    std::vector<float> out(kN);
+    for (int32_t nt = 0; nt < kN / 64; ++nt)
+    {
+        gemvTileFp4(tables(), fp4Tables(), kWeights, 2 * static_cast<size_t>(kN), kScales, static_cast<size_t>(kN), kX, kK, nt, mult, out.data() + 64 * nt);
+    }
+    EXPECT_TRUE(allFinite(out));
+    // the fp16 rounding of the stored multiplier is the only difference to the float64 reference
+    EXPECT_LT(maxRelativeError(out, kY, kN), 1e-3);
+}
+
+TEST(CpuMissKernelTest, Fp4ScaleVectorsFitTheTable)
+{
+    EXPECT_GT(fp4Tables().numScaleVectors, 0);
+    EXPECT_LE(fp4Tables().numScaleVectors, Fp4Tables::kMaxScaleVectors);
+}
+
+TEST(CpuMissKernelTest, Fp4E4m3TableDecodesTheExtremesAndTheSubnormals)
+{
+    Fp4Tables const& f = fp4Tables();
+    EXPECT_FLOAT_EQ(f.e4m3[0x00], 0.0F);
+    EXPECT_FLOAT_EQ(f.e4m3[0x01], std::ldexp(1.0F / 8.0F, -6)); // smallest subnormal
+    EXPECT_FLOAT_EQ(f.e4m3[0x08], std::ldexp(1.0F, -6));        // smallest normal
+    EXPECT_FLOAT_EQ(f.e4m3[0x38], 1.0F);
+    EXPECT_FLOAT_EQ(f.e4m3[0x7E], 448.0F);
+    EXPECT_FLOAT_EQ(f.e4m3[0xB8], -1.0F);
+}
+
+TEST(CpuMissKernelTest, Fp4ShapeSupportBounds)
+{
+    EXPECT_TRUE(shapeSupportedFp4(2304, 1152, 4096));
+    EXPECT_FALSE(shapeSupportedFp4(2304, 1344, 4096)); // intermediate size beyond the pool buffers
+    EXPECT_FALSE(shapeSupportedFp4(2304, 1100, 4096)); // not a multiple of 64
+    EXPECT_FALSE(shapeSupportedFp4(8192, 1152, 4096)); // hidden size beyond the mailbox
+}
+
+TEST(CpuMissKernelTest, Fp4VnniGemvStaysWithinTheActivationQuantisationErrorOfTheDenseResult)
+{
+    if (!haveVnni())
+    {
+        GTEST_SKIP() << "needs AVX-VNNI";
+    }
+    using namespace cpuMissFixtureFp4;
+    int32_t const bits = kGlobalBits;
+    float const half = std::ldexp(1.0F + static_cast<float>(bits & 0x3FF) / 1024.0F, ((bits >> 10) & 0x1F) - 15);
+    float const mult = half / 128.0F;
+    QuantisedX16<kMaxK> q;
+    quantiseX16<kMaxK>(kX, kK, q);
+    std::vector<float> out(kN);
+    for (int32_t nt = 0; nt < kN / 64; ++nt)
+    {
+        gemvTileFp4Vnni<kMaxK>(tables(), fp4Tables(), kWeights, 2 * static_cast<size_t>(kN), kScales, static_cast<size_t>(kN), q, nt, mult, out.data() + 64 * nt);
+    }
+    EXPECT_TRUE(allFinite(out));
+    EXPECT_LT(maxRelativeError(out, kY, kN), 2e-2);
+    std::vector<float> fp32(kN);
+    for (int32_t nt = 0; nt < kN / 64; ++nt)
+    {
+        gemvTileFp4(tables(), fp4Tables(), kWeights, 2 * static_cast<size_t>(kN), kScales, static_cast<size_t>(kN), kX, kK, nt, mult, fp32.data() + 64 * nt);
+    }
+    EXPECT_LT(maxRelativeError(out, fp32, kN), 2e-2);
+}
+
+TEST(CpuMissKernelTest, Fp4VnniHandlesAllZeroAndSpikyActivations)
+{
+    if (!haveVnni())
+    {
+        GTEST_SKIP() << "needs AVX-VNNI";
+    }
+    using namespace cpuMissFixtureFp4;
+    float const mult = 0.01F;
+    std::vector<float> zero(kK, 0.0F), spike(kK, 0.0F), negative(kK);
+    spike[0] = 7.0F;
+    spike[kK - 1] = -5.0F;
+    spike[100] = 0.001F;
+    for (int32_t i = 0; i < kK; ++i)
+    {
+        negative[i] = -0.5F - 0.001F * static_cast<float>(i);
+    }
+    for (auto const* x : {&zero, &spike, &negative})
+    {
+        QuantisedX16<kMaxK> q;
+        quantiseX16<kMaxK>(x->data(), kK, q);
+        std::vector<float> got(kN), want(kN);
+        for (int32_t nt = 0; nt < kN / 64; ++nt)
+        {
+            gemvTileFp4Vnni<kMaxK>(tables(), fp4Tables(), kWeights, 2 * static_cast<size_t>(kN), kScales, static_cast<size_t>(kN), q, nt, mult, got.data() + 64 * nt);
+            gemvTileFp4(tables(), fp4Tables(), kWeights, 2 * static_cast<size_t>(kN), kScales, static_cast<size_t>(kN), x->data(), kK, nt, mult, want.data() + 64 * nt);
+        }
+        EXPECT_TRUE(allFinite(got));
+        EXPECT_LT(maxRelativeError(got, want, kN), 3e-2);
+    }
+}
 
 #endif // __x86_64__
 

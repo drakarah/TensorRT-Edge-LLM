@@ -321,13 +321,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
     api.add_argument(
         "--reasoning-parser",
         choices=("auto", "none", "qwen3", "deepseek_r1", "muse_glimmer",
-                 "nemotron"),
+                 "nemotron", "inkling"),
         default="auto",
     )
     api.add_argument(
         "--tool-call-parser",
         choices=("auto", "generic", "hermes", "qwen3_xml", "nemotron",
-                 "openai", "gemma4"),
+                 "openai", "gemma4", "inkling"),
         default="auto",
     )
     api.add_argument("--enable-auto-tool-choice", action="store_true")

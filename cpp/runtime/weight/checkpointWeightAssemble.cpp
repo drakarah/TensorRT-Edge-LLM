@@ -1018,7 +1018,10 @@ void assembleInt4MoeQweights(CheckpointReader const& checkpoint, Json const& bin
         groupSize = K / numGroups;
     }
 
-    validateOutput(output, Coords{numExperts, K / 16, 2 * N * 4}, nvinfer1::DataType::kINT8, "INT4 MoE qweight output");
+    // the packed words may be bound as int8 bytes or as the same bytes viewed as int32 words
+    bool const wordView = output.getDataType() == nvinfer1::DataType::kINT32;
+    validateOutput(output, Coords{numExperts, K / 16, wordView ? 2 * N : 2 * N * 4},
+        wordView ? nvinfer1::DataType::kINT32 : nvinfer1::DataType::kINT8, "INT4 MoE qweight output");
     size_t const bytesPerExpert = static_cast<size_t>(K / 16) * 2 * N * sizeof(int32_t);
     auto* destination = static_cast<uint8_t*>(output.rawPointer());
     int32_t const zeroPointOffset = binding.value("zero_point_offset", 1);

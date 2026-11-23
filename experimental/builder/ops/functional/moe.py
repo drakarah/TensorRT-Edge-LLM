@@ -19,6 +19,7 @@ without exposing that choice to model definitions.
 """
 
 from enum import IntEnum
+from typing import Optional
 
 import numpy as np
 
@@ -42,6 +43,7 @@ class MoeActivation(IntEnum):
     SWIGLU = 2
     RELU2 = 4
     GEGLU = 5
+    SOFTCAP_SWIGLU = 6
 
 
 class MoeRouting(IntEnum):
@@ -134,30 +136,88 @@ def int4_moe(router_logits: Tensor,
              *,
              weight_prefix: str,
              weight_bindings: dict,
-             zero_point_offset: int = 1) -> Tensor:
-    """Run GPTQ-Marlin mixture-of-experts."""
+             zero_point_offset: int = 1,
+             gate_softcap: float = 0.0,
+             up_softcap: float = 0.0,
+             packed_dtype=np.int8,
+             weight_format: str = "int4",
+             route_bias: Optional[Tensor] = None,
+             pred_self: Optional[Tensor] = None,
+             pred_next: Optional[Tensor] = None) -> Tensor:
+    """Run GPTQ-Marlin mixture-of-experts.
+
+    ``route_bias`` (FP32 [num_experts], a tensor) switches the plugin to Inkling 2 routing: ``router_logits`` are then
+    the raw FP32 router outputs, the experts are chosen by ``sigmoid(logits) + route_bias`` (plus the optional residency
+    preference of EDGELLM_MOE_ROUTE_BIAS) and weighted by their normalised sigmoid scores.
+
+    ``pred_self`` / ``pred_next`` (FP32 [tokens, num_experts], need ``route_bias``) switch on the predicted prefetch: the router logits of THIS
+    visit predicted from the previous visit's router input, and those of the NEXT visit predicted from this visit's. They are plugin inputs only
+    (decode steps fill the predicted experts of the cache on a side stream); the result does not depend on them.
+
+    ``weight_format`` "nvfp4" takes Marlin-packed NVFP4 experts instead: E4M3 block scales (bound as int32 words) and the
+    two per-expert global scales (``fc1_global_scales`` / ``fc2_global_scales`` entries of ``weights`` and
+    ``weight_bindings``), group size 16.
+
+    ``packed_dtype`` (int8 or int32) is the element type of the packed weight inputs; int32 keeps the
+    network free of INT8 tensors, which TensorRT refuses to combine with FP8 Q/DQ.
+
+    Positive ``gate_softcap`` and ``up_softcap`` (given together) select the
+    softcapped SwiGLU activation.
+    """
+    if (gate_softcap
+            > 0.0) != (up_softcap
+                       > 0.0) or gate_softcap < 0.0 or up_softcap < 0.0:
+        raise ValueError(
+            "gate_softcap and up_softcap must be given together and be positive"
+        )
+    extra = ({
+        "gate_softcap": gate_softcap,
+        "up_softcap": up_softcap
+    } if gate_softcap > 0.0 else {})
     _validate_token_layout(router_logits, hidden_states)
+    scale_dtype = packed_dtype if weight_format == "nvfp4" else np.float16
 
     inputs = [
         router_logits,
         hidden_states,
         parameter(weight_prefix + ".fc_gate_up_qweights",
-                  _parameter_value(weights["fc_gate_up_qweights"], np.int8),
+                  _parameter_value(weights["fc_gate_up_qweights"], packed_dtype),
                   "int4_moe",
                   recipe=weight_bindings["fc_gate_up_qweights"]),
         parameter(weight_prefix + ".fc_gate_up_scales",
-                  _parameter_value(weights["fc_gate_up_scales"], np.float16),
+                  _parameter_value(weights["fc_gate_up_scales"], scale_dtype),
                   "int4_moe",
                   recipe=weight_bindings["fc_gate_up_scales"]),
         parameter(weight_prefix + ".fc_down_qweights",
-                  _parameter_value(weights["fc_down_qweights"], np.int8),
+                  _parameter_value(weights["fc_down_qweights"], packed_dtype),
                   "int4_moe",
                   recipe=weight_bindings["fc_down_qweights"]),
         parameter(weight_prefix + ".fc_down_scales",
-                  _parameter_value(weights["fc_down_scales"], np.float16),
+                  _parameter_value(weights["fc_down_scales"], scale_dtype),
                   "int4_moe",
                   recipe=weight_bindings["fc_down_scales"]),
     ]
+    if weight_format == "nvfp4":
+        for name in ("fc1_global_scales", "fc2_global_scales"):
+            inputs.append(
+                parameter(weight_prefix + "." + name,
+                          _parameter_value(weights[name], np.float16),
+                          "int4_moe",
+                          recipe=weight_bindings[name]))
+        extra["weight_format"] = 1
+    elif weight_format != "int4":
+        raise ValueError(f"unknown expert weight format {weight_format!r}")
+    if (pred_self is not None or pred_next is not None) and route_bias is None:
+        raise ValueError("the predicted prefetch needs the plugin's own routing (route_bias)")
+    if pred_self is not None:
+        inputs.append(pred_self)
+        extra["prefetch_self"] = 1
+    if pred_next is not None:
+        inputs.append(pred_next)
+        extra["prefetch_next"] = 1
+    if route_bias is not None:
+        inputs.append(route_bias)
+        extra["route_mode"] = 1
     return operation("int4_moe",
                      inputs,
                      num_experts=num_experts,
@@ -165,17 +225,41 @@ def int4_moe(router_logits: Tensor,
                      hidden_size=hidden_size,
                      moe_inter_size=moe_inter_size,
                      activation_type=0,
-                     quantization_group_size=group_size)
+                     quantization_group_size=group_size,
+                     **extra)
 
 
-def nvfp4_a16_moe(router_logits: Tensor, hidden_states: Tensor,
-                  moe_weights: dict, num_experts: int, top_k: int,
-                  hidden_size: int, moe_inter_size: int,
-                  activation_type: MoeActivation, n_group: int,
-                  topk_group: int, norm_topk_prob: int,
-                  routed_scaling_factor: float, routing_mode: MoeRouting, *,
-                  weight_prefix: str) -> Tensor:
-    """Run weight-only NVFP4 MoE with FP16 activations."""
+def nvfp4_a16_moe(router_logits: Tensor,
+                  hidden_states: Tensor,
+                  moe_weights: dict,
+                  num_experts: int,
+                  top_k: int,
+                  hidden_size: int,
+                  moe_inter_size: int,
+                  activation_type: MoeActivation,
+                  n_group: int,
+                  topk_group: int,
+                  norm_topk_prob: int,
+                  routed_scaling_factor: float,
+                  routing_mode: MoeRouting,
+                  *,
+                  weight_prefix: str,
+                  gate_softcap: float = 0.0,
+                  up_softcap: float = 0.0) -> Tensor:
+    """Run weight-only NVFP4 MoE with FP16 activations.
+
+    ``gate_softcap`` and ``up_softcap`` apply to ``SOFTCAP_SWIGLU`` only and
+    are not emitted for the other activations.
+    """
+    extra = {}
+    if activation_type == MoeActivation.SOFTCAP_SWIGLU:
+        if not (gate_softcap > 0.0 and up_softcap > 0.0):
+            raise ValueError(
+                "SOFTCAP_SWIGLU requires positive gate_softcap and up_softcap")
+        extra = {"gate_softcap": gate_softcap, "up_softcap": up_softcap}
+    elif gate_softcap or up_softcap:
+        raise ValueError(
+            "gate_softcap and up_softcap apply to SOFTCAP_SWIGLU only")
     _validate_token_layout(router_logits, hidden_states)
     order = [
         ("fc1_qweights", np.int8),
@@ -203,7 +287,8 @@ def nvfp4_a16_moe(router_logits: Tensor, hidden_states: Tensor,
                      norm_topk_prob=norm_topk_prob,
                      routed_scaling_factor=routed_scaling_factor,
                      routing_mode=int(routing_mode),
-                     max_routed_rows=_MAX_ROUTED_ROWS_AUTO)
+                     max_routed_rows=_MAX_ROUTED_ROWS_AUTO,
+                     **extra)
 
 
 def nvfp4_moe(router_logits: Tensor,

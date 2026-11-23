@@ -14,6 +14,7 @@
 # limitations under the License.
 """Checkpoint-backed dense projection shared by model families."""
 
+import os
 from dataclasses import replace
 from typing import Optional, Sequence
 
@@ -116,6 +117,11 @@ class Linear(Module):
                               and quant_type == "nvfp4"
                               and not self.has_adapter()
                               and not self.ctx.options.sm12x)
+        if (quant_type == quantization.QUANT_FP8 and self._fp8_gemv_enabled() and rank == 2 and self.cfg.tp_size == 1
+                and not self.has_adapter() and not self._uses_lora()):
+            fp8 = self._fp8_gemv(hidden_states)
+            if fp8 is not None:
+                return fp8
         full_descriptor = self._full_descriptor(quant_type, use_fused_nvfp4_tp)
         descriptor = self.weights.shard_linear(full_descriptor, tp_mode,
                                                self.cfg.tp_size,
@@ -144,6 +150,20 @@ class Linear(Module):
         if tp_mode == "row" and self.cfg.tp_size > 1:
             output = F.all_reduce(output, self.cfg.tp_size)
         return output
+
+    def _fp8_gemv_enabled(self) -> bool:
+        """EDGELLM_FP8_GEMV at build: "attn" runs the FP8 projections whose name contains "attn" on the FP8-weight / FP16-activation plugin (decode GEMV at
+        memory bandwidth, tensor-core GEMM for prefill) instead of TensorRT's FP8 matmul; "all" takes every FP8 linear (the LM head already runs at bandwidth)."""
+        mode = os.environ.get("EDGELLM_FP8_GEMV", "")
+        return mode == "all" or (mode == "attn" and "attn" in self.prefix)
+
+    def _fp8_gemv(self, hidden_states):
+        descriptor = self.weight_descriptor()
+        weight = descriptor.weight
+        if (descriptor.bias is not None or not isinstance(weight, np.ndarray) or weight.dtype != np.uint8 or weight.ndim != 2
+                or descriptor.weight_scale is None or weight.shape[0] % 8 != 0 or weight.shape[1] % 32 != 0):
+            return None
+        return F.fp8_linear(hidden_states, weight, descriptor.weight_scale, name=self.prefix)
 
     def forward_f32(self, hidden_states, rank: Optional[int] = None):
         """Apply an FP16 checkpoint projection with FP32 accumulation."""

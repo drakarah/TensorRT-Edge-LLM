@@ -350,6 +350,8 @@ class OpenAIServingChat:
                                    audio_params)
 
     def parse_output(self, text: str, prepared: PreparedChatRequest):
+        if os.environ.get("EDGELLM_DEBUG_RAW_OUTPUT") == "1":
+            logging.getLogger("uvicorn.error").warning("raw output: %r", text)
         return parse_assistant_output(
             text,
             prepared.tool_config,

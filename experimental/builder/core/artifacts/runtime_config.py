@@ -22,8 +22,9 @@ from tensorrt_edgellm.dflash import DFlashVersion
 
 from .. import contracts
 from ..config import LAYER_ATTN, LAYER_GDN, LAYER_MAMBA, DeviceConfig
-from ..ragged import (builder_config_fields, checked_kv_pool_pages,
-                      draft_ring_pool_pages)
+from ..ragged import (bounded_swa_capacity, builder_config_fields,
+                      checked_kv_pool_pages, draft_ring_pool_pages,
+                      swa_pool_pages)
 
 
 def normalize_rope_scaling(rope_scaling):
@@ -49,6 +50,12 @@ def _edgellm_version() -> str:
     except metadata.PackageNotFoundError:
         raise RuntimeError("could not resolve the Edge-LLM version; install "
                            "the package or use a full source checkout")
+
+
+def checked_bounded_capacity(cfg, args) -> int:
+    """Capacity of the bounded sliding-window entries of this build (0: stay unbounded)."""
+    return bounded_swa_capacity(cfg.kv_bounded_window, args.max_input_len,
+                                args.max_kv_cache_capacity)
 
 
 def _tp_local_kv_layer_configs(kv_layer_configs: list, tp_size: int) -> list:
@@ -215,6 +222,18 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
         out["layer_types"] = norm_lt
         out["kv_layer_configs"] = kv_cfgs
 
+    bounded_capacity = (checked_bounded_capacity(cfg, args)
+                        if getattr(cfg, "kv_bounded_entries", ()) else 0)
+    if bounded_capacity:
+        ordinal = 0
+        for entry, layer_type in zip(out["kv_layer_configs"],
+                                     out["layer_types"]):
+            if layer_type != "attention":
+                continue
+            if ordinal in getattr(cfg, "kv_bounded_entries", ()):
+                entry["kv_cache_capacity"] = bounded_capacity
+            ordinal += 1
+
     if args.resolved_spec_role == contracts.SpecRole.DRAFT:
         out["draft_vocab_size"] = (cfg.reduced_vocab_size
                                    or cfg.draft_vocab_size or cfg.vocab_size)
@@ -339,6 +358,9 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
         "max_kv_cache_capacity": args.max_kv_cache_capacity,
         "max_kv_pool_pages": max_kv_pool_pages,
     }
+    if bounded_capacity:
+        builder_config["num_swa_pages"] = swa_pool_pages(
+            args.max_batch_size, bounded_capacity)
     builder_config.update(builder_config_fields(cfg, args))
     if args.resolved_spec_role == contracts.SpecRole.BASE:
         builder_config["max_verify_tree_size"] = args.max_verify_tree_size

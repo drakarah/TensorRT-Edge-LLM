@@ -14,7 +14,7 @@
 # limitations under the License.
 """Reusable MoE modules whose checkpoint and routing semantics are identical."""
 
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import tensorrt as trt
@@ -62,9 +62,15 @@ def prepare_gated_int4_weights(
     ctx: BuildContext,
     load_projection: Callable[[int, str], Tuple[np.ndarray, np.ndarray,
                                                 np.ndarray]],
+    group_size: Optional[int] = None,
 ) -> Dict[str, np.ndarray]:
-    """Prepare model-provided GPTQ experts for the Marlin plugin layout."""
+    """Prepare model-provided GPTQ experts for the Marlin plugin layout.
+
+    ``group_size`` overrides the checkpoint-wide one for models whose experts
+    use a different group than their dense linears (mixed precision).
+    """
     cfg = ctx.cfg
+    group_size = cfg.group_size if group_size is None else group_size
     gate_up_weights = []
     gate_up_scales = []
     down_weights = []
@@ -74,7 +80,7 @@ def prepare_gated_int4_weights(
         def extract(projection: str):
             qweight, qzeros, scales = load_projection(expert_index, projection)
             return int4_pack.extract_gptq_for_moe(
-                qweight, qzeros, scales, cfg.group_size,
+                qweight, qzeros, scales, group_size,
                 cfg.quant.gptq_zero_point_offset)
 
         gate_weight, gate_scale = extract("gate_proj")
@@ -86,9 +92,9 @@ def prepare_gated_int4_weights(
         down_weights.append(down_weight)
         down_scales.append(down_scale)
     gate_weight, gate_scale = int4_pack.pack_moe_marlin(
-        np.stack(gate_up_weights), np.stack(gate_up_scales), cfg.group_size)
+        np.stack(gate_up_weights), np.stack(gate_up_scales), group_size)
     down_weight, down_scale = int4_pack.pack_moe_marlin(
-        np.stack(down_weights), np.stack(down_scales), cfg.group_size)
+        np.stack(down_weights), np.stack(down_scales), group_size)
     return {
         "fc_gate_up_qweights": gate_weight,
         "fc_gate_up_scales": gate_scale,

@@ -22,7 +22,7 @@ for visual, audio, vocoder, and action builders.
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from tensorrt_edgellm.dflash import DFlashVersion, resolve_dflash_contract
 
@@ -215,6 +215,9 @@ class DeviceConfig:
     # Raw dictionaries retain model-specific encoder and decoder fields.
     raw_root: Dict[str, Any] = field(default_factory=dict)
     raw_component: Dict[str, Any] = field(default_factory=dict)
+    # Attention-entry ordinals kept in bounded sliding-window KV storage, and that window (0: none)
+    kv_bounded_entries: Tuple[int, ...] = ()
+    kv_bounded_window: int = 0
 
     # hybrid
     mamba_cfg: Optional[MambaConfig] = None
@@ -270,6 +273,9 @@ class DeviceConfig:
     def kv_cache_dtype(self) -> str:
         if self.kv_cache_quant in ("fp8", "int8"):
             return self.kv_cache_quant
+        # a checkpoint without per-layer KV scales can still ask for a unit-scale FP8 cache with kv_cache_dtype: "fp8"
+        if self.raw_component.get("kv_cache_dtype") == "fp8":
+            return "fp8"
         return "fp16"
 
     @property
@@ -597,6 +603,9 @@ class DeviceConfig:
                 or intermediate_size),
             raw_root=root,
             raw_component=selected,
+            kv_bounded_entries=tuple(
+                int(i) for i in llm.get("kv_bounded_entries", ())),
+            kv_bounded_window=int(llm.get("kv_bounded_window", 0) or 0),
             mamba_cfg=mamba_cfg,
             gdn_cfg=gdn_cfg,
         )

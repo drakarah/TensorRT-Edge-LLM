@@ -24,7 +24,10 @@ from ._operation import network_input, operation
 
 KV_PAGE_SIZE = 128
 
-__all__ = ["KV_PAGE_SIZE", "attention", "gemma4_attention", "vit_attention"]
+__all__ = [
+    "KV_PAGE_SIZE", "attention", "gemma4_attention", "inkling2_attention",
+    "vit_attention"
+]
 
 
 def attention(
@@ -149,3 +152,49 @@ def vit_attention(query: Tensor, key: Tensor, value: Tensor,
                      [query, key, value, cu_seqlens, max_seqlen_carrier],
                      num_heads=num_heads,
                      head_size=head_size)
+
+
+def inkling2_attention(
+    q_lin: Tensor,
+    rel_lin: Tensor,
+    sink_lin: Tensor,
+    gate_lin: Tensor,
+    k_new: Tensor,
+    v_new: Tensor,
+    q_scale: Tensor,
+    rel_scale: Tensor,
+    rel_proj_t: Tensor,
+    past_kv: Tensor,
+    ragged: RaggedDecoderInputs,
+    num_q_heads: int,
+    num_kv_heads: int,
+    rel_extent: int,
+    window: int,
+    log_alpha: float,
+    log_n_floor: float,
+    q_clip: float,
+    rel_clip: float,
+    scaling: float,
+    bounded: bool = False,
+) -> Tuple[Tensor, Tensor]:
+    """Run one Inkling 2 attention visit and return output plus present KV.
+
+    ``window`` 0 selects full attention with log-length query scaling. ``bounded`` reads the sparse sliding-window
+    page table instead of the full one (the entry then lives in the runtime's bounded window pool).
+    """
+    page_table = ragged.swa_kv_page_table if bounded else ragged.kv_page_table
+    return operation("inkling2_attention", [
+        q_lin, rel_lin, sink_lin, gate_lin, k_new, v_new, q_scale, rel_scale,
+        rel_proj_t, past_kv, ragged.query_start_offsets, ragged.query_lengths,
+        ragged.past_lengths, page_table
+    ],
+                     output_count=2,
+                     num_q_heads=num_q_heads,
+                     num_kv_heads=num_kv_heads,
+                     rel_extent=rel_extent,
+                     window=window,
+                     log_alpha=log_alpha,
+                     log_n_floor=log_n_floor,
+                     q_clip=q_clip,
+                     rel_clip=rel_clip,
+                     scaling=scaling)

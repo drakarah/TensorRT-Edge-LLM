@@ -257,7 +257,8 @@ def _split_reasoning_events(text: str, parser_name: str, model_dir: str, *,
     parser = REASONING_PARSERS.resolve(parser_name, model_dir)
     if parser is None:
         return [{"type": "content", "text": text}]
-    if (not allow_implicit and parser.start_token not in text
+    if (not allow_implicit and not parser.always_enabled
+            and parser.start_token not in text
             and parser.end_token not in text):
         return [{"type": "content", "text": text}]
     reasoning, content = parser.extract(text)
@@ -788,6 +789,160 @@ class _Gemma4StreamingToolParser:
             yield ToolStreamEvent("tool_done", index=index)
 
 
+_INKLING_MESSAGE = "<|message_model|>"
+_INKLING_TOOL = "<|content_invoke_tool_json|>"
+_INKLING_END = "<|end_message|>"
+_INKLING_OTHER_KINDS = ("<|content_thinking|>", "<|content_text|>")
+_INKLING_BLOCK_RE = re.compile(
+    re.escape(_INKLING_MESSAGE) + r"([^<]*)" + re.escape(_INKLING_TOOL) +
+    r"(.*?)(?:" + re.escape(_INKLING_END) + r"|\Z)", re.S)
+
+
+class _InklingToolParser:
+    """Inkling 2 tool calls: ``<|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>``.
+
+    Messages of other kinds stay content (still carrying their markers, which the Inkling reasoning parser consumes
+    afterwards); only tool messages become calls.
+    """
+
+    def stream(self, tool_config: ToolConfig) -> "_InklingStreamingToolParser":
+        return _InklingStreamingToolParser(self, tool_config)
+
+    @staticmethod
+    def _calls(header: str, body: str,
+               tool_config: ToolConfig) -> List[ToolCall]:
+        payload = _loads_payload(body)
+        if not isinstance(payload, dict):
+            return []
+        name = payload.get("name") or header.strip()
+        if not isinstance(name, str) or not _tool_name_allowed(
+                name, tool_config):
+            return []
+        arguments = payload.get("args", payload.get("arguments", {}))
+        return [
+            ToolCall(id=_new_call_id(),
+                     name=name,
+                     arguments=_arguments_to_json(arguments))
+        ]
+
+    def parse(self, text: str,
+              tool_config: ToolConfig) -> Tuple[List[Dict[str, Any]], bool]:
+        events: List[Dict[str, Any]] = []
+        malformed = False
+        pos = 0
+        for match in _INKLING_BLOCK_RE.finditer(text):
+            if match.start() > pos:
+                events.append({
+                    "type": "content",
+                    "text": text[pos:match.start()]
+                })
+            calls = self._calls(match.group(1), match.group(2), tool_config)
+            if calls:
+                events.extend({
+                    "type": "tool_call",
+                    "tool_call": c
+                } for c in calls)
+            else:
+                malformed = True
+                events.append({"type": "content", "text": match.group(0)})
+            pos = match.end()
+        if pos < len(text) or not events:
+            events.append({"type": "content", "text": text[pos:]})
+        return events, malformed
+
+
+class _InklingStreamingToolParser:
+    """Streaming counterpart of ``_InklingToolParser``: content flows through, a tool message is held until its end."""
+
+    def __init__(self, whole_text_parser: _InklingToolParser,
+                 tool_config: ToolConfig) -> None:
+        self._whole = whole_text_parser
+        self._config = tool_config
+        self._buffer = ""
+        self._state = "content"  # content | decide | tool
+        self._next_index = 0
+
+    def feed(self, text: str) -> Iterable["ToolStreamEvent"]:
+        self._buffer += text
+        while True:
+            if self._state == "content":
+                start = self._buffer.find(_INKLING_MESSAGE)
+                if start < 0:
+                    hold = _longest_partial_token(self._buffer,
+                                                  (_INKLING_MESSAGE, ))
+                    emit_len = len(self._buffer) - hold
+                    if emit_len > 0:
+                        yield ToolStreamEvent("content",
+                                              self._buffer[:emit_len])
+                        self._buffer = self._buffer[emit_len:]
+                    return
+                if start > 0:
+                    yield ToolStreamEvent("content", self._buffer[:start])
+                self._buffer = self._buffer[start:]
+                self._state = "decide"
+            if self._state == "decide":
+                body = self._buffer[len(_INKLING_MESSAGE):]
+                tool = body.find(_INKLING_TOOL)
+                others = [(body.find(k), k) for k in _INKLING_OTHER_KINDS
+                          if body.find(k) >= 0]
+                stop = body.find(_INKLING_END)
+                nxt = body.find(_INKLING_MESSAGE)
+                first_other = min(others)[0] if others else -1
+                candidates = [(i, "tool") for i in (tool, ) if i >= 0]
+                candidates += [(first_other, "other")] if others else []
+                candidates += [(i, "end") for i in (stop, nxt) if i >= 0]
+                if not candidates:
+                    return  # header still incomplete
+                index, kind = min(candidates)
+                if kind == "tool":
+                    self._state = "tool"
+                elif kind == "other":
+                    cut = len(_INKLING_MESSAGE) + first_other + len(
+                        min(others)[1])
+                    yield ToolStreamEvent("content", self._buffer[:cut])
+                    self._buffer = self._buffer[cut:]
+                    self._state = "content"
+                    continue
+                else:
+                    # a header that never reaches a content marker: plain text
+                    cut = len(_INKLING_MESSAGE)
+                    yield ToolStreamEvent("content", self._buffer[:cut])
+                    self._buffer = self._buffer[cut:]
+                    self._state = "content"
+                    continue
+            end = self._buffer.find(_INKLING_END)
+            if end < 0:
+                return
+            end += len(_INKLING_END)
+            block, self._buffer = self._buffer[:end], self._buffer[end:]
+            self._state = "content"
+            yield from self._emit(block)
+
+    def flush(self) -> Iterable["ToolStreamEvent"]:
+        withheld, self._buffer = self._buffer, ""
+        self._state = "content"
+        if withheld:
+            yield from self._emit(withheld)
+
+    def _emit(self, text: str) -> Iterable["ToolStreamEvent"]:
+        events, _ = self._whole.parse(text, self._config)
+        for event in events:
+            if event["type"] == "content":
+                if event["text"]:
+                    yield ToolStreamEvent("content", event["text"])
+                continue
+            call = event["tool_call"]
+            index = self._next_index
+            self._next_index += 1
+            yield ToolStreamEvent("tool_head",
+                                  index=index,
+                                  call_id=call.id,
+                                  name=call.name)
+            if call.arguments:
+                yield ToolStreamEvent("tool_args", call.arguments, index=index)
+            yield ToolStreamEvent("tool_done", index=index)
+
+
 class _ToolParserRegistry:
 
     def __init__(self):
@@ -799,6 +954,7 @@ class _ToolParserRegistry:
             "nemotron": parser,
             "openai": parser,
             "gemma4": _Gemma4ToolParser(),
+            "inkling": _InklingToolParser(),
         }
 
     def names(self) -> List[str]:
@@ -1224,6 +1380,8 @@ def _parser_name_for_model(model_dir: str) -> str:
     except (OSError, ValueError):
         pass
     name = f"{model_type} {os.path.basename(model_dir).lower()}"
+    if "inkling" in name:
+        return "inkling"
     if "qwen3" in name and "coder" in name:
         return "qwen3_xml"
     if "qwen" in name:

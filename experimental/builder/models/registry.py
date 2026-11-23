@@ -169,6 +169,17 @@ FAMILIES: Tuple[ModelFamily, ...] = (
         },
     ),
     ModelFamily(
+        "inkling2",
+        {"inkling2_loop": _set(Component.LLM)},
+        {
+            Component.LLM:
+            _component("inkling2.modeling_inkling2", "Inkling2ForCausalLM")
+        },
+        configuration="inkling2.configuration",
+        artifact_writer="inkling2.artifacts",
+        weight_conversion="inkling2.weights",
+    ),
+    ModelFamily(
         "qwen3_5_moe",
         {
             "qwen3_5_moe": _set(Component.LLM, Component.VISUAL),

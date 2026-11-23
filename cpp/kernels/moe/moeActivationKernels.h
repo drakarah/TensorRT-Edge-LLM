@@ -32,6 +32,7 @@ enum MoeActivationType : int32_t
     kMoeSwiGlu = 2,
     kMoeRelu2 = 4,
     kMoeGeGlu = 5,
+    kMoeSoftcapSwiGlu = 6,
 };
 
 /**
@@ -41,6 +42,9 @@ enum MoeActivationType : int32_t
  * - kMoeSwiGlu: SwiGLU. The input is [numTokens, 2 * intermediateDim], with all gate values followed by all up values.
  * - kMoeRelu2: ReLU2. The input is [numTokens, intermediateDim].
  * - kMoeGeGlu: GeGLU. The input is [numTokens, 2 * intermediateDim], with all gate values followed by all up values.
+ * - kMoeSoftcapSwiGlu: softcapped SwiGLU, the same layout as SwiGLU:
+ *   out = gateCap * tanh(gate / gateCap) * sigmoid(gate) * upCap * tanh(up / upCap), computed in FP32. Both caps must
+ * be positive.
  *
  * FP16 and BF16 support all activation types. The input and output data types must match.
  *
@@ -50,11 +54,13 @@ enum MoeActivationType : int32_t
  * @param intermediateDim Intermediate dimension.
  * @param activationType Activation type from MoeActivationType enum.
  * @param stream CUDA stream.
+ * @param gateSoftcap Gate soft cap, used by kMoeSoftcapSwiGlu only.
+ * @param upSoftcap Up soft cap, used by kMoeSoftcapSwiGlu only.
  *
  * @throws std::runtime_error If the tensor shapes, data types, devices, alignment, or activation type are invalid.
  */
 void moeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t numTokens, int64_t intermediateDim,
-    int32_t activationType, cudaStream_t stream);
+    int32_t activationType, cudaStream_t stream, float gateSoftcap = 0.0F, float upSoftcap = 0.0F);
 
 } // namespace kernel
 } // namespace trt_edgellm

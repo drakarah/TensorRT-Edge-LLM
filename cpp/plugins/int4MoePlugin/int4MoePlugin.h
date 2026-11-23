@@ -19,6 +19,7 @@
 
 #include <NvInferRuntime.h>
 #include <atomic>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -121,6 +122,8 @@ public:
     bool supportsFormatCombination(int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
         int32_t nbOutputs) noexcept override;
 
+    bool supportsFormatCombinationImpl(int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept;
+
     //! @brief Configure plugin with tensor descriptions
     //! @param in Input tensor descriptors
     //! @param nbInputs Number of inputs
@@ -202,12 +205,45 @@ private:
     int32_t mHiddenSize{};
     int32_t mMoeInterSize{};
     nvinfer1::ActivationType mActivationType{};
+    float mGateSoftcap{0.0F}; //!< Both caps positive: softcapped SwiGLU instead of SwiGLU.
+    float mUpSoftcap{0.0F};
     int32_t mQuantizationGroupSize{};
+    // Weight format of the expert tensors: INT4 (GPTQ/AWQ Marlin) or NVFP4 (E2M1 + E4M3 block scales + per-expert global scales).
+    static constexpr int32_t kWeightFormatInt4{0};
+    static constexpr int32_t kWeightFormatNvfp4{1};
+    int32_t mWeightFormat{kWeightFormatInt4};
+    // Routing: softmax top-k over the router logits (0), or Inkling 2's sigmoid scores with a selection bias (an extra last
+    // input, FP32 [numExperts]) and an optional preference for experts resident in the cache (1).
+    static constexpr int32_t kRouteModeSoftmax{0};
+    static constexpr int32_t kRouteModeSigmoidBias{1};
+    int32_t mRouteMode{kRouteModeSoftmax};
+    // Predicted prefetch (route_mode 1, decode): with prefetch_self the plugin takes the router logits of THIS visit predicted from the previous visit's router
+    // input (FP32 [tokens, numExperts]) and fills the predicted experts on a side stream while the previous visit computes; with prefetch_next it takes the
+    // prediction made for the NEXT visit (it only orders the graph: the matmul runs before this visit) and publishes an event the next visit's side stream waits on.
+    // Both inputs sit between the weights and the route bias input.
+    int32_t mPrefetchSelf{0};
+    int32_t mPrefetchNext{0};
+    int32_t weightInputCount() const noexcept
+    {
+        return mWeightFormat == kWeightFormatNvfp4 ? 8 : 6;
+    }
+    int32_t predSelfIndex() const noexcept
+    {
+        return weightInputCount();
+    }
+    int32_t predNextIndex() const noexcept
+    {
+        return weightInputCount() + (mPrefetchSelf != 0 ? 1 : 0);
+    }
+    int32_t inputCount() const noexcept
+    {
+        return weightInputCount() + (mPrefetchSelf != 0 ? 1 : 0) + (mPrefetchNext != 0 ? 1 : 0) + (mRouteMode == kRouteModeSigmoidBias ? 1 : 0);
+    }
     int32_t mStageExperts{0};
     int32_t mTokenTile{0};
     int32_t* mStats{nullptr}; // device, [2][numExperts] selection counters (EDGELLM_MOE_STATS)
-    // EDGELLM_MOE_CACHE_SLOTS=<n>: per-layer device cache of the n most recently used experts (decode steps of <= 4 tokens);
-    // allocated at the first enqueue, outside graph capture.
+    // EDGELLM_MOE_CACHE_SLOTS=<n>: per-layer device cache of the n most recently used experts (decode steps of <= 4
+    // tokens); allocated at the first enqueue, outside graph capture.
     int32_t mCacheSlots{-1}; // -1 = env not read yet
     bool mCacheReady{false};
     void* mCacheMem{nullptr};
@@ -215,7 +251,12 @@ private:
     size_t mCacheBytesPerExpert[4]{};
     int32_t* mCacheState{nullptr}; // slotOf[E], expertOf[S], lastUse[S], counter[1], missList[1 + 2S], tally[3]
     std::atomic<int32_t*> mCacheTally{nullptr};
-    bool ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc) noexcept;
+    // EDGELLM_MOE_CACHE_SHARE=1: plugin instances that read the same expert weights (the repeated passes of a looped layer) use one cache.
+    bool mCacheShared{false};
+    bool mCacheOwner{false}; //!< the shared cache's owner: the instance resized by release/growth requests
+    void syncSharedUsers() noexcept;
+    std::shared_ptr<void> mCacheHold;
+    bool ensureExpertCache(nvinfer1::PluginTensorDesc const* inputDesc, void const* weightPtr) noexcept;
 
 public:
     //! Device bytes the cache holds per slot (the four tensors); 0 while no cache is allocated.
@@ -239,6 +280,11 @@ public:
     }
 
 private:
+    int32_t* mPrefetchIds{nullptr};      // device [kPrefetchMaxTokens * kPrefetchMaxExperts]: predicted experts of this visit
+    float* mPrefetchWeights{nullptr};    // device, same count: scores of the prediction (unused)
+    cudaEvent_t mPrefetchReady{nullptr}; // recorded when this visit starts (the next visit's side stream waits for it)
+    cudaEvent_t mPrefetchDone{nullptr};  // recorded when this visit's side stream has filled the predicted experts
+    bool mCacheOverlay{false};           // the cache arrays live in the runtime's execution-context memory (see edgellmMoeRegisterExecOverlay)
     int32_t* mCpuAdmit{nullptr}; // device [numExperts + 1]: miss counters and call counter of the CPU miss path
     bool mCpuMissChecked{false};
     bool mCpuMissReady{false};

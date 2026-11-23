@@ -17,6 +17,8 @@
 
 #include "stringUtils.h"
 
+#include <algorithm>
+
 #include "common/checkMacros.h"
 #include <cerrno>
 #include <cstdio>
@@ -72,6 +74,21 @@ std::string fmtstr(char const* format, ...)
         va_end(args); // Ensure cleanup even on exception
         throw;
     }
+}
+
+bool containsAnySubstring(std::string const& text, std::string const& commaSeparatedSubstrings)
+{
+    size_t begin = 0;
+    while (begin <= commaSeparatedSubstrings.size())
+    {
+        size_t const end = std::min(commaSeparatedSubstrings.find(',', begin), commaSeparatedSubstrings.size());
+        if (end > begin && text.find(commaSeparatedSubstrings.substr(begin, end - begin)) != std::string::npos)
+        {
+            return true;
+        }
+        begin = end + 1;
+    }
+    return false;
 }
 
 } // namespace format

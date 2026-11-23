@@ -694,6 +694,102 @@ __device__ __forceinline__ float sanitizeRouterLogit(float l)
     return l == l ? fminf(fmaxf(l, -3.0e38f), 3.0e38f) : -3.0e38f;
 }
 
+// Inkling 2 routing in one kernel: scores = sigmoid(z), the experts are chosen by scores + selectionBias + cacheBias * [resident], and the
+// combine weights are the plain scores of the chosen experts renormalised to sum to one (the route scale is applied by the caller's graph).
+// One block of 128 threads per token; the experts live in shared memory and the top-k is taken by repeated block-wide arg-max, like
+// cacheAwareTopkKernel.
+__global__ void sigmoidBiasTopkKernel(float const* logits, float const* selectionBias, int32_t numExperts, int32_t topK, float cacheBias,
+    int32_t const* slotOf, int32_t tailSkip, int32_t tailRenorm, float tailMaxWeight, int32_t* topkIndices, float* topkWeights)
+{
+    extern __shared__ float routeSmem[]; // [numExperts] selection values, then [numExperts] scores
+    float* selection = routeSmem;
+    float* score = routeSmem + numExperts;
+    __shared__ float warpBest[32];
+    __shared__ int32_t warpIdx[32];
+    __shared__ int32_t chosen[kRouterMaxTopK];
+    float const* row = logits + static_cast<size_t>(blockIdx.x) * numExperts;
+    for (int32_t e = threadIdx.x; e < numExperts; e += blockDim.x)
+    {
+        float const z = sanitizeRouterLogit(row[e]);
+        float const sc = fmaxf(1.0f / (1.0f + __expf(-z)), 1e-30f);
+        score[e] = sc;
+        selection[e] = sc + selectionBias[e] + ((slotOf != nullptr && slotOf[e] >= 0) ? cacheBias : 0.0f);
+    }
+    __syncthreads();
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const warp = threadIdx.x >> 5;
+    for (int32_t k = 0; k < topK; ++k)
+    {
+        float best = -3.0e38f;
+        int32_t bestIdx = 0x7fffffff;
+        for (int32_t e = threadIdx.x; e < numExperts; e += blockDim.x)
+        {
+            float const v = selection[e];
+            if (bestIdx == 0x7fffffff || v > best || (v == best && e < bestIdx))
+            {
+                best = v;
+                bestIdx = e;
+            }
+        }
+        for (int32_t off = 16; off > 0; off >>= 1)
+        {
+            float const ov = __shfl_xor_sync(0xffffffffu, best, off);
+            int32_t const oi = __shfl_xor_sync(0xffffffffu, bestIdx, off);
+            if (ov > best || (ov == best && oi < bestIdx))
+            {
+                best = ov;
+                bestIdx = oi;
+            }
+        }
+        if (lane == 0)
+        {
+            warpBest[warp] = best;
+            warpIdx[warp] = bestIdx;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            float b = warpBest[0];
+            int32_t bi = warpIdx[0];
+            for (int32_t w = 1; w < (blockDim.x >> 5); ++w)
+            {
+                if (warpBest[w] > b || (warpBest[w] == b && warpIdx[w] < bi))
+                {
+                    b = warpBest[w];
+                    bi = warpIdx[w];
+                }
+            }
+            bi = bi < numExperts ? bi : 0;
+            chosen[k] = bi;
+            selection[bi] = -3.4e38f;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        float sum = 0.0f;
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            sum += score[chosen[k]];
+        }
+        // Tail skip (lossy, opt-in): a non-resident expert ranked tailSkip+1 or lower is not fetched; its slot points at the top-ranked expert with
+        // weight 0. The weights keep the normalisation over all topK (dropped mass is lost) unless tailRenorm asks for a renormalisation over the kept ones.
+        bool skipped[kRouterMaxTopK];
+        float keptSum = 0.0f;
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            skipped[k] = tailSkip > 0 && k >= tailSkip && slotOf != nullptr && slotOf[chosen[k]] < 0 && score[chosen[k]] / (sum + 1e-20f) < tailMaxWeight;
+            keptSum += skipped[k] ? 0.0f : score[chosen[k]];
+        }
+        float const denom = (tailRenorm != 0 ? keptSum : sum) + 1e-20f;
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            topkIndices[static_cast<size_t>(blockIdx.x) * topK + k] = skipped[k] ? chosen[0] : chosen[k];
+            topkWeights[static_cast<size_t>(blockIdx.x) * topK + k] = skipped[k] ? 0.0f : score[chosen[k]] / denom;
+        }
+    }
+}
+
 __global__ void cacheAwareTopkKernel(float const* logits, int32_t numExperts, int32_t topK, float bias, int32_t tailSkip, int32_t const* slotOf,
     int32_t* topkIndices, float* topkWeights)
 {
@@ -893,12 +989,19 @@ void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExp
     }
 }
 
+void launchSigmoidBiasTopk(float const* logits, float const* selectionBias, int32_t numTokens, int32_t numExperts, int32_t topK, float cacheBias,
+    ExpertCacheState const* cache, int32_t tailSkip, int32_t tailRenorm, float tailMaxWeight, int32_t* topkIndices, float* topkWeights, cudaStream_t stream)
+{
+    sigmoidBiasTopkKernel<<<numTokens, 128, 2 * static_cast<size_t>(numExperts) * sizeof(float), stream>>>(logits, selectionBias, numExperts,
+        topK, cacheBias, cache != nullptr ? cache->slotOf : nullptr, tailSkip, tailRenorm, tailMaxWeight, topkIndices, topkWeights);
+}
+
 namespace
 {
 constexpr long long kCpuMissTimeoutCycles = 400000000LL;
 
 __global__ void cpuMissDoorbellKernel(int32_t* topkIndices, float* topkWeights, int32_t numTokens, int32_t topK, int32_t numExperts, half const* hidden,
-    int32_t hiddenSize, int32_t const* slotOf, int32_t const* expertOf, int32_t* admit, int32_t admitThreshold, CpuMissMailbox* mb,
+    int32_t hiddenSize, int32_t const* slotOf, int32_t const* expertOf, int32_t* admit, int32_t admitThreshold, int32_t budget, CpuMissMailbox* mb,
     CpuMissDeviceState* st, int32_t layer)
 {
     __shared__ int32_t count;
@@ -929,17 +1032,22 @@ __global__ void cpuMissDoorbellKernel(int32_t* topkIndices, float* topkWeights, 
             int32_t const misses = atomicAdd(&admit[id], 1) + 1;
             if (admitThreshold <= 0 || misses < admitThreshold)
             {
+                // at most `budget` misses of a call go to the CPU, the others take the normal fill path in parallel (budget <= 0: no limit)
                 int32_t const p = atomicAdd(&count, 1);
-                mb->expert[p] = id;
-                mb->token[p] = i / topK;
-                mb->weight[p] = topkWeights[i];
-                topkIndices[i] = dummy;
-                topkWeights[i] = 0.0F;
+                if (budget <= 0 || p < budget)
+                {
+                    mb->expert[p] = id;
+                    mb->token[p] = i / topK;
+                    mb->weight[p] = topkWeights[i];
+                    topkIndices[i] = dummy;
+                    topkWeights[i] = 0.0F;
+                }
             }
         }
     }
     __syncthreads();
-    if (count == 0)
+    int32_t const sent = budget > 0 ? min(count, budget) : count;
+    if (sent == 0)
     {
         if (threadIdx.x == 0)
         {
@@ -956,7 +1064,7 @@ __global__ void cpuMissDoorbellKernel(int32_t* topkIndices, float* topkWeights, 
     if (threadIdx.x == 0)
     {
         mb->layer = layer;
-        mb->numMiss = count;
+        mb->numMiss = sent;
         mb->numTokens = numTokens;
         mb->hidden = hiddenSize;
     }
@@ -1052,11 +1160,11 @@ __global__ void finiteWatchKernel(half const* x, int64_t n, uint32_t* counters)
 } // namespace
 
 void launchCpuMissDoorbell(int32_t* topkIndices, float* topkWeights, int32_t numTokens, int32_t topK, int32_t numExperts, half const* hidden,
-    int32_t hiddenSize, ExpertCacheState const& cache, int32_t* admit, int32_t admitThreshold, CpuMissMailbox* mailbox, CpuMissDeviceState* state,
+    int32_t hiddenSize, ExpertCacheState const& cache, int32_t* admit, int32_t admitThreshold, int32_t budget, CpuMissMailbox* mailbox, CpuMissDeviceState* state,
     int32_t layer, cudaStream_t stream)
 {
     cpuMissDoorbellKernel<<<1, 256, 0, stream>>>(topkIndices, topkWeights, numTokens, topK, numExperts, hidden, hiddenSize, cache.slotOf, cache.expertOf,
-        admit, admitThreshold, mailbox, state, layer);
+        admit, admitThreshold, budget, mailbox, state, layer);
 }
 
 void launchCpuMissWaitAdd(half* output, int32_t numTokens, int32_t hiddenSize, CpuMissMailbox* mailbox, CpuMissDeviceState* state, cudaStream_t stream)

@@ -18,6 +18,7 @@
 #include "common/checkMacros.h"
 #include "common/stringUtils.h"
 #include "moeActivationKernels.h"
+#include <cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -207,11 +208,70 @@ __global__ void geGluKernel(
     }
 }
 
+// ====================== Softcapped SwiGLU Kernel ======================
+
+template <typename T>
+__device__ __forceinline__ float toFloatValue(T value);
+template <>
+__device__ __forceinline__ float toFloatValue<half>(half value)
+{
+    return __half2float(value);
+}
+template <>
+__device__ __forceinline__ float toFloatValue<__nv_bfloat16>(__nv_bfloat16 value)
+{
+    return __bfloat162float(value);
+}
+template <typename T>
+__device__ __forceinline__ T fromFloatValue(float value);
+template <>
+__device__ __forceinline__ half fromFloatValue<half>(float value)
+{
+    return __float2half_rn(value);
+}
+template <>
+__device__ __forceinline__ __nv_bfloat16 fromFloatValue<__nv_bfloat16>(float value)
+{
+    return __float2bfloat16_rn(value);
+}
+
+// Same layout as swiGluKernel; gate and up are soft-capped before the product, all arithmetic in FP32.
+template <typename T>
+__global__ void softcapSwiGluKernel(Vec8<T> const* __restrict__ input, Vec8<T>* __restrict__ output,
+    int64_t numVecsPerRow, int64_t numTokens, float gateCap, float upCap)
+{
+    int64_t const tokenIdx = blockIdx.x;
+    if (tokenIdx >= numTokens)
+    {
+        return;
+    }
+    int64_t const gateStart = tokenIdx * kGatedInputMultiplier * numVecsPerRow;
+    int64_t const upStart = gateStart + numVecsPerRow;
+    int64_t const outStart = tokenIdx * numVecsPerRow;
+    for (int64_t i = threadIdx.x; i < numVecsPerRow; i += blockDim.x)
+    {
+        Vec8<T> const gateVec = input[gateStart + i];
+        Vec8<T> const upVec = input[upStart + i];
+        Vec8<T> outVec;
+#pragma unroll
+        for (int32_t j = 0; j < kElemPerVec; j++)
+        {
+            float const g = toFloatValue<T>(gateVec[j]);
+            float const u = toFloatValue<T>(upVec[j]);
+            float const cappedGate = gateCap * tanhf(g / gateCap);
+            float const cappedUp = upCap * tanhf(u / upCap);
+            float const sig = 1.0F / (1.0F + expf(-g));
+            outVec[j] = fromFloatValue<T>(cappedGate * sig * cappedUp);
+        }
+        output[outStart + i] = outVec;
+    }
+}
+
 // ====================== Launch Helper ======================
 
 template <typename T>
 void launchMoeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t numTokens, int64_t intermediateDim,
-    int32_t activationType, char const* inputName, cudaStream_t stream)
+    int32_t activationType, char const* inputName, cudaStream_t stream, float gateSoftcap, float upSoftcap)
 {
     using VectorType = Vec8<T>;
     auto const* inputRawPtr = input.dataPointer<T>();
@@ -238,20 +298,32 @@ void launchMoeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t nu
     {
         geGluKernel<T><<<blocks, threads, 0, stream>>>(inputVec, outputVec, numVecsPerRow, numTokens);
     }
+    else if (activationType == MoeActivationType::kMoeSoftcapSwiGlu)
+    {
+        softcapSwiGluKernel<T>
+            <<<blocks, threads, 0, stream>>>(inputVec, outputVec, numVecsPerRow, numTokens, gateSoftcap, upSoftcap);
+    }
 }
 
 // ====================== Public API ======================
 
 void moeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t numTokens, int64_t intermediateDim,
-    int32_t activationType, cudaStream_t stream)
+    int32_t activationType, cudaStream_t stream, float gateSoftcap, float upSoftcap)
 {
     check::check(activationType == MoeActivationType::kMoeSwiGlu || activationType == MoeActivationType::kMoeRelu2
-            || activationType == MoeActivationType::kMoeGeGlu,
-        fmtstr("Unsupported MoE activation type %d; expected %d (SwiGLU), %d (ReLU2), or %d (GeGLU)", activationType,
-            MoeActivationType::kMoeSwiGlu, MoeActivationType::kMoeRelu2, MoeActivationType::kMoeGeGlu));
+            || activationType == MoeActivationType::kMoeGeGlu || activationType == MoeActivationType::kMoeSoftcapSwiGlu,
+        fmtstr("Unsupported MoE activation type %d; expected %d (SwiGLU), %d (ReLU2), %d (GeGLU), or %d (softcapped "
+               "SwiGLU)",
+            activationType, MoeActivationType::kMoeSwiGlu, MoeActivationType::kMoeRelu2, MoeActivationType::kMoeGeGlu,
+            MoeActivationType::kMoeSoftcapSwiGlu));
+    if (activationType == MoeActivationType::kMoeSoftcapSwiGlu)
+    {
+        check::check(std::isfinite(gateSoftcap) && gateSoftcap > 0.0F && std::isfinite(upSoftcap) && upSoftcap > 0.0F,
+            "softcapped SwiGLU requires finite positive gate and up soft caps");
+    }
 
-    bool const isGated
-        = (activationType == MoeActivationType::kMoeSwiGlu || activationType == MoeActivationType::kMoeGeGlu);
+    bool const isGated = (activationType == MoeActivationType::kMoeSwiGlu
+        || activationType == MoeActivationType::kMoeGeGlu || activationType == MoeActivationType::kMoeSoftcapSwiGlu);
     auto const inputShape = input.getShape();
     auto const outputShape = output.getShape();
     int64_t const expectedInputDim = isGated ? kGatedInputMultiplier * intermediateDim : intermediateDim;
@@ -275,13 +347,20 @@ void moeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t numToken
     check::check(intermediateDim % kElemPerVec == 0,
         fmtstr("intermediateDim (%ld) must be a multiple of %d for vectorized access", intermediateDim, kElemPerVec));
 
+    if (numTokens == 0)
+    {
+        return;
+    }
+
     if (dataType == nvinfer1::DataType::kHALF)
     {
-        launchMoeActivation<half>(input, output, numTokens, intermediateDim, activationType, "input", stream);
+        launchMoeActivation<half>(
+            input, output, numTokens, intermediateDim, activationType, "input", stream, gateSoftcap, upSoftcap);
     }
     else
     {
-        launchMoeActivation<__nv_bfloat16>(input, output, numTokens, intermediateDim, activationType, "input", stream);
+        launchMoeActivation<__nv_bfloat16>(
+            input, output, numTokens, intermediateDim, activationType, "input", stream, gateSoftcap, upSoftcap);
     }
 }
 

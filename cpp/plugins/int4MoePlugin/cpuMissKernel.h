@@ -33,6 +33,12 @@ inline bool shapeSupported(int64_t hidden, int64_t inter, int64_t groupSize, int
     return groupSize == 128 && hidden % 128 == 0 && inter % 128 == 0 && hidden > groupSize && inter > groupSize && inter <= 1024 && hidden <= maxHidden;
 }
 
+//! NVFP4 (E2M1 codes, one E4M3 scale per 16 inputs, one global multiplier per layer): hidden and intermediate size multiples of 64, intermediate size up to 1280.
+inline bool shapeSupportedFp4(int64_t hidden, int64_t inter, int64_t maxHidden)
+{
+    return hidden % 64 == 0 && inter % 64 == 0 && hidden >= 64 && inter >= 64 && inter <= 1280 && hidden <= maxHidden;
+}
+
 } // namespace cpumiss
 } // namespace plugins
 } // namespace trt_edgellm
@@ -42,6 +48,7 @@ inline bool shapeSupported(int64_t hidden, int64_t inter, int64_t groupSize, int
 #include <immintrin.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 namespace trt_edgellm
@@ -258,6 +265,150 @@ __attribute__((target("avx2,fma,f16c"))) inline void gemvTile(
     }
 }
 
+//! NVFP4 variant of the tile decode above. The codes use the same Marlin nibble packing as int4; the scales are one raw E4M3 byte per 16 inputs, [K/16][N] with the
+//! column of a 64-wide chunk stored at 8 * (c % 8) + swap(c / 8) (swap exchanges the two low bits of the row index, see _nvfp4_marlin_e4m3_scale_perm).
+struct Fp4Tables
+{
+    static constexpr int32_t kMaxScaleVectors = 32;
+    alignas(32) int32_t sVec[kMaxScaleVectors][8]; // storage position of the lanes' columns inside the 64-byte scale chunk
+    uint8_t sOf[16][8];
+    int32_t numScaleVectors;
+    alignas(32) float e4m3[256];
+};
+
+inline Fp4Tables buildFp4Tables()
+{
+    Tables const& t = tables();
+    Fp4Tables f{};
+    auto const storagePosition = [](int32_t m) {
+        int32_t const r = m / 8;
+        int32_t const c = m % 8;
+        int32_t const swapped = (r & 0x4) | ((r & 0x1) << 1) | ((r >> 1) & 0x1);
+        return 8 * c + swapped;
+    };
+    int32_t n = 0;
+    for (int32_t b = 0; b < 16; ++b)
+    {
+        for (int32_t j = 0; j < 8; ++j)
+        {
+            int32_t v[8];
+            for (int32_t l = 0; l < 8; ++l)
+            {
+                v[l] = storagePosition(t.column[b][j][l]);
+            }
+            int32_t d = 0;
+            while (d < n && !std::equal(v, v + 8, f.sVec[d]))
+            {
+                ++d;
+            }
+            if (d == n)
+            {
+                std::copy(v, v + 8, f.sVec[n++]);
+            }
+            f.sOf[b][j] = static_cast<uint8_t>(d);
+        }
+    }
+    f.numScaleVectors = n;
+    for (int32_t i = 0; i < 256; ++i)
+    {
+        int32_t const e = (i >> 3) & 0xF;
+        int32_t const m = i & 7;
+        float const mag = e == 0 ? std::ldexp(static_cast<float>(m) / 8.0F, -6) : std::ldexp(1.0F + static_cast<float>(m) / 8.0F, e - 7);
+        f.e4m3[i] = (e == 15 && m == 7) ? 0.0F : ((i & 0x80) != 0 ? -mag : mag);
+    }
+    return f;
+}
+
+inline Fp4Tables const& fp4Tables()
+{
+    static Fp4Tables const f = buildFp4Tables();
+    return f;
+}
+
+//! out64[c] = mult * sum_k x[k] * e2m1(code[64 * nt + c, k]) * e4m3(scale[64 * nt + c, k / 16]) for the 64 output columns of tile nt. w points at the first int32 of the
+//! matrix (row k / 16 starts rowWords int32 later; a tile is 128 int32), s at the first scale byte (row stride sRow bytes). 128 accumulator vectors (one per block and
+//! nibble) stay in L1 and are reduced to columns at the end; the E2M1 value comes from an 8-entry permute (the index uses only the low 3 bits) and an xor of the sign bit.
+__attribute__((target("avx2,fma,f16c"))) inline void gemvTileFp4(Tables const& t, Fp4Tables const& f, int32_t const* w, size_t rowWords, uint8_t const* s,
+    size_t sRow, float const* x, int32_t K, int32_t nt, float mult, float* out64)
+{
+    alignas(32) float acc[128][8] = {};
+    alignas(32) float xp[8][8];
+    alignas(32) float chunk[64];
+    alignas(32) float sv[Fp4Tables::kMaxScaleVectors][8];
+    __m256i const seven = _mm256_set1_epi32(7);
+    __m256 const lut = _mm256_setr_ps(0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F);
+    __m256i const signMask = _mm256_set1_epi32(static_cast<int32_t>(0x80000000u));
+    for (int32_t kb = 0; kb < K / 16; ++kb)
+    {
+        __m256 const xlo = _mm256_loadu_ps(x + kb * 16);
+        __m256 const xhi = _mm256_loadu_ps(x + kb * 16 + 8);
+        for (int32_t d = 0; d < 8; ++d)
+        {
+            __m256i const ix = _mm256_load_si256(reinterpret_cast<__m256i const*>(t.xVec[d]));
+            _mm256_store_ps(xp[d], _mm256_blendv_ps(_mm256_permutevar8x32_ps(xlo, ix), _mm256_permutevar8x32_ps(xhi, ix), _mm256_castsi256_ps(_mm256_cmpgt_epi32(ix, seven))));
+        }
+        uint8_t const* sc = s + static_cast<size_t>(kb) * sRow + static_cast<size_t>(nt) * 64;
+        for (int32_t i = 0; i < 8; ++i)
+        {
+            __m256i const idx = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<__m128i const*>(sc + 8 * i)));
+            _mm256_store_ps(chunk + 8 * i, _mm256_i32gather_ps(f.e4m3, idx, 4));
+        }
+        for (int32_t e = 0; e < f.numScaleVectors; ++e)
+        {
+            _mm256_store_ps(sv[e], _mm256_i32gather_ps(chunk, _mm256_load_si256(reinterpret_cast<__m256i const*>(f.sVec[e])), 4));
+        }
+        int32_t const* tile = w + static_cast<size_t>(kb) * rowWords + static_cast<size_t>(nt) * 128;
+        if (kb + 2 < K / 16)
+        {
+            // the tiles of one column block sit rowWords apart; fetch the one two rows ahead (512 bytes) while this one is decoded
+            char const* ahead = reinterpret_cast<char const*>(tile + 2 * rowWords);
+            for (int32_t line = 0; line < 8; ++line)
+            {
+                _mm_prefetch(ahead + 64 * line, _MM_HINT_T0);
+            }
+        }
+#define EDGELLM_FP4_NIBBLE(J)                                                                                                                                  \
+    {                                                                                                                                                          \
+        __m256 const mag = _mm256_permutevar8x32_ps(lut, _mm256_srli_epi32(v, 4 * (J)));                                                                       \
+        __m256i const sign = _mm256_and_si256(_mm256_slli_epi32(v, 28 - 4 * (J)), signMask);                                                                   \
+        __m256 const val = _mm256_castsi256_ps(_mm256_xor_si256(_mm256_castps_si256(mag), sign));                                                              \
+        float* a = acc[b * 8 + (J)];                                                                                                                           \
+        _mm256_store_ps(a, _mm256_fmadd_ps(_mm256_mul_ps(val, _mm256_load_ps(xp[t.xOf[b][(J)]])), _mm256_load_ps(sv[f.sOf[b][(J)]]), _mm256_load_ps(a)));      \
+    }
+        for (int32_t b = 0; b < 16; ++b)
+        {
+            __m256i const v = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(tile + b * 8));
+            EDGELLM_FP4_NIBBLE(0)
+            EDGELLM_FP4_NIBBLE(1)
+            EDGELLM_FP4_NIBBLE(2)
+            EDGELLM_FP4_NIBBLE(3)
+            EDGELLM_FP4_NIBBLE(4)
+            EDGELLM_FP4_NIBBLE(5)
+            EDGELLM_FP4_NIBBLE(6)
+            EDGELLM_FP4_NIBBLE(7)
+        }
+#undef EDGELLM_FP4_NIBBLE
+    }
+    for (int32_t c = 0; c < 64; ++c)
+    {
+        out64[c] = 0.0F;
+    }
+    for (int32_t b = 0; b < 16; ++b)
+    {
+        for (int32_t j = 0; j < 8; ++j)
+        {
+            for (int32_t l = 0; l < 8; ++l)
+            {
+                out64[t.column[b][j][l]] += acc[b * 8 + j][l];
+            }
+        }
+    }
+    for (int32_t c = 0; c < 64; ++c)
+    {
+        out64[c] *= mult;
+    }
+}
+
 //! int8 activations of one input vector for gemvTileVnni: symmetric, one scale per 128 inputs, laid out per 16-row k-tile and block parity as 8 lanes x 4 bytes (rows
 //! 2p + {0, 8, 1, 9} of the tile, p = (2b + lane / 4) % 4 for blocks b of the tile), plus per group the int32 sum of every lane's four quantised values.
 template <int32_t kMaxK>
@@ -398,6 +549,141 @@ __attribute__((target("avx2,fma,f16c,avxvnni"))) inline void gemvTileVnni(
             out64[t.column[b][0][l]] += accF[b][0][l];
             out64[t.column[b][2][l]] += accF[b][1][l];
         }
+    }
+}
+
+//! int8 activations for gemvTileFp4Vnni: the layout of QuantisedX (per 16-row k-tile and block parity 8 lanes x 4 bytes, rows 2p + {0, 8, 1, 9}) with one symmetric
+//! scale per 16 inputs, because the NVFP4 weight scale changes every 16 rows; plus per tile and parity the int32 sum of every lane's four values.
+template <int32_t kMaxK>
+struct QuantisedX16
+{
+    alignas(32) int8_t v[kMaxK / 16 * 64];
+    alignas(32) int32_t sum[kMaxK / 16 * 16];
+    float scale[kMaxK / 16];
+    int32_t k;
+};
+
+template <int32_t kMaxK>
+__attribute__((target("avx2,fma,f16c,avxvnni"))) inline void quantiseX16(float const* x, int32_t K, QuantisedX16<kMaxK>& q)
+{
+    static __m128i const* const masks = []()
+    {
+        alignas(16) static uint8_t bytes[4][16];
+        for (int32_t p = 0; p < 4; ++p)
+        {
+            for (int32_t l = 0; l < 4; ++l)
+            {
+                bytes[p][4 * l + 0] = static_cast<uint8_t>(2 * p);
+                bytes[p][4 * l + 1] = static_cast<uint8_t>(2 * p + 8);
+                bytes[p][4 * l + 2] = static_cast<uint8_t>(2 * p + 1);
+                bytes[p][4 * l + 3] = static_cast<uint8_t>(2 * p + 9);
+            }
+        }
+        return reinterpret_cast<__m128i const*>(bytes);
+    }();
+    q.k = K;
+    __m256i const ones = _mm256_set1_epi8(1);
+    __m256 const signMask = _mm256_set1_ps(-0.0F);
+    for (int32_t kb = 0; kb < K / 16; ++kb)
+    {
+        float const* xk = x + kb * 16;
+        __m256 const lo = _mm256_loadu_ps(xk);
+        __m256 const hi = _mm256_loadu_ps(xk + 8);
+        __m256 amaxv = _mm256_max_ps(_mm256_andnot_ps(signMask, lo), _mm256_andnot_ps(signMask, hi));
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(amaxv), _mm256_extractf128_ps(amaxv, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_shuffle_ps(m4, m4, 1));
+        float const amax = _mm_cvtss_f32(m4);
+        float const scale = amax > 0.0F ? amax / 127.0F : 1.0F;
+        __m256 const inv = _mm256_set1_ps(1.0F / scale);
+        q.scale[kb] = scale;
+        __m256i const a = _mm256_cvtps_epi32(_mm256_mul_ps(lo, inv));
+        __m256i const b = _mm256_cvtps_epi32(_mm256_mul_ps(hi, inv));
+        __m256i const words = _mm256_permute4x64_epi64(_mm256_packs_epi32(a, b), 0xD8);
+        __m256i const bytes = _mm256_packs_epi16(words, words);
+        __m128i const row = _mm_unpacklo_epi64(_mm256_castsi256_si128(bytes), _mm256_extracti128_si256(bytes, 1));
+        int8_t* dst = q.v + static_cast<size_t>(kb) * 64;
+        for (int32_t par = 0; par < 2; ++par)
+        {
+            _mm_store_si128(reinterpret_cast<__m128i*>(dst + par * 32), _mm_shuffle_epi8(row, _mm_load_si128(masks + 2 * par)));
+            _mm_store_si128(reinterpret_cast<__m128i*>(dst + par * 32 + 16), _mm_shuffle_epi8(row, _mm_load_si128(masks + 2 * par + 1)));
+            __m256i const s = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ones, _mm256_load_si256(reinterpret_cast<__m256i const*>(dst + par * 32)));
+            _mm256_store_si256(reinterpret_cast<__m256i*>(q.sum + (kb * 2 + par) * 8), s);
+        }
+    }
+}
+
+//! gemvTileFp4 with int8 activations. The E2M1 code of every nibble goes through vpshufb to 2 * value + 12 (0..24, unsigned) and vpdpbusd multiplies it with the int8
+//! activations of its row; per 16-row tile the integer sum minus 12 * sum(x) is scaled by the E4M3 block scale times the activation scale and added to a float
+//! accumulator. Nibbles {0,1,4,5} of a word are one output column and {2,3,6,7} the column 8 away, both multiplying the same four activation rows. The factor 2
+//! of the table goes into mult.
+template <int32_t kMaxK>
+__attribute__((target("avx2,fma,f16c,avxvnni"))) inline void gemvTileFp4Vnni(Tables const& t, Fp4Tables const& f, int32_t const* w, size_t rowWords, uint8_t const* s,
+    size_t sRow, QuantisedX16<kMaxK> const& x, int32_t nt, float mult, float* out64)
+{
+    alignas(32) float accF[16][2][8] = {};
+    alignas(32) float chunk[64];
+    alignas(32) float sv[Fp4Tables::kMaxScaleVectors][8];
+    __m256i const m0 = _mm256_set1_epi32(0x000F000F);
+    __m256i const m1 = _mm256_set1_epi32(0x0F000F00);
+    __m256i const twelve = _mm256_set1_epi32(12);
+    __m256i const lut = _mm256_broadcastsi128_si256(_mm_setr_epi8(12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0));
+    for (int32_t kb = 0; kb < x.k / 16; ++kb)
+    {
+        uint8_t const* sc = s + static_cast<size_t>(kb) * sRow + static_cast<size_t>(nt) * 64;
+        for (int32_t i = 0; i < 8; ++i)
+        {
+            __m256i const idx = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<__m128i const*>(sc + 8 * i)));
+            _mm256_store_ps(chunk + 8 * i, _mm256_i32gather_ps(f.e4m3, idx, 4));
+        }
+        __m256 const xs = _mm256_set1_ps(x.scale[kb]);
+        for (int32_t e = 0; e < f.numScaleVectors; ++e)
+        {
+            _mm256_store_ps(sv[e], _mm256_mul_ps(_mm256_i32gather_ps(chunk, _mm256_load_si256(reinterpret_cast<__m256i const*>(f.sVec[e])), 4), xs));
+        }
+        __m256i const off[2] = {_mm256_mullo_epi32(_mm256_load_si256(reinterpret_cast<__m256i const*>(x.sum + (kb * 2 + 0) * 8)), twelve),
+            _mm256_mullo_epi32(_mm256_load_si256(reinterpret_cast<__m256i const*>(x.sum + (kb * 2 + 1) * 8)), twelve)};
+        int8_t const* xk = x.v + static_cast<size_t>(kb) * 64;
+        __m256i const xv[2] = {_mm256_load_si256(reinterpret_cast<__m256i const*>(xk)), _mm256_load_si256(reinterpret_cast<__m256i const*>(xk + 32))};
+        int32_t const* tile = w + static_cast<size_t>(kb) * rowWords + static_cast<size_t>(nt) * 128;
+        if (kb + 2 < x.k / 16)
+        {
+            char const* ahead = reinterpret_cast<char const*>(tile + 2 * rowWords);
+            for (int32_t line = 0; line < 8; ++line)
+            {
+                _mm_prefetch(ahead + 64 * line, _MM_HINT_T0);
+            }
+        }
+#pragma GCC unroll 16
+        for (int32_t b = 0; b < 16; ++b)
+        {
+            __m256i const v = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(tile + b * 8));
+            __m256i const lo = _mm256_or_si256(_mm256_and_si256(v, m0), _mm256_and_si256(_mm256_slli_epi32(v, 4), m1));
+            __m256i const hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi32(v, 8), m0), _mm256_and_si256(_mm256_srli_epi32(v, 4), m1));
+            __m256i const a = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), _mm256_shuffle_epi8(lut, lo), xv[b & 1]);
+            __m256i const c = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), _mm256_shuffle_epi8(lut, hi), xv[b & 1]);
+            __m256 const ca = _mm256_cvtepi32_ps(_mm256_sub_epi32(a, off[b & 1]));
+            __m256 const cb = _mm256_cvtepi32_ps(_mm256_sub_epi32(c, off[b & 1]));
+            _mm256_store_ps(accF[b][0], _mm256_fmadd_ps(ca, _mm256_load_ps(sv[f.sOf[b][0]]), _mm256_load_ps(accF[b][0])));
+            _mm256_store_ps(accF[b][1], _mm256_fmadd_ps(cb, _mm256_load_ps(sv[f.sOf[b][2]]), _mm256_load_ps(accF[b][1])));
+        }
+    }
+    for (int32_t c = 0; c < 64; ++c)
+    {
+        out64[c] = 0.0F;
+    }
+    for (int32_t b = 0; b < 16; ++b)
+    {
+        for (int32_t l = 0; l < 8; ++l)
+        {
+            out64[t.column[b][0][l]] += accF[b][0][l];
+            out64[t.column[b][2][l]] += accF[b][1][l];
+        }
+    }
+    float const scaled = 0.5F * mult; // the table holds 2 * value
+    for (int32_t c = 0; c < 64; ++c)
+    {
+        out64[c] *= scaled;
     }
 }
 

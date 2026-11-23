@@ -21,6 +21,7 @@
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
+#include "common/stringUtils.h"
 #include "common/trtUtils.h"
 #include "profiling/nvtx_wrapper.h"
 #include "runtime/exec/engineExecutor.h"
@@ -380,6 +381,15 @@ bool keepSidecarOnHost(std::string const& file)
     return pattern != nullptr && *pattern != '\0' && file.find(pattern) != std::string::npos;
 }
 
+//! EDGELLM_HOST_CHECKPOINT_WEIGHTS=<substring>[,<substring>...]: checkpoint bindings whose engine name contains any of
+//! the substrings are materialized into pinned host memory (read over PCIe through UVA) instead of the device weight
+//! arena.
+bool keepBindingOnHost(std::string const& engineName)
+{
+    char const* patterns = std::getenv("EDGELLM_HOST_CHECKPOINT_WEIGHTS");
+    return patterns != nullptr && format::containsAnySubstring(engineName, patterns);
+}
+
 void loadSidecars(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, Json const& config,
     std::vector<Tensor>& weights, std::vector<Tensor>& hostWeights, cudaStream_t stream)
 {
@@ -460,6 +470,7 @@ ExternalWeightManager& ExternalWeightManager::operator=(ExternalWeightManager&& 
     }
     releasePluginResources();
     mWeightStorage = std::move(other.mWeightStorage);
+    mHostWeightStorage = std::move(other.mHostWeightStorage);
     mWeights = std::move(other.mWeights);
     mBindingContracts = std::move(other.mBindingContracts);
     mHostWeights = std::move(other.mHostWeights);
@@ -645,10 +656,12 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
             size_t offset{0};
             bool materialize{true};
             void* shared{nullptr}; //!< Address of an identical tensor another engine's manager already holds.
+            bool host{false};
         };
         std::vector<BindingLayout> layouts(bindings.size());
         std::unordered_map<std::string, size_t> bindingIndices;
         size_t storageBytes = 0;
+        size_t hostStorageBytes = 0;
         for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex)
         {
             Json const& binding = bindings[bindingIndex];
@@ -681,6 +694,7 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
                     sharedWeightBytes += static_cast<size_t>(shape.volume()) * utils::getTypeSize(dtype);
                 }
             }
+            layouts[bindingIndex].host = keepBindingOnHost(name) && !isPackedNvfp4Binding(binding);
             mBindingContracts[name] = contractText;
         }
         bool const hasPackedNvfp4Weights = std::any_of(bindings.begin(), bindings.end(),
@@ -697,10 +711,11 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
                 BindingLayout& layout = layouts[bindingIndex];
                 size_t const bytes = static_cast<size_t>(layout.shape.volume()) * utils::getTypeSize(layout.dtype);
                 ELLM_CHECK(bytes > 0, "Checkpoint binding has an empty tensor: " + binding.value("engine_name", ""));
-                storageBytes = alignWeightBytes(storageBytes);
-                layout.offset = storageBytes;
-                ELLM_CHECK(bytes <= std::numeric_limits<size_t>::max() - storageBytes, "Weight arena size overflow");
-                storageBytes += bytes;
+                size_t& arenaBytes = layout.host ? hostStorageBytes : storageBytes;
+                arenaBytes = alignWeightBytes(arenaBytes);
+                layout.offset = arenaBytes;
+                ELLM_CHECK(bytes <= std::numeric_limits<size_t>::max() - arenaBytes, "Weight arena size overflow");
+                arenaBytes += bytes;
             }
         };
         allocateBindings(/*packedNvfp4=*/true);
@@ -727,6 +742,7 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
                 "Checkpoint storage alias shape or dtype differs from target: "
                     + binding["engine_name"].get<std::string>());
             layout.offset = targetLayout.offset;
+            layout.host = targetLayout.host;
             layout.materialize = false;
             size_t const bytes = static_cast<size_t>(layout.shape.volume()) * utils::getTypeSize(layout.dtype);
             ELLM_CHECK(
@@ -747,6 +763,17 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
                 nvinfer1::DataType::kUINT8, "ExternalWeightManager::weightArena");
         }
         weightArenaBytes = allocationBytes;
+        uint8_t* hostStorage = nullptr;
+        if (hostStorageBytes > 0)
+        {
+            hostStorageBytes = alignWeightBytes(hostStorageBytes);
+            mHostWeightStorage = Tensor(Coords{static_cast<int64_t>(hostStorageBytes)}, DeviceType::kCPU,
+                nvinfer1::DataType::kUINT8, "ExternalWeightManager::hostWeightArena");
+            hostStorage = static_cast<uint8_t*>(mHostWeightStorage.rawPointer());
+            HostMemoryAccounting::add(HostMemoryCategory::kExpertWeights, static_cast<int64_t>(hostStorageBytes));
+            LOG_INFO("Checkpoint weights in pinned host memory: %.2f GB (EDGELLM_HOST_CHECKPOINT_WEIGHTS)",
+                hostStorageBytes / 1e9);
+        }
         arenaAllocationTime = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - phaseStart);
 
         phaseStart = Clock::now();
@@ -764,8 +791,9 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
         {
             Json const& binding = bindings[bindingIndex];
             BindingLayout const& layout = layouts[bindingIndex];
+            uint8_t* const base = layout.host ? hostStorage : storage;
             preparedWeights.emplace_back(layout.shared != nullptr ? static_cast<void*>(layout.shared)
-                                                                  : static_cast<void*>(storage + layout.offset),
+                                                                  : static_cast<void*>(base + layout.offset),
                 layout.shape, DeviceType::kGPU, layout.dtype, binding.at("engine_name").get<std::string>());
         }
         auto materializePhase = [&](CheckpointWeightPhase phase) {
@@ -905,7 +933,8 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
                 ELLM_CHECK(!mEmbedding.has_value(), "Runtime config has multiple embedding bindings");
                 if (binding.at("engine_name").get<std::string>() != "__embedding__")
                 {
-                    mWeights.emplace_back(storage + layout.offset, layout.shape, DeviceType::kGPU, layout.dtype,
+                    mWeights.emplace_back((layout.host ? hostStorage : storage) + layout.offset, layout.shape,
+                        DeviceType::kGPU, layout.dtype,
                         binding.at("engine_name").get<std::string>());
                 }
                 mEmbedding = std::move(tensor);

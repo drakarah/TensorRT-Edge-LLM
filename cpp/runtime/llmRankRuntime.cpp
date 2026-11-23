@@ -80,6 +80,7 @@ namespace rt
 
 namespace
 {
+void* moePluginSymbol(char const* name);
 //! Prompt-token spacing of the host prefix snapshots taken between prefill passes (EDGELLM_SWA_PREFIX_CAPTURE_INTERVAL);
 //! 0 snapshots after every pass. Each snapshot re-stores the whole bounded window.
 int32_t swaPrefixCaptureInterval()
@@ -733,8 +734,11 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         if (char const* mb = std::getenv("EDGELLM_SWA_PREFIX_CACHE_MB"); mb != nullptr && std::atoll(mb) > 0)
         {
             size_t const budget = static_cast<size_t>(std::atoll(mb)) << 20;
-            mSwaPrefixCache = std::make_unique<SwaPrefixCache>(
-                mSharedResources->cacheManagers[0]->getKVCacheManager(), *mSharedResources->kvPageTables[0], budget);
+            mSwaPrefixCache = std::make_unique<SwaPrefixCache>(mSharedResources->cacheManagers[0]->getKVCacheManager(),
+                *mSharedResources->kvPageTables[0], budget,
+                mBaseExecutor != nullptr && mDeployment.base.numLinearAttnLayers > 0
+                    ? &mSharedResources->cacheManagers[0]->getMambaCacheManager()
+                    : nullptr);
             LOG_INFO("Bounded-SWA prefix cache enabled: %zu MiB of pinned host memory.", budget >> 20);
         }
     }
@@ -778,6 +782,42 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         static_cast<size_t>(strategyContextMemorySize), static_cast<size_t>(visionContextMemorySize),
         static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
 
+    // EDGELLM_MOE_EXEC_OVERLAY=1: lend the part of this memory that the decode profile (and every other engine) does not use to the MoE plugin's expert caches. An
+    // engine built for long prefill passes needs a much larger context than a decode step; the caches placed there are invalidated by the plugin at every prefill pass.
+    if (char const* overlay = std::getenv("EDGELLM_MOE_EXEC_OVERLAY"); overlay != nullptr && std::atoi(overlay) != 0 && sharedContextMemorySize > 0)
+    {
+        auto const& baseEngine = mBaseExecutor->getEngine();
+        int64_t smallest = sharedContextMemorySize;
+        for (int32_t profile = 0; profile < baseEngine.getNbOptimizationProfiles(); ++profile)
+        {
+            int64_t const forProfile = static_cast<int64_t>(baseEngine.getDeviceMemorySizeForProfileV2(profile));
+            LOG_INFO("Execution context memory of optimization profile %d: %.1f MiB", profile, forProfile / 1048576.0);
+            smallest = std::min<int64_t>(smallest, forProfile);
+        }
+        constexpr int64_t kAlign = 1 << 20;
+        int64_t const keep = (std::max({smallest, strategyContextMemorySize, visionContextMemorySize, audioContextMemorySize, actionContextMemorySize}) + kAlign - 1)
+            / kAlign * kAlign;
+        int64_t keepBytes = keep;
+        if (char const* keepMb = std::getenv("EDGELLM_MOE_EXEC_OVERLAY_KEEP_MB"); keepMb != nullptr)
+        {
+            keepBytes = std::max<int64_t>(keep, static_cast<int64_t>(std::atoll(keepMb)) * kAlign);
+        }
+        int64_t const lent = sharedContextMemorySize - keepBytes;
+        using RegisterFn = void (*)(void*, int64_t);
+        void* const symbol = moePluginSymbol("edgellmMoeRegisterExecOverlay");
+        if (symbol != nullptr && lent >= (64 << 20))
+        {
+            reinterpret_cast<RegisterFn>(symbol)(static_cast<uint8_t*>(mSharedExecContextMemory.rawPointer()) + keepBytes, lent);
+            mExecOverlayActive = true;
+            LOG_INFO("Lent %.0f MiB of the execution context memory to the MoE expert caches (decode needs %.0f MiB of the %.0f MiB).", lent / 1048576.0,
+                keepBytes / 1048576.0, sharedContextMemorySize / 1048576.0);
+        }
+        else
+        {
+            LOG_INFO("Execution context memory overlay not used (plugin symbol %s, lendable %.0f MiB).", symbol != nullptr ? "found" : "not found", lent / 1048576.0);
+        }
+    }
+
     // Encoder embedding cache — content-addressed GPU cache for ViT/audio encoder outputs.
     if ((mVisionRunner || mAudioRunner) && contextCacheConfig.encoderEmbeddingCacheBudgetBytes > 0)
     {
@@ -786,6 +826,75 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         LOG_INFO("Encoder embedding cache initialized with %zu MiB budget.",
             static_cast<size_t>(budgetBytes / (1024 * 1024)));
     }
+}
+
+namespace
+{
+constexpr uint8_t kExecPoison = 0xA5;
+constexpr int64_t kExecScanBucket = 1 << 20;
+} // namespace
+
+void LLMRankRuntime::invalidateExecOverlay(cudaStream_t stream)
+{
+    if (!mExecOverlayActive)
+    {
+        return;
+    }
+    using InvalidateFn = void (*)(void*);
+    if (void* const symbol = moePluginSymbol("edgellmMoeInvalidateExecOverlay"); symbol != nullptr)
+    {
+        reinterpret_cast<InvalidateFn>(symbol)(stream);
+    }
+}
+
+void LLMRankRuntime::poisonExecContext(cudaStream_t stream)
+{
+    if (mSharedExecContextMemory.isEmpty() || std::getenv("EDGELLM_EXEC_POISON_SCAN") == nullptr)
+    {
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemsetAsync(mSharedExecContextMemory.rawPointer(), kExecPoison, mSharedExecContextMemory.getMemoryCapacity(), stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    mExecContextPoisoned = true;
+}
+
+void LLMRankRuntime::scanExecContext(cudaStream_t stream)
+{
+    if (!mExecContextPoisoned)
+    {
+        return;
+    }
+    mExecContextPoisoned = false;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int64_t const bytes = mSharedExecContextMemory.getMemoryCapacity();
+    std::vector<uint8_t> host(static_cast<size_t>(bytes));
+    CUDA_CHECK(cudaMemcpy(host.data(), mSharedExecContextMemory.rawPointer(), host.size(), cudaMemcpyDeviceToHost));
+    int64_t highest = -1;
+    int64_t touchedBytes = 0;
+    for (int64_t bucket = 0; bucket * kExecScanBucket < bytes; ++bucket)
+    {
+        int64_t const begin = bucket * kExecScanBucket;
+        int64_t const end = std::min(bytes, begin + kExecScanBucket);
+        int64_t changed = 0;
+        int64_t last = -1;
+        for (int64_t i = begin; i < end; ++i)
+        {
+            if (host[static_cast<size_t>(i)] != kExecPoison)
+            {
+                ++changed;
+                last = i;
+            }
+        }
+        if (changed > 0)
+        {
+            LOG_INFO("ExecScan: MiB %ld changed %ld bytes (last at offset %ld)", static_cast<long>(bucket), static_cast<long>(changed), static_cast<long>(last));
+            highest = std::max(highest, last);
+            touchedBytes += changed;
+        }
+    }
+    LOG_INFO("ExecScan: decode changed %ld bytes of %ld, highest offset %ld (%.2f MiB)", static_cast<long>(touchedBytes), static_cast<long>(bytes),
+        static_cast<long>(highest), highest / 1048576.0);
 }
 
 void LLMRankRuntime::ensureLogprobsCapacity(int32_t logprobsRows, int32_t topK)
@@ -1302,6 +1411,8 @@ bool LLMRankRuntime::GenerationSession::performBatchEvictAndSnapshot()
 
 bool LLMRankRuntime::GenerationSession::primeFromPrefill()
 {
+    mRuntime.invalidateExecOverlay(mStream);
+    mRuntime.poisonExecContext(mStream);
 
     // Post-prefill per-iter pipeline:
     //   cancel → decode (emitDelta + stop match) → finalize (EOS/length/stop) → emit
@@ -1921,8 +2032,15 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
 
 ReasoningBudget LLMRankRuntime::makeReasoningBudget(LLMGenerationRequest const& request)
 {
-    int32_t const startId = reasoningStartMarkers(*mTokenizer)[1];
-    int32_t const endId = reasoningEndMarkers(*mTokenizer)[1];
+    int32_t startId = reasoningStartMarkers(*mTokenizer)[1];
+    int32_t endId = reasoningEndMarkers(*mTokenizer)[1];
+    if (startId < 0 || endId < 0)
+    {
+        // Inkling 2: a thinking message opens with <|content_thinking|> and closes with <|end_message|>, after which the model
+        // opens the answer message itself (the grammar gate keeps its own markers: it must not wait for this end token)
+        startId = static_cast<int32_t>(mTokenizer->getTokenId("<|content_thinking|>"));
+        endId = static_cast<int32_t>(mTokenizer->getTokenId("<|end_message|>"));
+    }
     if (startId < 0 || endId < 0)
     {
         LOG_ERROR("The tokenizer has no think start/end tokens, so a reasoning budget cannot be applied.");
@@ -2489,7 +2607,9 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         if (std::optional<SwaPrefixCache::Hit> const hit = mSwaPrefixCache->lookup(fullPrompt))
         {
             // Reuse hit.length - 1 tokens so the last cached token is recomputed, as the legacy system-prompt cache does.
-            int32_t const restoreLength = hit->length - 1;
+            // A snapshot with recurrent/convolution state is exact at hit.length (the lookup only returns strict
+            // prefixes, so the prompt still has tokens left), and that state cannot be rewound by one token.
+            int32_t const restoreLength = mSwaPrefixCache->hasStates() ? hit->length : hit->length - 1;
             if (restoreLength > 0 && managedRequest->prepareSwaPrefill({restoreLength}, false))
             {
                 mSwaPrefixCache->restore(*hit, context.residentRefs.at(0).slot, restoreLength,
@@ -2505,6 +2625,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
                 check::check(mHostReuseKVCacheLengths.reshape({1}), "Tensor reshape failed");
                 mHostReuseKVCacheLengths.dataPointer<int32_t>()[0] = restoreLength;
                 mSharedResources->cacheManagers[0]->resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+                mSwaPrefixCache->restoreStates(*hit, context.residentRefs.at(0).slot, context.stream);
                 if (decodingStrategy.isSpeculative())
                 {
                     decodingStrategy.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
@@ -2687,6 +2808,7 @@ bool LLMRankRuntime::finishGeneration(SteppedGeneration& generation, LLMGenerati
     ManagedKVCacheRequest* const managedRequest = generation.managedRequest();
     bool const enableSpecDecode = generation.enableSpecDecode;
     bool const hasActionRequest = generation.hasActionRequest;
+    scanExecContext(stream);
 
     // Few-layer-validation debug: write the accumulated per-layer logits/KV dump for this request.
     if (context.layerDebugger)

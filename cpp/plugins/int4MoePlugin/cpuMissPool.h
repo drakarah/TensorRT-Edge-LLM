@@ -57,6 +57,11 @@ struct LayerWeights
     size_t guWBytes{0}, guSBytes{0}, dnWBytes{0}, dnSBytes{0};
     int32_t hidden{0};
     int32_t inter{0};
+    bool fp4{false};     // NVFP4 experts (E2M1 codes, E4M3 block scales of 16) instead of int4 with fp16 scales of 128
+    float guMult{1.0F};  // per-layer global multiplier of the gate/up and down projections (fp4 only)
+    float dnMult{1.0F};
+    float gateCap{0.0F}; // soft caps of the gate and up activations (0 = plain SwiGLU)
+    float upCap{0.0F};
 };
 
 //! "0-11,14" -> {0..11, 14}
@@ -300,6 +305,7 @@ private:
         int32_t const numMiss = known ? mb.numMiss : 0;
         int32_t const inter = layer.inter;
         Tables const& tab = tables();
+        Fp4Tables const& fp4tab = fp4Tables();
         thread_local std::vector<float> xf(static_cast<size_t>(kernel::kCpuMissMaxTokens) * kernel::kCpuMissMaxHidden);
         for (int32_t i = 0; i < tokens * hidden; i += 8)
         {
@@ -309,6 +315,8 @@ private:
         {
             QuantisedX<kernel::kCpuMissMaxHidden> gu[kernel::kCpuMissMaxTokens];
             QuantisedX<1024> dn[kernel::kCpuMissMaxSlots];
+            QuantisedX16<kernel::kCpuMissMaxHidden> gu16[kernel::kCpuMissMaxTokens]; // NVFP4: one activation scale per 16 inputs
+            QuantisedX16<1280> dn16[kernel::kCpuMissMaxSlots];
         };
         thread_local std::unique_ptr<Int8Scratch> scratch;
         if (mInt8)
@@ -319,7 +327,14 @@ private:
             }
             for (int32_t tok = 0; tok < tokens; ++tok)
             {
-                quantiseX(xf.data() + static_cast<size_t>(tok) * hidden, hidden, scratch->gu[tok]);
+                if (layer.fp4)
+                {
+                    quantiseX16(xf.data() + static_cast<size_t>(tok) * hidden, hidden, scratch->gu16[tok]);
+                }
+                else
+                {
+                    quantiseX(xf.data() + static_cast<size_t>(tok) * hidden, hidden, scratch->gu[tok]);
+                }
             }
         }
         lap(0);
@@ -331,7 +346,26 @@ private:
                 size_t const e = static_cast<size_t>(mb.expert[m]);
                 auto const* wq = reinterpret_cast<int32_t const*>(layer.guW + e * layer.guWBytes);
                 auto const* sq = reinterpret_cast<uint16_t const*>(layer.guS + e * layer.guSBytes);
-                if (mInt8)
+                if (layer.fp4)
+                {
+                    // gate tiles first, then up tiles: [K/16][4 * inter] int32 words (gate | up), [K/16][2 * inter] scale bytes
+                    int32_t const tilesPerHalf = inter / 64;
+                    bool const up = tile >= tilesPerHalf;
+                    int32_t const nt = up ? tile - tilesPerHalf : tile;
+                    if (mInt8)
+                    {
+                        gemvTileFp4Vnni(tab, fp4tab, wq + (up ? 2 * static_cast<size_t>(inter) : 0), 4 * static_cast<size_t>(inter),
+                            reinterpret_cast<uint8_t const*>(sq) + (up ? inter : 0), 2 * static_cast<size_t>(inter), scratch->gu16[mb.token[m]], nt,
+                            layer.guMult, &mGateUp[m][tile * 64]);
+                    }
+                    else
+                    {
+                        gemvTileFp4(tab, fp4tab, wq + (up ? 2 * static_cast<size_t>(inter) : 0), 4 * static_cast<size_t>(inter),
+                            reinterpret_cast<uint8_t const*>(sq) + (up ? inter : 0), 2 * static_cast<size_t>(inter),
+                            xf.data() + static_cast<size_t>(mb.token[m]) * hidden, hidden, nt, layer.guMult, &mGateUp[m][tile * 64]);
+                    }
+                }
+                else if (mInt8)
                 {
                     gemvTileVnni(tab, wq, sq, scratch->gu[mb.token[m]], guN, tile, &mGateUp[m][tile * 64]);
                 }
@@ -350,7 +384,15 @@ private:
             int32_t const m = idx / inter;
             int32_t const i = idx % inter;
             float const g = mGateUp[m][i];
-            mAct[m][i] = g / (1.0F + std::exp(-g)) * mGateUp[m][inter + i];
+            float const u = mGateUp[m][inter + i];
+            if (layer.gateCap > 0.0F && layer.upCap > 0.0F)
+            {
+                mAct[m][i] = layer.gateCap * std::tanh(g / layer.gateCap) * (1.0F / (1.0F + std::exp(-g))) * (layer.upCap * std::tanh(u / layer.upCap));
+            }
+            else
+            {
+                mAct[m][i] = g / (1.0F + std::exp(-g)) * u;
+            }
         }
         lap(3);
         barrier();
@@ -359,7 +401,14 @@ private:
         {
             for (int32_t m = 0; m < numMiss; ++m)
             {
-                quantiseX(mAct[m], inter, scratch->dn[m]);
+                if (layer.fp4)
+                {
+                    quantiseX16(mAct[m], inter, scratch->dn16[m]);
+                }
+                else
+                {
+                    quantiseX(mAct[m], inter, scratch->dn[m]);
+                }
             }
         }
         for (int32_t tile = tid; tile < hidden / 64; tile += mThreads)
@@ -374,7 +423,20 @@ private:
                 float out[64];
                 auto const* wq = reinterpret_cast<int32_t const*>(layer.dnW + e * layer.dnWBytes);
                 auto const* sq = reinterpret_cast<uint16_t const*>(layer.dnS + e * layer.dnSBytes);
-                if (mInt8)
+                if (layer.fp4)
+                {
+                    if (mInt8)
+                    {
+                        gemvTileFp4Vnni(tab, fp4tab, wq, 2 * static_cast<size_t>(hidden), reinterpret_cast<uint8_t const*>(sq), static_cast<size_t>(hidden),
+                            scratch->dn16[m], tile, layer.dnMult, out);
+                    }
+                    else
+                    {
+                        gemvTileFp4(tab, fp4tab, wq, 2 * static_cast<size_t>(hidden), reinterpret_cast<uint8_t const*>(sq), static_cast<size_t>(hidden), mAct[m], inter,
+                            tile, layer.dnMult, out);
+                    }
+                }
+                else if (mInt8)
                 {
                     gemvTileVnni(tab, wq, sq, scratch->dn[m], hidden, tile, out);
                 }
@@ -402,7 +464,7 @@ private:
             mMissSum += static_cast<uint64_t>(numMiss);
             mBusyNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - startTime).count());
             static bool const stats = std::getenv("EDGELLM_MOE_CPU_STATS") != nullptr;
-            if (stats && mCalls % 4000 == 0)
+            if (stats && mCalls % 1000 == 0)
             {
                 // mean over threads, per doorbell: x->fp32, gate_up tiles, wait, SwiGLU, wait, down tiles, wait (threads other than 0 may lag a call)
                 double phase[7] = {};
@@ -449,8 +511,8 @@ private:
     alignas(64) std::atomic<int32_t> mArrived{0};
     alignas(64) std::atomic<int32_t> mGeneration{0};
     LayerWeights mLayers[kMaxLayers];
-    alignas(64) float mGateUp[kernel::kCpuMissMaxSlots][2048];
-    alignas(64) float mAct[kernel::kCpuMissMaxSlots][1024];
+    alignas(64) float mGateUp[kernel::kCpuMissMaxSlots][2560];
+    alignas(64) float mAct[kernel::kCpuMissMaxSlots][1280];
 };
 
 } // namespace cpumiss
@@ -481,6 +543,11 @@ struct LayerWeights
     size_t guWBytes{0}, guSBytes{0}, dnWBytes{0}, dnSBytes{0};
     int32_t hidden{0};
     int32_t inter{0};
+    bool fp4{false};     // NVFP4 experts (E2M1 codes, E4M3 block scales of 16) instead of int4 with fp16 scales of 128
+    float guMult{1.0F};  // per-layer global multiplier of the gate/up and down projections (fp4 only)
+    float dnMult{1.0F};
+    float gateCap{0.0F}; // soft caps of the gate and up activations (0 = plain SwiGLU)
+    float upCap{0.0F};
 };
 
 class Pool

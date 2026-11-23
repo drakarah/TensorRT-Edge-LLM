@@ -14,7 +14,7 @@
 # limitations under the License.
 """Recurrent and stateful sequence operations."""
 
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 from ..ragged import RaggedDecoderInputs
 from ..tensor import Tensor
@@ -168,3 +168,58 @@ def update_ssm_state(
                      use_spec_verify_state=int(use_intermediate),
                      use_ddtree=int(use_ddtree),
                      time_step_limit=[0.0, float("inf")])
+
+
+def inkling2_short_conv(
+    x: Tensor,
+    taps: Tensor,
+    conv_state: Tensor,
+    ragged: RaggedDecoderInputs,
+    channels: int,
+    kernel_size: int,
+    scale: float,
+    dynamic_taps: Optional[Tensor] = None,
+    groups: int = 0,
+    state_offset: int = 0,
+) -> Tuple[Tensor, Tensor]:
+    """Run one Inkling 2 short convolution with residual and return output plus present state.
+
+    ``taps`` is [channels, kernel_size] FP32 with lag 0 (the current token) first.
+    ``dynamic_taps`` [tokens, groups * kernel_size] adds per-token taps shared
+    by ``channels / groups`` consecutive channels. The convolution uses state
+    channels ``state_offset .. state_offset + channels``.
+    """
+    if (dynamic_taps is None) != (groups == 0):
+        raise ValueError("dynamic_taps and groups must be given together")
+    inputs = [
+        x, taps, conv_state, ragged.query_start_offsets, ragged.query_lengths,
+        ragged.state_indices
+    ]
+    if dynamic_taps is not None:
+        inputs.append(dynamic_taps)
+    return operation("inkling2_short_conv",
+                     inputs,
+                     output_count=2,
+                     channels=channels,
+                     kernel_size=kernel_size,
+                     groups=groups,
+                     scale=scale,
+                     state_offset=state_offset)
+
+
+def inkling2_block_residual(states: List[Tensor], queries: Tensor,
+                            num_queries: int, hidden: int,
+                            eps: float) -> List[Tensor]:
+    """Softmax-weighted mix of the RMS-normalised block states for every query row.
+
+    ``states`` are [tokens, hidden] FP32 tensors, ``queries`` is [num_queries, hidden] FP32; returns one
+    [tokens, hidden] FP32 tensor per query.
+    """
+    outputs = operation("inkling2_block_residual",
+                        list(states) + [queries],
+                        output_count=num_queries,
+                        hidden=hidden,
+                        num_states=len(states),
+                        num_queries=num_queries,
+                        eps=eps)
+    return [outputs] if isinstance(outputs, Tensor) else list(outputs)
