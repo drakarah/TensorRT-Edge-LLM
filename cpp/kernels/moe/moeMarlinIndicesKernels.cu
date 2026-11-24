@@ -948,7 +948,7 @@ __global__ void sigmoidBiasTopkKernel(float const* logits, float const* selectio
         float keptSum = 0.0f;
         for (int32_t k = 0; k < topK; ++k)
         {
-            skipped[k] = tailSkip > 0 && k >= tailSkip && slotOf != nullptr && slotOf[chosen[k]] < 0 && score[chosen[k]] / (sum + 1e-20f) < tailMaxWeight;
+            skipped[k] = tailSkip > 0 && k >= tailSkip && (slotOf == nullptr || slotOf[chosen[k]] < 0) && score[chosen[k]] / (sum + 1e-20f) < tailMaxWeight; // no cache: every expert is resident, skipping is a pure quality-for-bytes trade (EDGELLM_MOE_TAIL_ALL)
             keptSum += skipped[k] ? 0.0f : score[chosen[k]];
         }
         float const denom = (tailRenorm != 0 ? keptSum : sum) + 1e-20f;

@@ -327,6 +327,17 @@ int32_t tailSkipFromEnv()
     return n;
 }
 
+//! EDGELLM_MOE_TAIL_ALL=1 (lossy, opt-in, decode only): with every expert resident (no expert cache, as on the Orin) EDGELLM_MOE_TAIL_SKIP=N skips every expert ranked N+1 or lower whose
+//! normalised routing weight is below EDGELLM_MOE_TAIL_MIN_WEIGHT; the skipped slots point at the top-ranked expert with weight 0, so Marlin reads fewer distinct experts.
+bool tailAllFromEnv()
+{
+    static bool const on = []() {
+        char const* const v = std::getenv("EDGELLM_MOE_TAIL_ALL");
+        return v != nullptr && std::string(v) == "1";
+    }();
+    return on;
+}
+
 //! EDGELLM_MOE_TAIL_MIN_WEIGHT=<w> (sigmoid routing, with EDGELLM_MOE_TAIL_SKIP=N): a tail expert is only skipped when its normalised routing weight is below w
 //! (default 1e9 = every non-resident tail expert is skipped).
 float tailMaxWeightFromEnv()
@@ -2912,7 +2923,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                     mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
             }
             kernel::launchSigmoidBiasTopk(static_cast<float const*>(inputs[0]), static_cast<float const*>(inputs[inputCount() - 1]), numTokens,
-                mNumExperts, mTopK, useCache ? routeBiasFromEnv() : 0.0f, useCache ? &routeState : nullptr, (useCache && numTokens <= 4) ? tailSkipFromEnv() : 0, tailRenormFromEnv(), tailMaxWeightFromEnv(), topkIndicesPtr, topkWeightsPtr, stream);
+                mNumExperts, mTopK, useCache ? routeBiasFromEnv() : 0.0f, useCache ? &routeState : nullptr, (useCache && numTokens <= 4) ? tailSkipFromEnv() : ((!useCache && tailAllFromEnv() && numTokens <= 4) ? tailSkipFromEnv() : 0), tailRenormFromEnv(), tailMaxWeightFromEnv(), topkIndicesPtr, topkWeightsPtr, stream);
         }
         else if (useCache && (cacheBiasFromEnv() > 0.0f || tailSkipFromEnv() > 0) && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
         {
