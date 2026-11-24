@@ -27,11 +27,15 @@ namespace kernel
 
 constexpr int32_t kFp8LinearMaxGemvTokens = 4;
 
+//! Weight byte format of launchFp8Linear: E4M3 codes (the Fp8LinearPlugin) or two's-complement INT8 (weight-only INT8, per-row scale).
+constexpr int32_t kLinearWeightFp8 = 0;
+constexpr int32_t kLinearWeightInt8 = 1;
+
 //! y[m, n] = scale[n] * sum_k x[m, k] * w[n, k]: FP8 (E4M3) weights [N, K] with one scale per output row, FP16 activations, FP32 accumulation, FP16 output.
 //! The weights arrive as 4 bytes per int32 word ([N, K / 4]). K must be a multiple of 32, N of 8. Decode shapes (numTokens <= kFp8LinearMaxGemvTokens) run a
 //! warp-per-row GEMV that streams the weights at memory bandwidth; longer inputs run a tensor-core GEMM that dequantises the weights tile by tile.
 void launchFp8Linear(void const* x, void const* weightWords, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32,
-    cudaStream_t stream);
+    cudaStream_t stream, int32_t weightFormat = kLinearWeightFp8);
 
 //! Which path launchFp8Linear takes (for tests).
 bool fp8LinearUsesGemv(int32_t numTokens);

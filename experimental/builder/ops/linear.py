@@ -122,6 +122,11 @@ class Linear(Module):
             fp8 = self._fp8_gemv(hidden_states)
             if fp8 is not None:
                 return fp8
+        if (quant_type == quantization.QUANT_FP16 and self._int8_gemv_enabled() and rank == 2 and self.cfg.tp_size == 1
+                and not self.has_adapter() and not self._uses_lora()):
+            int8 = self._int8_gemv(hidden_states)
+            if int8 is not None:
+                return int8
         full_descriptor = self._full_descriptor(quant_type, use_fused_nvfp4_tp)
         descriptor = self.weights.shard_linear(full_descriptor, tp_mode,
                                                self.cfg.tp_size,
@@ -156,6 +161,36 @@ class Linear(Module):
         memory bandwidth, tensor-core GEMM for prefill) instead of TensorRT's FP8 matmul; "all" takes every FP8 linear (the LM head already runs at bandwidth)."""
         mode = os.environ.get("EDGELLM_FP8_GEMV", "")
         return mode == "all" or (mode == "attn" and "attn" in self.prefix)
+
+    def _int8_gemv_enabled(self) -> bool:
+        """EDGELLM_INT8_GEMV at build: FP16-checkpoint projections run as INT8 weight-only (per-row scale, round-to-nearest) on the FP8-linear plugin's
+        INT8 path. "attn" takes the projections whose name contains "attn", "attn+head" also the LM head ("unembed"), "all" every projection."""
+        mode = os.environ.get("EDGELLM_INT8_GEMV", "")
+        if mode == "all":
+            return True
+        if mode in ("attn", "attn+head") and "attn" in self.prefix:
+            return True
+        return mode == "attn+head" and "unembed" in self.prefix
+
+    def _int8_gemv(self, hidden_states):
+        # the FP16 path externalizes dense weights (metadata only); INT8 needs the values to quantize, and bakes the result into the engine
+        descriptor = self.weights.linear(self.prefix, quantization.QUANT_FP16)
+        weight = descriptor.weight
+        if (descriptor.bias is not None or not isinstance(weight, np.ndarray) or weight.ndim != 2 or weight.dtype.kind not in "fV"
+                or weight.shape[0] % 8 != 0 or weight.shape[1] % 32 != 0):
+            print(f"INT8 GEMV: {self.prefix} stays FP16 (bias {descriptor.bias is not None}, weight {type(weight).__name__} "
+                  f"{getattr(weight, 'dtype', None)} {getattr(weight, 'shape', None)})", flush=True)
+            return None
+        print(f"INT8 GEMV: {self.prefix} {weight.shape} -> int8 per-row", flush=True)
+        n, k = weight.shape
+        quantized = np.empty((n, k), np.int8)
+        scale = np.empty((n, ), np.float32)
+        for start in range(0, n, 8192):  # row chunks keep the float32 temporary small (the LM head is 201,024 x 2,304)
+            block = weight[start:start + 8192].astype(np.float32)
+            amax = np.maximum(np.abs(block).max(axis=1), 1e-8)
+            scale[start:start + 8192] = amax / 127.0
+            quantized[start:start + 8192] = np.clip(np.rint(block / scale[start:start + 8192, None]), -127, 127).astype(np.int8)
+        return F.int8_linear(hidden_states, quantized, scale, name=self.prefix)
 
     def _fp8_gemv(self, hidden_states):
         descriptor = self.weight_descriptor()

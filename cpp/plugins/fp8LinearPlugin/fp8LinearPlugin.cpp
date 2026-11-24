@@ -45,11 +45,16 @@ bool linear(PluginTensorDesc const& d, DataType type, int32_t rank)
 
 REGISTER_TENSORRT_PLUGIN(Fp8LinearPluginCreator);
 
-Fp8LinearPlugin::Fp8LinearPlugin(std::string const& name, int32_t outFeatures, int32_t inFeatures)
+Fp8LinearPlugin::Fp8LinearPlugin(std::string const& name, int32_t outFeatures, int32_t inFeatures, int32_t weightFormat)
     : mLayerName(name)
     , mOutFeatures(outFeatures)
     , mInFeatures(inFeatures)
+    , mWeightFormat(weightFormat)
 {
+    if (weightFormat != kernel::kLinearWeightFp8 && weightFormat != kernel::kLinearWeightInt8)
+    {
+        throw std::invalid_argument("Fp8LinearPlugin: weight_format must be 0 (E4M3) or 1 (INT8)");
+    }
     if (outFeatures <= 0 || outFeatures % 8 != 0 || inFeatures <= 0 || inFeatures % 32 != 0)
     {
         throw std::invalid_argument("Fp8LinearPlugin: out_features must be a positive multiple of 8 and in_features a positive multiple of 32");
@@ -73,7 +78,7 @@ IPluginV3* Fp8LinearPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Fp8LinearPlugin(mLayerName, mOutFeatures, mInFeatures);
+        auto* plugin = new Fp8LinearPlugin(mLayerName, mOutFeatures, mInFeatures, mWeightFormat);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -183,7 +188,7 @@ int32_t Fp8LinearPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
         return -1;
     }
     kernel::launchFp8Linear(inputs[kInX], inputs[kInWeight], inputs[kInScale], outputs[0], tokens, mOutFeatures, mInFeatures,
-        inputDesc[kInScale].type == DataType::kFLOAT, stream);
+        inputDesc[kInScale].type == DataType::kFLOAT, stream, mWeightFormat);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -202,6 +207,7 @@ PluginFieldCollection const* Fp8LinearPlugin::getFieldsToSerialize() noexcept
     mData.clear();
     mData.emplace_back("out_features", &mOutFeatures, PluginFieldType::kINT32, 1);
     mData.emplace_back("in_features", &mInFeatures, PluginFieldType::kINT32, 1);
+    mData.emplace_back("weight_format", &mWeightFormat, PluginFieldType::kINT32, 1);
     mFields.nbFields = static_cast<int32_t>(mData.size());
     mFields.fields = mData.data();
     return &mFields;
@@ -214,7 +220,7 @@ Fp8LinearPluginCreator::Fp8LinearPluginCreator()
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     mAttributes.clear();
-    for (char const* name : {"out_features", "in_features"})
+    for (char const* name : {"out_features", "in_features", "weight_format"})
     {
         mAttributes.emplace_back(name, nullptr, PluginFieldType::kINT32, 1);
     }
@@ -269,12 +275,15 @@ IPluginV3* Fp8LinearPluginCreator::createPlugin(char const* name, PluginFieldCol
                 throw std::invalid_argument(std::string("Fp8LinearPlugin: duplicate attribute ") + field.name);
             }
         }
-        if (byName.size() != 2 || byName.count("out_features") == 0 || byName.count("in_features") == 0)
+        // weight_format is optional (absent in engines built before INT8 support: E4M3)
+        size_t const expected = byName.count("weight_format") != 0 ? 3 : 2;
+        if (byName.size() != expected || byName.count("out_features") == 0 || byName.count("in_features") == 0)
         {
             throw std::invalid_argument("Fp8LinearPlugin: unknown or missing attributes");
         }
-        auto* plugin = new Fp8LinearPlugin(
-            name, *static_cast<int32_t const*>(byName["out_features"]->data), *static_cast<int32_t const*>(byName["in_features"]->data));
+        int32_t const weightFormat = byName.count("weight_format") != 0 ? *static_cast<int32_t const*>(byName["weight_format"]->data) : 0;
+        auto* plugin = new Fp8LinearPlugin(name, *static_cast<int32_t const*>(byName["out_features"]->data),
+            *static_cast<int32_t const*>(byName["in_features"]->data), weightFormat);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }

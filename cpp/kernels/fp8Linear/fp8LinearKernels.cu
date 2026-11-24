@@ -30,12 +30,29 @@ namespace
 {
 constexpr int32_t kGemvWarps = 8;
 
+//! 16 weight bytes -> floats. kInt8 = false: E4M3 codes; true: two's-complement INT8 (the sign flip plus the 0x6400 half exponent turns each byte b into the half
+//! 1024 + (b + 128), exact, and one subtraction of 1152 gives b).
+template <bool kInt8>
 __device__ __forceinline__ void decode16(uint4 const v, float (&w)[16])
 {
     uint32_t const words[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
     for (int32_t i = 0; i < 4; ++i)
     {
+        if constexpr (kInt8)
+        {
+            uint32_t const flipped = words[i] ^ 0x80808080U;
+            uint32_t const lo = __byte_perm(flipped, 0x64646464U, 0x5140);
+            uint32_t const hi = __byte_perm(flipped, 0x64646464U, 0x7362);
+            __half2 const bias = __float2half2_rn(1152.0F);
+            float2 const a = __half22float2(__hsub2(*reinterpret_cast<__half2 const*>(&lo), bias));
+            float2 const b = __half22float2(__hsub2(*reinterpret_cast<__half2 const*>(&hi), bias));
+            w[4 * i + 0] = a.x;
+            w[4 * i + 1] = a.y;
+            w[4 * i + 2] = b.x;
+            w[4 * i + 3] = b.y;
+            continue;
+        }
         __half2_raw const lo = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(words[i] & 0xFFFFu), __NV_E4M3);
         __half2_raw const hi = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(words[i] >> 16), __NV_E4M3);
         float2 const a = __half22float2(__half2(lo));
@@ -54,16 +71,10 @@ __device__ __forceinline__ float loadScale(void const* scale, int32_t n, bool fp
 
 //! One warp per output row, up to kM tokens: the activations of all tokens sit in shared memory as floats, each lane streams 16 weight bytes at a time and keeps kM
 //! partial sums; the row result comes from a shuffle reduction. Rows of a block are consecutive, so a block reads a contiguous slab of weights.
-template <int32_t kM>
+template <int32_t kM, bool kInt8>
 __global__ void fp8GemvKernel(__half const* __restrict__ x, uint4 const* __restrict__ w, void const* scale, __half* __restrict__ y, int32_t numTokens, int32_t n,
     int32_t k, bool scaleIsFp32)
 {
-    extern __shared__ float xs[]; // [kM][k]
-    for (int32_t i = threadIdx.x; i < numTokens * k; i += blockDim.x)
-    {
-        xs[i] = __half2float(x[i]);
-    }
-    __syncthreads();
     int32_t const warp = threadIdx.x >> 5;
     int32_t const lane = threadIdx.x & 31;
     int32_t const row = blockIdx.x * kGemvWarps + warp;
@@ -96,19 +107,22 @@ __global__ void fp8GemvKernel(__half const* __restrict__ x, uint4 const* __restr
             if (c < chunks)
             {
                 float wv[16];
-                decode16(v[u], wv);
+                decode16<kInt8>(v[u], wv);
 #pragma unroll
                 for (int32_t m = 0; m < kM; ++m)
                 {
-                    float4 const* xp = reinterpret_cast<float4 const*>(xs + static_cast<size_t>(m) * k + c * 16);
+                    // activations straight from global memory (L1/L2 resident, shared by the 8 rows of the block): no shared-memory staging, so the weight loads
+                    // above are never behind a barrier
+                    uint4 const* xp = reinterpret_cast<uint4 const*>(x + static_cast<size_t>(m) * k + c * 16);
+                    uint4 const xa = __ldg(xp);
+                    uint4 const xb = __ldg(xp + 1);
+                    uint32_t const xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
 #pragma unroll
-                    for (int32_t q = 0; q < 4; ++q)
+                    for (int32_t q = 0; q < 8; ++q)
                     {
-                        float4 const xv = xp[q];
-                        acc[m] = fmaf(wv[4 * q + 0], xv.x, acc[m]);
-                        acc[m] = fmaf(wv[4 * q + 1], xv.y, acc[m]);
-                        acc[m] = fmaf(wv[4 * q + 2], xv.z, acc[m]);
-                        acc[m] = fmaf(wv[4 * q + 3], xv.w, acc[m]);
+                        float2 const xv = __half22float2(*reinterpret_cast<__half2 const*>(&xw[q]));
+                        acc[m] = fmaf(wv[2 * q + 0], xv.x, acc[m]);
+                        acc[m] = fmaf(wv[2 * q + 1], xv.y, acc[m]);
                     }
                 }
             }
@@ -144,6 +158,7 @@ constexpr int32_t kPad = 8;
 
 //! 64 x 64 output tile per block of 4 warps (32 x 32 each): the FP8 weight tile is dequantised to half in shared memory, the product runs as 16x16x16 half WMMA with
 //! FP32 accumulation, the row scale is applied in the epilogue. Rows beyond numTokens are zero-filled on load and not stored.
+template <bool kInt8>
 __global__ void fp8GemmKernel(__half const* __restrict__ x, uint4 const* __restrict__ w, void const* scale, __half* __restrict__ y, int32_t numTokens, int32_t n,
     int32_t k, bool scaleIsFp32)
 {
@@ -192,7 +207,7 @@ __global__ void fp8GemmKernel(__half const* __restrict__ x, uint4 const* __restr
                 v = __ldg(w + static_cast<size_t>(n0 + r) * chunksPerRow + (k0 + c) / 16);
             }
             float wv[16];
-            decode16(v, wv);
+            decode16<kInt8>(v, wv);
 #pragma unroll
             for (int32_t i = 0; i < 16; i += 2)
             {
@@ -244,15 +259,10 @@ __global__ void fp8GemmKernel(__half const* __restrict__ x, uint4 const* __restr
     }
 }
 
-template <int32_t kM>
+template <int32_t kM, bool kInt8>
 void launchGemv(void const* x, void const* w, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32, cudaStream_t stream)
 {
-    size_t const smem = static_cast<size_t>(kM) * k * sizeof(float);
-    if (smem > 48 * 1024)
-    {
-        cudaFuncSetAttribute(fp8GemvKernel<kM>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
-    }
-    fp8GemvKernel<kM><<<(n + kGemvWarps - 1) / kGemvWarps, kGemvWarps * 32, smem, stream>>>(
+    fp8GemvKernel<kM, kInt8><<<(n + kGemvWarps - 1) / kGemvWarps, kGemvWarps * 32, 0, stream>>>(
         static_cast<__half const*>(x), static_cast<uint4 const*>(w), scale, static_cast<__half*>(y), numTokens, n, k, scaleIsFp32);
 }
 } // namespace
@@ -262,7 +272,8 @@ bool fp8LinearUsesGemv(int32_t numTokens)
     return numTokens <= kFp8LinearMaxGemvTokens;
 }
 
-void launchFp8Linear(void const* x, void const* weightWords, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32,
+template <bool kInt8>
+void launchLinear(void const* x, void const* weightWords, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32,
     cudaStream_t stream)
 {
     if (numTokens <= 0)
@@ -273,15 +284,28 @@ void launchFp8Linear(void const* x, void const* weightWords, void const* scale, 
     {
         switch (numTokens)
         {
-        case 1: launchGemv<1>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
-        case 2: launchGemv<2>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
-        default: launchGemv<4>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
+        case 1: launchGemv<1, kInt8>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
+        case 2: launchGemv<2, kInt8>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
+        default: launchGemv<4, kInt8>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
         }
         return;
     }
     dim3 const grid((n + kBn - 1) / kBn, (numTokens + kBm - 1) / kBm);
-    fp8GemmKernel<<<grid, 128, 0, stream>>>(
+    fp8GemmKernel<kInt8><<<grid, 128, 0, stream>>>(
         static_cast<__half const*>(x), static_cast<uint4 const*>(weightWords), scale, static_cast<__half*>(y), numTokens, n, k, scaleIsFp32);
+}
+
+void launchFp8Linear(void const* x, void const* weightWords, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32,
+    cudaStream_t stream, int32_t weightFormat)
+{
+    if (weightFormat == kLinearWeightInt8)
+    {
+        launchLinear<true>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
+    }
+    else
+    {
+        launchLinear<false>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
+    }
 }
 
 } // namespace kernel

@@ -34,7 +34,7 @@ class Fp8LinearPlugin : public nvinfer1::IPluginV3,
                         public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    Fp8LinearPlugin(std::string const& name, int32_t outFeatures, int32_t inFeatures);
+    Fp8LinearPlugin(std::string const& name, int32_t outFeatures, int32_t inFeatures, int32_t weightFormat = 0);
 
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
     nvinfer1::IPluginV3* clone() noexcept override;
@@ -68,6 +68,7 @@ private:
     std::string mNamespace;
     int32_t mOutFeatures;
     int32_t mInFeatures;
+    int32_t mWeightFormat{0}; //!< 0 = E4M3 weights, 1 = INT8 weights (per-row scale in both cases)
     std::vector<nvinfer1::PluginField> mData;
     nvinfer1::PluginFieldCollection mFields{};
 };

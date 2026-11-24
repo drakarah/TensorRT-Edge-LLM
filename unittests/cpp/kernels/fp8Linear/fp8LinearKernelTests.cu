@@ -58,14 +58,21 @@ struct Problem
     std::vector<uint8_t> w;
     std::vector<float> scale;
     std::vector<__half> x;
+    int32_t fmt{0}; // kLinearWeightFp8 or kLinearWeightInt8
 };
 
-Problem makeProblem(uint32_t seed, int32_t tokens, int32_t n, int32_t k, float xAmp = 1.0F)
+Problem makeProblem(uint32_t seed, int32_t tokens, int32_t n, int32_t k, float xAmp = 1.0F, int32_t fmt = kLinearWeightFp8)
 {
     std::mt19937 g(seed);
     Problem p{tokens, n, k, std::vector<uint8_t>(static_cast<size_t>(n) * k), std::vector<float>(n), std::vector<__half>(static_cast<size_t>(tokens) * k)};
+    p.fmt = fmt;
     for (auto& b : p.w)
     {
+        if (fmt == kLinearWeightInt8)
+        {
+            b = static_cast<uint8_t>(g()); // every int8 value, -128 included
+            continue;
+        }
         // small magnitudes so the products stay moderate: exponent field 2..9
         b = static_cast<uint8_t>((g() & 0x80) | ((2 + g() % 8) << 3) | (g() & 7));
     }
@@ -87,7 +94,7 @@ std::vector<double> reference(Problem const& p)
     std::vector<float> wf(p.w.size());
     for (size_t i = 0; i < wf.size(); ++i)
     {
-        wf[i] = fp8ToFloat(p.w[i]);
+        wf[i] = p.fmt == kLinearWeightInt8 ? static_cast<float>(static_cast<int8_t>(p.w[i])) : fp8ToFloat(p.w[i]);
     }
     for (int32_t m = 0; m < p.tokens; ++m)
     {
@@ -128,7 +135,7 @@ std::vector<float> run(Problem const& p, bool scaleFp32 = true)
         CUDA_CHECK(cudaMalloc(&ds, p.n * 2));
         CUDA_CHECK(cudaMemcpy(ds, sh.data(), p.n * 2, cudaMemcpyHostToDevice));
     }
-    launchFp8Linear(dx, dw, ds, dy, p.tokens, p.n, p.k, scaleFp32, nullptr);
+    launchFp8Linear(dx, dw, ds, dy, p.tokens, p.n, p.k, scaleFp32, nullptr, p.fmt);
     CUDA_CHECK(cudaGetLastError());
     std::vector<__half> yh(static_cast<size_t>(p.tokens) * p.n);
     CUDA_CHECK(cudaMemcpy(yh.data(), dy, yh.size() * 2, cudaMemcpyDeviceToHost));
@@ -270,6 +277,7 @@ TEST(Fp8LinearBench, DecodeBandwidth)
     {
         totalBytes += static_cast<double>(n) * k;
     }
+    for (int32_t fmt : {kLinearWeightFp8, kLinearWeightInt8})
     for (int32_t tokens : {1, 2, 4})
     {
         for (int32_t warm = 0; warm < 2; ++warm)
@@ -281,7 +289,7 @@ TEST(Fp8LinearBench, DecodeBandwidth)
                 {
                     for (size_t i = 0; i < shapes.size(); ++i)
                     {
-                        launchFp8Linear(x, weights[s * shapes.size() + i], sc, y, tokens, shapes[i].first, shapes[i].second, true, nullptr);
+                        launchFp8Linear(x, weights[s * shapes.size() + i], sc, y, tokens, shapes[i].first, shapes[i].second, true, nullptr, fmt);
                     }
                 }
             }
@@ -292,8 +300,40 @@ TEST(Fp8LinearBench, DecodeBandwidth)
             if (warm == 1)
             {
                 double const us = ms * 1000.0 / (20.0 * sets);
-                printf("BENCH decode GEMV tokens %d: %.1f us per visit (6 linears, %.1f MB) = %.0f GB/s\n", tokens, us, totalBytes / 1e6, totalBytes / (us * 1e-6) / 1e9);
+                printf("BENCH decode GEMV %s tokens %d: %.1f us per visit (6 linears, %.1f MB) = %.0f GB/s\n", fmt == kLinearWeightInt8 ? "int8" : "fp8", tokens, us, totalBytes / 1e6, totalBytes / (us * 1e-6) / 1e9);
             }
         }
     }
+}
+
+// INT8 weight-only path (same kernels, weight_format 1): every int8 value including -128, the decode GEMV for 1-4 tokens, the prefill GEMM, tails, FP16 scales.
+TEST(Int8LinearTest, DecodeGemvMatchesTheReferenceForInklingShapes)
+{
+    for (auto const& [n, k] : {std::pair{3072, 2304}, std::pair{1024, 2304}, std::pair{2304, 3072}, std::pair{384, 2304}})
+    {
+        for (int32_t tokens : {1, 2, 3, 4})
+        {
+            expectClose(makeProblem(300 + tokens, tokens, n, k, 1.0F, kLinearWeightInt8));
+        }
+    }
+}
+
+TEST(Int8LinearTest, PrefillGemmMatchesTheReferenceForInklingShapes)
+{
+    for (auto const& [n, k] : {std::pair{3072, 2304}, std::pair{1024, 2304}, std::pair{2304, 3072}, std::pair{384, 2304}})
+    {
+        for (int32_t tokens : {5, 8, 64, 100})
+        {
+            expectClose(makeProblem(400 + tokens, tokens, n, k, 1.0F, kLinearWeightInt8));
+        }
+    }
+}
+
+TEST(Int8LinearTest, TailsAndFp16Scales)
+{
+    expectClose(makeProblem(11, 65, 200, 96, 1.0F, kLinearWeightInt8));
+    expectClose(makeProblem(12, 129, 72, 32, 1.0F, kLinearWeightInt8));
+    expectClose(makeProblem(13, 1, 8, 48, 1.0F, kLinearWeightInt8));
+    expectClose(makeProblem(14, 1, 3072, 2304, 1.0F, kLinearWeightInt8), false);
+    expectClose(makeProblem(15, 70, 1024, 2304, 1.0F, kLinearWeightInt8), false);
 }
