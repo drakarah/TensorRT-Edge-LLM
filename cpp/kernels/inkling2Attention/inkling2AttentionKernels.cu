@@ -1243,6 +1243,494 @@ __global__ void mergeKernel(Inkling2AttentionParams p, half const* __restrict__ 
 }
 } // namespace
 
+
+// ---- Tensor-core decode kernel (FP16 and INT8 KV): S = Q K^T and O = P V on mma.m16n8k16 with the GQA rows padded to 16, warp-private online softmax, one block per
+// (token slot, KV head, key split). Every warp streams its own 16 keys of each 64-key tile through a private double-buffered shared-memory slice (cp.async for FP16,
+// register-staged dequantisation for INT8), so the main loop has no block barriers. INT8 rows are dequantised to FP16 without their scale; the K scale multiplies the
+// score columns and the V scale is folded into P (fp32 -> fp16), which is the same product with one rounding fewer. The four warps are merged once at the end. ----
+constexpr int32_t kMmaThreads = 128;
+constexpr int32_t kMmaWarps = 4;
+constexpr int32_t kMmaWarpKeys = 16;
+constexpr int32_t kMmaTile = kMmaWarps * kMmaWarpKeys; // keys per block tile
+constexpr int32_t kMmaKP = kInkling2HeadDim + 8;       // staged row of 136 halves = 272 bytes: 16-byte multiple and conflict-free for ldmatrix
+constexpr int32_t kMmaSliceHalves = 2 * kMmaWarpKeys * kMmaKP; // K and V of one warp stage
+
+//! INT8 rows are staged through registers, so one shared-memory stage per warp is enough (the next tile's loads are in flight while the current one is computed);
+//! FP16 rows are copied with cp.async into the other of two stages.
+__host__ __device__ constexpr int32_t decodeMmaStages(bool int8)
+{
+    return int8 ? 1 : 2;
+}
+
+constexpr size_t decodeMmaSmemBytes(bool int8)
+{
+    return sizeof(half) * kMmaSliceHalves * decodeMmaStages(int8) * kMmaWarps // [warp][stage] K and V slices
+        + kMmaWarps * 2 * kMmaWarpKeys                                        // flags (two stages reserved)
+        + sizeof(float) * kMmaWarps * 2 * kMmaWarpKeys * 2                    // K and V scales
+        + sizeof(float) * kMmaWarps * kInkling2HeadDim                        // Q rows
+        + sizeof(float) * kMmaWarps * kInkling2RelDim;                        // relative-state rows
+}
+
+__device__ __forceinline__ void ldmatrixX4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, void const* smemPtr)
+{
+    uint32_t const addr = static_cast<uint32_t>(__cvta_generic_to_shared(smemPtr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+__device__ __forceinline__ void ldmatrixX4Trans(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, void const* smemPtr)
+{
+    uint32_t const addr = static_cast<uint32_t>(__cvta_generic_to_shared(smemPtr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+//! (c0, c1) += rows 0-7 of A (16 x 16; a1 = a3 = 0) * B (16 x 8): FP16 inputs, FP32 accumulation. Only the first row group is live, so the second half of the
+//! accumulator fragment (rows 8-15) is a discarded temporary instead of 2 persistent registers per tile.
+__device__ __forceinline__ void mmaRows8(float& c0, float& c1, uint32_t a0, uint32_t a2, uint32_t b0, uint32_t b1)
+{
+    float d2, d3;
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+                 : "=f"(c0), "=f"(c1), "=f"(d2), "=f"(d3)
+                 : "r"(a0), "r"(0U), "r"(a2), "r"(0U), "r"(b0), "r"(b1), "f"(c0), "f"(c1), "f"(0.F), "f"(0.F));
+}
+
+__device__ __forceinline__ uint32_t packHalf2(float lo, float hi)
+{
+    half2 const h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<uint32_t const*>(&h);
+}
+
+__device__ __forceinline__ void cpAsync16(void* dst, void const* src, bool valid)
+{
+    uint32_t const addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    int32_t const srcSize = valid ? 16 : 0; // 0 bytes copied: the destination is zero-filled
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(addr), "l"(src), "r"(srcSize));
+}
+
+__device__ __forceinline__ void cpAsyncCommitWaitAll()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+//! Two signed bytes of x (selected by sel: 0x5140 for the low pair, 0x7362 for the high pair) as exact half2 values: (b ^ 0x80) | 0x6400 is 1024 + b + 128, minus 1152.
+__device__ __forceinline__ uint32_t int8PairToHalf2(uint32_t x, uint32_t sel)
+{
+    uint32_t const biased = __byte_perm(x ^ 0x80808080U, 0x64646464U, sel);
+    half2 const v = __hsub2(*reinterpret_cast<half2 const*>(&biased), __float2half2_rn(1152.F));
+    return *reinterpret_cast<uint32_t const*>(&v);
+}
+
+template <typename KvT>
+__global__ void __launch_bounds__(kMmaThreads, std::is_same_v<KvT, int8_t> ? 2 : 3) decodeMmaKernel(Inkling2AttentionParams p, half const* __restrict__ qLin, half const* __restrict__ relLin,
+    float const* __restrict__ qScale, float const* __restrict__ relScale, float const* __restrict__ relProjT, KvT const* __restrict__ kvPool,
+    int32_t const* __restrict__ offsets, int32_t const* __restrict__ lengths, int32_t const* __restrict__ past, int32_t const* __restrict__ pageTable,
+    float* __restrict__ partials, int32_t splits)
+{
+    constexpr bool kInt8 = std::is_same_v<KvT, int8_t>;
+    constexpr int32_t kStages = decodeMmaStages(kInt8);
+    extern __shared__ __align__(16) unsigned char smemRaw[];
+    half* const slices = reinterpret_cast<half*>(smemRaw);
+    uint8_t* const flags = reinterpret_cast<uint8_t*>(slices + kMmaSliceHalves * kStages * kMmaWarps);
+    float* const kScales = reinterpret_cast<float*>(flags + kMmaWarps * 2 * kMmaWarpKeys);
+    float* const vScales = kScales + kMmaWarps * 2 * kMmaWarpKeys;
+    float* const Qsm = vScales + kMmaWarps * 2 * kMmaWarpKeys;
+    float* const RSsm = Qsm + kMmaWarps * kInkling2HeadDim;
+
+    int32_t const tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    int32_t const gid = lane >> 2, tig = lane & 3;
+    int32_t const slot = blockIdx.x, kvh = blockIdx.y, split = blockIdx.z;
+    int32_t seq = 0, qpos = 0;
+    bool const valid = locateToken(slot, offsets, lengths, past, p.batchSize, seq, qpos);
+    int32_t const group = p.numQHeads / p.numKVHeads;
+    int64_t const rowElems = int64_t(p.numKVHeads) * KvTraits<KvT>::rowStride;
+    int64_t const pageElems = int64_t(kInkling2TokensPerPage) * rowElems;
+    int32_t const* table = pageTable + int64_t(seq) * 2 * p.maxPagesPerSeq;
+
+    // Query rows: warp w < group prepares head kvh * group + w (same scaling and clipping as the other decode kernels).
+    if (w < group && valid)
+    {
+        int32_t const h = kvh * group + w;
+        float const logScale = p.window == 0 ? 1.F + p.logAlpha * logf(fmaxf((qpos + 1.F) / p.logNFloor, 1.F)) : 1.F;
+        float q[4];
+        float ss = 0.F;
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            int32_t const d = lane * 4 + i;
+            q[i] = __half2float(qLin[int64_t(slot) * p.qLd + h * kInkling2HeadDim + d]) * qScale[h * kInkling2HeadDim + d];
+            ss += q[i] * q[i];
+        }
+        ss = warpSum(ss);
+        float const qFactor = fminf(p.qClip / (sqrtf(ss) + 1e-6F), 1.F) * logScale;
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            Qsm[w * kInkling2HeadDim + lane * 4 + i] = q[i] * qFactor;
+        }
+        int32_t const j = lane & 15;
+        float rs = __half2float(relLin[int64_t(slot) * p.relLd + h * kInkling2RelDim + j]) * relScale[h * kInkling2RelDim + j];
+        float const rss = halfWarpSum(rs * rs);
+        rs *= fminf(p.relClip / (sqrtf(rss) + 1e-6F), 1.F) * logScale;
+        if (lane < 16)
+        {
+            RSsm[w * kInkling2RelDim + j] = rs;
+        }
+    }
+    __syncthreads();
+
+    int32_t const lo = valid ? (p.window > 0 ? max(0, qpos - p.window + 1) : 0) : 0;
+    int32_t const hi = valid ? qpos : -1;
+    int32_t const nTiles = hi >= lo ? (hi - lo + kMmaTile) / kMmaTile : 0;
+    int32_t const perSplit = (nTiles + splits - 1) / splits;
+    int32_t const tBegin = min(nTiles, split * perSplit), tEnd = min(nTiles, tBegin + perSplit);
+
+    // Q as the A operand of the score product: row gid (head kvh * group + gid), dimensions 16 * ks + 2 * tig + {0, 1} and + 8; rows >= group are zero.
+    uint32_t qa[8][2];
+#pragma unroll
+    for (int32_t ks = 0; ks < 8; ++ks)
+    {
+        float const* row = Qsm + gid * kInkling2HeadDim + ks * 16 + 2 * tig;
+        bool const live = gid < group && valid;
+        qa[ks][0] = live ? packHalf2(row[0], row[1]) : 0U;
+        qa[ks][1] = live ? packHalf2(row[8], row[9]) : 0U;
+    }
+
+    float accO[16][2];
+#pragma unroll
+    for (int32_t i = 0; i < 16; ++i)
+    {
+        accO[i][0] = accO[i][1] = 0.F;
+    }
+    float rowM = -INFINITY, rowL = 0.F;
+
+    half* const warpSlices = slices + int64_t(w) * kStages * kMmaSliceHalves;
+    uint8_t* const warpFlags = flags + w * 2 * kMmaWarpKeys;
+    float* const warpKS = kScales + w * 2 * kMmaWarpKeys;
+    float* const warpVS = vScales + w * 2 * kMmaWarpKeys;
+
+    uint32_t pfK[kInt8 ? kMmaWarpKeys : 1], pfV[kInt8 ? kMmaWarpKeys : 1];
+    float pfScale = 0.F; // INT8: lanes 0-15 hold the K scale of key `lane`, lanes 16-31 the V scale of key `lane - 16`
+    uint32_t pfOk = 0;
+
+    auto keyBaseOf = [&](int32_t ti) { return lo + ti * kMmaTile + w * kMmaWarpKeys; };
+
+    // Page-table entries of a tile's slice (the K and V page of its first key and of the next page when the slice straddles a boundary); fetched one tile ahead so the
+    // data loads of the next tile do not wait for a dependent table load.
+    struct TileTable
+    {
+        int32_t k0, v0, k1, v1;
+    };
+    auto fetchTable = [&](int32_t ti)
+    {
+        int32_t const base = keyBaseOf(ti);
+        int32_t const nValid = max(0, min(kMmaWarpKeys, hi - base + 1));
+        int32_t const page0 = base / kInkling2TokensPerPage;
+        int32_t const n0 = min(kMmaWarpKeys, kInkling2TokensPerPage - (base - page0 * kInkling2TokensPerPage));
+        bool const has0 = nValid > 0, has1 = nValid > n0;
+        TileTable t;
+        t.k0 = has0 ? table[page0] : -1;
+        t.v0 = has0 ? table[p.maxPagesPerSeq + page0] : -1;
+        t.k1 = has1 ? table[page0 + 1] : -1;
+        t.v1 = has1 ? table[p.maxPagesPerSeq + page0 + 1] : -1;
+        return t;
+    };
+
+    // Loads the 16 keys of this warp's slice of tile ti (FP16: cp.async into stage st; INT8: into registers, converted and stored by storeStage).
+    auto issueLoads = [&](int32_t ti, int32_t st, TileTable const& tt)
+    {
+        int32_t const base = keyBaseOf(ti);
+        int32_t const nValid = max(0, min(kMmaWarpKeys, hi - base + 1));
+        int32_t const page0 = base / kInkling2TokensPerPage;
+        int32_t const row0 = base - page0 * kInkling2TokensPerPage;
+        int32_t const n0 = min(kMmaWarpKeys, kInkling2TokensPerPage - row0); // keys of this slice in the first page, the rest are in the next one
+        int32_t const k0 = tt.k0, v0 = tt.v0, k1 = tt.k1, v1 = tt.v1;
+        uint32_t const validMask = nValid >= kMmaWarpKeys ? 0xFFFFU : ((1U << nValid) - 1U);
+        uint32_t const lowMask = (1U << n0) - 1U; // n0 <= 16; n0 == 16 gives 0xFFFF
+        uint32_t const okMask = validMask & (((k0 >= 0 && v0 >= 0) ? lowMask : 0U) | ((k1 >= 0 && v1 >= 0) ? (0xFFFFU & ~lowMask) : 0U));
+        int64_t const kvOff = int64_t(kvh) * KvTraits<KvT>::rowStride;
+        KvT const* const kBase0 = kvPool + int64_t(k0 < 0 ? 0 : k0) * pageElems + kvOff;
+        KvT const* const vBase0 = kvPool + int64_t(v0 < 0 ? 0 : v0) * pageElems + kvOff;
+        KvT const* const kBase1 = kvPool + int64_t(k1 < 0 ? 0 : k1) * pageElems + kvOff;
+        KvT const* const vBase1 = kvPool + int64_t(v1 < 0 ? 0 : v1) * pageElems + kvOff;
+        if constexpr (kInt8)
+        {
+            pfOk = okMask;
+#pragma unroll
+            for (int32_t kk = 0; kk < kMmaWarpKeys; ++kk)
+            {
+                bool const second = kk >= n0;
+                int64_t const idx = (second ? kk - n0 : row0 + kk) * rowElems;
+                KvT const* const kRow = (second ? kBase1 : kBase0) + idx;
+                KvT const* const vRow = (second ? vBase1 : vBase0) + idx;
+                bool const ok = ((okMask >> kk) & 1U) != 0U;
+                pfK[kk] = ok ? *reinterpret_cast<uint32_t const*>(kRow + lane * 4) : 0U;
+                pfV[kk] = ok ? *reinterpret_cast<uint32_t const*>(vRow + lane * 4) : 0U;
+            }
+            // one scale per lane: key (lane & 15), K rows for lanes 0-15 and V rows for lanes 16-31
+            {
+                int32_t const kk = lane & 15;
+                bool const second = kk >= n0;
+                int64_t const idx = (second ? kk - n0 : row0 + kk) * rowElems;
+                KvT const* const row = (lane < 16 ? (second ? kBase1 : kBase0) : (second ? vBase1 : vBase0)) + idx;
+                pfScale = ((okMask >> kk) & 1U) != 0U ? __half2float(*reinterpret_cast<half const*>(row + kInkling2HeadDim)) : 0.F;
+            }
+        }
+        else
+        {
+            half* const kDst = warpSlices + st * kMmaSliceHalves;
+            half* const vDst = kDst + kMmaWarpKeys * kMmaKP;
+#pragma unroll
+            for (int32_t kk = 0; kk < kMmaWarpKeys; ++kk)
+            {
+                bool const second = kk >= n0;
+                int64_t const idx = (second ? kk - n0 : row0 + kk) * rowElems;
+                bool const ok = ((okMask >> kk) & 1U) != 0U;
+                // lanes 0-15 copy the 16 chunks of the K row, lanes 16-31 those of the V row
+                if (lane < 16)
+                {
+                    cpAsync16(kDst + kk * kMmaKP + lane * 8, (second ? kBase1 : kBase0) + idx + lane * 8, ok);
+                }
+                else
+                {
+                    cpAsync16(vDst + kk * kMmaKP + (lane - 16) * 8, (second ? vBase1 : vBase0) + idx + (lane - 16) * 8, ok);
+                }
+            }
+            if (lane < kMmaWarpKeys)
+            {
+                warpFlags[st * kMmaWarpKeys + lane] = (okMask >> lane) & 1U;
+            }
+        }
+    };
+
+    auto storeStage = [&](int32_t st)
+    {
+        if constexpr (kInt8)
+        {
+            half* const kDst = warpSlices + st * kMmaSliceHalves;
+            half* const vDst = kDst + kMmaWarpKeys * kMmaKP;
+#pragma unroll
+            for (int32_t kk = 0; kk < kMmaWarpKeys; ++kk)
+            {
+                uint2 kv, vv;
+                kv.x = int8PairToHalf2(pfK[kk], 0x5140U);
+                kv.y = int8PairToHalf2(pfK[kk], 0x7362U);
+                vv.x = int8PairToHalf2(pfV[kk], 0x5140U);
+                vv.y = int8PairToHalf2(pfV[kk], 0x7362U);
+                *reinterpret_cast<uint2*>(kDst + kk * kMmaKP + lane * 4) = kv;
+                *reinterpret_cast<uint2*>(vDst + kk * kMmaKP + lane * 4) = vv;
+            }
+            if (lane < kMmaWarpKeys)
+            {
+                warpKS[st * kMmaWarpKeys + lane] = pfScale;
+                warpFlags[st * kMmaWarpKeys + lane] = (pfOk >> lane) & 1U;
+            }
+            else
+            {
+                warpVS[st * kMmaWarpKeys + lane - kMmaWarpKeys] = pfScale;
+            }
+        }
+    };
+
+    TileTable nextTable{-1, -1, -1, -1};
+    if (tBegin < tEnd)
+    {
+        issueLoads(tBegin, 0, fetchTable(tBegin));
+        if (tBegin + 1 < tEnd)
+        {
+            nextTable = fetchTable(tBegin + 1);
+        }
+        if constexpr (kInt8)
+        {
+            storeStage(0);
+        }
+        else
+        {
+            cpAsyncCommitWaitAll();
+        }
+        __syncwarp();
+    }
+
+    for (int32_t ti = tBegin; ti < tEnd; ++ti)
+    {
+        int32_t const st = kStages == 1 ? 0 : ((ti - tBegin) & 1);
+        int32_t const nst = kStages == 1 ? 0 : (st ^ 1);
+        bool const hasNext = ti + 1 < tEnd;
+        if (hasNext)
+        {
+            issueLoads(ti + 1, nst, nextTable);
+            if (ti + 2 < tEnd)
+            {
+                nextTable = fetchTable(ti + 2);
+            }
+        }
+        half const* const kS = warpSlices + st * kMmaSliceHalves;
+        half const* const vS = kS + kMmaWarpKeys * kMmaKP;
+
+        // scores: S[row gid][key] for the warp's 16 keys as two n8 tiles
+        float c[2][2] = {{0.F, 0.F}, {0.F, 0.F}};
+#pragma unroll
+        for (int32_t ks = 0; ks < 8; ++ks)
+        {
+            uint32_t b0, b1, b2, b3;
+            int32_t const key = ((lane >> 4) & 1) * 8 + (lane & 7);
+            int32_t const col = ks * 16 + ((lane >> 3) & 1) * 8;
+            ldmatrixX4(b0, b1, b2, b3, kS + key * kMmaKP + col);
+            mmaRows8(c[0][0], c[0][1], qa[ks][0], qa[ks][1], b0, b1);
+            mmaRows8(c[1][0], c[1][1], qa[ks][0], qa[ks][1], b2, b3);
+        }
+
+        int32_t const base = keyBaseOf(ti);
+        float sc[2][2];
+        float tileMax = -INFINITY;
+#pragma unroll
+        for (int32_t n = 0; n < 2; ++n)
+        {
+#pragma unroll
+            for (int32_t j = 0; j < 2; ++j)
+            {
+                int32_t const kt = n * 8 + 2 * tig + j; // key within the warp's slice
+                int32_t const sKey = base + kt;
+                float score = -INFINITY;
+                if (gid < group && warpFlags[st * kMmaWarpKeys + kt] != 0 && sKey <= hi && sKey >= lo)
+                {
+                    float const ksc = kInt8 ? warpKS[st * kMmaWarpKeys + kt] : 1.F;
+                    score = c[n][j] * ksc * p.scaling;
+                    int32_t const dist = hi - sKey;
+                    if (dist < p.relExtent)
+                    {
+                        float const* rp = relProjT + int64_t(dist) * kInkling2RelDim;
+                        float const* rsr = RSsm + gid * kInkling2RelDim;
+                        float bias = 0.F;
+#pragma unroll
+                        for (int32_t jj = 0; jj < kInkling2RelDim; jj += 4)
+                        {
+                            float4 const a = *reinterpret_cast<float4 const*>(rp + jj);
+                            bias += rsr[jj] * a.x + rsr[jj + 1] * a.y + rsr[jj + 2] * a.z + rsr[jj + 3] * a.w;
+                        }
+                        score += bias;
+                    }
+                }
+                sc[n][j] = score;
+                tileMax = fmaxf(tileMax, score);
+            }
+        }
+        tileMax = fmaxf(tileMax, __shfl_xor_sync(0xffffffffu, tileMax, 1));
+        tileMax = fmaxf(tileMax, __shfl_xor_sync(0xffffffffu, tileMax, 2));
+        float const mNew = fmaxf(rowM, tileMax);
+        float const corr = rowM == -INFINITY ? 0.F : __expf(rowM - mNew);
+        float e[2][2];
+        float sum = 0.F;
+#pragma unroll
+        for (int32_t n = 0; n < 2; ++n)
+        {
+#pragma unroll
+            for (int32_t j = 0; j < 2; ++j)
+            {
+                e[n][j] = sc[n][j] == -INFINITY ? 0.F : __expf(sc[n][j] - mNew);
+                sum += e[n][j];
+            }
+        }
+        sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+        rowL = rowL * corr + sum;
+        rowM = mNew;
+#pragma unroll
+        for (int32_t i = 0; i < 16; ++i)
+        {
+            accO[i][0] *= corr;
+            accO[i][1] *= corr;
+        }
+
+        // P as the A operand (V scale folded in)
+        uint32_t pa0, pa1;
+        {
+            float v0 = 1.F, v1 = 1.F, v2 = 1.F, v3 = 1.F;
+            if constexpr (kInt8)
+            {
+                v0 = warpVS[st * kMmaWarpKeys + 2 * tig];
+                v1 = warpVS[st * kMmaWarpKeys + 2 * tig + 1];
+                v2 = warpVS[st * kMmaWarpKeys + 8 + 2 * tig];
+                v3 = warpVS[st * kMmaWarpKeys + 8 + 2 * tig + 1];
+            }
+            pa0 = packHalf2(e[0][0] * v0, e[0][1] * v1);
+            pa1 = packHalf2(e[1][0] * v2, e[1][1] * v3);
+        }
+#pragma unroll
+        for (int32_t dt = 0; dt < 8; ++dt)
+        {
+            uint32_t b0, b1, b2, b3;
+            int32_t const key = ((lane >> 3) & 1) * 8 + (lane & 7);
+            int32_t const col = dt * 16 + ((lane >> 4) & 1) * 8;
+            ldmatrixX4Trans(b0, b1, b2, b3, vS + key * kMmaKP + col);
+            mmaRows8(accO[2 * dt][0], accO[2 * dt][1], pa0, pa1, b0, b1);
+            mmaRows8(accO[2 * dt + 1][0], accO[2 * dt + 1][1], pa0, pa1, b2, b3);
+        }
+
+        if (hasNext)
+        {
+            __syncwarp(); // every lane is done reading this stage (INT8 reuses it for the next tile)
+            if constexpr (kInt8)
+            {
+                storeStage(nst);
+            }
+            else
+            {
+                cpAsyncCommitWaitAll();
+            }
+            __syncwarp();
+        }
+    }
+
+    // Merge the four warps: (m, l, acc) per row.
+    __syncthreads();
+    float* const accS = reinterpret_cast<float*>(smemRaw); // reuses the stage slices
+    float* const mS = accS + kMmaWarps * 4 * kInkling2HeadDim;
+    float* const lS = mS + kMmaWarps * 4;
+    if (gid < group)
+    {
+#pragma unroll
+        for (int32_t i = 0; i < 16; ++i)
+        {
+            accS[(w * 4 + gid) * kInkling2HeadDim + i * 8 + 2 * tig] = accO[i][0];
+            accS[(w * 4 + gid) * kInkling2HeadDim + i * 8 + 2 * tig + 1] = accO[i][1];
+        }
+        if (tig == 0)
+        {
+            mS[w * 4 + gid] = rowM;
+            lS[w * 4 + gid] = rowL;
+        }
+    }
+    __syncthreads();
+    int32_t const d = tid;
+    for (int32_t row = 0; row < group; ++row)
+    {
+        float mm = -INFINITY;
+#pragma unroll
+        for (int32_t ww = 0; ww < kMmaWarps; ++ww)
+        {
+            mm = fmaxf(mm, mS[ww * 4 + row]);
+        }
+        // A warp without a finite maximum has weight 0 but is still multiplied in, so a NaN in its partials (a NaN query) stays in this token like in the other kernels.
+        float num = 0.F, den = 0.F;
+#pragma unroll
+        for (int32_t ww = 0; ww < kMmaWarps; ++ww)
+        {
+            float const mw = mS[ww * 4 + row];
+            float const cf = (mm == -INFINITY || mw == -INFINITY) ? 0.F : __expf(mw - mm);
+            num += accS[(ww * 4 + row) * kInkling2HeadDim + d] * cf;
+            den += lS[ww * 4 + row] * cf;
+        }
+        int32_t const h = kvh * group + row;
+        float* out = partials + ((int64_t(slot) * p.numQHeads + h) * splits + split) * kPartialStride;
+        out[2 + d] = num;
+        if (d == 0)
+        {
+            out[0] = mm;
+            out[1] = den;
+        }
+    }
+}
+
 template <typename KvT>
 static void launchTyped(Inkling2AttentionParams const& params, half const* qLin, half const* relLin, half const* sinkLin,
     half const* gateLin, float const* qScale, float const* relScale, float const* relProjT, half const* kNew,
@@ -1300,6 +1788,36 @@ static void launchTyped(Inkling2AttentionParams const& params, half const* qLin,
         splits = std::min<int64_t>(splits, std::max<int64_t>(1, int64_t(params.maxPagesPerSeq) * kInkling2TokensPerPage / kDecKeys));
         splits = std::min<int64_t>(splits, 64);
         splits = std::max<int64_t>(1, std::min<int64_t>(splits, rowCap / (int64_t(params.numTokens) * params.numQHeads)));
+        // Tensor-core kernel for FP16 and INT8 KV (INKLING2_NO_DECODE_MMA=1 selects the scalar kernel); FP8 pools keep the scalar kernel.
+        static bool const decodeMma = std::getenv("INKLING2_NO_DECODE_MMA") == nullptr;
+        if constexpr (!std::is_same_v<KvT, __nv_fp8_e4m3>)
+        {
+            if (decodeMma)
+            {
+                static bool const decodeMmaConfigured = []()
+                {
+                    cudaFuncSetAttribute(decodeMmaKernel<half>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(decodeMmaSmemBytes(false)));
+                    cudaFuncSetAttribute(decodeMmaKernel<int8_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(decodeMmaSmemBytes(true)));
+                    return true;
+                }();
+                static_cast<void>(decodeMmaConfigured);
+                // about `INKLING2_DECODE_BLOCKS_PER_SM` blocks per SM (two fit by shared memory), never more splits than 64-key tiles exist
+                static int32_t const blocksPerSm = []()
+                {
+                    char const* v = std::getenv("INKLING2_DECODE_BLOCKS_PER_SM");
+                    return v != nullptr ? std::max(1, std::atoi(v)) : 4;
+                }();
+                int64_t mmaSplits = (int64_t(blocksPerSm) * sms + int64_t(params.numTokens) * params.numKVHeads - 1) / (int64_t(params.numTokens) * params.numKVHeads);
+                mmaSplits = std::min<int64_t>(mmaSplits, std::max<int64_t>(1, int64_t(params.maxPagesPerSeq) * kInkling2TokensPerPage / kMmaTile));
+                mmaSplits = std::max<int64_t>(1, std::min<int64_t>(mmaSplits, rowCap / (int64_t(params.numTokens) * params.numQHeads)));
+                decodeMmaKernel<KvT><<<dim3(params.numTokens, params.numKVHeads, static_cast<unsigned>(mmaSplits)), kMmaThreads, decodeMmaSmemBytes(std::is_same_v<KvT, int8_t>), stream>>>(
+                    params, qLin, relLin, qScale, relScale, relProjT, kvPool, queryStartOffsets, queryLengths, pastLengths, pageTable,
+                    static_cast<float*>(workspace), static_cast<int32_t>(mmaSplits));
+                mergeKernel<<<dim3(params.numTokens, params.numQHeads), kInkling2HeadDim, 0, stream>>>(params, sinkLin, gateLin, queryStartOffsets,
+                    queryLengths, pastLengths, static_cast<float const*>(workspace), static_cast<int32_t>(mmaSplits), out);
+                return;
+            }
+        }
         decodeAttentionKernel<KvT><<<dim3(params.numTokens, params.numKVHeads, static_cast<unsigned>(splits)), kDecThreads, decodeSmemBytes(), stream>>>(
             params, qLin, relLin, qScale, relScale, relProjT, kvPool, queryStartOffsets, queryLengths, pastLengths, pageTable,
             static_cast<float*>(workspace), static_cast<int32_t>(splits));
