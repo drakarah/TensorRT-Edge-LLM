@@ -25,11 +25,13 @@ namespace trt_edgellm
 namespace kernel
 {
 
-constexpr int32_t kFp8LinearMaxGemvTokens = 4;
+constexpr int32_t kFp8LinearMaxGemvTokens = 8;
 
 //! Weight byte format of launchFp8Linear: E4M3 codes (the Fp8LinearPlugin) or two's-complement INT8 (weight-only INT8, per-row scale).
 constexpr int32_t kLinearWeightFp8 = 0;
 constexpr int32_t kLinearWeightInt8 = 1;
+//! INT8 in mma-fragment order (see the fp8LinearKernels.cu i8mma namespace; K a multiple of 64): tensor-core kernels for every token count.
+constexpr int32_t kLinearWeightInt8Mma = 2;
 
 //! y[m, n] = scale[n] * sum_k x[m, k] * w[n, k]: FP8 (E4M3) weights [N, K] with one scale per output row, FP16 activations, FP32 accumulation, FP16 output.
 //! The weights arrive as 4 bytes per int32 word ([N, K / 4]). K must be a multiple of 32, N of 8. Decode shapes (numTokens <= kFp8LinearMaxGemvTokens) run a

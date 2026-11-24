@@ -217,7 +217,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.recurrentStateSize=*/cfg.recurrentStateSize,
         /*.convDim=*/cfg.convDim,
         /*.convKernel=*/cfg.convKernel,
-        /*.maxIntermediateSeqLen=*/0,
+        /*.maxIntermediateSeqLen=*/cfg.inklingVerifyTokens,
         /*.recurrentStateType=*/cfg.recurrentStateDtype,
         /*.convStateType=*/cfg.convStateDtype,
         /*.recurrentStateNumGroups=*/cfg.recurrentStateNumGroups,

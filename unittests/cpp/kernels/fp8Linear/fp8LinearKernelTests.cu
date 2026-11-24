@@ -68,7 +68,7 @@ Problem makeProblem(uint32_t seed, int32_t tokens, int32_t n, int32_t k, float x
     p.fmt = fmt;
     for (auto& b : p.w)
     {
-        if (fmt == kLinearWeightInt8)
+        if (fmt == kLinearWeightInt8 || fmt == kLinearWeightInt8Mma)
         {
             b = static_cast<uint8_t>(g()); // every int8 value, -128 included
             continue;
@@ -94,7 +94,7 @@ std::vector<double> reference(Problem const& p)
     std::vector<float> wf(p.w.size());
     for (size_t i = 0; i < wf.size(); ++i)
     {
-        wf[i] = p.fmt == kLinearWeightInt8 ? static_cast<float>(static_cast<int8_t>(p.w[i])) : fp8ToFloat(p.w[i]);
+        wf[i] = (p.fmt == kLinearWeightInt8 || p.fmt == kLinearWeightInt8Mma) ? static_cast<float>(static_cast<int8_t>(p.w[i])) : fp8ToFloat(p.w[i]);
     }
     for (int32_t m = 0; m < p.tokens; ++m)
     {
@@ -111,6 +111,24 @@ std::vector<double> reference(Problem const& p)
     return y;
 }
 
+//! The bytes in mma-fragment order (kLinearWeightInt8Mma): per 8 rows x 64 k slab, lane (g, t) holds W[g][16 j + {2t, 2t + 1, 2t + 8, 2t + 9}] of its four k16 tiles.
+std::vector<uint8_t> shuffleMma(std::vector<uint8_t> const& w, int32_t n, int32_t k)
+{
+    std::vector<uint8_t> out(w.size());
+    int32_t const cols[4][4] = {{0, 1, 8, 9}, {2, 3, 10, 11}, {4, 5, 12, 13}, {6, 7, 14, 15}};
+    for (int32_t grp = 0; grp < n / 8; ++grp)
+        for (int32_t kb = 0; kb < k / 64; ++kb)
+            for (int32_t g = 0; g < 8; ++g)
+                for (int32_t t = 0; t < 4; ++t)
+                    for (int32_t j = 0; j < 4; ++j)
+                        for (int32_t e = 0; e < 4; ++e)
+                        {
+                            size_t const dst = ((static_cast<size_t>(grp) * (k / 64) + kb) * 32 + g * 4 + t) * 16 + j * 4 + e;
+                            out[dst] = w[static_cast<size_t>(grp * 8 + g) * k + (kb * 4 + j) * 16 + cols[t][e]];
+                        }
+    return out;
+}
+
 std::vector<float> run(Problem const& p, bool scaleFp32 = true)
 {
     void *dx, *dw, *dy, *ds;
@@ -118,7 +136,15 @@ std::vector<float> run(Problem const& p, bool scaleFp32 = true)
     CUDA_CHECK(cudaMalloc(&dw, p.w.size()));
     CUDA_CHECK(cudaMalloc(&dy, static_cast<size_t>(p.tokens) * p.n * 2));
     CUDA_CHECK(cudaMemcpy(dx, p.x.data(), p.x.size() * 2, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dw, p.w.data(), p.w.size(), cudaMemcpyHostToDevice));
+    if (p.fmt == kLinearWeightInt8Mma)
+    {
+        auto const shuffled = shuffleMma(p.w, p.n, p.k);
+        CUDA_CHECK(cudaMemcpy(dw, shuffled.data(), shuffled.size(), cudaMemcpyHostToDevice));
+    }
+    else
+    {
+        CUDA_CHECK(cudaMemcpy(dw, p.w.data(), p.w.size(), cudaMemcpyHostToDevice));
+    }
     CUDA_CHECK(cudaMemset(dy, 0xFF, static_cast<size_t>(p.tokens) * p.n * 2)); // NaN canary
     if (scaleFp32)
     {
@@ -175,7 +201,7 @@ TEST(Fp8LinearTest, DecodeGemvMatchesTheReferenceForInklingShapes)
 {
     for (auto const& [n, k] : {std::pair{3072, 2304}, std::pair{1024, 2304}, std::pair{2304, 3072}, std::pair{384, 2304}})
     {
-        for (int32_t tokens : {1, 2, 3, 4})
+        for (int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8})
         {
             ASSERT_TRUE(fp8LinearUsesGemv(tokens));
             expectClose(makeProblem(100 + tokens, tokens, n, k));
@@ -187,10 +213,22 @@ TEST(Fp8LinearTest, PrefillGemmMatchesTheReferenceForInklingShapes)
 {
     for (auto const& [n, k] : {std::pair{3072, 2304}, std::pair{1024, 2304}, std::pair{2304, 3072}, std::pair{384, 2304}})
     {
-        for (int32_t tokens : {5, 8, 64, 100})
+        for (int32_t tokens : {9, 16, 64, 100})
         {
             ASSERT_FALSE(fp8LinearUsesGemv(tokens));
             expectClose(makeProblem(200 + tokens, tokens, n, k));
+        }
+    }
+}
+
+TEST(Fp8LinearTest, MmaOrderedInt8MatchesTheReferenceForEveryTokenCount)
+{
+    // tensor-core kernels: one half-filled m16 group up to 8 tokens, 64-token tiles above; K a multiple of 64, N of 8
+    for (auto const& [n, k] : {std::pair{3072, 2304}, std::pair{1024, 2304}, std::pair{2304, 3072}, std::pair{384, 2304}, std::pair{8, 64}, std::pair{200, 256}, std::pair{2304, 9216}})
+    {
+        for (int32_t tokens : {1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 63, 64, 65, 100, 200})
+        {
+            expectClose(makeProblem(300 + tokens, tokens, n, k, 1.0F, kLinearWeightInt8Mma));
         }
     }
 }

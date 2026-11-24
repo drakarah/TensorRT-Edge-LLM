@@ -18,6 +18,13 @@
 #pragma once
 
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/decoding/draftSource.h"
+#include "runtime/decoding/lookupDraftPolicy.h"
+#include "runtime/decoding/suffixDraftCache.h"
+
+#include <array>
+#include <chrono>
+#include <memory>
 
 namespace trt_edgellm
 {
@@ -51,6 +58,18 @@ public:
 
     bool decodeStep(DecodingInferenceContext& context) override;
     bool captureCudaGraphs(cudaStream_t stream) override;
+    //! Inkling drafter (EDGELLM_INKLING_SPEC=drafter | hybrid): it needs the taps of every prompt position, pass by pass.
+    bool needsPerPassDraftUpdate() const noexcept override
+    {
+        return mDrafter != nullptr;
+    }
+    bool absorbPrefillPass(DecodingInferenceContext& context) override;
+    bool initializeForGeneration(DecodingInferenceContext& context) override;
+
+    DecodingKvHeadroom requiredKvHeadroom() const override
+    {
+        return {/*.baseExtraTokens=*/std::max(1, mChainWindow), /*.draftExtraTokens=*/0};
+    }
 
     int64_t getRequiredContextMemorySize() const noexcept override
     {
@@ -76,7 +95,51 @@ public:
     void onBatchEvict(std::vector<int32_t> const&, int32_t, int32_t, Tensor&, cudaStream_t) override {}
 
 private:
+    //! Inkling 2 chain verification (EDGELLM_INKLING_SPEC=lookup | cost:<T>): a step verifies [committed token, drafts...] in one engine pass and
+    //! commits the accepted prefix. Needs an engine built with EDGELLM_INKLING_VERIFY and a greedy single-sequence request; every other request, and every
+    //! step without a proposal, runs the plain single-token step. Greedy output equals plain decoding by construction.
+    bool chainApplies(DecodingInferenceContext const& context) const;
+    bool decodeStepChain(DecodingInferenceContext& context);
+    bool decodeStepPlain(DecodingInferenceContext& context);
+    //! Runs one chain pass of ids.size() tokens at past length pastLength; the logits are left in outputLogits [T, vocab].
+    bool runChainPass(std::vector<int32_t> const& ids, ResidentRef ref, RequestId requestId, int32_t pastLength,
+        RaggedBatchBuilder& builder, RaggedExecutionBatch& batch, StepId stepId, cudaStream_t stream, bool captureOnly);
+    void prepareChainTensors();
+    void indexLookupTokens(DecodingInferenceContext& context);
+    bool feedDrafterPrefill(DecodingInferenceContext& context, bool lastPass);
+
     DecodingRuntimeContext& mRuntime;
+    int32_t mChainWindow{0};      //!< Largest verified window (0 = chain verification off).
+    int32_t mChainMinProposal{2}; //!< Shortest lookup proposal worth a verify.
+    int32_t mChainFixed{0};       //!< cost mode: always verify this many tokens (fillers when the lookup has no proposal).
+    int32_t mLookupIndexed{0};
+    SuffixDraftCache mLookupCache;
+    std::unique_ptr<LookupDraftPolicy> mLookupPolicy;
+    Tensor mChainArgmax;          //!< GPU [maxWindow, 1] INT32
+    Tensor mChainHostArgmax;      //!< CPU [maxWindow]
+    Tensor mChainAcceptLength;    //!< GPU [1]
+    Tensor mChainAcceptedIds;     //!< GPU [1, maxWindow]
+    Tensor mChainHostAcceptLength;
+    Tensor mChainHostAcceptedIds;
+    std::unique_ptr<IDraftSource> mDrafter;
+    bool mDrafterPrefillOpen{false}; //!< a chunked prefill has fed passes and awaits its last one
+    bool mDrafterValid{false};   //!< the drafter has the taps of every position of this request
+    bool mAutoK{false};          //!< EDGELLM_INKLING_DRAFT_K=auto: the verified draft count follows the running acceptance
+    std::array<double, 7> mPrefixAcceptance{0.70, 0.47, 0.33, 0.24, 0.18, 0.14, 0.10}; //!< P(at least j + 1 drafts accepted), offline prior
+    int32_t mDraftK{3};          //!< drafted tokens verified per round
+    bool mHybrid{false};         //!< prefer a long lookup proposal over the drafter's
+    Tensor mDrafterIds;          //!< GPU [1, 1] INT32
+    Tensor mDrafterEmb;          //!< GPU [1, 1, hidden] FP16
+    Tensor mDrafterHostTokens;   //!< pinned [8] INT32
+    int64_t mStatDraftRounds{0};
+    int64_t mStatDraftAccepted{0};
+    int64_t mStatRounds{0};
+    int64_t mStatChainRounds{0};
+    int64_t mStatTokens{0};
+    int64_t mStatAccepted{0};
+    std::array<int64_t, 9> mStatWindowRounds{};
+    std::array<double, 9> mStatWindowMs{};
+    std::array<int64_t, 9> mStatWindowAccepted{};
 };
 
 } // namespace rt

@@ -49,7 +49,7 @@ enum Input : int32_t
 };
 constexpr int32_t kOutY{0};
 constexpr int32_t kOutState{1};
-constexpr int32_t kNumOutputs{2};
+constexpr int32_t kOutInter{2};
 
 bool linear(PluginTensorDesc const& d, DataType type, int32_t rank)
 {
@@ -60,13 +60,14 @@ bool linear(PluginTensorDesc const& d, DataType type, int32_t rank)
 REGISTER_TENSORRT_PLUGIN(Inkling2ShortConvPluginCreator);
 
 Inkling2ShortConvPlugin::Inkling2ShortConvPlugin(
-    std::string const& name, int32_t channels, int32_t kernelSize, int32_t groups, float scale, int32_t stateOffset)
+    std::string const& name, int32_t channels, int32_t kernelSize, int32_t groups, float scale, int32_t stateOffset, int32_t intermediate)
     : mLayerName(name)
     , mChannels(channels)
     , mKernelSize(kernelSize)
     , mGroups(groups)
     , mScale(scale)
     , mStateOffset(stateOffset)
+    , mIntermediate(intermediate)
 {
     if (stateOffset < 0)
     {
@@ -90,6 +91,11 @@ int32_t Inkling2ShortConvPlugin::numInputs() const noexcept
     return mGroups > 0 ? kMaxInputs : kDyn;
 }
 
+int32_t Inkling2ShortConvPlugin::numOutputs() const noexcept
+{
+    return mIntermediate != 0 ? 3 : 2;
+}
+
 IPluginCapability* Inkling2ShortConvPlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
 {
     if (type == PluginCapabilityType::kBUILD)
@@ -107,7 +113,7 @@ IPluginV3* Inkling2ShortConvPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Inkling2ShortConvPlugin(mLayerName, mChannels, mKernelSize, mGroups, mScale, mStateOffset);
+        auto* plugin = new Inkling2ShortConvPlugin(mLayerName, mChannels, mKernelSize, mGroups, mScale, mStateOffset, mIntermediate);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -139,18 +145,22 @@ void Inkling2ShortConvPlugin::setPluginNamespace(char const* pluginNamespace) no
 
 int32_t Inkling2ShortConvPlugin::getNbOutputs() const noexcept
 {
-    return kNumOutputs;
+    return numOutputs();
 }
 
 int32_t Inkling2ShortConvPlugin::getOutputDataTypes(
     DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
 {
-    if (outputTypes == nullptr || inputTypes == nullptr || nbOutputs != kNumOutputs || nbInputs != numInputs())
+    if (outputTypes == nullptr || inputTypes == nullptr || nbOutputs != numOutputs() || nbInputs != numInputs())
     {
         return -1;
     }
     outputTypes[kOutY] = DataType::kHALF;
     outputTypes[kOutState] = inputTypes[kState];
+    if (mIntermediate != 0)
+    {
+        outputTypes[kOutInter] = DataType::kHALF;
+    }
     return 0;
 }
 
@@ -158,7 +168,7 @@ int32_t Inkling2ShortConvPlugin::getOutputShapes(DimsExprs const* inputs, int32_
     DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs, int32_t nbOutputs,
     IExprBuilder& exprBuilder) noexcept
 {
-    if (inputs == nullptr || outputs == nullptr || nbInputs != numInputs() || nbOutputs != kNumOutputs
+    if (inputs == nullptr || outputs == nullptr || nbInputs != numInputs() || nbOutputs != numOutputs()
         || inputs[kX].nbDims != 2 || inputs[kState].nbDims != 3)
     {
         return -1;
@@ -167,13 +177,21 @@ int32_t Inkling2ShortConvPlugin::getOutputShapes(DimsExprs const* inputs, int32_
     outputs[kOutY].d[0] = inputs[kX].d[0];
     outputs[kOutY].d[1] = exprBuilder.constant(mChannels);
     outputs[kOutState] = inputs[kState];
+    if (mIntermediate != 0)
+    {
+        outputs[kOutInter].nbDims = 3;
+        // capped at the capacity: a long prefill chunk gets a placeholder of at most mIntermediate rows (the kernel skips it)
+        outputs[kOutInter].d[0] = exprBuilder.operation(DimensionOperation::kMIN, *inputs[kX].d[0], *exprBuilder.constant(mIntermediate));
+        outputs[kOutInter].d[1] = exprBuilder.constant(mChannels);
+        outputs[kOutInter].d[2] = exprBuilder.constant(mKernelSize);
+    }
     return 0;
 }
 
 bool Inkling2ShortConvPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
-    if (inOut == nullptr || nbInputs != numInputs() || nbOutputs != kNumOutputs || pos < 0
+    if (inOut == nullptr || nbInputs != numInputs() || nbOutputs != numOutputs() || pos < 0
         || pos >= nbInputs + nbOutputs)
     {
         return false;
@@ -196,15 +214,15 @@ bool Inkling2ShortConvPlugin::supportsFormatCombination(
     {
         return linear(d, DataType::kHALF, 2);
     }
-    return pos == nbInputs + kOutState && linear(d, DataType::kHALF, 3);
+    return (pos == nbInputs + kOutState || pos == nbInputs + kOutInter) && linear(d, DataType::kHALF, 3);
 }
 
 int32_t Inkling2ShortConvPlugin::configurePlugin(
     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    if (in == nullptr || out == nullptr || nbInputs != numInputs() || nbOutputs != kNumOutputs)
+    if (in == nullptr || out == nullptr || nbInputs != numInputs() || nbOutputs != numOutputs())
     {
-        LOG_ERROR("Inkling2ShortConvPlugin: expected %d inputs and %d outputs", numInputs(), kNumOutputs);
+        LOG_ERROR("Inkling2ShortConvPlugin: expected %d inputs and %d outputs", numInputs(), numOutputs());
         return -1;
     }
     Dims const& state = in[kState].desc.dims;
@@ -268,14 +286,15 @@ int32_t Inkling2ShortConvPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
         static_cast<float const*>(inputs[kTaps]), mGroups > 0 ? static_cast<half const*>(inputs[kDyn]) : nullptr,
         const_cast<half*>(static_cast<half const*>(inputs[kState])),
         static_cast<int32_t const*>(inputs[kQueryStartOffsets]), static_cast<int32_t const*>(inputs[kQueryLengths]),
-        static_cast<int32_t const*>(inputs[kStateIndices]), static_cast<half*>(outputs[kOutY]), stream);
+        static_cast<int32_t const*>(inputs[kStateIndices]), static_cast<half*>(outputs[kOutY]), stream,
+        (mIntermediate != 0 && params.numTokens <= mIntermediate) ? static_cast<half*>(outputs[kOutInter]) : nullptr);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
 int32_t Inkling2ShortConvPlugin::onShapeChange(
     PluginTensorDesc const* in, int32_t nbInputs, PluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    return (in != nullptr && out != nullptr && nbInputs == numInputs() && nbOutputs == kNumOutputs) ? 0 : -1;
+    return (in != nullptr && out != nullptr && nbInputs == numInputs() && nbOutputs == numOutputs()) ? 0 : -1;
 }
 
 IPluginV3* Inkling2ShortConvPlugin::attachToContext(IPluginResourceContext* /* context */) noexcept
@@ -291,6 +310,10 @@ PluginFieldCollection const* Inkling2ShortConvPlugin::getFieldsToSerialize() noe
     mData.emplace_back("groups", &mGroups, PluginFieldType::kINT32, 1);
     mData.emplace_back("state_offset", &mStateOffset, PluginFieldType::kINT32, 1);
     mData.emplace_back("scale", &mScale, PluginFieldType::kFLOAT32, 1);
+    if (mIntermediate != 0)
+    {
+        mData.emplace_back("intermediate", &mIntermediate, PluginFieldType::kINT32, 1);
+    }
     mFields.nbFields = static_cast<int32_t>(mData.size());
     mFields.fields = mData.data();
     return &mFields;
@@ -303,7 +326,7 @@ Inkling2ShortConvPluginCreator::Inkling2ShortConvPluginCreator()
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     mAttributes.clear();
-    for (char const* name : {"channels", "kernel_size", "groups", "state_offset"})
+    for (char const* name : {"channels", "kernel_size", "groups", "state_offset", "intermediate"})
     {
         mAttributes.emplace_back(name, nullptr, PluginFieldType::kINT32, 1);
     }
@@ -360,7 +383,8 @@ IPluginV3* Inkling2ShortConvPluginCreator::createPlugin(
                 throw std::invalid_argument(std::string("Inkling2ShortConvPlugin: duplicate attribute ") + field.name);
             }
         }
-        if (byName.size() != 5)
+        size_t const expected = byName.count("intermediate") != 0 ? 6 : 5; // intermediate is optional (absent in engines built before speculative verification)
+        if (byName.size() != expected)
         {
             throw std::invalid_argument("Inkling2ShortConvPlugin: unknown or missing attributes");
         }
@@ -378,7 +402,8 @@ IPluginV3* Inkling2ShortConvPluginCreator::createPlugin(
             throw std::invalid_argument("Inkling2ShortConvPlugin: missing FLOAT32 attribute scale");
         }
         auto* plugin = new Inkling2ShortConvPlugin(name, intField("channels"), intField("kernel_size"),
-            intField("groups"), *static_cast<float const*>(scaleIt->second->data), intField("state_offset"));
+            intField("groups"), *static_cast<float const*>(scaleIt->second->data), intField("state_offset"),
+            byName.count("intermediate") != 0 ? intField("intermediate") : 0);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }

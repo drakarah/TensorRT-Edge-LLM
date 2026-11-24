@@ -181,13 +181,15 @@ def inkling2_short_conv(
     dynamic_taps: Optional[Tensor] = None,
     groups: int = 0,
     state_offset: int = 0,
-) -> Tuple[Tensor, Tensor]:
+    intermediate: int = 0,
+) -> Tuple[Tensor, ...]:
     """Run one Inkling 2 short convolution with residual and return output plus present state.
 
     ``taps`` is [channels, kernel_size] FP32 with lag 0 (the current token) first.
     ``dynamic_taps`` [tokens, groups * kernel_size] adds per-token taps shared
     by ``channels / groups`` consecutive channels. The convolution uses state
-    channels ``state_offset .. state_offset + channels``.
+    channels ``state_offset .. state_offset + channels``. With ``intermediate`` a third output [tokens, channels, kernel_size] holds the state after
+    every token (speculative verification restores the last accepted one).
     """
     if (dynamic_taps is None) != (groups == 0):
         raise ValueError("dynamic_taps and groups must be given together")
@@ -199,12 +201,13 @@ def inkling2_short_conv(
         inputs.append(dynamic_taps)
     return operation("inkling2_short_conv",
                      inputs,
-                     output_count=2,
+                     output_count=3 if intermediate else 2,
                      channels=channels,
                      kernel_size=kernel_size,
                      groups=groups,
                      scale=scale,
-                     state_offset=state_offset)
+                     state_offset=state_offset,
+                     **({"intermediate": int(intermediate)} if intermediate else {}))
 
 
 def inkling2_block_residual(states: List[Tensor], queries: Tensor,

@@ -470,6 +470,10 @@ static void buildTensorMapImpl(
     map.set(binding_names::kLogits, io.outputLogits);
     bindUnifiedDecoderMetadata(map, io);
     map.set(binding_names::kLogitsIndices, io.logitsIndices);
+    if (cfg.inklingVerifyTokens > 0 && !io.inklingTaps.isEmpty())
+    {
+        map.set(binding_names::kInklingTaps, io.inklingTaps);
+    }
     if (cfg.isDiffusionBackbone)
     {
         bindDiffusionGemmaBackboneTensorMap(map, io, cfg);
@@ -743,7 +747,14 @@ PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t str
     PipelineIO io;
 
     allocateBasicIO(io, cfg.maxSupportedBatchSize, cfg.outputVocabSize);
-    int32_t const maxLogitsRows = cfg.isDiffusionBackbone ? cfg.maxPhysicalTokens : cfg.maxNumSequences;
+    int32_t const maxLogitsRows = cfg.isDiffusionBackbone ? cfg.maxPhysicalTokens : std::max(cfg.maxNumSequences, cfg.inklingVerifyTokens);
+    if (cfg.inklingVerifyTokens > 0)
+    {
+        // chain verification returns one logits row per verified token; the taps cover every token of a prefill chunk
+        io.outputLogits = Tensor({std::max(cfg.maxSupportedBatchSize, cfg.inklingVerifyTokens), cfg.outputVocabSize},
+            DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
+        io.inklingTaps = Tensor({cfg.maxPhysicalTokens, kInklingTapsWidth}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::inklingTaps");
+    }
     allocateRaggedMetadata(
         io, cfg.maxPhysicalTokens, cfg.maxNumSequences, maxLogitsRows, cfg.maxKVCacheCapacity, cfg.hiddenSize);
     allocateRaggedRope(io, cfg);

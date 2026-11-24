@@ -259,6 +259,259 @@ __global__ void fp8GemmKernel(__half const* __restrict__ x, uint4 const* __restr
     }
 }
 
+//! kRows output rows per warp (verify steps with 3 to 8 tokens): the activations of a chunk are read once and used for the weights of kRows rows, which cuts the
+//! activation loads per weight byte by kRows. Per row and token the products are accumulated in the same order as fp8GemvKernel, so results are bit-identical.
+template <int32_t kM, bool kInt8, int32_t kRows>
+__global__ void fp8GemvRowsKernel(__half const* __restrict__ x, uint4 const* __restrict__ w, void const* scale, __half* __restrict__ y, int32_t numTokens,
+    int32_t n, int32_t k, bool scaleIsFp32)
+{
+    int32_t const warp = threadIdx.x >> 5;
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const row0 = (blockIdx.x * kGemvWarps + warp) * kRows;
+    if (row0 >= n)
+    {
+        return;
+    }
+    int32_t const chunks = k / 16;
+    float acc[kRows][kM];
+#pragma unroll
+    for (int32_t r = 0; r < kRows; ++r)
+    {
+#pragma unroll
+        for (int32_t m = 0; m < kM; ++m)
+        {
+            acc[r][m] = 0.0F;
+        }
+    }
+    constexpr int32_t kUnroll = 2;
+    for (int32_t base = lane; base < chunks; base += 32 * kUnroll)
+    {
+        uint4 v[kUnroll][kRows];
+#pragma unroll
+        for (int32_t u = 0; u < kUnroll; ++u)
+        {
+            int32_t const c = base + u * 32;
+#pragma unroll
+            for (int32_t r = 0; r < kRows; ++r)
+            {
+                int32_t const row = min(row0 + r, n - 1);
+                v[u][r] = c < chunks ? __ldg(w + static_cast<size_t>(row) * chunks + c) : make_uint4(0, 0, 0, 0);
+            }
+        }
+#pragma unroll
+        for (int32_t u = 0; u < kUnroll; ++u)
+        {
+            int32_t const c = base + u * 32;
+            if (c < chunks)
+            {
+                float wv[kRows][16];
+#pragma unroll
+                for (int32_t r = 0; r < kRows; ++r)
+                {
+                    decode16<kInt8>(v[u][r], wv[r]);
+                }
+#pragma unroll
+                for (int32_t m = 0; m < kM; ++m)
+                {
+                    uint4 const* xp = reinterpret_cast<uint4 const*>(x + static_cast<size_t>(m) * k + c * 16);
+                    uint4 const xa = __ldg(xp);
+                    uint4 const xb = __ldg(xp + 1);
+                    uint32_t const xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+                    for (int32_t q = 0; q < 8; ++q)
+                    {
+                        float2 const xv = __half22float2(*reinterpret_cast<__half2 const*>(&xw[q]));
+#pragma unroll
+                        for (int32_t r = 0; r < kRows; ++r)
+                        {
+                            acc[r][m] = fmaf(wv[r][2 * q + 0], xv.x, acc[r][m]);
+                            acc[r][m] = fmaf(wv[r][2 * q + 1], xv.y, acc[r][m]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int32_t r = 0; r < kRows; ++r)
+    {
+#pragma unroll
+        for (int32_t m = 0; m < kM; ++m)
+        {
+#pragma unroll
+            for (int32_t off = 16; off > 0; off >>= 1)
+            {
+                acc[r][m] += __shfl_xor_sync(0xffffffffu, acc[r][m], off);
+            }
+        }
+    }
+    if (lane == 0)
+    {
+#pragma unroll
+        for (int32_t r = 0; r < kRows; ++r)
+        {
+            if (row0 + r < n)
+            {
+                float const s = loadScale(scale, row0 + r, scaleIsFp32);
+#pragma unroll
+                for (int32_t m = 0; m < kM; ++m)
+                {
+                    if (m < numTokens)
+                    {
+                        y[static_cast<size_t>(m) * n + row0 + r] = __float2half_rn(acc[r][m] * s);
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int32_t kM, bool kInt8, int32_t kRows>
+void launchGemvRows(void const* x, void const* w, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32, cudaStream_t stream)
+{
+    int32_t const perBlock = kGemvWarps * kRows;
+    fp8GemvRowsKernel<kM, kInt8, kRows><<<(n + perBlock - 1) / perBlock, kGemvWarps * 32, 0, stream>>>(
+        static_cast<__half const*>(x), static_cast<uint4 const*>(w), scale, static_cast<__half*>(y), numTokens, n, k, scaleIsFp32);
+}
+
+//! INT8 weights in mma-fragment order (kLinearWeightInt8Mma): per 8 output rows x 64 k slab, lane (g = lane / 4, t = lane % 4) of a warp holds 16 contiguous bytes: for
+//! each of four k16 tiles j the bytes W[g][16 j + {2t, 2t + 1, 2t + 8, 2t + 9}], i.e. exactly its m16n8k16 B fragment of that tile. Tensor cores (activations are the A operand,
+//! tokens the M dimension, 16 per group) read it once per token tile with one 16-byte load per lane and k64.
+namespace i8mma
+{
+constexpr int32_t kWarps = 4;
+constexpr int32_t kStageSmall = 1024; //!< k elements of the activation tile staged in shared memory at a time (up to 8 tokens)
+constexpr int32_t kStageTile = 256;   //!< the same for 64-token tiles
+
+__device__ __forceinline__ void mma16816(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1)
+{
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void int8Pairs(uint32_t w, uint32_t& b0, uint32_t& b1)
+{
+    uint32_t const flipped = w ^ 0x80808080U;
+    uint32_t const lo = __byte_perm(flipped, 0x64646464U, 0x5140);
+    uint32_t const hi = __byte_perm(flipped, 0x64646464U, 0x7362);
+    __half2 const bias = __float2half2_rn(1152.0F);
+    __half2 const l = __hsub2(*reinterpret_cast<__half2 const*>(&lo), bias);
+    __half2 const h = __hsub2(*reinterpret_cast<__half2 const*>(&hi), bias);
+    b0 = *reinterpret_cast<uint32_t const*>(&l);
+    b1 = *reinterpret_cast<uint32_t const*>(&h);
+}
+
+//! One warp per group of 8 output rows, kWarps groups per block; a block covers kGroups x 16 tokens (kGroups = 1: the A rows 8..15 are zero for up to 8 tokens when kSmall).
+template <int32_t kGroups, bool kSmall>
+__global__ void __launch_bounds__(kWarps * 32) gemm(__half const* __restrict__ x, uint4 const* __restrict__ wShuf, void const* scale, __half* __restrict__ y,
+    int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32)
+{
+    constexpr int32_t kTokens = kSmall ? 8 : 16 * kGroups;
+    constexpr int32_t kStageK = kSmall ? kStageSmall : kStageTile;
+    constexpr int32_t kStride = kStageK + 8;
+    extern __shared__ __align__(16) __half xs[]; // [kTokens][kStride]
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const warp = threadIdx.x >> 5;
+    int32_t const g = lane >> 2;
+    int32_t const t = lane & 3;
+    int32_t const group = blockIdx.x * kWarps + warp; // output group of 8 rows
+    bool const active = group * 8 < n;
+    int32_t const token0 = blockIdx.y * kTokens;
+    int32_t const kb64 = k / 64;
+    float c[kGroups][4];
+#pragma unroll
+    for (int32_t i = 0; i < kGroups; ++i)
+    {
+        c[i][0] = c[i][1] = c[i][2] = c[i][3] = 0.F;
+    }
+    uint4 const* wp = wShuf + static_cast<size_t>(active ? group : 0) * kb64 * 32 + lane;
+    for (int32_t k0 = 0; k0 < k; k0 += kStageK)
+    {
+        int32_t const kc = min(kStageK, k - k0);
+        __syncthreads();
+        for (int32_t idx = threadIdx.x; idx < kTokens * kc / 8; idx += blockDim.x)
+        {
+            int32_t const r = idx / (kc / 8);
+            int32_t const cc = idx % (kc / 8);
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (token0 + r < numTokens)
+            {
+                v = *reinterpret_cast<uint4 const*>(x + static_cast<size_t>(token0 + r) * k + k0 + cc * 8);
+            }
+            *reinterpret_cast<uint4*>(&xs[r * kStride + cc * 8]) = v;
+        }
+        __syncthreads();
+        if (active)
+        {
+            int32_t const nkb = kc / 64;
+            int32_t const kbBase = k0 / 64;
+#pragma unroll 1
+            for (int32_t kb = 0; kb < nkb; ++kb)
+            {
+                uint4 const w = __ldg(wp + static_cast<size_t>(kbBase + kb) * 32);
+                uint32_t const ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+                for (int32_t j = 0; j < 4; ++j)
+                {
+                    int32_t const kk = kb * 64 + j * 16;
+                    uint32_t b0, b1;
+                    int8Pairs(ws[j], b0, b1);
+#pragma unroll
+                    for (int32_t i = 0; i < kGroups; ++i)
+                    {
+                        int32_t const r0 = (kSmall ? 0 : 16 * i) + g;
+                        uint32_t const a0 = *reinterpret_cast<uint32_t const*>(&xs[r0 * kStride + kk + 2 * t]);
+                        uint32_t const a2 = *reinterpret_cast<uint32_t const*>(&xs[r0 * kStride + kk + 8 + 2 * t]);
+                        uint32_t a1 = 0;
+                        uint32_t a3 = 0;
+                        if constexpr (!kSmall)
+                        {
+                            a1 = *reinterpret_cast<uint32_t const*>(&xs[(r0 + 8) * kStride + kk + 2 * t]);
+                            a3 = *reinterpret_cast<uint32_t const*>(&xs[(r0 + 8) * kStride + kk + 8 + 2 * t]);
+                        }
+                        mma16816(c[i], a0, a1, a2, a3, b0, b1);
+                    }
+                }
+            }
+        }
+    }
+    if (!active)
+    {
+        return;
+    }
+    int32_t const n0 = group * 8 + 2 * t;
+    float const s0 = loadScale(scale, n0, scaleIsFp32);
+    float const s1 = loadScale(scale, n0 + 1, scaleIsFp32);
+#pragma unroll
+    for (int32_t i = 0; i < kGroups; ++i)
+    {
+        int32_t const row0 = token0 + (kSmall ? 0 : 16 * i) + g;
+        if (row0 < numTokens)
+        {
+            y[static_cast<size_t>(row0) * n + n0] = __float2half_rn(c[i][0] * s0);
+            y[static_cast<size_t>(row0) * n + n0 + 1] = __float2half_rn(c[i][1] * s1);
+        }
+        if (!kSmall && row0 + 8 < numTokens)
+        {
+            y[static_cast<size_t>(row0 + 8) * n + n0] = __float2half_rn(c[i][2] * s0);
+            y[static_cast<size_t>(row0 + 8) * n + n0 + 1] = __float2half_rn(c[i][3] * s1);
+        }
+    }
+}
+
+template <int32_t kGroups, bool kSmall>
+void launch(void const* x, void const* w, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32, cudaStream_t stream)
+{
+    constexpr int32_t kTokens = kSmall ? 8 : 16 * kGroups;
+    constexpr int32_t kStride = (kSmall ? kStageSmall : kStageTile) + 8;
+    size_t const smem = static_cast<size_t>(kTokens) * kStride * sizeof(__half);
+    dim3 const grid((n / 8 + kWarps - 1) / kWarps, (numTokens + kTokens - 1) / kTokens);
+    gemm<kGroups, kSmall><<<grid, kWarps * 32, smem, stream>>>(
+        static_cast<__half const*>(x), static_cast<uint4 const*>(w), scale, static_cast<__half*>(y), numTokens, n, k, scaleIsFp32);
+}
+} // namespace i8mma
+
 template <int32_t kM, bool kInt8>
 void launchGemv(void const* x, void const* w, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32, cudaStream_t stream)
 {
@@ -286,7 +539,9 @@ void launchLinear(void const* x, void const* weightWords, void const* scale, voi
         {
         case 1: launchGemv<1, kInt8>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
         case 2: launchGemv<2, kInt8>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
-        default: launchGemv<4, kInt8>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
+        case 3:
+        case 4: launchGemvRows<4, kInt8, 2>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
+        default: launchGemvRows<8, kInt8, 2>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream); break;
         }
         return;
     }
@@ -298,6 +553,23 @@ void launchLinear(void const* x, void const* weightWords, void const* scale, voi
 void launchFp8Linear(void const* x, void const* weightWords, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32,
     cudaStream_t stream, int32_t weightFormat)
 {
+    if (weightFormat == kLinearWeightInt8Mma)
+    {
+        if (numTokens <= 0)
+        {
+            return;
+        }
+        // tensor cores for every token count: up to 8 tokens one half-filled m16 group, then 64-token tiles
+        if (numTokens <= 8)
+        {
+            i8mma::launch<1, true>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
+        }
+        else
+        {
+            i8mma::launch<4, false>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
+        }
+        return;
+    }
     if (weightFormat == kLinearWeightInt8)
     {
         launchLinear<true>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);

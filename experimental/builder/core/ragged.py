@@ -107,7 +107,8 @@ def _role_generation_query_length(args) -> int:
     if args.resolved_spec_role == contracts.SpecRole.BASE:
         return _checked_positive_int32(args.max_verify_tree_size,
                                        "max_verify_tree_size")
-    return 1
+    # Inkling 2 chain verification: a plain engine whose generation profile takes up to N tokens per step
+    return max(1, int(os.environ.get("EDGELLM_INKLING_VERIFY", "0")))
 
 
 def diffusion_canvas_length(root: dict,
@@ -188,7 +189,7 @@ def decoder_profile_ranges(
     max_generation_tokens = checked_physical_tokens(max_sequences,
                                                     max_generation_query)
     logits_rows = (max_generation_tokens if args.resolved_spec_role
-                   != contracts.SpecRole.NONE else max_sequences)
+                   != contracts.SpecRole.NONE or max_generation_query > 1 else max_sequences)
     generation = DecoderProfileRange(
         (1, max_sequences, max_sequences),
         (1, max_generation_tokens, max_generation_tokens),

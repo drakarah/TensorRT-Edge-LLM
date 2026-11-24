@@ -47,9 +47,12 @@ struct Inkling2ShortConvParams
 //! state[stateIndices[b], stateOffset + c, :], which holds the last k - 1 inputs oldest first (slots 0..k-2; slot k-1
 //! is unused). Padding slots (local index >= queryLengths[b]) produce zero and leave the state untouched; the state is
 //! updated in place after all outputs were computed. x, dyn, y, state FP16; taps FP32 [C, k].
+//! intermediate (optional, [numTokens, C, k] FP16): the state this convolution would hold after each token, in the layout of a state row (slots 0..k-2
+//! the last k - 1 inputs up to and including that token, oldest first; slot k-1 zero). Speculative verification restores the state of the last accepted
+//! token from it. Written for every located token; padding slots get zeros.
 void launchInkling2ShortConv(Inkling2ShortConvParams const& params, half const* x, float const* taps, half const* dyn,
     half* state, int32_t const* queryStartOffsets, int32_t const* queryLengths, int32_t const* stateIndices, half* y,
-    cudaStream_t stream);
+    cudaStream_t stream, half* intermediate = nullptr);
 
 } // namespace kernel
 } // namespace trt_edgellm

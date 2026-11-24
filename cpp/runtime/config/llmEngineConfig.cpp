@@ -904,6 +904,7 @@ LLMEngineConfig parseEngineConfig(
     cfg.recurrentStateSize = configJson.value("recurrent_state_size", 0);
     cfg.convDim = configJson.value("conv_dim", 0);
     cfg.convKernel = configJson.value("conv_kernel", 0);
+    cfg.inklingVerifyTokens = configJson.value("inkling_verify_tokens", 0);
     parseDFlashFields(configJson, cfg, cfg.numDecoderLayers);
     parseJetSpecFields(configJson, cfg, cfg.numDecoderLayers);
     parseDSparkFields(configJson, cfg, cfg.numDecoderLayers);

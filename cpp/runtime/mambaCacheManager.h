@@ -197,6 +197,11 @@ public:
     void scatterAcceptedLinearStates(
         rt::Tensor const& acceptLengths, rt::Tensor const& stateIndices, cudaStream_t stream);
 
+    //! Conv-state half of the linear scatter, for engines whose recurrent state is a placeholder (Inkling 2): dst[state row] = intermediate[b, acceptLengths[b] - 1].
+    //! verifySize is the row stride of the intermediate buffers (rows of the verify just executed).
+    void scatterAcceptedConvStatesOnly(
+        rt::Tensor const& acceptLengths, rt::Tensor const& stateIndices, int32_t verifySize, cudaStream_t stream);
+
     //! Scatter DDTree base-verify intermediate states to persistent state pools.
     //! acceptedStateNodeIds shape: [activeBatchSize, maxAcceptLen], INT32 GPU.
     //! Entries with -1 are ignored. The ids should name the tree node whose

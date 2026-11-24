@@ -35,6 +35,8 @@ namespace trt_edgellm
 namespace rt
 {
 
+constexpr int32_t kInklingTapsWidth = 4 * 2304;
+
 class AsyncHostStagingFence
 {
 public:
@@ -127,6 +129,8 @@ struct PipelineIO
 
     // Spec decode
     Tensor baseHiddenStates;
+    //! Inkling 2 chain-verify engines: [maxPhysicalTokens, kInklingTapsWidth] FP32, the four drafter taps (stream entering visits 5, 23, 41 and after the last visit) of every row.
+    Tensor inklingTaps;
     Tensor draftHiddenStatesIn;
     Tensor draftHiddenStatesOut;
 

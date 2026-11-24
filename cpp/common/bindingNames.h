@@ -55,6 +55,8 @@ inline constexpr char const* kAttentionSequenceLengths = "attention_sequence_len
 inline constexpr char const* kStateIndices = "state_indices";
 //! Physical token-row selection for logits: [L] INT64.
 inline constexpr char const* kLogitsIndices = "logits_indices";
+//! Inkling 2 chain-verify engines: FP32 [tokens, 4 * hidden] taps for the drafter.
+inline constexpr char const* kInklingTaps = "inkling_taps";
 
 /*!
  * @brief Gemma4 per-layer token-identity embedding input template.

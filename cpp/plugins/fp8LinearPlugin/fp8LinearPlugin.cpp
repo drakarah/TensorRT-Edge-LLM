@@ -51,9 +51,13 @@ Fp8LinearPlugin::Fp8LinearPlugin(std::string const& name, int32_t outFeatures, i
     , mInFeatures(inFeatures)
     , mWeightFormat(weightFormat)
 {
-    if (weightFormat != kernel::kLinearWeightFp8 && weightFormat != kernel::kLinearWeightInt8)
+    if (weightFormat != kernel::kLinearWeightFp8 && weightFormat != kernel::kLinearWeightInt8 && weightFormat != kernel::kLinearWeightInt8Mma)
     {
-        throw std::invalid_argument("Fp8LinearPlugin: weight_format must be 0 (E4M3) or 1 (INT8)");
+        throw std::invalid_argument("Fp8LinearPlugin: weight_format must be 0 (E4M3), 1 (INT8) or 2 (INT8 in mma fragment order)");
+    }
+    if (weightFormat == kernel::kLinearWeightInt8Mma && inFeatures % 64 != 0)
+    {
+        throw std::invalid_argument("Fp8LinearPlugin: the mma-ordered INT8 format needs in_features to be a multiple of 64");
     }
     if (outFeatures <= 0 || outFeatures % 8 != 0 || inFeatures <= 0 || inFeatures % 32 != 0)
     {

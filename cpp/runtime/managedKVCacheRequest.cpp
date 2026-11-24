@@ -65,7 +65,7 @@ std::optional<ManagedKVCacheRequest> ManagedKVCacheRequest::begin(ContextCacheCo
 
     ELLM_CHECK(tokenStateContract == DecodingTokenStateContract::kCommittedPlusLookahead
             && headroom.baseExtraTokens >= 1 && headroom.baseExtraTokens <= kSWA_LOOKAHEAD_SLACK_TOKENS
-            && headroom.draftExtraTokens == 0 && (speculativeRequest || headroom.baseExtraTokens == 1),
+            && headroom.draftExtraTokens == 0, // the Inkling chain verify of the vanilla decoder asks for a window of headroom without being a speculative strategy
         "Bounded SWA KV cache supports one-token decode and speculative verify within the lookahead slack");
     ELLM_CHECK(context.activeBatchSize > 0
             && context.rawBatchedInputIds.size() == static_cast<size_t>(context.activeBatchSize),

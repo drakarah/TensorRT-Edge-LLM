@@ -265,7 +265,9 @@ class Linear(Module):
         rows = self.int8_rows()
         if rows is None:
             return None
-        return F.int8_linear(hidden_states, rows[0], rows[1], name=self.prefix)
+        # EDGELLM_INT8_MMA=1 at build: tensor-core kernels over mma-ordered bytes (any token count; verify steps of 3-8 tokens and prefill gain most)
+        mma = os.environ.get("EDGELLM_INT8_MMA") == "1" and rows[0].shape[1] % 64 == 0
+        return F.int8_linear(hidden_states, rows[0], rows[1], name=self.prefix, mma=mma)
 
     def _fp8_gemv(self, hidden_states):
         descriptor = self.weight_descriptor()

@@ -51,11 +51,29 @@ def fp8_linear(hidden_states: Tensor,
                      in_features=k)
 
 
+_MMA_COLUMNS = np.array([[0, 1, 8, 9], [2, 3, 10, 11], [4, 5, 12, 13], [6, 7, 14, 15]])
+
+
+def shuffle_int8_mma(weight_int8: np.ndarray) -> np.ndarray:
+    """int8 [N, K] -> the same bytes in mma-fragment order (weight_format 2): per 8 rows x 64 k slab, lane (g, t) holds the bytes W[g][16 j + {2t, 2t + 1, 2t + 8, 2t + 9}]
+    of its four k16 tiles j contiguously; slabs follow each other along k, then along groups of 8 rows."""
+    n, k = weight_int8.shape
+    if n % 8 != 0 or k % 64 != 0:
+        raise ValueError(f"the mma-ordered INT8 format needs N % 8 == 0 and K % 64 == 0, got [{n}, {k}]")
+    out = np.empty((n // 8, k // 64, 8, 4, 4, 4), np.int8)                      # [group, slab, g, t, j, e]
+    step = 1024                                                                    # row groups per chunk keep the temporary small (the LM head is 201,024 rows)
+    for start in range(0, n // 8, step):
+        part = weight_int8[start * 8:(start + step) * 8].reshape(-1, 8, k // 64, 4, 16)
+        out[start:start + step] = part[..., _MMA_COLUMNS].transpose(0, 2, 1, 4, 3, 5)   # [G, g, slab, j, t, e] -> [G, slab, g, t, j, e]
+    return out.reshape(n, k)
+
+
 def int8_linear(hidden_states: Tensor,
                 weight_int8: np.ndarray,
                 weight_scale: np.ndarray,
                 *,
-                name: str) -> Tensor:
+                name: str,
+                mma: bool = False) -> Tensor:
     """y[T, N] = weight_scale[n] * sum_k hidden_states[T, k] * weight_int8[n, k]: INT8 weight-only linear (FP16 activations, FP32 accumulation).
 
     ``weight_int8`` is the int8 ``[N, K]`` array (K a multiple of 32, N of 8), ``weight_scale`` one scale per output row. Runs on the
@@ -69,6 +87,8 @@ def int8_linear(hidden_states: Tensor,
     scale = np.ascontiguousarray(np.asarray(weight_scale, np.float32).reshape(-1))
     if scale.shape[0] != n:
         raise ValueError(f"{name}: expected {n} weight scales, got {scale.shape[0]}")
+    if mma:
+        weight_int8 = shuffle_int8_mma(weight_int8)
     words = np.ascontiguousarray(weight_int8).view(np.int32).reshape(n, k // 4)
     return operation("fp8_linear", [
         hidden_states,
@@ -77,4 +97,4 @@ def int8_linear(hidden_states: Tensor,
     ],
                      out_features=n,
                      in_features=k,
-                     weight_format=1)
+                     weight_format=2 if mma else 1)

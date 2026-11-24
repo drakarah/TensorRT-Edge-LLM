@@ -18,6 +18,7 @@ Every layer visit owns one paged-KV entry and one conv-state entry that carries 
 (K, V, post-attention, post-MLP) as consecutive channel ranges. A looped layer therefore appears once per pass.
 """
 
+import os
 from typing import Any, Dict
 
 from ...core import contracts
@@ -40,6 +41,10 @@ def conv_channels(cfg) -> int:
 def update_llm_config(config: Dict[str, Any], root: Dict[str, Any], cfg,
                       args) -> None:
     config["use_rope"] = False
+    verify = int(os.environ.get("EDGELLM_INKLING_VERIFY", "0"))
+    if verify > 0:
+        # chain verification engine: generation profile of up to `verify` tokens, per-token conv states and drafter taps as extra outputs
+        config["inkling_verify_tokens"] = verify
     if cfg.inkling_int8_kv():
         # INT8 KV rows of 132 bytes (128 values, FP16 scale, 2 pad): the runtime sizes the pools from head_dim and kv_cache_dtype
         config["kv_cache_dtype"] = "int8"

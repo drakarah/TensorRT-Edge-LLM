@@ -382,7 +382,8 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
               "parameters baked for runtime performance. FP8 and MXFP8 "
               "weights are always baked in."))
     parser.add_argument("--profiling-detailed", action="store_true")
-    parser.set_defaults(spec_role=contracts.SpecRole.NONE.value,
+    # EDGELLM_BUILD_SPEC_ROLE=base builds just the verify-capable base engine of a pair (Inkling 2: its draft engine is built separately)
+    parser.set_defaults(spec_role=os.environ.get("EDGELLM_BUILD_SPEC_ROLE", contracts.SpecRole.NONE.value),
                         target_model_dir=None)
 
 

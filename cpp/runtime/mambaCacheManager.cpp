@@ -562,6 +562,17 @@ void MambaCacheManager::scatterAcceptedLinearStates(
         verifySize, convElements, acceptPtr, stateIndices.dataPointer<int32_t>(), stream);
 }
 
+void MambaCacheManager::scatterAcceptedConvStatesOnly(
+    rt::Tensor const& acceptLengths, rt::Tensor const& stateIndices, int32_t verifySize, cudaStream_t stream)
+{
+    check::check(!mIntermediateConvStates.empty(), "Intermediate conv states are not allocated.");
+    int32_t const activeBatchSize = static_cast<int32_t>(acceptLengths.getShape()[0]);
+    auto const* const layerInfos = static_cast<kernel::MtpLayerInfo const*>(mDeviceMtpLayerInfos.rawPointer());
+    kernel::mtpScatterConvStates(layerInfos, mConfig.numRecurrentLayers, activeBatchSize, mConfig.maxBatchSize,
+        verifySize, mConfig.convDim * mConfig.convKernel, acceptLengths.dataPointer<int32_t>(),
+        stateIndices.dataPointer<int32_t>(), stream);
+}
+
 void MambaCacheManager::scatterAcceptedTreeStates(rt::Tensor const& acceptedStateNodeIds,
     rt::Tensor const& acceptLengths, rt::Tensor const& stateIndices, cudaStream_t stream)
 {

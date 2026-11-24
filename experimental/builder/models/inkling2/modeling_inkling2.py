@@ -43,6 +43,9 @@ _FUSED_GATE = os.environ.get("EDGELLM_INKLING_FUSED_GATE") == "1"
 # EDGELLM_INKLING_TAPS=1 at build: the block-residual plugins that see the stream entering visits 5, 23, 41 and the final mix carry a debug capture slot (drafter study)
 _TAPS = os.environ.get("EDGELLM_INKLING_TAPS") == "1"
 _TAP_VISITS = {5: 0, 23: 1, 41: 2}
+# EDGELLM_INKLING_VERIFY=N at build: the generation profile takes 1..N tokens per step (chain verification of N - 1 drafted tokens). Every short convolution
+# then also emits its per-token states (the rollback source after a partly accepted window) and the engine outputs the drafter's four taps.
+_VERIFY = int(os.environ.get("EDGELLM_INKLING_VERIFY", "0"))
 
 
 def _f32(weights, name: str) -> np.ndarray:
@@ -345,23 +348,23 @@ class Inkling2Layer(Module):
         v_lin = self.wv(hv)
         kv_ch = nkv * hd
         if self.full:
-            k_conv, _ = F.inkling2_short_conv(
+            k_conv, _, *ik = F.inkling2_short_conv(
                 k_lin, F.constant(self.k_taps, "k_taps"), state_in, ragged,
                 kv_ch, 4, 1.0 / math.sqrt(9.0),
                 hk.matmul(F.constant(self.k_dyn_w,
-                                     "k_dyn_w")), self.k_dyn_groups, 0)
-            v_conv, _ = F.inkling2_short_conv(
+                                     "k_dyn_w")), self.k_dyn_groups, 0, _VERIFY)
+            v_conv, _, *iv = F.inkling2_short_conv(
                 v_lin, F.constant(self.v_taps, "v_taps"), state_in, ragged,
                 kv_ch, 4, 1.0 / math.sqrt(9.0),
                 hv.matmul(F.constant(self.v_dyn_w,
-                                     "v_dyn_w")), self.k_dyn_groups, kv_ch)
+                                     "v_dyn_w")), self.k_dyn_groups, kv_ch, _VERIFY)
         else:
-            k_conv, _ = F.inkling2_short_conv(
+            k_conv, _, *ik = F.inkling2_short_conv(
                 k_lin, F.constant(self.k_taps, "k_taps"), state_in, ragged,
-                kv_ch, 4, 1.0 / math.sqrt(5.0), None, 0, 0)
-            v_conv, _ = F.inkling2_short_conv(
+                kv_ch, 4, 1.0 / math.sqrt(5.0), None, 0, 0, _VERIFY)
+            v_conv, _, *iv = F.inkling2_short_conv(
                 v_lin, F.constant(self.v_taps, "v_taps"), state_in, ragged,
-                kv_ch, 4, 1.0 / math.sqrt(5.0), None, 0, kv_ch)
+                kv_ch, 4, 1.0 / math.sqrt(5.0), None, 0, kv_ch, _VERIFY)
         k32 = k_conv.cast(trt.float32).reshape([-1, nkv, hd])
         k_new = l2_clip_rows(k32,
                              self.qk_clip).reshape([-1,
@@ -382,11 +385,12 @@ class Inkling2Layer(Module):
         if os.environ.get("EDGELLM_INKLING_HESSIAN") == "1":
             attn = F.inkling2_hessian_tap(attn, int(attn.shape[-1]), self.index * 4 + 3)
         out = self.wo(attn)
-        out, _ = F.inkling2_short_conv(out,
-                                       F.constant(self.attn_taps, "attn_taps"),
-                                       state_in, ragged, self.hidden, 4,
-                                       1.0 / math.sqrt(5.0), None, 0,
-                                       2 * kv_ch)
+        out, _, *io = F.inkling2_short_conv(out,
+                                            F.constant(self.attn_taps, "attn_taps"),
+                                            state_in, ragged, self.hidden, 4,
+                                            1.0 / math.sqrt(5.0), None, 0,
+                                            2 * kv_ch, _VERIFY)
+        self.inter = ik + iv + io  # per-token conv states of K, V and the attention output (channel order of the conv state)
         return out.cast(trt.float32), present_kv, state_in
 
     def _int4_moe(self, logits, hidden16):
@@ -509,10 +513,11 @@ class Inkling2Layer(Module):
         return self._moe_conv(routed, conv_state, ragged)
 
     def _moe_conv(self, routed, conv_state, ragged):
-        out, conv_state = F.inkling2_short_conv(
+        out, conv_state, *im = F.inkling2_short_conv(
             routed, F.constant(self.mlp_taps, "mlp_taps"), conv_state, ragged,
             self.hidden, 4, 1.0 / math.sqrt(5.0), None, 0,
-            2 * self.nkv * self.hd + self.hidden)
+            2 * self.nkv * self.hd + self.hidden, _VERIFY)
+        self.inter = self.inter + im
         return out.cast(trt.float32), conv_state
 
     def _tap(self) -> int:
@@ -638,6 +643,8 @@ class Inkling2ForCausalLM(NetworkModule):
         present_kv: List = [None] * self.visits
         present_conv: List = [None] * self.visits
         present_rec: List = [None] * self.visits
+        inter_conv: List = [None] * self.visits
+        tap_states: List = []
 
         # The runtime always binds a rope table; the model has no rotary embedding, so tie it to a dummy output.
         keep_rope = io["rope"].reshape([-1]).sum(0, keepdim=True).reshape(
@@ -658,8 +665,12 @@ class Inkling2ForCausalLM(NetworkModule):
                 layer.prefetch_next_w = (self.layers[order[v + 1]].router_w
                                          if v + 1 < len(order) else None)
                 layer.prefetch_self_pred = carry[0]
+            if _VERIFY and v in _TAP_VISITS:
+                tap_states.append(h)  # the stream entering the visit (drafter tap 0..2)
             new, kv, conv = layer(h, bs, messages, io["past_key_values"][v],
                                   io["conv_states"][v], ragged)
+            if _VERIFY:
+                inter_conv[v] = F.concatenate(layer.inter, 1)
             if prefetch:
                 carry[0] = layer.prefetch_pred_out
             present_kv[v], present_conv[v] = kv, conv
@@ -687,6 +698,8 @@ class Inkling2ForCausalLM(NetworkModule):
                 h, bs = run_layer(l, h, bs, messages)
         for l in range(self.core_end, self.num_layers):
             h, bs = run_layer(l, h, bs, None)
+        if _VERIFY:
+            tap_states.append(h)  # the stream after the last visit (drafter tap 3, before the final mix and norm)
         final = block_attention_residual(bs + [h], self.final_query, hidden, 3 if _TAPS else -1)[0]
         normed = rms_weighted(final, self.norm).cast(trt.float16)
         selected = F.gather_token_rows(normed, ragged.logits_indices)
@@ -705,4 +718,10 @@ class Inkling2ForCausalLM(NetworkModule):
             outputs[f"present_key_values_{i}"] = present_kv[i]
             outputs[f"present_conv_state_{i}"] = present_conv[i]
             outputs[f"present_recurrent_state_{i}"] = present_rec[i]
+        if _VERIFY:
+            for i in range(self.visits):
+                outputs[f"intermediate_conv_state_{i}"] = inter_conv[i]
+                # placeholder (the recurrent state is unused): one row, whatever the token count, so a long prefill never overruns the runtime's [verify, ...] buffer; distinct per visit
+                outputs[f"intermediate_recurrent_state_{i}"] = io["recurrent_states"][i] + F.constant(np.array([[[[float(i), 0.0]]]], np.float32), f"inter_rec_{i}")
+            outputs["inkling_taps"] = F.concatenate(tap_states, 1)
         return outputs

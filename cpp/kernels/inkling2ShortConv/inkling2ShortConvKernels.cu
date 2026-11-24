@@ -42,7 +42,7 @@ __device__ __forceinline__ bool locate(
 
 __global__ void shortConvKernel(Inkling2ShortConvParams p, half const* __restrict__ x, float const* __restrict__ taps,
     half const* __restrict__ dyn, half const* __restrict__ state, int32_t const* __restrict__ offsets,
-    int32_t const* __restrict__ lengths, int32_t const* __restrict__ stateIndices, half* __restrict__ y)
+    int32_t const* __restrict__ lengths, int32_t const* __restrict__ stateIndices, half* __restrict__ y, half* __restrict__ inter)
 {
     int32_t const c = blockIdx.x * blockDim.x + threadIdx.x;
     int32_t const t = blockIdx.y;
@@ -55,9 +55,37 @@ __global__ void shortConvKernel(Inkling2ShortConvParams p, half const* __restric
     if (!locate(t, offsets, lengths, p.batchSize, seq, local))
     {
         y[outIdx] = __float2half(0.F);
+        if (inter != nullptr)
+        {
+            for (int32_t m = 0; m < p.kernelSize; ++m)
+            {
+                inter[outIdx * p.kernelSize + m] = __float2half(0.F);
+            }
+        }
         return;
     }
     int32_t const row = stateIndices[seq];
+    if (inter != nullptr)
+    {
+        // state after this token: slot m holds the input of local index local - (k - 2) + m, from the old state before the sequence start
+        int32_t const slots = p.kernelSize - 1;
+        bool const haveOld = row >= 0 && row < p.stateRows;
+        for (int32_t m = 0; m < slots; ++m)
+        {
+            int32_t const idx = local - (slots - 1) + m;
+            half v = __float2half(0.F);
+            if (idx >= 0)
+            {
+                v = x[int64_t(t - local + idx) * p.channels + c];
+            }
+            else if (haveOld)
+            {
+                v = state[(int64_t(row) * p.stateStride + p.stateOffset + c) * p.kernelSize + (slots + idx)];
+            }
+            inter[outIdx * p.kernelSize + m] = v;
+        }
+        inter[outIdx * p.kernelSize + slots] = __float2half(0.F);
+    }
     int32_t const group = p.groups > 0 ? c / (p.channels / p.groups) : 0;
     float acc = 0.F;
     for (int32_t j = 0; j < p.kernelSize; ++j)
@@ -124,7 +152,7 @@ __global__ void stateUpdateKernel(Inkling2ShortConvParams p, half const* __restr
 //! registers, writes the output and then rewrites the state, which only its own channel owns, so no other thread can observe a half-updated state.
 __global__ void shortConvDecodeKernel(Inkling2ShortConvParams p, half const* __restrict__ x, float const* __restrict__ taps,
     half const* __restrict__ dyn, half* __restrict__ state, int32_t const* __restrict__ offsets, int32_t const* __restrict__ lengths,
-    int32_t const* __restrict__ stateIndices, half* __restrict__ y)
+    int32_t const* __restrict__ stateIndices, half* __restrict__ y, half* __restrict__ inter)
 {
     int32_t const c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= p.channels)
@@ -134,6 +162,13 @@ __global__ void shortConvDecodeKernel(Inkling2ShortConvParams p, half const* __r
     if (offsets[0] != 0 || lengths[0] <= 0)
     {
         y[c] = __float2half(0.F); // padding slot: zero output, state untouched
+        if (inter != nullptr)
+        {
+            for (int32_t m = 0; m < p.kernelSize; ++m)
+            {
+                inter[int64_t(c) * p.kernelSize + m] = __float2half(0.F);
+            }
+        }
         return;
     }
     int32_t const row = stateIndices[0];
@@ -169,12 +204,22 @@ __global__ void shortConvDecodeKernel(Inkling2ShortConvParams p, half const* __r
         }
         rowPtr[slots - 1] = x[c];
     }
+    if (inter != nullptr)
+    {
+        // one token: the state after it is the old one shifted by one with the current input appended (slot k - 1 stays zero)
+        for (int32_t m = 0; m < slots - 1; ++m)
+        {
+            inter[int64_t(c) * p.kernelSize + m] = old[m + 1];
+        }
+        inter[int64_t(c) * p.kernelSize + slots - 1] = x[c];
+        inter[int64_t(c) * p.kernelSize + slots] = __float2half(0.F);
+    }
 }
 } // namespace
 
 void launchInkling2ShortConv(Inkling2ShortConvParams const& params, half const* x, float const* taps, half const* dyn,
     half* state, int32_t const* queryStartOffsets, int32_t const* queryLengths, int32_t const* stateIndices, half* y,
-    cudaStream_t stream)
+    cudaStream_t stream, half* intermediate)
 {
     if (params.numTokens <= 0)
     {
@@ -189,12 +234,12 @@ void launchInkling2ShortConv(Inkling2ShortConvParams const& params, half const* 
     if (fusedEnabled && params.numTokens == 1 && params.batchSize == 1)
     {
         shortConvDecodeKernel<<<(params.channels + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            params, x, taps, dyn, state, queryStartOffsets, queryLengths, stateIndices, y);
+            params, x, taps, dyn, state, queryStartOffsets, queryLengths, stateIndices, y, intermediate);
         return;
     }
     dim3 const grid((params.channels + kThreads - 1) / kThreads, params.numTokens);
     shortConvKernel<<<grid, kThreads, 0, stream>>>(
-        params, x, taps, dyn, state, queryStartOffsets, queryLengths, stateIndices, y);
+        params, x, taps, dyn, state, queryStartOffsets, queryLengths, stateIndices, y, intermediate);
     dim3 const updateGrid((params.channels + kThreads - 1) / kThreads, params.batchSize);
     stateUpdateKernel<<<updateGrid, kThreads, 0, stream>>>(
         params, x, state, queryStartOffsets, queryLengths, stateIndices);

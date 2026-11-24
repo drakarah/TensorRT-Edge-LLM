@@ -31,7 +31,8 @@ namespace trt_edgellm::plugins
 //! Inputs: x [T, C], taps [C, k] (FP32, lag 0 = current token), state [rows, stateC >= state_offset + C, k],
 //! query_start_offsets [B+1], query_lengths [B], state_indices [B], and dyn [T, groups * k] when groups > 0 (FP16
 //! except taps and the metadata). Outputs: y [T, C], present_state (aliases state). y = scale * (sum_j (taps + dyn) *
-//! x[t - j] + x[t]).
+//! x[t - j] + x[t]). With the optional attribute intermediate=1 a third output holds the state after every token
+//! ([T, C, k]), the rollback source of speculative verification.
 class Inkling2ShortConvPlugin : public nvinfer1::IPluginV3,
                                 public nvinfer1::IPluginV3OneCore,
                                 public nvinfer1::IPluginV3OneBuild,
@@ -39,7 +40,7 @@ class Inkling2ShortConvPlugin : public nvinfer1::IPluginV3,
 {
 public:
     Inkling2ShortConvPlugin(std::string const& name, int32_t channels, int32_t kernelSize, int32_t groups, float scale,
-        int32_t stateOffset);
+        int32_t stateOffset, int32_t intermediate = 0);
 
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
     nvinfer1::IPluginV3* clone() noexcept override;
@@ -70,6 +71,7 @@ public:
 
 private:
     int32_t numInputs() const noexcept;
+    int32_t numOutputs() const noexcept;
 
     std::string mLayerName;
     std::string mNamespace;
@@ -78,6 +80,7 @@ private:
     int32_t mGroups;
     float mScale;
     int32_t mStateOffset;
+    int32_t mIntermediate; //!< > 0: third output [min(T, mIntermediate), C, k] with the state after each token of a step of at most mIntermediate tokens (speculative verification).
     std::vector<nvinfer1::PluginField> mData;
     nvinfer1::PluginFieldCollection mFields{};
 };

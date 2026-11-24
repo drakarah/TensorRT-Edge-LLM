@@ -188,6 +188,9 @@ struct LLMEngineConfig
     int32_t gdnTreeScratchRows{0};
     int32_t convDim{0};    //!< Conv1d channel dimension
     int32_t convKernel{0}; //!< Conv1d kernel width
+    //! Inkling 2 chain verification: the generation profile takes up to this many tokens per step (0 = plain decode engine). The engine then also outputs the
+    //! per-token conv states (rollback source) and the drafter's taps.
+    int32_t inklingVerifyTokens{0};
 
     // --- SpecDecode engine limits (per-engine) ---
     //! Max seq_len the base engine accepts for proposal verification. Parsed from
