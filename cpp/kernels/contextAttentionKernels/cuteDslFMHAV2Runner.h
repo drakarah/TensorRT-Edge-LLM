@@ -36,6 +36,13 @@ extern "C" cudaError_t cudaLibraryUnload(cudaLibrary_t library);
 #endif
 #define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
+
+//! The INT8-pool paged prefill kernels need 147 KB of shared memory, so the artifact only carries them for sm_80/sm_87.
+#if __has_include("fmha_v2_d256_paged_i8.h")
+#define EDGELLM_CUTE_DSL_PAGED_I8 1
+#else
+#define EDGELLM_CUTE_DSL_PAGED_I8 0
+#endif
 #undef CUTE_DSL_CUDA_ERROR_CHECK
 #endif // defined(CUTE_DSL_FMHA_ENABLED)
 
@@ -195,8 +202,10 @@ private:
     static detail::LazyKernelModule<fmha_v2_d512_Kernel_Module_t> sLLM_d512;
     //! INT8 Q·Kᵀ variant of the causal D512 kernel (EDGELLM_FMHA_INT8_QK=1).
     static detail::LazyKernelModule<fmha_v2_d512_i8_Kernel_Module_t> sLLM_d512I8;
+#if EDGELLM_CUTE_DSL_PAGED_I8
     static detail::LazyKernelModule<fmha_v2_d256_paged_i8_Kernel_Module_t> sLLM_d256PagedI8;
     static detail::LazyKernelModule<fmha_v2_d256_paged_i8qk_Kernel_Module_t> sLLM_d256PagedI8Qk;
+#endif
     static detail::LazyKernelModule<fmha_v2_d256_padding_Kernel_Module_t> sLLM_d256Padding;
     static detail::LazyKernelModule<fmha_v2_d64_sw_Kernel_Module_t> sLLM_d64Sw;
     static detail::LazyKernelModule<fmha_v2_d128_sw_Kernel_Module_t> sLLM_d128Sw;

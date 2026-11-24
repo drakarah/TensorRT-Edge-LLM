@@ -40,8 +40,10 @@ detail::LazyKernelModule<fmha_v2_d128_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM
 detail::LazyKernelModule<fmha_v2_d256_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256{};
 detail::LazyKernelModule<fmha_v2_d512_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d512{};
 detail::LazyKernelModule<fmha_v2_d512_i8_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d512I8{};
+#if EDGELLM_CUTE_DSL_PAGED_I8
 detail::LazyKernelModule<fmha_v2_d256_paged_i8_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256PagedI8{};
 detail::LazyKernelModule<fmha_v2_d256_paged_i8qk_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256PagedI8Qk{};
+#endif
 detail::LazyKernelModule<fmha_v2_d256_padding_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256Padding{};
 detail::LazyKernelModule<fmha_v2_d64_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64Sw{};
 detail::LazyKernelModule<fmha_v2_d128_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128Sw{};
@@ -1014,6 +1016,7 @@ bool CuteDslFMHAV2Runner::runPagedInt8(void const* qPtr, void const* pagedKVPool
     params.windowSizeLeft = 1 << 30;
     params.attentionScale = attentionScale;
     params.stream = stream;
+#if EDGELLM_CUTE_DSL_PAGED_I8
     int32_t const ret = callFmhaV2PagedInt8<cute_dsl_fmha_v2_d256_paged_i8_wrapper,
         fmha_v2_d256_paged_i8_Kernel_Module_Load, fmha_v2_d256_paged_i8_Kernel_Module_Unload>(
         sLLM_d256PagedI8, "fmha_v2_d256_paged_i8", params, kScale, vScale);
@@ -1022,6 +1025,11 @@ bool CuteDslFMHAV2Runner::runPagedInt8(void const* qPtr, void const* pagedKVPool
         LOG_ERROR("FMHA-v2 INT8 paged FMHA kernel failed with error code: %d", ret);
     }
     return ret == 0;
+#else
+    static_cast<void>(params);
+    LOG_ERROR("FMHA-v2 INT8 paged kernels are not part of this CuTe DSL artifact.");
+    return false;
+#endif
 }
 
 bool CuteDslFMHAV2Runner::int8QKPagedUsable(int32_t headSize, int32_t smVersion, cudaStream_t stream)
@@ -1103,6 +1111,7 @@ bool CuteDslFMHAV2Runner::runPagedInt8QK(void const* qPtr, void const* pagedKVPo
     params.windowSizeLeft = 1 << 30;
     params.attentionScale = attentionScale;
     params.stream = stream;
+#if EDGELLM_CUTE_DSL_PAGED_I8
     int32_t const ret = callFmhaV2PagedInt8Qk<cute_dsl_fmha_v2_d256_paged_i8qk_wrapper,
         fmha_v2_d256_paged_i8qk_Kernel_Module_Load, fmha_v2_d256_paged_i8qk_Kernel_Module_Unload>(
         sLLM_d256PagedI8Qk, "fmha_v2_d256_paged_i8qk", params, qI8, qScale, kScale, vScale);
@@ -1111,6 +1120,11 @@ bool CuteDslFMHAV2Runner::runPagedInt8QK(void const* qPtr, void const* pagedKVPo
         LOG_ERROR("FMHA-v2 INT8-QK paged FMHA kernel failed with error code: %d", ret);
     }
     return ret == 0;
+#else
+    static_cast<void>(params);
+    LOG_ERROR("FMHA-v2 INT8 paged kernels are not part of this CuTe DSL artifact.");
+    return false;
+#endif
 }
 
 bool CuteDslFMHAV2Runner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList,
