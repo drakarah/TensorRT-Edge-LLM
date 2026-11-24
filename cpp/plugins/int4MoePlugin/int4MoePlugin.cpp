@@ -3186,9 +3186,11 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             if (mWeightFormat == kWeightFormatNvfp4)
             {
                 rt::Tensor fc2Global(const_cast<void*>(inputs[7]), {mNumExperts}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+                // after the gate-up GEMM of this call the lock array is zero again (Marlin resets the locks it takes, MarlinLockReset test), so the
+                // fused routing path skips the memset here too
                 moeNvfp4A16MarlinGemm(activationOutputTensor, downOutputTensor, downQWeightsTensor, downScalesTensor, fc2Global,
                     sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsPaddedTensor,
-                    marlinWorkspaceTensor, moeBlockSize, 1, true, stream);
+                    marlinWorkspaceTensor, moeBlockSize, 1, true, stream, fusedRouting);
             }
             else
             {
