@@ -240,7 +240,8 @@ class Linear(Module):
                                 logical_out_features=n, logical_in_features=k)
         return F.linear_from_weights(hidden_states, weights, rank, name=self.prefix)
 
-    def _int8_gemv(self, hidden_states):
+    def int8_rows(self):
+        """Per-row INT8 quantisation of this FP16 checkpoint projection: (int8 [N, K], float32 scale [N]) or None when it cannot take the INT8 path."""
         # the FP16 path externalizes dense weights (metadata only); INT8 needs the values to quantize, and bakes the result into the engine
         descriptor = self.weights.linear(self.prefix, quantization.QUANT_FP16)
         weight = descriptor.weight
@@ -258,7 +259,13 @@ class Linear(Module):
             amax = np.maximum(np.abs(block).max(axis=1), 1e-8)
             scale[start:start + 8192] = amax / 127.0
             quantized[start:start + 8192] = np.clip(np.rint(block / scale[start:start + 8192, None]), -127, 127).astype(np.int8)
-        return F.int8_linear(hidden_states, quantized, scale, name=self.prefix)
+        return quantized, scale
+
+    def _int8_gemv(self, hidden_states):
+        rows = self.int8_rows()
+        if rows is None:
+            return None
+        return F.int8_linear(hidden_states, rows[0], rows[1], name=self.prefix)
 
     def _fp8_gemv(self, hidden_states):
         descriptor = self.weight_descriptor()

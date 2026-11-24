@@ -291,6 +291,9 @@ std::vector<float> int8PoolDequant(std::vector<int8_t> const& bytes, size_t floa
     return out;
 }
 
+//! Set by the fused-layout test: q, gate, rel and sink are passed as column ranges of one [slots, nh * 273] tensor laid out [q | gate | rel | sink] with explicit row strides.
+bool gFusedQrsg = false;
+
 Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false, bool int8 = false)
 {
     int32_t const nTok = d.slots;
@@ -298,6 +301,38 @@ Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false, bool int8 
     half* drel = upload(toHalf(d.rel));
     half* dsink = upload(toHalf(d.sink));
     half* dgate = upload(toHalf(d.gate));
+    half* dfused = nullptr;
+    int32_t const fusedLd = c.nh * (2 * kHd + kRd + 1);
+    if (gFusedQrsg)
+    {
+        std::vector<half> fused(size_t(nTok) * fusedLd, __float2half(7.0F)); // the columns outside the four parts never read; fill them with a marker
+        for (int32_t t = 0; t < nTok; ++t)
+        {
+            half* row = fused.data() + size_t(t) * fusedLd;
+            for (int32_t i = 0; i < c.nh * kHd; ++i)
+            {
+                row[i] = __float2half(d.q[size_t(t) * c.nh * kHd + i]);
+                row[c.nh * kHd + i] = __float2half(d.gate[size_t(t) * c.nh * kHd + i]);
+            }
+            for (int32_t i = 0; i < c.nh * kRd; ++i)
+            {
+                row[2 * c.nh * kHd + i] = __float2half(d.rel[size_t(t) * c.nh * kRd + i]);
+            }
+            for (int32_t i = 0; i < c.nh; ++i)
+            {
+                row[2 * c.nh * kHd + c.nh * kRd + i] = __float2half(d.sink[size_t(t) * c.nh + i]);
+            }
+        }
+        for (void* ptr : {(void*) dq, (void*) drel, (void*) dsink, (void*) dgate})
+        {
+            CUDA_CHECK(cudaFree(ptr));
+        }
+        dfused = upload(fused);
+        dq = dfused;
+        dgate = dfused + c.nh * kHd;
+        drel = dfused + 2 * c.nh * kHd;
+        dsink = drel + c.nh * kRd;
+    }
     half* dk = upload(toHalf(d.k));
     half* dv = upload(toHalf(d.v));
     float* dqs = upload(d.qScale);
@@ -358,6 +393,10 @@ Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false, bool int8 
     p.logNFloor = c.nFloor;
     p.qClip = c.qClip;
     p.relClip = c.relClip;
+    if (gFusedQrsg)
+    {
+        p.qLd = p.relLd = p.sinkLd = p.gateLd = fusedLd;
+    }
     launchInkling2Attention(
         p, dq, drel, dsink, dgate, dqs, drs, dproj, dk, dv, dpool, doff, dlen, dpast, dtab, dout, dws, wsBytes, nullptr);
     CUDA_CHECK(cudaGetLastError());
@@ -403,8 +442,8 @@ Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false, bool int8 
         }
     }
     for (void* ptr :
-        {(void*) dq, (void*) drel, (void*) dsink, (void*) dgate, (void*) dk, (void*) dv, (void*) dqs, (void*) drs,
-            (void*) dproj, (void*) dpool, (void*) doff, (void*) dlen, (void*) dpast, (void*) dtab, (void*) dout, dws})
+        {gFusedQrsg ? (void*) dfused : (void*) dq, gFusedQrsg ? nullptr : (void*) drel, gFusedQrsg ? nullptr : (void*) dsink, gFusedQrsg ? nullptr : (void*) dgate, (void*) dk,
+            (void*) dv, (void*) dqs, (void*) drs, (void*) dproj, (void*) dpool, (void*) doff, (void*) dlen, (void*) dpast, (void*) dtab, (void*) dout, dws})
     {
         if (ptr != nullptr)
         {
@@ -1120,6 +1159,35 @@ TEST(Inkling2AttentionBench, LongContextTiming)
                  (void*) drs, (void*) dproj, dws})
         {
             CUDA_CHECK(cudaFree(ptr));
+        }
+    }
+}
+
+// The fused q/gate/rel/sink layout (EDGELLM_INKLING_FUSED_QRSG) reads the same values through row strides: the output must equal the separate-tensor run bit for bit,
+// for decode and prefill, full attention and sliding windows, and the grouped-head Inkling configuration.
+TEST(Inkling2Attention, FusedQrsgLayoutMatchesSeparateTensorsExactly)
+{
+    for (int32_t variant = 0; variant < 3; ++variant)
+    {
+        Case c;
+        c.nh = variant == 2 ? 24 : 8;
+        c.nkv = variant == 2 ? 8 : 2;
+        c.window = variant == 1 ? 1024 : 0;
+        c.batch = 1;
+        c.maxPages = 4;
+        c.numPages = 10;
+        std::vector<int32_t> const past{variant == 0 ? 300 : 40};
+        Data d = makeData(c, past, {variant == 0 ? 1 : 70}, 0, 11U + variant);
+        Pool const pool = poolWithHistory(c, d, past, 5U + variant);
+        gFusedQrsg = false;
+        Result const separate = run(c, d, pool);
+        gFusedQrsg = true;
+        Result const fused = run(c, d, pool);
+        gFusedQrsg = false;
+        ASSERT_EQ(separate.out.size(), fused.out.size());
+        for (size_t i = 0; i < separate.out.size(); ++i)
+        {
+            ASSERT_EQ(separate.out[i], fused.out[i]) << "variant " << variant << " element " << i;
         }
     }
 }

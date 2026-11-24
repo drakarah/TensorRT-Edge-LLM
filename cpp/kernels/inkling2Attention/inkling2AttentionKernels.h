@@ -48,6 +48,12 @@ struct Inkling2AttentionParams
     float logNFloor;
     float qClip;   //!< L2 clip threshold for the scaled query.
     float relClip; //!< L2 clip threshold for the relative state.
+    //! Row strides in elements of qLin, relLin, sinkLin and gateLin (0 = contiguous: nh * 128, nh * 16, nh, nh * 128). A fused q/r/sink/gate projection passes
+    //! pointers into one [T, ld] tensor and the same ld four times.
+    int32_t qLd;
+    int32_t relLd;
+    int32_t sinkLd;
+    int32_t gateLd;
 };
 
 //! One Inkling 2 attention visit: appends the new K/V rows to the paged pool, then computes

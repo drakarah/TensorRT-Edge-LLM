@@ -310,6 +310,21 @@ class Inkling2Layer(Module):
         return packed, padded
 
     # -- one visit ------------------------------------------------------------------------------------------------
+    def _fused_qrsg(self, hq):
+        """EDGELLM_INKLING_FUSED_QRSG=1 at build (with INT8 projections): wq, gate_attn, wr and the sink projection share the input, so they run as one INT8 GEMV of
+        nh * 273 rows laid out [q | gate | rel | sink] (a launch of 6,552 rows instead of four launches that each sit near the launch-latency floor). The attention
+        plugin reads the four parts as column ranges of that tensor (``fused_qrsg``). Returns the fused [T, nh * 273] tensor or None."""
+        if os.environ.get("EDGELLM_INKLING_FUSED_QRSG") != "1":
+            return None
+        linears = (self.wq, self.gate_attn, self.wr, self.sink)
+        if not all(l._int8_gemv_enabled() and not l._int4_gemv_enabled() for l in linears):
+            return None
+        parts = [l.int8_rows() for l in linears]
+        if any(p is None for p in parts) or self.nh * 273 != sum(p[0].shape[0] for p in parts):
+            return None
+        return F.int8_linear(hq, np.ascontiguousarray(np.concatenate([p[0] for p in parts])),
+                             np.ascontiguousarray(np.concatenate([p[1] for p in parts])), name=self.wq.prefix.rsplit(".", 1)[0] + ".qrsg")
+
     def attention(self, hq, hk, hv, past_kv, conv_state,
                   ragged: RaggedDecoderInputs):
         state_in = conv_state
@@ -318,10 +333,14 @@ class Inkling2Layer(Module):
             hq = F.inkling2_hessian_tap(hq, int(hq.shape[-1]), self.index * 4)
             hk = F.inkling2_hessian_tap(hk, int(hk.shape[-1]), self.index * 4 + 1)
             hv = F.inkling2_hessian_tap(hv, int(hv.shape[-1]), self.index * 4 + 2)
-        q_lin = self.wq(hq)
-        rel_lin = self.wr(hq)
-        sink_lin = self.sink(hq)
-        gate_lin = self.gate_attn(hq)
+        fused_qrsg = self._fused_qrsg(hq)
+        if fused_qrsg is not None:
+            q_lin = rel_lin = sink_lin = gate_lin = fused_qrsg
+        else:
+            q_lin = self.wq(hq)
+            rel_lin = self.wr(hq)
+            sink_lin = self.sink(hq)
+            gate_lin = self.gate_attn(hq)
         k_lin = self.wk(hk)
         v_lin = self.wv(hv)
         kv_ch = nkv * hd
@@ -358,7 +377,8 @@ class Inkling2Layer(Module):
             nkv, self.rel_extent, self.window, self.log_alpha, self.log_floor,
             self.qk_clip, self.rel_clip, hd**-0.5,
             bounded=self.window > 0 and ragged.swa_kv_page_table is not None,
-            kv_int8=self.cfg.kv_cache_dtype == "int8")
+            kv_int8=self.cfg.kv_cache_dtype == "int8",
+            fused_qrsg=fused_qrsg is not None)
         if os.environ.get("EDGELLM_INKLING_HESSIAN") == "1":
             attn = F.inkling2_hessian_tap(attn, int(attn.shape[-1]), self.index * 4 + 3)
         out = self.wo(attn)

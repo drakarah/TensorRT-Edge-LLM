@@ -243,7 +243,7 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
     for (int32_t i = 0; i < 4; ++i)
     {
         int32_t const d = lane * 4 + i;
-        q[i] = __half2float(qLin[(int64_t(t) * p.numQHeads + h) * kInkling2HeadDim + d])
+        q[i] = __half2float(qLin[int64_t(t) * p.qLd + h * kInkling2HeadDim + d])
             * qScale[h * kInkling2HeadDim + d];
         ss += q[i] * q[i];
     }
@@ -256,7 +256,7 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
     }
 
     int32_t const j = lane & 15;
-    float rs = __half2float(relLin[(int64_t(t) * p.numQHeads + h) * kInkling2RelDim + j])
+    float rs = __half2float(relLin[int64_t(t) * p.relLd + h * kInkling2RelDim + j])
         * relScale[h * kInkling2RelDim + j];
     float const rss = halfWarpSum(rs * rs);
     rs *= fminf(p.relClip / (sqrtf(rss) + 1e-6F), 1.F) * logScale;
@@ -314,7 +314,7 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
     __syncthreads();
     if (w == 0)
     {
-        float const sink = __half2float(sinkLin[int64_t(t) * p.numQHeads + h]);
+        float const sink = __half2float(sinkLin[int64_t(t) * p.sinkLd + h]);
         float mm = sink;
 #pragma unroll
         for (int32_t i = 0; i < kWarps; ++i)
@@ -339,7 +339,7 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
         {
             int32_t const d = lane * 4 + k;
             int64_t const idx = (int64_t(t) * p.numQHeads + h) * kInkling2HeadDim + d;
-            float const g = 1.F / (1.F + __expf(-__half2float(gateLin[idx])));
+            float const g = 1.F / (1.F + __expf(-__half2float(gateLin[int64_t(t) * p.gateLd + h * kInkling2HeadDim + d])));
             out[idx] = __float2half(o[k] / den * g);
         }
     }
@@ -487,7 +487,7 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionKernel(Inkling2Att
         for (int32_t i = 0; i < 4; ++i)
         {
             int32_t const d = lane * 4 + i;
-            q[i] = __half2float(qLin[(int64_t(slot) * p.numQHeads + h) * kInkling2HeadDim + d])
+            q[i] = __half2float(qLin[int64_t(slot) * p.qLd + h * kInkling2HeadDim + d])
                 * qScale[h * kInkling2HeadDim + d];
             ss += q[i] * q[i];
         }
@@ -499,7 +499,7 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionKernel(Inkling2Att
             Qsm[row * kInkling2HeadDim + lane * 4 + i] = q[i] * qFactor;
         }
         int32_t const j = lane & 15;
-        float rs = __half2float(relLin[(int64_t(slot) * p.numQHeads + h) * kInkling2RelDim + j])
+        float rs = __half2float(relLin[int64_t(slot) * p.relLd + h * kInkling2RelDim + j])
             * relScale[h * kInkling2RelDim + j];
         float const rss = halfWarpSum(rs * rs);
         rs *= fminf(p.relClip / (sqrtf(rss) + 1e-6F), 1.F) * logScale;
@@ -762,7 +762,7 @@ __global__ void __launch_bounds__(kDecThreads) decodeAttentionKernel(Inkling2Att
             for (int32_t i = 0; i < 4; ++i)
             {
                 int32_t const d = lane * 4 + i;
-                q[i] = __half2float(qLin[(int64_t(slot) * p.numQHeads + h) * kInkling2HeadDim + d]) * qScale[h * kInkling2HeadDim + d];
+                q[i] = __half2float(qLin[int64_t(slot) * p.qLd + h * kInkling2HeadDim + d]) * qScale[h * kInkling2HeadDim + d];
                 ss += q[i] * q[i];
             }
             ss = warpSum(ss);
@@ -773,7 +773,7 @@ __global__ void __launch_bounds__(kDecThreads) decodeAttentionKernel(Inkling2Att
                 Qsm[w * kInkling2HeadDim + lane * 4 + i] = q[i] * qFactor;
             }
             int32_t const j = lane & 15;
-            float rs = __half2float(relLin[(int64_t(slot) * p.numQHeads + h) * kInkling2RelDim + j]) * relScale[h * kInkling2RelDim + j];
+            float rs = __half2float(relLin[int64_t(slot) * p.relLd + h * kInkling2RelDim + j]) * relScale[h * kInkling2RelDim + j];
             float const rss = halfWarpSum(rs * rs);
             rs *= fminf(p.relClip / (sqrtf(rss) + 1e-6F), 1.F) * logScale;
             if (lane < 16)
@@ -1030,7 +1030,7 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionMmaKernel(Inkling2
         for (int32_t i = 0; i < 4; ++i)
         {
             int32_t const d = lane * 4 + i;
-            q[i] = __half2float(qLin[(int64_t(slot) * p.numQHeads + h) * kInkling2HeadDim + d]) * qScale[h * kInkling2HeadDim + d];
+            q[i] = __half2float(qLin[int64_t(slot) * p.qLd + h * kInkling2HeadDim + d]) * qScale[h * kInkling2HeadDim + d];
             ss += q[i] * q[i];
         }
         ss = warpSum(ss);
@@ -1041,7 +1041,7 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionMmaKernel(Inkling2
             Qh[row * kKLd + lane * 4 + i] = __float2half(q[i] * qFactor);
         }
         int32_t const j = lane & 15;
-        float rs = __half2float(relLin[(int64_t(slot) * p.numQHeads + h) * kInkling2RelDim + j]) * relScale[h * kInkling2RelDim + j];
+        float rs = __half2float(relLin[int64_t(slot) * p.relLd + h * kInkling2RelDim + j]) * relScale[h * kInkling2RelDim + j];
         float const rss = halfWarpSum(rs * rs);
         rs *= fminf(p.relClip / (sqrtf(rss) + 1e-6F), 1.F) * logScale;
         if (lane < 16)
@@ -1224,7 +1224,7 @@ __global__ void mergeKernel(Inkling2AttentionParams p, half const* __restrict__ 
         return;
     }
     float const* base = partials + (int64_t(t) * p.numQHeads + h) * splits * kPartialStride;
-    float const sink = __half2float(sinkLin[int64_t(t) * p.numQHeads + h]);
+    float const sink = __half2float(sinkLin[int64_t(t) * p.sinkLd + h]);
     float mm = sink;
     for (int32_t i = 0; i < splits; ++i)
     {
@@ -1238,7 +1238,7 @@ __global__ void mergeKernel(Inkling2AttentionParams p, half const* __restrict__ 
         den += base[i * kPartialStride + 1] * c;
         o += base[i * kPartialStride + 2 + d] * c;
     }
-    float const g = 1.F / (1.F + __expf(-__half2float(gateLin[idx])));
+    float const g = 1.F / (1.F + __expf(-__half2float(gateLin[int64_t(t) * p.gateLd + h * kInkling2HeadDim + d])));
     out[idx] = __float2half(o / den * g);
 }
 } // namespace
@@ -1354,15 +1354,32 @@ size_t inkling2AttentionWorkspaceBytes(int64_t maxTokens, int32_t numQHeads)
     return static_cast<size_t>(rows) * kPartialStride * sizeof(float);
 }
 
-void launchInkling2Attention(Inkling2AttentionParams const& params, half const* qLin, half const* relLin,
+void launchInkling2Attention(Inkling2AttentionParams const& callerParams, half const* qLin, half const* relLin,
     half const* sinkLin, half const* gateLin, float const* qScale, float const* relScale, float const* relProjT,
     half const* kNew, half const* vNew, void* kvPool, int32_t const* queryStartOffsets, int32_t const* queryLengths,
     int32_t const* pastLengths, int32_t const* pageTable, half* out, void* workspace, size_t workspaceBytes,
     cudaStream_t stream)
 {
-    if (params.numTokens <= 0)
+    if (callerParams.numTokens <= 0)
     {
         return;
+    }
+    Inkling2AttentionParams params = callerParams;
+    if (params.qLd == 0)
+    {
+        params.qLd = params.numQHeads * kInkling2HeadDim;
+    }
+    if (params.relLd == 0)
+    {
+        params.relLd = params.numQHeads * kInkling2RelDim;
+    }
+    if (params.sinkLd == 0)
+    {
+        params.sinkLd = params.numQHeads;
+    }
+    if (params.gateLd == 0)
+    {
+        params.gateLd = params.numQHeads * kInkling2HeadDim;
     }
     if (params.kvInt8 != 0)
     {
