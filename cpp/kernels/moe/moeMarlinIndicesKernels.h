@@ -53,6 +53,20 @@ void launchBuildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, int32
     float* topkWeightsFlat, int32_t* expertIds, int32_t numTokens, int32_t topK, int32_t numExperts,
     int32_t moeBlockSize, cudaStream_t stream);
 
+constexpr int32_t kFusedRoutingMaxSlots = 64;
+
+//! Whether the single-block fused routing kernel handles this step (at most 64 routed slots and 128 experts).
+bool canUseFusedDecodeRouting(int32_t numSlots, int32_t numExperts, int32_t moeBlockSize);
+
+/**
+ * @brief Whole routing preparation of a small step in one single-block kernel (counts, padded offsets, sorted slot ids, weights, block expert ids,
+ * padded routing weights for the down projection, zeroing of @p numLocks Marlin lock ints at @p locks). Same arrays as the count / scan / list / index
+ * kernel chain; slots of one expert are in slot order.
+ */
+void launchFusedDecodeRouting(int32_t const* topkIndices, float const* topkWeights, int32_t numSlots, int32_t numExperts, int32_t moeBlockSize,
+    int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds, float* topkWeightsFlat, int32_t* expertIds,
+    float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks, cudaStream_t stream);
+
 /**
  * @brief Build the trivial Marlin routing arrays for a dense (single-expert, topK=1) GEMM.
  *

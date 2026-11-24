@@ -173,6 +173,31 @@ size_t stagedExpertBytes(nvinfer1::Dims const* const dims[4], nvinfer1::DataType
 //! private pair instead of the TRT workspace, so the pair replaces the workspace head (net cost: one layer of INT4 experts, ~386 MB for the 26B).
 constexpr int32_t kPrefetchMinTokens = 128;
 
+//! EDGELLM_MOE_FUSED_ROUTING=0 disables the single-kernel routing preparation of small decode / verify steps (default on).
+bool fusedRoutingEnabled()
+{
+    static bool const enabled = []
+    {
+        char const* const value = std::getenv("EDGELLM_MOE_FUSED_ROUTING");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return enabled;
+}
+
+//! Number of SMs: the Marlin lock array has at most 4 ints per SM.
+int32_t numSmsForLocks()
+{
+    static int32_t const sms = []
+    {
+        int32_t dev = 0;
+        int32_t count = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, dev);
+        return count;
+    }();
+    return sms;
+}
+
 bool prefillOverlapFromEnv()
 {
     char const* const value = std::getenv("EDGELLM_MOE_PREFILL_OVERLAP");
@@ -2893,30 +2918,43 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             {tokens, mHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // ==================== Step 2: Prepare Marlin GEMM Indices ====================
-        CUDA_CHECK(cudaMemsetAsync(slotsPerExpertWorkspace, 0, mNumExperts * sizeof(int32_t), stream));
-        kernel::launchCountSlotsPerExpertKernel(
-            tileTopkIdx, slotsPerExpertWorkspace, tokens, mTopK, mNumExperts, stream);
-        CUDA_CHECK(cudaGetLastError());
-        if (routedMode)
+        // Small decode / verify steps: one fused kernel replaces the count, scan, list and index kernels, 3 memsets and the memcpy of the routing weights
+        // (EDGELLM_MOE_FUSED_ROUTING=0 turns it off). It also zeroes the lock ints of the first Marlin GEMM.
+        bool const fusedRouting = !routedMode && !chunkMode && fusedRoutingEnabled() && kernel::canUseFusedDecodeRouting(tileSlots, mNumExperts, moeBlockSize)
+            && marlinWorkspaceSize >= 4 * numSmsForLocks();
+        if (fusedRouting)
         {
-            routedring::RoutedExpertRing& ring = routedring::RoutedExpertRing::get();
-            kernel::launchBuildRoutedList(
-                slotsPerExpertWorkspace, mNumExperts, ring.routedListDevice(), ring.rankOfDevice(), ring.numRoutedDevice(), stream);
-            void const* const srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
-            if (ring.readRouted(stream) < 1 || !ring.beginLayer(srcPtrs, stream))
-            {
-                throw std::runtime_error("routed expert ring: layer not available");
-            }
+            kernel::launchFusedDecodeRouting(tileTopkIdx, tileTopkW, tileSlots, mNumExperts, moeBlockSize, paddedCountsPtr, paddedOffsetsPtr,
+                numTokensPostPaddedPtr, sortedTokenIdsPtr, topkWeightsFlatPtr, expertIdsPtr, topkWeightsPaddedPtr, tilePadded,
+                marlinWorkspacePtr, 4 * numSmsForLocks(), stream);
         }
+        else
+        {
+            CUDA_CHECK(cudaMemsetAsync(slotsPerExpertWorkspace, 0, mNumExperts * sizeof(int32_t), stream));
+            kernel::launchCountSlotsPerExpertKernel(
+                tileTopkIdx, slotsPerExpertWorkspace, tokens, mTopK, mNumExperts, stream);
+            CUDA_CHECK(cudaGetLastError());
+            if (routedMode)
+            {
+                routedring::RoutedExpertRing& ring = routedring::RoutedExpertRing::get();
+                kernel::launchBuildRoutedList(
+                    slotsPerExpertWorkspace, mNumExperts, ring.routedListDevice(), ring.rankOfDevice(), ring.numRoutedDevice(), stream);
+                void const* const srcPtrs[4] = {inputs[2], inputs[3], inputs[4], inputs[5]};
+                if (ring.readRouted(stream) < 1 || !ring.beginLayer(srcPtrs, stream))
+                {
+                    throw std::runtime_error("routed expert ring: layer not available");
+                }
+            }
 
-        kernel::launchComputePaddedOffsetsKernel(slotsPerExpertWorkspace, paddedCountsPtr, paddedOffsetsPtr,
-            numTokensPostPaddedPtr, mNumExperts, moeBlockSize, stream);
-        CUDA_CHECK(cudaGetLastError());
+            kernel::launchComputePaddedOffsetsKernel(slotsPerExpertWorkspace, paddedCountsPtr, paddedOffsetsPtr,
+                numTokensPostPaddedPtr, mNumExperts, moeBlockSize, stream);
+            CUDA_CHECK(cudaGetLastError());
 
-        CUDA_CHECK(cudaMemsetAsync(slotsPerExpertWorkspace, 0, mNumExperts * sizeof(int32_t), stream));
-        kernel::launchBuildSlotListsKernel(
-            tileTopkIdx, slotsByExpertWorkspace, slotsPerExpertWorkspace, tokens, mTopK, mNumExperts, stream);
-        CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemsetAsync(slotsPerExpertWorkspace, 0, mNumExperts * sizeof(int32_t), stream));
+            kernel::launchBuildSlotListsKernel(
+                tileTopkIdx, slotsByExpertWorkspace, slotsPerExpertWorkspace, tokens, mTopK, mNumExperts, stream);
+            CUDA_CHECK(cudaGetLastError());
+        }
 
         rt::Tensor sortedTokenIdsTensor(
             sortedTokenIdsPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
@@ -2928,9 +2966,12 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor marlinWorkspaceTensor(
             marlinWorkspacePtr, {marlinWorkspaceSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
-        kernel::launchBuildMarlinIndicesKernel(slotsByExpertWorkspace, slotsPerExpertWorkspace, paddedCountsPtr,
-            paddedOffsetsPtr, tileTopkW, sortedTokenIdsPtr, topkWeightsFlatPtr, expertIdsPtr, tokens, mTopK,
-            mNumExperts, moeBlockSize, stream);
+        if (!fusedRouting)
+        {
+            kernel::launchBuildMarlinIndicesKernel(slotsByExpertWorkspace, slotsPerExpertWorkspace, paddedCountsPtr,
+                paddedOffsetsPtr, tileTopkW, sortedTokenIdsPtr, topkWeightsFlatPtr, expertIdsPtr, tokens, mTopK,
+                mNumExperts, moeBlockSize, stream);
+        }
 
         // ==================== Step 3: Gate-Up Projection (Marlin INT4 GEMM) ====================
         rt::Tensor gateUpOutputTensor(
@@ -3032,13 +3073,13 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                 rt::Tensor fc1Global(const_cast<void*>(inputs[6]), {mNumExperts}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
                 moeNvfp4A16MarlinGemm(hiddenStates2D, gateUpOutputTensor, gateUpQWeightsTensor, gateUpScalesTensor, fc1Global,
                     sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsFlatTensor,
-                    marlinWorkspaceTensor, moeBlockSize, mTopK, false, stream);
+                    marlinWorkspaceTensor, moeBlockSize, mTopK, false, stream, fusedRouting);
             }
             else
             {
                 moeAwqW4A16MarlinGemm(hiddenStates2D, gateUpOutputTensor, gateUpQWeightsTensor, gateUpScalesTensor,
                     sortedTokenIdsTensor, expertIdsTensor, numTokensPostPaddedTensor, topkWeightsFlatTensor,
-                    marlinWorkspaceTensor, moeBlockSize, mTopK, false, stream);
+                    marlinWorkspaceTensor, moeBlockSize, mTopK, false, stream, fusedRouting);
             }
         }
         CUDA_CHECK(cudaGetLastError());
@@ -3061,9 +3102,12 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             downOutputPtr, {tileSlots, mHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // Routing weights in padded slot order for down GEMM (mulTopkWeights=true)
-        cudaMemsetAsync(topkWeightsPaddedPtr, 0, tilePadded * sizeof(float), stream);
-        cudaMemcpyAsync(
-            topkWeightsPaddedPtr, tileTopkW, tileSlots * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        if (!fusedRouting)
+        {
+            cudaMemsetAsync(topkWeightsPaddedPtr, 0, tilePadded * sizeof(float), stream);
+            cudaMemcpyAsync(
+                topkWeightsPaddedPtr, tileTopkW, tileSlots * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        }
         rt::Tensor topkWeightsPaddedTensor(
             topkWeightsPaddedPtr, {tilePadded}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
 

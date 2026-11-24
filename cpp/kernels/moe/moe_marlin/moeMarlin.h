@@ -69,10 +69,11 @@ namespace kernel
  * @param mulTopkWeights Whether to multiply output by topk weights
  * @param stream CUDA stream
  */
+//! locksZeroed: the caller already zeroed the first sms * 4 ints of the workspace (the lock array) on this stream, so the GEMM skips its own memset.
 void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tensor const& weights,
     rt::Tensor const& scales, rt::Tensor const& sortedTokenIds, rt::Tensor const& expertIds,
     rt::Tensor const& numTokensPostPadded, rt::Tensor const& topkWeights, rt::Tensor& workspace, int64_t moeBlockSize,
-    int64_t topK, bool mulTopkWeights, cudaStream_t stream);
+    int64_t topK, bool mulTopkWeights, cudaStream_t stream, bool locksZeroed = false);
 
 /*!
  * @brief MoE FP16/BF16-A, E2M1-W, FP16/BF16-C GEMM using Marlin.
@@ -99,7 +100,7 @@ void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tens
 void moeNvfp4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tensor const& weights,
     rt::Tensor const& blockScales, rt::Tensor const& globalScales, rt::Tensor const& sortedTokenIds,
     rt::Tensor const& expertIds, rt::Tensor const& numTokensPostPadded, rt::Tensor const& topkWeights,
-    rt::Tensor& workspace, int64_t moeBlockSize, int64_t topK, bool mulTopkWeights, cudaStream_t stream);
+    rt::Tensor& workspace, int64_t moeBlockSize, int64_t topK, bool mulTopkWeights, cudaStream_t stream, bool locksZeroed = false);
 
 /*!
  * @brief Get required workspace size for MoE Marlin GEMM

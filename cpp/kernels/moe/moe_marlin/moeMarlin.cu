@@ -57,7 +57,7 @@ constexpr bool kUseAtomicAdd = false;
 void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tensor const& weights,
     rt::Tensor const& scales, rt::Tensor const& sortedTokenIds, rt::Tensor const& expertIds,
     rt::Tensor const& numTokensPostPadded, rt::Tensor const& topkWeights, rt::Tensor& workspace, int64_t moeBlockSize,
-    int64_t topK, bool mulTopkWeights, cudaStream_t stream)
+    int64_t topK, bool mulTopkWeights, cudaStream_t stream, bool locksZeroed)
 {
     // Validate input shapes
     auto const inputShape = input.getShape();
@@ -149,7 +149,10 @@ void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tens
     void* cTmpPtr = workspaceBasePtr + locksSize;
 
     // Marlin uses locks for reductions; these must be zeroed each call.
-    CUDA_CHECK(cudaMemsetAsync(locksPtr, 0, locksSize * sizeof(int32_t), stream));
+    if (!locksZeroed)
+    {
+        CUDA_CHECK(cudaMemsetAsync(locksPtr, 0, locksSize * sizeof(int32_t), stream));
+    }
 
     // Call the raw marlin_mm function with AWQ-specific parameters
     marlin_moe_wna16::marlin_mm(inputPtr, // A
@@ -187,7 +190,7 @@ void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tens
 void moeNvfp4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tensor const& weights,
     rt::Tensor const& blockScales, rt::Tensor const& globalScales, rt::Tensor const& sortedTokenIds,
     rt::Tensor const& expertIds, rt::Tensor const& numTokensPostPadded, rt::Tensor const& topkWeights,
-    rt::Tensor& workspace, int64_t moeBlockSize, int64_t topK, bool mulTopkWeights, cudaStream_t stream)
+    rt::Tensor& workspace, int64_t moeBlockSize, int64_t topK, bool mulTopkWeights, cudaStream_t stream, bool locksZeroed)
 {
 #if !SUPPORTS_FP8
     check::check(false, "NVFP4 A16 Marlin is unavailable: build does not support FP8 (SUPPORTS_FP8=0)");
@@ -272,7 +275,10 @@ void moeNvfp4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tens
     int32_t* workspaceBase = static_cast<int32_t*>(workspace.rawPointer());
     void* locks = workspaceBase;
     void* cTmp = workspaceBase + locksSize;
-    CUDA_CHECK(cudaMemsetAsync(locks, 0, locksSize * sizeof(int32_t), stream));
+    if (!locksZeroed)
+    {
+        CUDA_CHECK(cudaMemsetAsync(locks, 0, locksSize * sizeof(int32_t), stream));
+    }
 
     trt_edgellm::marlin_dtypes::ScalarType const activationScalarType = activationType == nvinfer1::DataType::kHALF
         ? trt_edgellm::marlin_dtypes::kFloat16

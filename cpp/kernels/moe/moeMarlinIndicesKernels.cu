@@ -98,6 +98,157 @@ __global__ void buildDenseMarlinIndicesKernel(int32_t* sortedTokenIds, int32_t* 
 
 namespace
 {
+constexpr int32_t kFusedRoutingThreads = 256;
+constexpr int32_t kFusedRoutingMaxExperts = 128;
+
+//! One block does the whole routing preparation of a small decode or verify step: per-expert counts, padded counts and offsets (block scan), the Marlin sorted
+//! slot ids / routing weights / block expert ids, the padded copy of the routing weights for the down projection and the zeroing of the Marlin locks. Slots of
+//! an expert are listed in slot order (deterministic). Replaces count, scan, list and index kernels plus 3 memsets and a memcpy (about 40 us of kernels and gaps per layer visit).
+__global__ void __launch_bounds__(kFusedRoutingThreads) fusedDecodeRoutingKernel(int32_t const* topkIndices, float const* topkWeights, int32_t numSlots,
+    int32_t numExperts, int32_t moeBlockSize, int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds,
+    float* topkWeightsFlat, int32_t* expertIds, float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks)
+{
+    __shared__ int32_t slotExpert[kFusedRoutingMaxSlots];
+    __shared__ int32_t counts[kFusedRoutingMaxExperts];
+    __shared__ int32_t offsets[kFusedRoutingMaxExperts];
+    __shared__ int32_t padded[kFusedRoutingMaxExperts];
+    __shared__ int32_t warpTotals[kFusedRoutingThreads / 32];
+    __shared__ int32_t totalPadded;
+
+    int32_t const tid = threadIdx.x;
+    int32_t const lane = tid & 31;
+    int32_t const warp = tid >> 5;
+    for (int32_t i = tid; i < numSlots; i += kFusedRoutingThreads)
+    {
+        int32_t const e = topkIndices[i];
+        slotExpert[i] = (e >= 0 && e < numExperts) ? e : -1;
+    }
+    if (tid < kFusedRoutingMaxExperts)
+    {
+        counts[tid] = 0;
+    }
+    __syncthreads();
+    for (int32_t i = tid; i < numSlots; i += kFusedRoutingThreads)
+    {
+        if (slotExpert[i] >= 0)
+        {
+            atomicAdd(&counts[slotExpert[i]], 1);
+        }
+    }
+    __syncthreads();
+
+    // exclusive scan of the padded counts, one expert per thread
+    int32_t const c = tid < numExperts ? counts[tid] : 0;
+    int32_t const pc = c > 0 ? ((c + moeBlockSize - 1) / moeBlockSize) * moeBlockSize : 0;
+    int32_t inclusive = pc;
+#pragma unroll
+    for (int32_t off = 1; off < 32; off <<= 1)
+    {
+        int32_t const v = __shfl_up_sync(0xffffffffU, inclusive, off);
+        if (lane >= off)
+        {
+            inclusive += v;
+        }
+    }
+    if (lane == 31)
+    {
+        warpTotals[warp] = inclusive;
+    }
+    __syncthreads();
+    int32_t base = 0;
+    for (int32_t w = 0; w < warp; ++w)
+    {
+        base += warpTotals[w];
+    }
+    int32_t const exclusive = base + inclusive - pc;
+    if (tid == kFusedRoutingThreads - 1)
+    {
+        totalPadded = base + inclusive;
+        numTokensPostPadded[0] = base + inclusive;
+    }
+    if (tid < numExperts)
+    {
+        paddedCounts[tid] = pc;
+        paddedOffsets[tid] = exclusive;
+        offsets[tid] = exclusive;
+        padded[tid] = pc;
+    }
+    __syncthreads();
+
+    int32_t const total = totalPadded;
+    for (int32_t p = tid; p < total; p += kFusedRoutingThreads)
+    {
+        // largest expert whose offset is <= p (empty experts share the offset of the next one and precede it)
+        int32_t lo = 0;
+        int32_t hi = numExperts - 1;
+        while (lo < hi)
+        {
+            int32_t const mid = (lo + hi + 1) >> 1;
+            if (offsets[mid] <= p)
+            {
+                lo = mid;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+        int32_t const e = lo;
+        int32_t const i = p - offsets[e];
+        int32_t slot = numSlots;
+        float weight = 0.0F;
+        if (i < counts[e])
+        {
+            int32_t seen = 0;
+            for (int32_t s = 0; s < numSlots; ++s)
+            {
+                if (slotExpert[s] == e)
+                {
+                    if (seen == i)
+                    {
+                        slot = s;
+                        break;
+                    }
+                    ++seen;
+                }
+            }
+            weight = topkWeights[slot];
+        }
+        sortedTokenIds[p] = slot;
+        topkWeightsFlat[p] = weight;
+        if (i % moeBlockSize == 0)
+        {
+            expertIds[p / moeBlockSize] = e;
+        }
+    }
+    for (int32_t i = tid; i < paddedWeightsLen; i += kFusedRoutingThreads)
+    {
+        topkWeightsPadded[i] = i < numSlots ? topkWeights[i] : 0.0F;
+    }
+    for (int32_t i = tid; i < numLocks; i += kFusedRoutingThreads)
+    {
+        locks[i] = 0;
+    }
+}
+} // namespace
+
+bool canUseFusedDecodeRouting(int32_t numSlots, int32_t numExperts, int32_t moeBlockSize)
+{
+    return numSlots > 0 && numSlots <= kFusedRoutingMaxSlots && numExperts > 0 && numExperts <= kFusedRoutingMaxExperts && moeBlockSize > 0
+        && moeBlockSize <= 64;
+}
+
+void launchFusedDecodeRouting(int32_t const* topkIndices, float const* topkWeights, int32_t numSlots, int32_t numExperts, int32_t moeBlockSize,
+    int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds, float* topkWeightsFlat, int32_t* expertIds,
+    float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks, cudaStream_t stream)
+{
+    fusedDecodeRoutingKernel<<<1, kFusedRoutingThreads, 0, stream>>>(topkIndices, topkWeights, numSlots, numExperts, moeBlockSize, paddedCounts,
+        paddedOffsets, numTokensPostPadded, sortedTokenIds, topkWeightsFlat, expertIds, topkWeightsPadded, paddedWeightsLen, locks, numLocks);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+namespace
+{
 
 constexpr int32_t kAggregateThreadsPerBlock{256};
 constexpr float kFiniteWatchNearLimit{30000.0F};
