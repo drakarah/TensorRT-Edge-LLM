@@ -223,3 +223,12 @@ def inkling2_block_residual(states: List[Tensor], queries: Tensor,
                         num_queries=num_queries,
                         eps=eps)
     return [outputs] if isinstance(outputs, Tensor) else list(outputs)
+
+
+def inkling2_message_gate(hidden: Tensor, message: Tensor, down: Tensor, forget: Tensor, gain: Tensor, hidden_size: int, rank: int, eps: float) -> Tensor:
+    """Inkling 2 message gate in one plugin: (1 - tanh(forget(low))) * hidden + tanh(gain(low)) * message with low = down([rms(hidden), rms(message)]).
+
+    ``hidden`` and ``message`` are [tokens, hidden] FP32; ``down`` [rank, hidden], ``forget`` and ``gain`` [hidden, rank / 2] are int32 constants holding
+    packed BF16 pairs (the checkpoint's BF16 layout, so no value changes).
+    """
+    return operation("inkling2_message_gate", [hidden, message, down, forget, gain], hidden=hidden_size, rank=rank, eps=eps)

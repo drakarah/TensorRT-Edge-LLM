@@ -166,6 +166,9 @@ edgellm_add_unit_test(NAME unitTestKernelsInkling2ShortConv DIRS
 edgellm_add_unit_test(NAME unitTestKernelsInkling2BlockResidual DIRS
                       cpp/kernels/inkling2BlockResidual)
 
+edgellm_add_unit_test(NAME unitTestKernelsInkling2MessageGate DIRS
+                      cpp/kernels/inkling2MessageGate)
+
 edgellm_add_unit_test(NAME unitTestKernelsFp8Linear DIRS cpp/kernels/fp8Linear)
 
 # CuTe DSL AOT wrappers lower extended launches through the runtime's

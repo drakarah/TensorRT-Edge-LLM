@@ -38,6 +38,8 @@ from . import weights as weight_conversion
 LOGGER = logging.getLogger("builder.inkling2")
 _EPS = 1e-6
 _FUSED_RESIDUAL = os.environ.get("EDGELLM_INKLING_FUSED_RESIDUAL") == "1"
+# EDGELLM_INKLING_FUSED_GATE=1 at build: the message gates of the looped passes run as one plugin (BF16 weights, FP32 activations) instead of three TF32 matmuls
+_FUSED_GATE = os.environ.get("EDGELLM_INKLING_FUSED_GATE") == "1"
 
 
 def _f32(weights, name: str) -> np.ndarray:
@@ -121,6 +123,16 @@ def l2_clip_rows(x, threshold: float):
     return x * factor
 
 
+def _bf16_words(w, key: str) -> np.ndarray:
+    """A BF16 checkpoint matrix [rows, cols] as int32 words [rows, cols / 2] (two BF16 per word, element 2i in the low half): exact, the plugin widens BF16 to FP32."""
+    f32 = np.ascontiguousarray(_f32(w, key))
+    bits = f32.view(np.uint32)
+    if np.any(bits & 0xFFFF):
+        raise ValueError(f"{key}: not exactly representable in BF16")
+    half = (bits >> 16).astype(np.uint16)
+    return np.ascontiguousarray(half).view(np.int32).reshape(f32.shape[0], f32.shape[1] // 2)
+
+
 def _matmul_const(x, weight_kn: np.ndarray, name: str):
     return x.matmul(
         F.constant(np.ascontiguousarray(weight_kn, np.float32), name))
@@ -157,8 +169,17 @@ class MessageGate(Module):
         self.down = _f32(w, self.key("down_weight")).T  # [2H, rank]
         self.forget = _f32(w, self.key("forget_weight")).T  # [rank, H]
         self.gain = _f32(w, self.key("gain_weight")).T
+        self.rank = int(self.down.shape[1])
+        self.hidden = int(self.down.shape[0]) // 2
+        if _FUSED_GATE:
+            # the checkpoint weights are BF16: keep their bits (exact) as packed int32 words for the fused plugin; layouts [rank, 2H], [H, rank], [H, rank]
+            self.packed = tuple(_bf16_words(w, self.key(name)) for name in ("down_weight", "forget_weight", "gain_weight"))
 
     def forward(self, hidden, message):
+        if _FUSED_GATE:
+            down, forget, gain = self.packed
+            return F.inkling2_message_gate(hidden, message, F.constant(down, "gate_down"), F.constant(forget, "gate_forget"), F.constant(gain, "gate_gain"),
+                                           self.hidden, self.rank, _EPS)
         gate_in = F.concatenate(
             [rms_unweighted(hidden),
              rms_unweighted(message)], dim=1)
