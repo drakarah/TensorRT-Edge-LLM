@@ -40,6 +40,13 @@ def conv_channels(cfg) -> int:
 def update_llm_config(config: Dict[str, Any], root: Dict[str, Any], cfg,
                       args) -> None:
     config["use_rope"] = False
+    if cfg.inkling_int8_kv():
+        # INT8 KV rows of 132 bytes (128 values, FP16 scale, 2 pad): the runtime sizes the pools from head_dim and kv_cache_dtype
+        config["kv_cache_dtype"] = "int8"
+        config["head_dim"] = cfg.layer_head_dim(0)
+        for entry in config.get("kv_layer_configs", []):
+            if isinstance(entry, dict):  # None marks entries that own no pool of that kind
+                entry["head_dim"] = cfg.layer_head_dim(0)
 
 
 def component_runtime_config(bundle, component: contracts.Component, args):

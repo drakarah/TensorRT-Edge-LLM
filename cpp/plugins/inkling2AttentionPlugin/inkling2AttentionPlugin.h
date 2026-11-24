@@ -42,7 +42,7 @@ class Inkling2AttentionPlugin : public nvinfer1::IPluginV3,
 {
 public:
     Inkling2AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t relExtent,
-        int32_t window, float logAlpha, float logNFloor, float qClip, float relClip, float scaling);
+        int32_t window, float logAlpha, float logNFloor, float qClip, float relClip, float scaling, int32_t kvInt8 = 0);
 
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
     nvinfer1::IPluginV3* clone() noexcept override;
@@ -83,6 +83,7 @@ private:
     float mQClip;
     float mRelClip;
     float mScaling;
+    int32_t mKvInt8{0}; //!< 1: the KV pool (declared FP8, i.e. one byte per value) holds INT8 rows of 132 bytes (128 values, FP16 scale, 2 pad)
     std::vector<nvinfer1::PluginField> mData;
     nvinfer1::PluginFieldCollection mFields{};
 };

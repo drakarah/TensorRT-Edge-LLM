@@ -82,7 +82,7 @@ bool allPositive(Dims const& d)
 REGISTER_TENSORRT_PLUGIN(Inkling2AttentionPluginCreator);
 
 Inkling2AttentionPlugin::Inkling2AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads,
-    int32_t relExtent, int32_t window, float logAlpha, float logNFloor, float qClip, float relClip, float scaling)
+    int32_t relExtent, int32_t window, float logAlpha, float logNFloor, float qClip, float relClip, float scaling, int32_t kvInt8)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
@@ -93,10 +93,15 @@ Inkling2AttentionPlugin::Inkling2AttentionPlugin(std::string const& name, int32_
     , mQClip(qClip)
     , mRelClip(relClip)
     , mScaling(scaling)
+    , mKvInt8(kvInt8)
 {
     if (numQHeads <= 0 || numKVHeads <= 0 || numQHeads % numKVHeads != 0)
     {
         throw std::invalid_argument("Inkling2AttentionPlugin: num_q_heads must be a positive multiple of num_kv_heads");
+    }
+    if (kvInt8 != 0 && kvInt8 != 1)
+    {
+        throw std::invalid_argument("Inkling2AttentionPlugin: kv_int8 must be 0 or 1");
     }
     if (relExtent <= 0 || window < 0)
     {
@@ -128,7 +133,7 @@ IPluginV3* Inkling2AttentionPlugin::clone() noexcept
     try
     {
         auto* plugin = new Inkling2AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mRelExtent, mWindow, mLogAlpha,
-            mLogNFloor, mQClip, mRelClip, mScaling);
+            mLogNFloor, mQClip, mRelClip, mScaling, mKvInt8);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -211,7 +216,7 @@ bool Inkling2AttentionPlugin::supportsFormatCombination(
     case kQScale:
     case kRelScale: return linear(d, DataType::kFLOAT, 1);
     case kRelProjT: return linear(d, DataType::kFLOAT, 2);
-    case kPastKv: return linear(d, DataType::kHALF, 5) || linear(d, DataType::kFP8, 5);
+    case kPastKv: return linear(d, DataType::kHALF, 5) || linear(d, DataType::kFP8, 5) || linear(d, DataType::kINT8, 5);
     case kQueryStartOffsets:
     case kQueryLengths:
     case kPastLengths: return linear(d, DataType::kINT32, 1);
@@ -239,7 +244,9 @@ int32_t Inkling2AttentionPlugin::configurePlugin(
     Check const checks[] = {
         {"past_kv must be [2, pages, 128, num_kv_heads, 128]",
             kv.nbDims == 5 && kv.d[0] == 2 && kv.d[2] == kTokensPerPage && kv.d[3] == mNumKVHeads
-                && kv.d[4] == kHeadDim},
+                && kv.d[4] == (mKvInt8 != 0 ? kernel::kInkling2Int8RowBytes : kHeadDim)},
+        {"INT8 KV rows need a one-byte (INT8 or FP8 typed) pool",
+            mKvInt8 == 0 || in[kPastKv].desc.type == DataType::kINT8 || in[kPastKv].desc.type == DataType::kFP8},
         {"q_lin width must be num_q_heads * 128", in[kQLin].desc.dims.d[1] == mNumQHeads * kHeadDim},
         {"rel_lin width must be num_q_heads * 16", in[kRelLin].desc.dims.d[1] == mNumQHeads * kRelDim},
         {"sink_lin width must be num_q_heads", in[kSinkLin].desc.dims.d[1] == mNumQHeads},
@@ -303,7 +310,8 @@ int32_t Inkling2AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
     params.relExtent = mRelExtent;
     params.window = mWindow;
     params.maxPagesPerSeq = inputDesc[kPageTable].dims.d[2];
-    params.kvFp8 = inputDesc[kPastKv].type == DataType::kFP8 ? 1 : 0;
+    params.kvFp8 = inputDesc[kPastKv].type == DataType::kFP8 && mKvInt8 == 0 ? 1 : 0;
+    params.kvInt8 = mKvInt8;
     params.scaling = mScaling;
     params.logAlpha = mLogAlpha;
     params.logNFloor = mLogNFloor;
@@ -359,6 +367,7 @@ PluginFieldCollection const* Inkling2AttentionPlugin::getFieldsToSerialize() noe
     mData.emplace_back("q_clip", &mQClip, PluginFieldType::kFLOAT32, 1);
     mData.emplace_back("rel_clip", &mRelClip, PluginFieldType::kFLOAT32, 1);
     mData.emplace_back("scaling", &mScaling, PluginFieldType::kFLOAT32, 1);
+    mData.emplace_back("kv_int8", &mKvInt8, PluginFieldType::kINT32, 1);
     mFields.nbFields = static_cast<int32_t>(mData.size());
     mFields.fields = mData.data();
     return &mFields;
@@ -371,7 +380,7 @@ Inkling2AttentionPluginCreator::Inkling2AttentionPluginCreator()
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     mAttributes.clear();
-    for (char const* name : {"num_q_heads", "num_kv_heads", "rel_extent", "window"})
+    for (char const* name : {"num_q_heads", "num_kv_heads", "rel_extent", "window", "kv_int8"})
     {
         mAttributes.emplace_back(name, nullptr, PluginFieldType::kINT32, 1);
     }
@@ -447,13 +456,14 @@ IPluginV3* Inkling2AttentionPluginCreator::createPlugin(
             }
             return *static_cast<float const*>(it->second->data);
         };
-        if (byName.size() != 9)
+        // kv_int8 is optional (absent in engines built before INT8 KV)
+        if (byName.size() != (byName.count("kv_int8") != 0 ? 10 : 9))
         {
             throw std::invalid_argument("Inkling2AttentionPlugin: unknown or missing attributes");
         }
         auto* plugin = new Inkling2AttentionPlugin(name, intField("num_q_heads"), intField("num_kv_heads"),
             intField("rel_extent"), intField("window"), floatField("log_alpha"), floatField("log_n_floor"),
-            floatField("q_clip"), floatField("rel_clip"), floatField("scaling"));
+            floatField("q_clip"), floatField("rel_clip"), floatField("scaling"), byName.count("kv_int8") != 0 ? intField("kv_int8") : 0);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }

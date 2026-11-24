@@ -30,6 +30,7 @@ namespace kernel
 constexpr int32_t kInkling2HeadDim = 128;
 constexpr int32_t kInkling2RelDim = 16;
 constexpr int32_t kInkling2TokensPerPage = 128;
+constexpr int32_t kInkling2Int8RowBytes = kInkling2HeadDim + 4; //!< INT8 KV row: 128 values + FP16 scale + 2 pad bytes (pool head dimension 132)
 
 struct Inkling2AttentionParams
 {
@@ -41,6 +42,7 @@ struct Inkling2AttentionParams
     int32_t window;     //!< Sliding window in tokens; 0 selects full attention (with log-length query scaling).
     int32_t maxPagesPerSeq;
     int32_t kvFp8; //!< Non-zero: the KV pool holds FP8 E4M3 (unit scale) instead of FP16.
+    int32_t kvInt8; //!< Non-zero (wins over kvFp8): INT8 rows of kInkling2Int8RowBytes bytes: 128 values, an FP16 scale per (token, KV head) row, 2 pad bytes.
     float scaling;  //!< Attention score scale (1 / sqrt(headDim)).
     float logAlpha; //!< Full layers: q *= 1 + logAlpha * log(max((pos + 1) / logNFloor, 1)).
     float logNFloor;

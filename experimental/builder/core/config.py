@@ -20,6 +20,7 @@ and no framework imports. Component-specific dictionaries remain available
 for visual, audio, vocoder, and action builders.
 """
 
+import os
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -271,6 +272,8 @@ class DeviceConfig:
 
     @property
     def kv_cache_dtype(self) -> str:
+        if self.inkling_int8_kv():
+            return "int8"
         if self.kv_cache_quant in ("fp8", "int8"):
             return self.kv_cache_quant
         # a checkpoint without per-layer KV scales can still ask for a unit-scale FP8 cache with kv_cache_dtype: "fp8"
@@ -313,7 +316,14 @@ class DeviceConfig:
             return self.attention_layer_types[layer_index]
         return "full_attention"
 
+    def inkling_int8_kv(self) -> bool:
+        """EDGELLM_INKLING_KV_INT8=1 at build: Inkling 2 keeps its KV pool as INT8 rows with an FP16 scale per (token, KV head) row: 128 values + scale + 2 pad
+        bytes = 132 bytes per row, so the pool's head dimension is 132 (see inkling2AttentionKernels.h)."""
+        return os.environ.get("EDGELLM_INKLING_KV_INT8") == "1" and str(self.model_type).startswith("inkling2")
+
     def layer_head_dim(self, layer_index: int) -> int:
+        if self.inkling_int8_kv():
+            return self.head_dim + 4
         if (self.attention_type(layer_index) == "full_attention"
                 and self.global_head_dim > 0):
             return self.global_head_dim

@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cuda_fp8.h>
+#include <type_traits>
 #include <mma.h>
 #include <cuda_runtime.h>
 
@@ -67,21 +68,45 @@ __device__ __forceinline__ bool locateToken(int32_t t, int32_t const* offsets, i
     return local >= 0 && local < lengths[seq];
 }
 
-//! KV pool element access: FP16, or FP8 E4M3 (unit scale, saturating) for the long-context cache.
-__device__ __forceinline__ void loadKv4(half const* p, float (&f)[4])
+//! KV pool element access: FP16, FP8 E4M3 (unit scale, saturating), or INT8 with one FP16 scale per (token, KV head) row stored behind the 128 values: a row is
+//! 132 bytes = 128 INT8 values, the FP16 scale and 2 pad bytes (4-byte aligned), so every row address is `row * rowStride` instead of `row * 128`.
+template <typename KvT>
+struct KvTraits
 {
-    uint2 const r = *reinterpret_cast<uint2 const*>(p);
+    static constexpr int32_t rowStride = kInkling2HeadDim;
+};
+
+template <>
+struct KvTraits<int8_t>
+{
+    static constexpr int32_t rowStride = kInkling2HeadDim + 4;
+};
+
+//! Four consecutive values of a row starting at element `off` as floats.
+__device__ __forceinline__ void loadKv4(half const* row, int32_t off, float (&f)[4])
+{
+    uint2 const r = *reinterpret_cast<uint2 const*>(row + off);
     half2 const* h = reinterpret_cast<half2 const*>(&r);
     float2 const a = __half22float2(h[0]), b = __half22float2(h[1]);
     f[0] = a.x, f[1] = a.y, f[2] = b.x, f[3] = b.y;
 }
 
-__device__ __forceinline__ void loadKv4(__nv_fp8_e4m3 const* p, float (&f)[4])
+__device__ __forceinline__ void loadKv4(__nv_fp8_e4m3 const* row, int32_t off, float (&f)[4])
 {
-    uint32_t const r = *reinterpret_cast<uint32_t const*>(p);
+    uint32_t const r = *reinterpret_cast<uint32_t const*>(row + off);
     __nv_fp8x2_e4m3 const* h = reinterpret_cast<__nv_fp8x2_e4m3 const*>(&r);
     float2 const a = static_cast<float2>(h[0]), b = static_cast<float2>(h[1]);
     f[0] = a.x, f[1] = a.y, f[2] = b.x, f[3] = b.y;
+}
+
+__device__ __forceinline__ void loadKv4(int8_t const* row, int32_t off, float (&f)[4])
+{
+    float const scale = __half2float(*reinterpret_cast<half const*>(row + kInkling2HeadDim));
+    uint32_t const r = *reinterpret_cast<uint32_t const*>(row + off);
+    f[0] = static_cast<float>(static_cast<int8_t>(r & 0xFFU)) * scale;
+    f[1] = static_cast<float>(static_cast<int8_t>((r >> 8) & 0xFFU)) * scale;
+    f[2] = static_cast<float>(static_cast<int8_t>((r >> 16) & 0xFFU)) * scale;
+    f[3] = static_cast<float>(static_cast<int8_t>(r >> 24)) * scale;
 }
 
 __device__ __forceinline__ void storeKv(half* p, half v)
@@ -92,6 +117,12 @@ __device__ __forceinline__ void storeKv(half* p, half v)
 __device__ __forceinline__ void storeKv(__nv_fp8_e4m3* p, half v)
 {
     *p = __nv_fp8_e4m3(__half2float(v));
+}
+
+//! INT8 rows are written by appendInt8Kernel (scale per row); this overload only keeps the generic template compiling.
+__device__ __forceinline__ void storeKv(int8_t* p, half v)
+{
+    *p = static_cast<int8_t>(__half2float(v));
 }
 
 template <typename KvT>
@@ -106,7 +137,7 @@ __global__ void appendKernel(Inkling2AttentionParams p, half const* __restrict__
         return;
     }
     int64_t const rowElems = int64_t(p.numKVHeads) * kInkling2HeadDim;
-    int64_t const pageElems = int64_t(kInkling2TokensPerPage) * rowElems;
+    int64_t const pageElems = int64_t(kInkling2TokensPerPage) * int64_t(p.numKVHeads) * KvTraits<KvT>::rowStride;
     int32_t const* table = pageTable + int64_t(seq) * 2 * p.maxPagesPerSeq;
     // A negative page id is an unmapped logical page (bounded window storage, graph-capture warmup): nothing to write.
     int32_t const kPage = table[pos / kInkling2TokensPerPage], vPage = table[p.maxPagesPerSeq + pos / kInkling2TokensPerPage];
@@ -114,12 +145,69 @@ __global__ void appendKernel(Inkling2AttentionParams p, half const* __restrict__
     {
         return;
     }
-    int64_t const kDst = int64_t(kPage) * pageElems + (pos % kInkling2TokensPerPage) * rowElems;
-    int64_t const vDst = int64_t(vPage) * pageElems + (pos % kInkling2TokensPerPage) * rowElems;
+    int64_t const kDst = int64_t(kPage) * pageElems + (pos % kInkling2TokensPerPage) * int64_t(p.numKVHeads) * KvTraits<KvT>::rowStride;
+    int64_t const vDst = int64_t(vPage) * pageElems + (pos % kInkling2TokensPerPage) * int64_t(p.numKVHeads) * KvTraits<KvT>::rowStride;
     for (int64_t i = threadIdx.x; i < rowElems; i += blockDim.x)
     {
-        storeKv(kvPool + kDst + i, kNew[int64_t(t) * rowElems + i]);
-        storeKv(kvPool + vDst + i, vNew[int64_t(t) * rowElems + i]);
+        // element i of the new row = head (i / 128), element (i % 128); the pool row of that head starts at head * rowStride
+        int64_t const head = i / kInkling2HeadDim, d = i % kInkling2HeadDim;
+        storeKv(kvPool + kDst + head * KvTraits<KvT>::rowStride + d, kNew[int64_t(t) * rowElems + i]);
+        storeKv(kvPool + vDst + head * KvTraits<KvT>::rowStride + d, vNew[int64_t(t) * rowElems + i]);
+    }
+}
+
+//! INT8 append: one warp per (plane, KV head) row of the new token: absmax over the 128 values, FP16 scale = absmax / 127 (1 for an all-zero row), values rounded
+//! to nearest with that scale, scale and two zero pad bytes behind the values. 8 warps per block cover K and V of up to 8 heads per pass.
+__global__ void appendInt8Kernel(Inkling2AttentionParams p, half const* __restrict__ kNew, half const* __restrict__ vNew, int8_t* __restrict__ kvPool,
+    int32_t const* __restrict__ offsets, int32_t const* __restrict__ lengths, int32_t const* __restrict__ past, int32_t const* __restrict__ pageTable)
+{
+    int32_t const t = blockIdx.x;
+    int32_t seq, pos;
+    if (!locateToken(t, offsets, lengths, past, p.batchSize, seq, pos))
+    {
+        return;
+    }
+    constexpr int32_t kStride = KvTraits<int8_t>::rowStride;
+    int64_t const rowElems = int64_t(p.numKVHeads) * kInkling2HeadDim;
+    int64_t const pageElems = int64_t(kInkling2TokensPerPage) * int64_t(p.numKVHeads) * kStride;
+    int32_t const* table = pageTable + int64_t(seq) * 2 * p.maxPagesPerSeq;
+    int32_t const kPage = table[pos / kInkling2TokensPerPage], vPage = table[p.maxPagesPerSeq + pos / kInkling2TokensPerPage];
+    if (kPage < 0 || vPage < 0)
+    {
+        return;
+    }
+    int32_t const warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int64_t const inPageRow = (pos % kInkling2TokensPerPage) * int64_t(p.numKVHeads) * kStride;
+    for (int32_t job = warp; job < 2 * p.numKVHeads; job += blockDim.x >> 5)
+    {
+        int32_t const plane = job / p.numKVHeads, head = job % p.numKVHeads;
+        half const* src = (plane == 0 ? kNew : vNew) + int64_t(t) * rowElems + int64_t(head) * kInkling2HeadDim + lane * 4;
+        int8_t* dst = kvPool + int64_t(plane == 0 ? kPage : vPage) * pageElems + inPageRow + int64_t(head) * kStride;
+        float v[4];
+        uint2 const raw = *reinterpret_cast<uint2 const*>(src);
+        half2 const* h = reinterpret_cast<half2 const*>(&raw);
+        float2 const a = __half22float2(h[0]), b = __half22float2(h[1]);
+        v[0] = a.x, v[1] = a.y, v[2] = b.x, v[3] = b.y;
+        float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+#pragma unroll
+        for (int32_t off = 16; off > 0; off >>= 1)
+        {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffU, amax, off));
+        }
+        half const scaleH = __float2half(amax > 0.F ? amax / 127.F : 1.F);
+        float const inv = 1.F / __half2float(scaleH);
+        uint32_t packed = 0;
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            int32_t const q = max(-127, min(127, __float2int_rn(v[i] * inv)));
+            packed |= static_cast<uint32_t>(static_cast<uint8_t>(static_cast<int8_t>(q))) << (8 * i);
+        }
+        *reinterpret_cast<uint32_t*>(dst + lane * 4) = packed;
+        if (lane == 0)
+        {
+            *reinterpret_cast<uint32_t*>(dst + kInkling2HeadDim) = static_cast<uint32_t>(__half_as_ushort(scaleH)); // scale, then two zero pad bytes
+        }
     }
 }
 
@@ -144,7 +232,7 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
         return;
     }
     int32_t const kvh = h / (p.numQHeads / p.numKVHeads);
-    int64_t const rowElems = int64_t(p.numKVHeads) * kInkling2HeadDim;
+    int64_t const rowElems = int64_t(p.numKVHeads) * KvTraits<KvT>::rowStride;
     int64_t const pageElems = int64_t(kInkling2TokensPerPage) * rowElems;
     int32_t const* table = pageTable + int64_t(seq) * 2 * p.maxPagesPerSeq;
     float const logScale = p.window == 0 ? 1.F + p.logAlpha * logf(fmaxf((qpos + 1.F) / p.logNFloor, 1.F)) : 1.F;
@@ -177,15 +265,14 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
     float m = -INFINITY, l = 0.F, acc[4] = {0.F, 0.F, 0.F, 0.F};
     for (int32_t s = lo + w; s <= qpos; s += kWarps)
     {
-        int64_t const inPage
-            = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * kInkling2HeadDim + lane * 4;
+        int64_t const inPage = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * KvTraits<KvT>::rowStride;
         int32_t const kPage = table[s / kInkling2TokensPerPage], vPage = table[p.maxPagesPerSeq + s / kInkling2TokensPerPage];
         if (kPage < 0 || vPage < 0)
         {
             continue; // unmapped logical page: no key (never inside a live window)
         }
         float kf[4];
-        loadKv4(kvPool + int64_t(kPage) * pageElems + inPage, kf);
+        loadKv4(kvPool + int64_t(kPage) * pageElems + inPage, lane * 4, kf);
         float dot = 0.F;
 #pragma unroll
         for (int32_t i = 0; i < 4; ++i)
@@ -203,7 +290,7 @@ __global__ void attentionKernel(Inkling2AttentionParams p, half const* __restric
         float const mNew = fmaxf(m, score);
         float const corr = __expf(m - mNew), e = __expf(score - mNew);
         float vf[4];
-        loadKv4(kvPool + int64_t(vPage) * pageElems + inPage, vf);
+        loadKv4(kvPool + int64_t(vPage) * pageElems + inPage, lane * 4, vf);
 #pragma unroll
         for (int32_t i = 0; i < 4; ++i)
         {
@@ -312,6 +399,28 @@ __device__ __forceinline__ void stageRow(half* dst, __nv_fp8_e4m3 const* src, bo
     }
 }
 
+__device__ __forceinline__ void stageRow(half* dst, int8_t const* src, bool valid, int32_t part)
+{
+    // 16 parts of 8 values; the FP16 scale of the row sits behind its 128 values
+    half2* d2 = reinterpret_cast<half2*>(dst) + part * 4;
+    if (!valid)
+    {
+        d2[0] = d2[1] = d2[2] = d2[3] = __floats2half2_rn(0.F, 0.F);
+        return;
+    }
+    float const scale = __half2float(*reinterpret_cast<half const*>(src + kInkling2HeadDim));
+    // rows are 132 bytes (4-byte aligned, not 8): two 32-bit loads
+    uint32_t const w[2] = {*reinterpret_cast<uint32_t const*>(src + part * 8), *reinterpret_cast<uint32_t const*>(src + part * 8 + 4)};
+#pragma unroll
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        uint32_t const x = w[i >> 1] >> (16 * (i & 1));
+        float const lo = static_cast<float>(static_cast<int8_t>(x & 0xFFU)) * scale;
+        float const hi = static_cast<float>(static_cast<int8_t>((x >> 8) & 0xFFU)) * scale;
+        d2[i] = __floats2half2_rn(lo, hi);
+    }
+}
+
 template <typename KvT>
 __global__ void __launch_bounds__(kTileThreads) tiledAttentionKernel(Inkling2AttentionParams p,
     half const* __restrict__ qLin, half const* __restrict__ relLin, float const* __restrict__ qScale,
@@ -349,7 +458,7 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionKernel(Inkling2Att
     int32_t const slot0 = offsets[seq] + tile * qTile, slotsEnd = offsets[seq + 1];
     int32_t const group = p.numQHeads / p.numKVHeads, rows = qTile * group;
     int32_t const kvh = blockIdx.y, split = blockIdx.z;
-    int64_t const rowElems = int64_t(p.numKVHeads) * kInkling2HeadDim;
+    int64_t const rowElems = int64_t(p.numKVHeads) * KvTraits<KvT>::rowStride;
     int64_t const pageElems = int64_t(kInkling2TokensPerPage) * rowElems;
     int32_t const* table = pageTable + int64_t(seq) * 2 * p.maxPagesPerSeq;
 
@@ -439,7 +548,7 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionKernel(Inkling2Att
                 vPage = table[p.maxPagesPerSeq + s / kInkling2TokensPerPage];
                 valid = kPage >= 0 && vPage >= 0;
             }
-            int64_t const inPage = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * kInkling2HeadDim;
+            int64_t const inPage = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * KvTraits<KvT>::rowStride;
             stageRow(Ksm + key * kKPad, kvPool + int64_t(kPage) * pageElems + inPage, valid, part);
             stageRow(Vsm + key * kInkling2HeadDim, kvPool + int64_t(vPage) * pageElems + inPage, valid, part);
         }
@@ -629,7 +738,7 @@ __global__ void __launch_bounds__(kDecThreads) decodeAttentionKernel(Inkling2Att
     int32_t seq = 0, qpos = 0;
     bool const valid = locateToken(slot, offsets, lengths, past, p.batchSize, seq, qpos);
     int32_t const group = p.numQHeads / p.numKVHeads;
-    int64_t const rowElems = int64_t(p.numKVHeads) * kInkling2HeadDim;
+    int64_t const rowElems = int64_t(p.numKVHeads) * KvTraits<KvT>::rowStride;
     int64_t const pageElems = int64_t(kInkling2TokensPerPage) * rowElems;
     int32_t const* table = pageTable + int64_t(seq) * 2 * p.maxPagesPerSeq;
 
@@ -714,7 +823,7 @@ __global__ void __launch_bounds__(kDecThreads) decodeAttentionKernel(Inkling2Att
                 vPage = table[p.maxPagesPerSeq + s / kInkling2TokensPerPage];
                 ok = kPage >= 0 && vPage >= 0;
             }
-            int64_t const inPage = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * kInkling2HeadDim;
+            int64_t const inPage = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * KvTraits<KvT>::rowStride;
             stageRow(Ksm + key * kKPad, kvPool + int64_t(kPage) * pageElems + inPage, ok, part);
             stageRow(Vsm + key * kInkling2HeadDim, kvPool + int64_t(vPage) * pageElems + inPage, ok, part);
         }
@@ -878,7 +987,7 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionMmaKernel(Inkling2
     int32_t const slot0 = offsets[seq] + tile * qTile, slotsEnd = offsets[seq + 1];
     int32_t const group = p.numQHeads / p.numKVHeads, rows = qTile * group;
     int32_t const kvh = blockIdx.y, split = blockIdx.z;
-    int64_t const rowElems = int64_t(p.numKVHeads) * kInkling2HeadDim;
+    int64_t const rowElems = int64_t(p.numKVHeads) * KvTraits<KvT>::rowStride;
     int64_t const pageElems = int64_t(kInkling2TokensPerPage) * rowElems;
     int32_t const* table = pageTable + int64_t(seq) * 2 * p.maxPagesPerSeq;
 
@@ -970,7 +1079,7 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionMmaKernel(Inkling2
                 vPage = table[p.maxPagesPerSeq + s / kInkling2TokensPerPage];
                 valid = kPage >= 0 && vPage >= 0;
             }
-            int64_t const inPage = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * kInkling2HeadDim;
+            int64_t const inPage = int64_t(s % kInkling2TokensPerPage) * rowElems + int64_t(kvh) * KvTraits<KvT>::rowStride;
             stageRow(Ksm + key * kKLd, kvPool + int64_t(kPage) * pageElems + inPage, valid, part);
             stageRow(Vsm + key * kInkling2HeadDim, kvPool + int64_t(vPage) * pageElems + inPage, valid, part);
         }
@@ -1141,8 +1250,15 @@ static void launchTyped(Inkling2AttentionParams const& params, half const* qLin,
     int32_t const* pastLengths, int32_t const* pageTable, half* out, void* workspace, size_t workspaceBytes,
     cudaStream_t stream)
 {
-    appendKernel<KvT><<<params.numTokens, 128, 0, stream>>>(
-        params, kNew, vNew, kvPool, queryStartOffsets, queryLengths, pastLengths, pageTable);
+    if constexpr (std::is_same_v<KvT, int8_t>)
+    {
+        appendInt8Kernel<<<params.numTokens, 256, 0, stream>>>(params, kNew, vNew, kvPool, queryStartOffsets, queryLengths, pastLengths, pageTable);
+    }
+    else
+    {
+        appendKernel<KvT><<<params.numTokens, 128, 0, stream>>>(
+            params, kNew, vNew, kvPool, queryStartOffsets, queryLengths, pastLengths, pageTable);
+    }
     int32_t const group = params.numQHeads / params.numKVHeads;
     int64_t const rowCap = static_cast<int64_t>(workspaceBytes / sizeof(float) / kPartialStride);
     if (workspace == nullptr || group > kMaxRows || rowCap < static_cast<int64_t>(params.numTokens) * params.numQHeads)
@@ -1158,6 +1274,7 @@ static void launchTyped(Inkling2AttentionParams const& params, half const* qLin,
             static_cast<int>(tiledSmemBytes()));
         cudaFuncSetAttribute(tiledAttentionKernel<__nv_fp8_e4m3>, cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(tiledSmemBytes()));
+        cudaFuncSetAttribute(tiledAttentionKernel<int8_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(tiledSmemBytes()));
         return true;
     }();
     static_cast<void>(configured);
@@ -1168,6 +1285,7 @@ static void launchTyped(Inkling2AttentionParams const& params, half const* qLin,
             cudaFuncSetAttribute(decodeAttentionKernel<half>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(decodeSmemBytes()));
             cudaFuncSetAttribute(decodeAttentionKernel<__nv_fp8_e4m3>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(decodeSmemBytes()));
+            cudaFuncSetAttribute(decodeAttentionKernel<int8_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(decodeSmemBytes()));
             return true;
         }();
         static_cast<void>(decodeConfigured);
@@ -1211,6 +1329,7 @@ static void launchTyped(Inkling2AttentionParams const& params, half const* qLin,
             cudaFuncSetAttribute(tiledAttentionMmaKernel<half>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mmaSmemBytes()));
             cudaFuncSetAttribute(tiledAttentionMmaKernel<__nv_fp8_e4m3>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(mmaSmemBytes()));
+            cudaFuncSetAttribute(tiledAttentionMmaKernel<int8_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mmaSmemBytes()));
             return true;
         }();
         static_cast<void>(mmaConfigured);
@@ -1245,7 +1364,12 @@ void launchInkling2Attention(Inkling2AttentionParams const& params, half const* 
     {
         return;
     }
-    if (params.kvFp8 != 0)
+    if (params.kvInt8 != 0)
+    {
+        launchTyped(params, qLin, relLin, sinkLin, gateLin, qScale, relScale, relProjT, kNew, vNew, static_cast<int8_t*>(kvPool), queryStartOffsets,
+            queryLengths, pastLengths, pageTable, out, workspace, workspaceBytes, stream);
+    }
+    else if (params.kvFp8 != 0)
     {
         launchTyped(params, qLin, relLin, sinkLin, gateLin, qScale, relScale, relProjT, kNew, vNew,
             static_cast<__nv_fp8_e4m3*>(kvPool), queryStartOffsets, queryLengths, pastLengths, pageTable, out,

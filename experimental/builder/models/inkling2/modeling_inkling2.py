@@ -353,7 +353,8 @@ class Inkling2Layer(Module):
             F.constant(self.rel_proj_t, "rel_proj_t"), past_kv, ragged, nh,
             nkv, self.rel_extent, self.window, self.log_alpha, self.log_floor,
             self.qk_clip, self.rel_clip, hd**-0.5,
-            bounded=self.window > 0 and ragged.swa_kv_page_table is not None)
+            bounded=self.window > 0 and ragged.swa_kv_page_table is not None,
+            kv_int8=self.cfg.kv_cache_dtype == "int8")
         out = self.wo(attn)
         out, _ = F.inkling2_short_conv(out,
                                        F.constant(self.attn_taps, "attn_taps"),
@@ -569,7 +570,9 @@ class Inkling2ForCausalLM(NetworkModule):
     def input_tensors(self) -> Dict[str, object]:
         cfg = self.cfg
         conv_channels = rc.conv_channels(cfg)
-        kv_dtype = trt.DataType.FP8 if cfg.kv_cache_dtype == "fp8" else trt.float16
+        kv_dtype = (trt.DataType.INT8 if cfg.kv_cache_dtype == "int8" else
+                    trt.DataType.FP8 if cfg.kv_cache_dtype == "fp8" else trt.float16)
+        kv_head_dim = cfg.layer_head_dim(0)  # 128, or 132 for INT8 rows (EDGELLM_INKLING_KV_INT8=1)
         result = {
             "inputs_embeds":
             self.add_input("inputs_embeds", trt.float16,
@@ -577,7 +580,7 @@ class Inkling2ForCausalLM(NetworkModule):
             "past_key_values": [
                 self.add_input(f"past_key_values_{i}", kv_dtype,
                                (2, -1, F.KV_PAGE_SIZE, cfg.num_key_value_heads,
-                                cfg.head_dim)) for i in range(self.visits)
+                                kv_head_dim)) for i in range(self.visits)
             ],
             "conv_states": [
                 self.add_input(f"conv_state_{i}", trt.float16,

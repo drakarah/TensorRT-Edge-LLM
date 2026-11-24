@@ -243,10 +243,55 @@ struct Result
 {
     std::vector<float> out; // [slots, nh * 128]
     Pool pool;
+    std::vector<int8_t> int8Bytes; // INT8 runs: the raw pool rows of 132 bytes
 };
 
 //! Runs the kernel for one step, updating the host pool image with the appended rows first (for the reference).
-Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false)
+//! INT8 KV row image: 128 values, the FP16 scale (absmax / 127, 1 for a zero row) and 2 pad bytes.
+constexpr int32_t kInt8Row = kHd + 4;
+
+std::vector<int8_t> int8PoolImage(std::vector<float> const& host)
+{
+    size_t const rows = host.size() / kHd;
+    std::vector<int8_t> bytes(rows * kInt8Row, 0);
+    for (size_t r = 0; r < rows; ++r)
+    {
+        float amax = 0.F;
+        for (int32_t x = 0; x < kHd; ++x)
+        {
+            amax = std::max(amax, std::fabs(host[r * kHd + x]));
+        }
+        half const sh = __float2half(amax > 0.F ? amax / 127.F : 1.F);
+        float const inv = 1.F / h2f(sh);
+        for (int32_t x = 0; x < kHd; ++x)
+        {
+            int32_t const q = std::max(-127, std::min(127, static_cast<int32_t>(std::lrintf(host[r * kHd + x] * inv))));
+            bytes[r * kInt8Row + x] = static_cast<int8_t>(q);
+        }
+        uint16_t const bits = __half_as_ushort(sh);
+        bytes[r * kInt8Row + kHd] = static_cast<int8_t>(bits & 0xFF);
+        bytes[r * kInt8Row + kHd + 1] = static_cast<int8_t>(bits >> 8);
+    }
+    return bytes;
+}
+
+std::vector<float> int8PoolDequant(std::vector<int8_t> const& bytes, size_t floats)
+{
+    size_t const rows = floats / kHd;
+    std::vector<float> out(floats);
+    for (size_t r = 0; r < rows; ++r)
+    {
+        uint16_t const bits = static_cast<uint16_t>(static_cast<uint8_t>(bytes[r * kInt8Row + kHd]) | (static_cast<uint8_t>(bytes[r * kInt8Row + kHd + 1]) << 8));
+        float const scale = h2f(__ushort_as_half(bits));
+        for (int32_t x = 0; x < kHd; ++x)
+        {
+            out[r * kHd + x] = static_cast<float>(bytes[r * kInt8Row + x]) * scale;
+        }
+    }
+    return out;
+}
+
+Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false, bool int8 = false)
 {
     int32_t const nTok = d.slots;
     half* dq = upload(toHalf(d.q));
@@ -261,7 +306,11 @@ Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false)
     // FP8 pools hold one byte per element (E4M3); the host image is rounded through it.
     std::vector<uint8_t> poolBytes;
     half* dpool = nullptr;
-    if (fp8)
+    if (int8)
+    {
+        dpool = reinterpret_cast<half*>(upload(int8PoolImage(pool.host)));
+    }
+    else if (fp8)
     {
         poolBytes.resize(pool.host.size());
         for (size_t i = 0; i < pool.host.size(); ++i)
@@ -303,6 +352,7 @@ Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false)
     p.window = c.window;
     p.maxPagesPerSeq = c.maxPages;
     p.kvFp8 = fp8 ? 1 : 0;
+    p.kvInt8 = int8 ? 1 : 0;
     p.scaling = c.scaling;
     p.logAlpha = c.alpha;
     p.logNFloor = c.nFloor;
@@ -324,7 +374,15 @@ Result run(Case const& c, Data const& d, Pool pool, bool fp8 = false)
         r.out[i] = h2f(hout[i]);
     }
     r.pool = pool;
-    if (fp8)
+    if (int8)
+    {
+        std::vector<int8_t> bytes(pool.host.size() / kHd * kInt8Row);
+        CUDA_CHECK(cudaMemcpy(bytes.data(), dpool, bytes.size(), cudaMemcpyDeviceToHost));
+        r.pool.host = int8PoolDequant(bytes, pool.host.size());
+        // the pad bytes of every row must stay zero where the kernel wrote the row
+        r.int8Bytes = bytes;
+    }
+    else if (fp8)
     {
         std::vector<uint8_t> bytes(pool.host.size());
         CUDA_CHECK(cudaMemcpy(bytes.data(), dpool, bytes.size(), cudaMemcpyDeviceToHost));
@@ -788,6 +846,135 @@ TEST(Inkling2Attention, Fp8KvSaturatesInsteadOfOverflowing)
     EXPECT_TRUE(sawMax);
 }
 
+
+//! Rounds every cached and new K/V row to the INT8 row grid (per-row FP16 scale), so an FP16 pool and an INT8 pool hold the same numbers (up to the FP16
+//! rounding of the scale, which re-quantising a grid value reproduces exactly).
+void roundKvToInt8(Data& d, Pool& pool, Case const& c)
+{
+    auto roundRows = [](std::vector<float>& v)
+    {
+        for (size_t r = 0; r < v.size() / kHd; ++r)
+        {
+            float amax = 0.F;
+            for (int32_t x = 0; x < kHd; ++x)
+            {
+                amax = std::max(amax, std::fabs(v[r * kHd + x]));
+            }
+            float const scale = h2f(__float2half(amax > 0.F ? amax / 127.F : 1.F));
+            for (int32_t x = 0; x < kHd; ++x)
+            {
+                int32_t const q = std::max(-127, std::min(127, static_cast<int32_t>(std::lrintf(v[r * kHd + x] / scale))));
+                v[r * kHd + x] = h2f(__float2half(static_cast<float>(q) * scale));
+            }
+        }
+    };
+    (void) c;
+    roundRows(d.k);
+    roundRows(d.v);
+    roundRows(pool.host);
+}
+
+void expectInt8MatchesFp16(Case const& c, Data& d, Pool pool)
+{
+    roundKvToInt8(d, pool, c);
+    Result ref = run(c, d, pool, false, false);
+    Result got = run(c, d, pool, false, true);
+    ASSERT_EQ(ref.out.size(), got.out.size());
+    for (size_t i = 0; i < ref.out.size(); ++i)
+    {
+        ASSERT_TRUE(std::isfinite(got.out[i]));
+        ASSERT_NEAR(got.out[i], ref.out[i], 3e-3F + 3e-3F * std::fabs(ref.out[i])) << "output element " << i;
+    }
+    // the appended rows are the INT8 image of the grid-aligned inputs (within the FP16 rounding of the scale); untouched rows keep their image
+    for (size_t i = 0; i < ref.pool.host.size(); ++i)
+    {
+        ASSERT_NEAR(got.pool.host[i], ref.pool.host[i], 2e-3F * std::fabs(ref.pool.host[i]) + 1e-3F) << "pool element " << i;
+    }
+    // every row written by the kernel has zero pad bytes behind its scale
+    for (size_t r = 0; r < got.int8Bytes.size() / kInt8Row; ++r)
+    {
+        ASSERT_EQ(got.int8Bytes[r * kInt8Row + kHd + 2], 0) << "pad byte of row " << r;
+        ASSERT_EQ(got.int8Bytes[r * kInt8Row + kHd + 3], 0) << "pad byte of row " << r;
+    }
+}
+
+TEST(Inkling2Attention, Int8KvPoolMatchesFp16OnTheSameGridValuesPrefill)
+{
+    Case c;
+    c.nh = 24;
+    c.nkv = 8;
+    c.maxPages = 3;
+    c.numPages = 8;
+    Data d = makeData(c, {0}, {150}, 0, 51);
+    expectInt8MatchesFp16(c, d, newPool(c));
+}
+
+TEST(Inkling2Attention, Int8KvPoolMatchesFp16DecodeWithHistoryAndWindow)
+{
+    Case c;
+    c.window = 100;
+    c.maxPages = 8;
+    c.numPages = 20;
+    Data d = makeData(c, {600}, {1}, 0, 53);
+    unmapLeadingPages(c, d, 3);
+    Pool pool = poolWithHistory(c, d, {600}, 54);
+    expectInt8MatchesFp16(c, d, pool);
+}
+
+TEST(Inkling2Attention, Int8KvPoolMultiRowStepsFullAttentionAndGroupedHeads)
+{
+    Case c;
+    c.nh = 24;
+    c.nkv = 8;
+    c.maxPages = 6;
+    c.numPages = 16;
+    Data d = makeData(c, {300}, {4}, 0, 55);
+    Pool pool = poolWithHistory(c, d, {300}, 56);
+    expectInt8MatchesFp16(c, d, pool);
+}
+
+TEST(Inkling2Attention, Int8KvZeroRowsAndHugeValuesStayFinite)
+{
+    Case c;
+    c.maxPages = 2;
+    c.numPages = 4;
+    Data d = makeData(c, {0}, {3}, 0, 57);
+    for (size_t i = 0; i < d.k.size(); ++i)
+    {
+        d.k[i] = (i / kHd) % 3 == 0 ? 0.F : 3000.F * (static_cast<int32_t>(i % 7) - 3);
+        d.v[i] = (i / kHd) % 2 == 0 ? 0.F : -2000.F;
+    }
+    Result got = run(c, d, newPool(c), false, true);
+    for (float v : got.out)
+    {
+        ASSERT_TRUE(std::isfinite(v));
+    }
+    for (float v : got.pool.host)
+    {
+        ASSERT_TRUE(std::isfinite(v));
+    }
+}
+
+TEST(Inkling2Attention, Int8KvErrorAgainstUnquantisedFp16IsSmall)
+{
+    // quantisation noise of INT8 rows on realistic (normal) K/V: the attention output stays within about 1.5% relative L2 of the FP16 pool
+    Case c;
+    c.nh = 24;
+    c.nkv = 8;
+    c.maxPages = 6;
+    c.numPages = 16;
+    Data d = makeData(c, {400}, {1}, 0, 59);
+    Pool pool = poolWithHistory(c, d, {400}, 60);
+    Result ref = run(c, d, pool, false, false);
+    Result got = run(c, d, pool, false, true);
+    double err = 0, norm = 0;
+    for (size_t i = 0; i < ref.out.size(); ++i)
+    {
+        err += double(got.out[i] - ref.out[i]) * (got.out[i] - ref.out[i]);
+        norm += double(ref.out[i]) * ref.out[i];
+    }
+    EXPECT_LT(std::sqrt(err / std::max(norm, 1e-12)), 0.015);
+}
 
 TEST(Inkling2Attention, GroupSizesAndKeySplits)
 {

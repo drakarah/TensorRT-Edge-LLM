@@ -176,6 +176,7 @@ def inkling2_attention(
     rel_clip: float,
     scaling: float,
     bounded: bool = False,
+    kv_int8: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Run one Inkling 2 attention visit and return output plus present KV.
 
@@ -197,4 +198,5 @@ def inkling2_attention(
                      log_n_floor=log_n_floor,
                      q_clip=q_clip,
                      rel_clip=rel_clip,
-                     scaling=scaling)
+                     scaling=scaling,
+                     **({"kv_int8": 1} if kv_int8 else {}))
