@@ -22,6 +22,8 @@ import numpy as np
 import tensorrt as trt
 
 from ..core import quantization, weight_policy
+from ..core.weights import LinearWeights
+from ..weight_packing import int4 as int4_pack
 from . import functional as F
 from .module import BuildContext, Module
 
@@ -122,6 +124,11 @@ class Linear(Module):
             fp8 = self._fp8_gemv(hidden_states)
             if fp8 is not None:
                 return fp8
+        if (quant_type == quantization.QUANT_FP16 and self._int4_gemv_enabled() and rank == 2 and self.cfg.tp_size == 1
+                and not self.has_adapter() and not self._uses_lora()):
+            int4 = self._int4_gemv(hidden_states, rank)
+            if int4 is not None:
+                return int4
         if (quant_type == quantization.QUANT_FP16 and self._int8_gemv_enabled() and rank == 2 and self.cfg.tp_size == 1
                 and not self.has_adapter() and not self._uses_lora()):
             int8 = self._int8_gemv(hidden_states)
@@ -171,6 +178,66 @@ class Linear(Module):
         if mode in ("attn", "attn+head") and "attn" in self.prefix:
             return True
         return mode == "attn+head" and "unembed" in self.prefix
+
+    def _int4_gemv_enabled(self) -> bool:
+        """EDGELLM_INT4_GEMV at build: like EDGELLM_INT8_GEMV but INT4 (group EDGELLM_INT4_GROUP, default 32, symmetric round-to-nearest with a
+        small clip search) on the legacy INT4 groupwise plugin (build with --int4-gemm-plugin-version 1). Takes precedence over INT8 for the
+        layers it selects, so "attn" with EDGELLM_INT8_GEMV=attn+head gives INT4 projections and an INT8 head."""
+        mode = os.environ.get("EDGELLM_INT4_GEMV", "")
+        if any(x and x in self.prefix for x in os.environ.get("EDGELLM_INT4_EXCLUDE", "").split(",")):
+            return False
+        if mode == "all":
+            return True
+        if mode in ("attn", "attn+head") and "attn" in self.prefix:
+            return True
+        return mode == "attn+head" and "unembed" in self.prefix
+
+    def _int4_gemv(self, hidden_states, rank):
+        descriptor = self.weights.linear(self.prefix, quantization.QUANT_FP16)
+        weight = descriptor.weight
+        group = int(os.environ.get("EDGELLM_INT4_GROUP", "32"))
+        if (descriptor.bias is not None or not isinstance(weight, np.ndarray) or weight.ndim != 2 or weight.dtype.kind not in "fV"
+                or weight.shape[0] % 4 != 0 or weight.shape[1] % 64 != 0 or weight.shape[1] % group != 0):
+            print(f"INT4 GEMV: {self.prefix} stays FP16/INT8 (bias {descriptor.bias is not None}, weight {type(weight).__name__} "
+                  f"{getattr(weight, 'dtype', None)} {getattr(weight, 'shape', None)})", flush=True)
+            return None
+        n, k = weight.shape
+        print(f"INT4 GEMV: {self.prefix} {weight.shape} -> int4 g{group}", flush=True)
+        gptq_dir = os.environ.get("EDGELLM_INT4_GPTQ_DIR", "")
+        if gptq_dir:  # GPTQ result of gptq_dense.py: nibbles [N, K] (value + 8) and fp16 scales [K / group, N]
+            blob = np.load(os.path.join(gptq_dir, self.prefix + ".npz"))
+            nibbles, scales = blob["nibbles"], blob["scales"].astype(np.float16)
+            if nibbles.shape != (n, k) or scales.shape != (k // group, n):
+                raise ValueError(f"{self.prefix}: GPTQ tensors {nibbles.shape} / {scales.shape} do not match {(n, k)} group {group}")
+            packed = int4_pack.pack_intweights(nibbles)
+            weights = LinearWeights(quantization.QUANT_INT4_GPTQ, packed, None, weight_scale=scales, group_size=group,
+                                    logical_out_features=n, logical_in_features=k)
+            return F.linear_from_weights(hidden_states, weights, rank, name=self.prefix)
+        nibbles = np.empty((n, k), np.uint8)
+        scales = np.empty((k // group, n), np.float16)
+        ratios = (1.0, 0.92, 0.85, 0.78)  # clip search: the scale is amax / (7.5 / ratio...) per group, best MSE wins
+        step = max(1, 4096 * 2304 // k)
+        for start in range(0, n, step):
+            block = weight[start:start + step].astype(np.float32).reshape(-1, k // group, group)
+            amax = np.maximum(np.abs(block).max(axis=2, keepdims=True), 1e-8)
+            best_err = None
+            for ratio in ratios:
+                scale = (amax * ratio / 7.5).astype(np.float16).astype(np.float32)
+                q = np.clip(np.rint(block / scale), -8, 7)
+                err = ((q * scale - block) ** 2).sum(axis=2, keepdims=True)
+                if best_err is None:
+                    best_err, best_q, best_s = err, q, scale
+                else:
+                    better = err < best_err
+                    best_err = np.where(better, err, best_err)
+                    best_q = np.where(better, q, best_q)
+                    best_s = np.where(better, scale, best_s)
+            nibbles[start:start + step] = (best_q + 8).astype(np.uint8).reshape(-1, k)
+            scales[:, start:start + step] = best_s[:, :, 0].T.astype(np.float16)
+        packed = int4_pack.pack_intweights(nibbles)
+        weights = LinearWeights(quantization.QUANT_INT4_GPTQ, packed, None, weight_scale=scales, group_size=group,
+                                logical_out_features=n, logical_in_features=k)
+        return F.linear_from_weights(hidden_states, weights, rank, name=self.prefix)
 
     def _int8_gemv(self, hidden_states):
         # the FP16 path externalizes dense weights (metadata only); INT8 needs the values to quantize, and bakes the result into the engine

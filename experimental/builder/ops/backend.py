@@ -66,6 +66,7 @@ _OPERATION_CREATORS = {
     "inkling2_attention": "Inkling2AttentionPlugin",
     "inkling2_block_residual": "Inkling2BlockResidualPlugin",
     "inkling2_message_gate": "Inkling2MessageGatePlugin",
+    "inkling2_hessian_tap": "Inkling2HessianTapPlugin",
     "inkling2_short_conv": "Inkling2ShortConvPlugin",
     "fp16_moe": "Fp16MoePlugin",
     "fp8_linear": "Fp8LinearPlugin",

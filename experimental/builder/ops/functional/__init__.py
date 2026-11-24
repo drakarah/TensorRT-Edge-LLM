@@ -41,7 +41,7 @@ from .fp8 import fp8_linear, int8_linear
 from .moe import (MoeActivation, MoeRouting, fp16_moe, int4_moe, nvfp4_a16_moe,
                   nvfp4_moe)
 from .recurrent import (causal_conv1d, gated_delta_net,
-                        inkling2_block_residual, inkling2_message_gate,
+                        inkling2_block_residual, inkling2_hessian_tap, inkling2_message_gate,
                         inkling2_short_conv,
                         update_ssm_state)
 from .speculative import (dflash2_grouped_dynamic_conv, hidden_state_feedback,
@@ -80,6 +80,7 @@ __all__ = [
     "gemma4_attention",
     "inkling2_attention",
     "inkling2_block_residual",
+    "inkling2_hessian_tap",
     "inkling2_message_gate",
     "inkling2_short_conv",
     "dflash2_grouped_dynamic_conv",

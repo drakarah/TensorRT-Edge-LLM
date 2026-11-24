@@ -233,3 +233,8 @@ def inkling2_message_gate(hidden: Tensor, message: Tensor, down: Tensor, forget:
     packed BF16 pairs (the checkpoint's BF16 layout, so no value changes).
     """
     return operation("inkling2_message_gate", [hidden, message, down, forget, gain], hidden=hidden_size, rank=rank, eps=eps)
+
+
+def inkling2_hessian_tap(x: Tensor, dim: int, slot: int) -> Tensor:
+    """Calibration identity: returns ``x`` ([tokens, dim] FP16) unchanged and, when EDGELLM_HESSIAN_DIR is set at run time, accumulates X^T X per ``slot``."""
+    return operation("inkling2_hessian_tap", [x], dim=dim, slot=slot)

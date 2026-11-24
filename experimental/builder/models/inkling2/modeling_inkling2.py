@@ -314,6 +314,10 @@ class Inkling2Layer(Module):
                   ragged: RaggedDecoderInputs):
         state_in = conv_state
         nh, nkv, hd = self.nh, self.nkv, self.hd
+        if os.environ.get("EDGELLM_INKLING_HESSIAN") == "1":  # calibration engine: GPTQ Hessians of the dense attention inputs (builder-time switch)
+            hq = F.inkling2_hessian_tap(hq, int(hq.shape[-1]), self.index * 4)
+            hk = F.inkling2_hessian_tap(hk, int(hk.shape[-1]), self.index * 4 + 1)
+            hv = F.inkling2_hessian_tap(hv, int(hv.shape[-1]), self.index * 4 + 2)
         q_lin = self.wq(hq)
         rel_lin = self.wr(hq)
         sink_lin = self.sink(hq)
@@ -355,6 +359,8 @@ class Inkling2Layer(Module):
             self.qk_clip, self.rel_clip, hd**-0.5,
             bounded=self.window > 0 and ragged.swa_kv_page_table is not None,
             kv_int8=self.cfg.kv_cache_dtype == "int8")
+        if os.environ.get("EDGELLM_INKLING_HESSIAN") == "1":
+            attn = F.inkling2_hessian_tap(attn, int(attn.shape[-1]), self.index * 4 + 3)
         out = self.wo(attn)
         out, _ = F.inkling2_short_conv(out,
                                        F.constant(self.attn_taps, "attn_taps"),
