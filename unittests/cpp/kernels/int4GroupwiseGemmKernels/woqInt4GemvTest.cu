@@ -137,3 +137,83 @@ TEST(WOQInt4GemvTest, accuracySmallNGemv)
         TestInt4GroupwiseGemvAccuracy(m, 32, 2560, 128);
     }
 }
+
+// Shapes of the tuned launch configuration (METRICS 196): N >= 1024 runs 128-thread blocks, M = 1 with N % 16 == 0 runs 4 rows per thread pair; small N keeps 256 threads.
+// The check is against a float64 CPU reference on the unpacked weights, with the error bounded relative to the output scale (the fp16 accumulation of the kernel is exact to about
+// 1e-3 of the output RMS; the fp16 naive GEMM of the tests above is not a usable reference once K reaches a few thousand).
+void TestInt4GemvAgainstDouble(int m, int n, int k)
+{
+    int const group_size = 128;
+    std::vector<half> input_arr(static_cast<size_t>(m) * k);
+    std::vector<int16_t> input_weights(static_cast<size_t>(k) * n);
+    std::vector<half> input_scales(static_cast<size_t>(k / group_size) * n);
+    uniformFloatInitialization(input_arr, -0.5f, 0.5f);
+    uniformIntInitialization(input_weights, -5, 5);
+    uniformFloatInitialization(input_scales, 0.2f, 0.5f);
+
+    std::vector<int16_t> Wpacked_Ndiv4xK((n / 4) * k);
+    awqPackReference(input_weights.data(), n, k, Wpacked_Ndiv4xK.data());
+
+    std::vector<double> ref(static_cast<size_t>(m) * n, 0.0);
+    double sumSq = 0.0;
+    for (int r = 0; r < m; ++r)
+    {
+        for (int c = 0; c < n; ++c)
+        {
+            double acc = 0.0;
+            for (int kk = 0; kk < k; ++kk)
+            {
+                acc += static_cast<double>(__half2float(input_arr[static_cast<size_t>(r) * k + kk]))
+                    * input_weights[static_cast<size_t>(kk) * n + c]
+                    * static_cast<double>(__half2float(input_scales[static_cast<size_t>(kk / group_size) * n + c]));
+            }
+            ref[static_cast<size_t>(r) * n + c] = acc;
+            sumSq += acc * acc;
+        }
+    }
+    double const rms = std::sqrt(sumSq / ref.size());
+
+    cudaStream_t stream{nullptr};
+    half *d_act, *d_scales, *d_out;
+    int8_t* d_weight;
+    CUDA_CHECK(cudaMalloc(&d_act, (size_t) m * k * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_weight, ((size_t) k * n / 2) * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc(&d_scales, (size_t) (k / group_size) * n * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_out, (size_t) m * n * sizeof(__half)));
+    CUDA_CHECK(cudaMemcpy(d_act, input_arr.data(), (size_t) m * k * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_weight, reinterpret_cast<int8_t const*>(Wpacked_Ndiv4xK.data()), ((size_t) k * n / 2), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scales, input_scales.data(), (size_t) (k / group_size) * n * sizeof(__half), cudaMemcpyHostToDevice));
+    trt_edgellm::kernel::gemv_forward_cuda_new(d_act, d_weight, d_scales, d_out, m, n, k, group_size, stream);
+    std::vector<half> gpu(static_cast<size_t>(m) * n);
+    CUDA_CHECK(cudaMemcpy(gpu.data(), d_out, gpu.size() * sizeof(__half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_act));
+    CUDA_CHECK(cudaFree(d_weight));
+    CUDA_CHECK(cudaFree(d_scales));
+    CUDA_CHECK(cudaFree(d_out));
+
+    double maxErr = 0.0, errSq = 0.0;
+    for (size_t i = 0; i < gpu.size(); ++i)
+    {
+        double const e = std::fabs(static_cast<double>(__half2float(gpu[i])) - ref[i]);
+        maxErr = std::max(maxErr, e);
+        errSq += e * e;
+    }
+    double const relRms = std::sqrt(errSq / gpu.size()) / rms;
+    std::printf("m=%d n=%d k=%d: output rms %.3f, max |err| %.4f (%.2e of rms), relative rms error %.2e\n", m, n, k, rms, maxErr, maxErr / rms, relRms);
+    EXPECT_LT(relRms, 3e-3) << "m=" << m << " n=" << n << " k=" << k;
+    EXPECT_LT(maxErr, 0.03 * rms) << "m=" << m << " n=" << n << " k=" << k;
+}
+
+// Inkling 2 attention projections (K = 2304 and 3072), Gemma-sized and Qwen-sized projections, M = 1..3 (M = 1 takes the 4-row path, M = 2 and 3 the 2-row path with 128 threads).
+// N must be a multiple of 32 here: the reference packing of the tests does not handle other N (the 24-row sink projection of Inkling 2 runs in the engine and is covered by the KL checks).
+TEST(WOQInt4GemvTest, accuracyTunedLaunchConfig)
+{
+    for (int m = 1; m <= 3; ++m)
+    {
+        TestInt4GemvAgainstDouble(m, 3072, 2304);
+        TestInt4GemvAgainstDouble(m, 2304, 3072);
+        TestInt4GemvAgainstDouble(m, 1024, 2304);
+        TestInt4GemvAgainstDouble(m, 2560, 2560);
+        TestInt4GemvAgainstDouble(m, 5120, 5120);
+    }
+}

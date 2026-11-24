@@ -41,6 +41,7 @@
 
 #include "common/checkMacros.h"
 #include "dequantize.cuh"
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <stdexcept>
 #include <string>
@@ -55,7 +56,7 @@ namespace kernel
 {
 
 // Reduce sum within the warp using the tree reduction algorithm.
-template <int Num, int WarpSize>
+template <int Num>
 __device__ __forceinline__ static void warp_reduce(half* psum, float (*out_smem)[Num * 4])
 {
     // kInterleave = 4
@@ -75,7 +76,7 @@ __device__ __forceinline__ static void warp_reduce(half* psum, float (*out_smem)
         fpsum[i] += __shfl_xor_sync(~0, fpsum[i], 1);
     }
     __syncthreads();
-    int warp = threadIdx.x / WarpSize, lane = threadIdx.x % WarpSize;
+    int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
     if (lane == 0 || lane == 2 || lane == 4 || lane == 6)
     {
 #pragma unroll
@@ -87,15 +88,15 @@ __device__ __forceinline__ static void warp_reduce(half* psum, float (*out_smem)
     __syncthreads();
 };
 
-__device__ __forceinline__ int make_divisible(int c, int divisor)
-{
-    return (c + divisor - 1) / divisor;
-}
-
-template <int NPerBlock, int Batch, int BlockSize, int GroupSize>
-__global__ void gemv_kernel(
+// The block size is a launch parameter (a multiple of 32, at most 1024): the per-row arithmetic does not depend on it except for how the K range is split over the
+// threads (fp16 partial sums per thread, fp32 across threads and warps), so 256 threads with 2 rows reproduces the original MIT-AWQ kernel bit for bit.
+// NPerBlock rows per thread pair (2 or 4): 4 keeps twice as many weight loads in flight per thread.
+template <int NPerBlock, int Batch>
+__global__ void __launch_bounds__(1024) gemv_kernel(
     half const* inputs, uint32_t const* weight, half const* scales, half* outputs, int const IC, int const OC)
 {
+    constexpr int GroupSize = 128;
+    int const BlockSize = blockDim.x;
     int const kStride = 64;
     int const kElemsPerThread = MEM_ACCESS_SIZE / 4;
     int const kThreadsNumPerTile = kStride / kElemsPerThread;
@@ -118,18 +119,15 @@ __global__ void gemv_kernel(
     for (int i = 0; i < Num; ++i)
         psum[i] = static_cast<half>(0.f);
 
-    // extern __shared__ uint8_t shmem[];
-    // float(*out_smem)[Num * kInterleave] = reinterpret_cast<float(*)[Num * kInterleave]>(shmem);
-    __shared__ float out_smem[BlockSize / WARP_SIZE * 2][Num * kInterleave];
+    __shared__ float out_smem[1024 / WARP_SIZE][Num * kInterleave];
 
     int const blk_row_offset = blockIdx.x * NPerBlock * kInterleave;
     int const thd_row_offset = (threadIdx.x / kThreadsNumPerTile) % kInterleave;
     int const act_k_offset = threadIdx.x / (kThreadsNumPerTile * kInterleave) * kStride
         + (threadIdx.x % kThreadsNumPerTile) * kElemsPerThread;
     int const group_offset = act_k_offset / GroupSize;
-    // TODO: use make_divisible
-    uint32_t const* blk_weight_ptr = weight + blk_row_offset * IC / PACK_FACTOR;
-    half const* scale_ptr = scales + blk_row_offset + thd_row_offset + group_offset * OC;
+    uint32_t const* blk_weight_ptr = weight + static_cast<size_t>(blk_row_offset) * IC / PACK_FACTOR;
+    half const* scale_ptr = scales + blk_row_offset + thd_row_offset + static_cast<size_t>(group_offset) * OC;
     half const* inputs_ptr = inputs + act_k_offset;
 
     int const act_forward_step = BlockSize * kElemsPerThread / kInterleave;
@@ -143,7 +141,8 @@ __global__ void gemv_kernel(
         for (int idx = 0; idx < NPerBlock; ++idx)
         {
             // use float4 to load weights, each thread load 32 int4 numbers (1 x float4, 128 bit)
-            *((float4*) (local_qweights)) = *((float4*) (blk_weight_ptr + (idx * kInterleave * IC + kk) / PACK_FACTOR));
+            *((float4*) (local_qweights))
+                = *((float4*) (blk_weight_ptr + (static_cast<size_t>(idx) * kInterleave * IC + kk) / PACK_FACTOR));
             local_scale[idx] = *(scale_ptr + idx * kInterleave);
 
 // Map int4 qweight to fp format
@@ -197,7 +196,7 @@ __global__ void gemv_kernel(
         scale_ptr += scale_forward_step;
     }
 
-    warp_reduce<Num, WARP_SIZE>(psum, out_smem);
+    warp_reduce<Num>(psum, out_smem);
 
     // Num * Interleave = batch * NPerBlock * Interleave -> 1 thread_block write back num
     for (int i = threadIdx.x; i < Num * kInterleave; i += BlockSize)
@@ -209,49 +208,63 @@ __global__ void gemv_kernel(
         {
             acc += out_smem[j][i];
         }
-        outputs[batch_idx * OC + blk_row_offset + oc_idx] = static_cast<half>(acc);
+        outputs[static_cast<size_t>(batch_idx) * OC + blk_row_offset + oc_idx] = static_cast<half>(acc);
     }
 }
 
+namespace
+{
+//! EDGELLM_INT4_GEMV_LEGACY=1 restores the original launch configuration (256 threads, 2 rows per thread pair) for every shape.
+bool legacyGemvConfig()
+{
+    static bool const legacy = []
+    {
+        char const* const value = std::getenv("EDGELLM_INT4_GEMV_LEGACY");
+        return value != nullptr && std::string(value) == "1";
+    }();
+    return legacy;
+}
+
+template <int NPerBlock, int Batch>
+void launchGemv(half const* in_feats, uint32_t const* weights, half const* scaling_factors, half* out_feats, int n, int k,
+    int block, cudaStream_t stream)
+{
+    static constexpr int K_INTERLEAVE = 4;
+    gemv_kernel<NPerBlock, Batch><<<n / NPerBlock / K_INTERLEAVE, block, 0, stream>>>(
+        in_feats, weights, scaling_factors, out_feats, k, n);
+}
+} // namespace
+
+//! Launch configuration (measured on the Orin, METRICS 196, 11 shapes of Inkling 2, Qwen3.8 and Gemma 4 at M = 1 and 3): blocks of 128 threads beat 256 for every
+//! shape with N >= 1024 (3-18%), and 4 rows per thread pair help at M = 1 when N is a multiple of 16; small N (a router or sink projection) stays on the original
+//! configuration, which is already at the launch-latency floor.
 void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
     half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
 {
     auto kernel = reinterpret_cast<uint32_t const*>(weights_device);
-    static constexpr int N_PER_BLOCK = 2;
-    static constexpr int K_INTERLEAVE = 4;
-    static constexpr int BLOCK_SIZE = 256;
-
-    dim3 num_blocks(n / N_PER_BLOCK / K_INTERLEAVE);
-    dim3 num_threads(BLOCK_SIZE);
-
     ELLM_CHECK(group_size == 128,
         "Unsupported group size " + std::to_string(group_size) + " for gemv kernel; only 128 is supported.");
+
+    bool const tuned = !legacyGemvConfig() && n >= 1024;
+    int const block = tuned ? 128 : 256;
+    bool const fourRows = tuned && m == 1 && n % 16 == 0;
     switch (m)
     {
     case 1:
-        gemv_kernel<N_PER_BLOCK, 1, BLOCK_SIZE, 128>
-            <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+        if (fourRows)
+        {
+            launchGemv<4, 1>(in_feats, kernel, scaling_factors, out_feats, n, k, block, stream);
+        }
+        else
+        {
+            launchGemv<2, 1>(in_feats, kernel, scaling_factors, out_feats, n, k, block, stream);
+        }
         break;
-    case 2:
-        gemv_kernel<N_PER_BLOCK, 2, BLOCK_SIZE, 128>
-            <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
-        break;
-    case 3:
-        gemv_kernel<N_PER_BLOCK, 3, BLOCK_SIZE, 128>
-            <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
-        break;
-    case 4:
-        gemv_kernel<N_PER_BLOCK, 4, BLOCK_SIZE, 128>
-            <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
-        break;
-    case 5:
-        gemv_kernel<N_PER_BLOCK, 5, BLOCK_SIZE, 128>
-            <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
-        break;
-    case 6:
-        gemv_kernel<N_PER_BLOCK, 6, BLOCK_SIZE, 128>
-            <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
-        break;
+    case 2: launchGemv<2, 2>(in_feats, kernel, scaling_factors, out_feats, n, k, block, stream); break;
+    case 3: launchGemv<2, 3>(in_feats, kernel, scaling_factors, out_feats, n, k, block, stream); break;
+    case 4: launchGemv<2, 4>(in_feats, kernel, scaling_factors, out_feats, n, k, block, stream); break;
+    case 5: launchGemv<2, 5>(in_feats, kernel, scaling_factors, out_feats, n, k, block, stream); break;
+    case 6: launchGemv<2, 6>(in_feats, kernel, scaling_factors, out_feats, n, k, block, stream); break;
     default: throw std::runtime_error("Unsupported batch size for gemv kernel.\n");
     }
 }

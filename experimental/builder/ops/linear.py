@@ -181,7 +181,8 @@ class Linear(Module):
 
     def _int4_gemv_enabled(self) -> bool:
         """EDGELLM_INT4_GEMV at build: like EDGELLM_INT8_GEMV but INT4 (group EDGELLM_INT4_GROUP, default 32, symmetric round-to-nearest with a
-        small clip search) on the legacy INT4 groupwise plugin (build with --int4-gemm-plugin-version 1). Takes precedence over INT8 for the
+        small clip search, or GPTQ tensors from EDGELLM_INT4_GPTQ_DIR) on the INT4 groupwise plugin of the build's --int4-gemm-plugin-version (1: legacy AWQ GEMV,
+        group 128 only; 2, the builder default: CuTe DSL GEMV and GEMM). Takes precedence over INT8 for the
         layers it selects, so "attn" with EDGELLM_INT8_GEMV=attn+head gives INT4 projections and an INT8 head."""
         mode = os.environ.get("EDGELLM_INT4_GEMV", "")
         if any(x and x in self.prefix for x in os.environ.get("EDGELLM_INT4_EXCLUDE", "").split(",")):
@@ -209,7 +210,7 @@ class Linear(Module):
             nibbles, scales = blob["nibbles"], blob["scales"].astype(np.float16)
             if nibbles.shape != (n, k) or scales.shape != (k // group, n):
                 raise ValueError(f"{self.prefix}: GPTQ tensors {nibbles.shape} / {scales.shape} do not match {(n, k)} group {group}")
-            packed = int4_pack.pack_intweights(nibbles)
+            packed = int4_pack._pack_for_gemm(nibbles, self.weights.int4_gemm_plugin_version)
             weights = LinearWeights(quantization.QUANT_INT4_GPTQ, packed, None, weight_scale=scales, group_size=group,
                                     logical_out_features=n, logical_in_features=k)
             return F.linear_from_weights(hidden_states, weights, rank, name=self.prefix)
@@ -234,7 +235,7 @@ class Linear(Module):
                     best_s = np.where(better, scale, best_s)
             nibbles[start:start + step] = (best_q + 8).astype(np.uint8).reshape(-1, k)
             scales[:, start:start + step] = best_s[:, :, 0].T.astype(np.float16)
-        packed = int4_pack.pack_intweights(nibbles)
+        packed = int4_pack._pack_for_gemm(nibbles, self.weights.int4_gemm_plugin_version)
         weights = LinearWeights(quantization.QUANT_INT4_GPTQ, packed, None, weight_scale=scales, group_size=group,
                                 logical_out_features=n, logical_in_features=k)
         return F.linear_from_weights(hidden_states, weights, rank, name=self.prefix)

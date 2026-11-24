@@ -87,6 +87,38 @@ def pack_intweights(unpacked: np.ndarray) -> np.ndarray:
 
 
 def pack_cutedsl_fragment(unpacked: np.ndarray) -> np.ndarray:
+    """Pack biased nibbles for ``Int4GroupwiseGemmPluginV2`` (vectorised; identical output to ``_pack_cutedsl_fragment_loops``).
+
+    The V2 plugin consumes an INT8 view of fragment-ordered uint32 words with
+    shape ``[ceil(N/128) * ceil(K/64) * 8, 512]``. N is padded to 128 with
+    nibble 8 (quantized zero); K must already be 64-aligned.
+    """
+    n_dim, k_dim = unpacked.shape
+    if k_dim % 64:
+        raise ValueError(
+            f"INT4 V2 fragment packing requires K%64=0, got {(n_dim, k_dim)}")
+    n_blocks = (n_dim + 127) // 128
+    k_tiles = k_dim // 64
+    padded = np.full((n_blocks * 128, k_dim), 8, dtype=np.uint8)
+    padded[:n_dim] = np.asarray(unpacked, dtype=np.uint8) & np.uint8(0xF)
+    thread = np.arange(128)
+    fragment = np.arange(8)
+    k_block, n_pair = fragment // 2, fragment % 2
+    # coordinates of the eight nibbles of one word, per (fragment, thread): rows n_lo / n_hi, columns k0 + {0, 8, 1, 9}
+    n_lo = (thread[None, :] // 4) + 64 * n_pair[:, None]  # [8, 128], relative to the N block
+    k0 = 16 * k_block[:, None] + 2 * (thread[None, :] % 4)  # [8, 128], relative to the K tile
+    rows = [n_lo, n_lo, n_lo + 32, n_lo + 32, n_lo, n_lo, n_lo + 32, n_lo + 32]
+    cols = [k0, k0 + 8, k0, k0 + 8, k0 + 1, k0 + 9, k0 + 1, k0 + 9]
+    words = np.zeros((n_blocks, k_tiles, 8, 128), dtype=np.uint32)
+    for n_block in range(n_blocks):
+        block = padded[n_block * 128:(n_block + 1) * 128].reshape(128, k_tiles, 64)  # [n, k_tile, k]
+        for shift, (r, c) in enumerate(zip(rows, cols)):
+            # block[r, :, c] has shape [8, 128, k_tiles]; the words are laid out [k_tile, fragment, thread]
+            words[n_block] |= np.moveaxis(block[r, :, c], 2, 0).astype(np.uint32) << np.uint32(4 * shift)
+    return np.ascontiguousarray(words.reshape(n_blocks * k_tiles * 8, 128)).view(np.int8).reshape(-1, 512)
+
+
+def _pack_cutedsl_fragment_loops(unpacked: np.ndarray) -> np.ndarray:
     """Pack biased nibbles for ``Int4GroupwiseGemmPluginV2``.
 
     The V2 plugin consumes an INT8 view of fragment-ordered uint32 words with

@@ -170,6 +170,7 @@ edgellm_add_unit_test(NAME unitTestKernelsInkling2MessageGate DIRS
                       cpp/kernels/inkling2MessageGate)
 
 edgellm_add_unit_test(NAME unitTestKernelsFp8Linear DIRS cpp/kernels/fp8Linear)
+edgellm_add_unit_test(NAME unitTestKernelsInt4Gemv DIRS cpp/kernels/int4GroupwiseGemmKernels)
 
 # CuTe DSL AOT wrappers lower extended launches through the runtime's
 # _cudaLaunchKernelEx entry point. Intercept it only when MoE grouped-GEMM
