@@ -63,6 +63,15 @@ __device__ __forceinline__ uint32_t e4m3x2ToFloat16x2Times128(uint16_t const raw
         = __hmul2(*reinterpret_cast<half2 const*>(&converted), *reinterpret_cast<half2 const*>(&kTIMES_128_SCALE));
     return *reinterpret_cast<uint32_t const*>(&result);
 #else
+    // Branch-free path for normal E4M3 values (exponent field != 0) on both halves at once:
+    // fp16 bits = sign | ((raw & 0x7F) << 7) + (15 << 10). Zero and subnormal scales take the exact scalar path.
+    uint32_t const x = (static_cast<uint32_t>(raw) & 0xFFU) | ((static_cast<uint32_t>(raw) & 0xFF00U) << 8);
+    uint32_t const expLow = x & 0x00780000U;
+    uint32_t const expLo = x & 0x00000078U;
+    if (expLow != 0U && expLo != 0U)
+    {
+        return (((x & 0x007F007FU) << 7) + 0x3C003C00U) | ((x & 0x00800080U) << 8);
+    }
     uint32_t const low = static_cast<uint32_t>(e4m3ToFloat16Times128(raw & 0xFFU));
     uint32_t const high = static_cast<uint32_t>(e4m3ToFloat16Times128((raw >> 8) & 0xFFU));
     return low | (high << 16);

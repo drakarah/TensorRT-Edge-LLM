@@ -50,6 +50,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 // Simple check macros - no framework dependencies
@@ -580,6 +581,24 @@ void marlin_mm(void const* A, void const* B, void* C, void* C_tmp, void* b_bias,
             thread_m_blocks, m_block_size_8, num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float,
             is_a_8bit, stages, max_shared_mem, sms);
         thread_tfg = exec_cfg.tb_cfg;
+        if (thread_m_blocks == 1)
+        {
+            // Experiment hooks (Orin tuning): EDGELLM_MARLIN_TK / _TN force the thread tile, _BPS the blocks per SM.
+            char const* etk = std::getenv("EDGELLM_MARLIN_TK");
+            char const* etn = std::getenv("EDGELLM_MARLIN_TN");
+            char const* ebps = std::getenv("EDGELLM_MARLIN_BPS");
+            if (etk != nullptr && etn != nullptr)
+            {
+                int const k = std::atoi(etk);
+                int const n = std::atoi(etn);
+                thread_tfg = thread_config_t{k, n, k * n / 64};
+                exec_cfg.tb_cfg = thread_tfg;
+            }
+            if (ebps != nullptr)
+            {
+                exec_cfg.blocks_per_sm = std::max(1, std::atoi(ebps));
+            }
+        }
     }
 
     int num_threads = thread_tfg.num_threads;
