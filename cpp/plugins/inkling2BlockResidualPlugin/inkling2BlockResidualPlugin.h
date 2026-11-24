@@ -36,9 +36,10 @@ class Inkling2BlockResidualPlugin : public nvinfer1::IPluginV3,
 {
 public:
     Inkling2BlockResidualPlugin(
-        std::string const& name, int32_t hidden, int32_t numStates, int32_t numQueries, float eps);
+        std::string const& name, int32_t hidden, int32_t numStates, int32_t numQueries, float eps, int32_t tap = -1);
 
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
+    ~Inkling2BlockResidualPlugin() noexcept override;
     nvinfer1::IPluginV3* clone() noexcept override;
 
     char const* getPluginName() const noexcept override;
@@ -72,6 +73,7 @@ private:
     int32_t mNumStates;
     int32_t mNumQueries;
     float mEps;
+    int32_t mTap{-1}; //!< debug capture slot (EDGELLM_TAP_TRACE): 0-2 the last state input, 3 the last state input and the output; -1 off
     std::vector<nvinfer1::PluginField> mData;
     nvinfer1::PluginFieldCollection mFields{};
 };

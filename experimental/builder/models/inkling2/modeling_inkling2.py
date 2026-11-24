@@ -40,6 +40,9 @@ _EPS = 1e-6
 _FUSED_RESIDUAL = os.environ.get("EDGELLM_INKLING_FUSED_RESIDUAL") == "1"
 # EDGELLM_INKLING_FUSED_GATE=1 at build: the message gates of the looped passes run as one plugin (BF16 weights, FP32 activations) instead of three TF32 matmuls
 _FUSED_GATE = os.environ.get("EDGELLM_INKLING_FUSED_GATE") == "1"
+# EDGELLM_INKLING_TAPS=1 at build: the block-residual plugins that see the stream entering visits 5, 23, 41 and the final mix carry a debug capture slot (drafter study)
+_TAPS = os.environ.get("EDGELLM_INKLING_TAPS") == "1"
+_TAP_VISITS = {5: 0, 23: 1, 41: 2}
 
 
 def _f32(weights, name: str) -> np.ndarray:
@@ -138,14 +141,14 @@ def _matmul_const(x, weight_kn: np.ndarray, name: str):
         F.constant(np.ascontiguousarray(weight_kn, np.float32), name))
 
 
-def block_attention_residual(states: List, queries: np.ndarray, hidden: int):
+def block_attention_residual(states: List, queries: np.ndarray, hidden: int, tap: int = -1):
     """Softmax-weighted mix of the (normalized) block states, one output row per query; returns a list of [T, H] tensors."""
     if _FUSED_RESIDUAL and len(states) <= 8:
         q_rows = np.ascontiguousarray(queries.reshape(-1, hidden),
                                       dtype=np.float32)
         return F.inkling2_block_residual(states,
                                          F.constant(q_rows, "attn_res_q"),
-                                         q_rows.shape[0], hidden, _EPS)
+                                         q_rows.shape[0], hidden, _EPS, tap)
     stacked = F.concatenate([s.reshape([-1, 1, hidden]) for s in states],
                             dim=1)
     normed = rms_unweighted(stacked)
@@ -485,6 +488,9 @@ class Inkling2Layer(Module):
             2 * self.nkv * self.hd + self.hidden)
         return out.cast(trt.float32), conv_state
 
+    def _tap(self) -> int:
+        return _TAP_VISITS.get(getattr(self, "visit", -1), -1) if _TAPS else -1
+
     def forward(self, h, bs, messages, past_kv, conv_state, ragged):
         hidden = self.hidden
         residual_in = h
@@ -495,7 +501,7 @@ class Inkling2Layer(Module):
             else:
                 qi, ki, vi = block_attention_residual(bs + [h],
                                                       self.attn_input_query,
-                                                      hidden)
+                                                      hidden, self._tap())
             if messages is not None:
                 qi, ki, vi = (gates["attn"](qi, messages[0]),
                               gates["k"](ki,
@@ -506,7 +512,7 @@ class Inkling2Layer(Module):
             hv = rms_weighted(vi, self.v_norm, self.eps).cast(trt.float16)
         else:
             x = h if self.attn_input_query is None else block_attention_residual(
-                bs + [h], self.attn_input_query, hidden)[0]
+                bs + [h], self.attn_input_query, hidden, self._tap())[0]
             if messages is None:
                 hq = hk = hv = rms_weighted(x, self.in_norm,
                                             self.eps).cast(trt.float16)
@@ -618,6 +624,7 @@ class Inkling2ForCausalLM(NetworkModule):
             v = visit[0]
             visit[0] += 1
             layer = self.layers[l]
+            layer.visit = v
             if prefetch:
                 layer.prefetch_next_w = (self.layers[order[v + 1]].router_w
                                          if v + 1 < len(order) else None)
@@ -651,7 +658,7 @@ class Inkling2ForCausalLM(NetworkModule):
                 h, bs = run_layer(l, h, bs, messages)
         for l in range(self.core_end, self.num_layers):
             h, bs = run_layer(l, h, bs, None)
-        final = block_attention_residual(bs + [h], self.final_query, hidden)[0]
+        final = block_attention_residual(bs + [h], self.final_query, hidden, 3 if _TAPS else -1)[0]
         normed = rms_weighted(final, self.norm).cast(trt.float16)
         selected = F.gather_token_rows(normed, ragged.logits_indices)
         logits = self.lm_head(selected).cast(trt.float32)

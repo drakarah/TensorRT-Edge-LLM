@@ -209,7 +209,7 @@ def inkling2_short_conv(
 
 def inkling2_block_residual(states: List[Tensor], queries: Tensor,
                             num_queries: int, hidden: int,
-                            eps: float) -> List[Tensor]:
+                            eps: float, tap: int = -1) -> List[Tensor]:
     """Softmax-weighted mix of the RMS-normalised block states for every query row.
 
     ``states`` are [tokens, hidden] FP32 tensors, ``queries`` is [num_queries, hidden] FP32; returns one
@@ -221,7 +221,8 @@ def inkling2_block_residual(states: List[Tensor], queries: Tensor,
                         hidden=hidden,
                         num_states=len(states),
                         num_queries=num_queries,
-                        eps=eps)
+                        eps=eps,
+                        **({"tap": tap} if tap >= 0 else {}))
     return [outputs] if isinstance(outputs, Tensor) else list(outputs)
 
 

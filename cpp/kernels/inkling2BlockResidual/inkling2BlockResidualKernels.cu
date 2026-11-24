@@ -505,5 +505,48 @@ void launchInkling2BlockResidual(Inkling2BlockResidualParams const& params, floa
     blockResidualKernel<<<static_cast<unsigned int>(params.numTokens), kThreads, 0, stream>>>(params, queries);
 }
 
+namespace
+{
+//! Debug capture (EDGELLM_TAP_TRACE): copies `rows` rows of `hidden` floats to dst at the device-side row counter, then a second kernel advances the counter and logs the step size.
+__global__ void tapCopyKernel(float const* src, float* dst, int32_t const* counter, int32_t hidden, int32_t capacityRows)
+{
+    int64_t const row = blockIdx.x;
+    int64_t const at = static_cast<int64_t>(counter[0]) + row;
+    if (at >= capacityRows)
+    {
+        return;
+    }
+    for (int32_t i = threadIdx.x; i < hidden; i += blockDim.x)
+    {
+        dst[at * hidden + i] = src[row * hidden + i];
+    }
+}
+
+__global__ void tapAdvanceKernel(int32_t* counter, int32_t* stepLog, int32_t* stepCounter, int32_t rows, int32_t capacityRows, int32_t capacitySteps)
+{
+    if (stepLog != nullptr)
+    {
+        int32_t const step = stepCounter[0];
+        if (step < capacitySteps)
+        {
+            stepLog[step] = rows;
+        }
+        stepCounter[0] = step + 1;
+    }
+    counter[0] = min(counter[0] + rows, capacityRows);
+}
+} // namespace
+
+void launchTapCapture(float const* src, int64_t rows, int32_t hidden, float* dst, int32_t* counter, int32_t capacityRows, int32_t* stepLog, int32_t* stepCounter,
+    int32_t capacitySteps, cudaStream_t stream)
+{
+    if (rows <= 0)
+    {
+        return;
+    }
+    tapCopyKernel<<<static_cast<unsigned int>(rows), 256, 0, stream>>>(src, dst, counter, hidden, capacityRows);
+    tapAdvanceKernel<<<1, 1, 0, stream>>>(counter, stepLog, stepCounter, static_cast<int32_t>(rows), capacityRows, capacitySteps);
+}
+
 } // namespace kernel
 } // namespace trt_edgellm

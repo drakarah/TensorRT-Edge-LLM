@@ -50,6 +50,10 @@ void launchInkling2BlockResidual(
 
 constexpr int32_t kInkling2ResidualSplit = 8;
 
+//! Debug capture of a [rows, hidden] tensor into a device ring (rows appended at the device-side counter; the step size is logged when stepLog is not null).
+void launchTapCapture(float const* src, int64_t rows, int32_t hidden, float* dst, int32_t* counter, int32_t capacityRows, int32_t* stepLog, int32_t* stepCounter,
+    int32_t capacitySteps, cudaStream_t stream);
+
 size_t inkling2BlockResidualWorkspaceBytes(int64_t numTokens);
 
 } // namespace kernel

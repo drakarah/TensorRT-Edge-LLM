@@ -18,8 +18,13 @@
 #include "common/logger.h"
 #include "kernels/inkling2BlockResidual/inkling2BlockResidualKernels.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 #include <exception>
 #include <map>
 #include <mutex>
@@ -38,17 +43,96 @@ bool linearFloat(PluginTensorDesc const& d, int32_t rank)
 {
     return d.type == DataType::kFLOAT && d.format == PluginFormat::kLINEAR && d.dims.nbDims == rank;
 }
+
+//! EDGELLM_TAP_TRACE=<prefix>: planes captured by plugins with a tap >= 0 (5 slots: the stream entering three visits, after the last visit, and the final mixed output), written as
+//! <prefix>.slot<k>.f32 (float32 [rows, hidden]) and <prefix>.steps.i32 (rows of every step) when a plugin is destroyed. Debug only (drafter acceptance study).
+struct TapTrace
+{
+    static constexpr int32_t kSlots = 5;
+    static constexpr int32_t kCapacityRows = 20000;
+    static constexpr int32_t kCapacitySteps = 20000;
+    float* rows[kSlots]{};
+    int32_t* counter[kSlots]{};
+    int32_t* stepLog{nullptr};
+    int32_t* stepCounter{nullptr};
+    int32_t hidden{0};
+    std::string prefix;
+};
+
+TapTrace& tapTrace(int32_t hidden)
+{
+    static TapTrace trace = [hidden]
+    {
+        TapTrace t;
+        char const* const value = std::getenv("EDGELLM_TAP_TRACE");
+        if (value != nullptr && value[0] != '\0')
+        {
+            t.prefix = value;
+            t.hidden = hidden;
+            for (int32_t i = 0; i < TapTrace::kSlots; ++i)
+            {
+                cudaMalloc(&t.rows[i], static_cast<size_t>(TapTrace::kCapacityRows) * hidden * 4);
+                cudaMalloc(&t.counter[i], 4);
+                cudaMemset(t.counter[i], 0, 4);
+            }
+            cudaMalloc(&t.stepLog, TapTrace::kCapacitySteps * 4);
+            cudaMalloc(&t.stepCounter, 4);
+            cudaMemset(t.stepCounter, 0, 4);
+        }
+        return t;
+    }();
+    return trace;
+}
+
+void dumpTapTrace()
+{
+    TapTrace& t = tapTrace(0);
+    static int32_t lastSteps = -1;
+    if (t.stepLog == nullptr)
+    {
+        return;
+    }
+    cudaDeviceSynchronize();
+    int32_t steps = 0;
+    if (cudaMemcpy(&steps, t.stepCounter, 4, cudaMemcpyDeviceToHost) != cudaSuccess || steps == lastSteps)
+    {
+        return;
+    }
+    lastSteps = steps;
+    steps = std::min(steps, TapTrace::kCapacitySteps);
+    std::vector<int32_t> log(steps);
+    cudaMemcpy(log.data(), t.stepLog, steps * 4, cudaMemcpyDeviceToHost);
+    if (FILE* f = std::fopen((t.prefix + ".steps.i32").c_str(), "wb"))
+    {
+        std::fwrite(log.data(), 4, log.size(), f);
+        std::fclose(f);
+    }
+    for (int32_t slot = 0; slot < TapTrace::kSlots; ++slot)
+    {
+        int32_t rows = 0;
+        cudaMemcpy(&rows, t.counter[slot], 4, cudaMemcpyDeviceToHost);
+        std::vector<float> host(static_cast<size_t>(rows) * t.hidden);
+        cudaMemcpy(host.data(), t.rows[slot], host.size() * 4, cudaMemcpyDeviceToHost);
+        if (FILE* f = std::fopen((t.prefix + ".slot" + std::to_string(slot) + ".f32").c_str(), "wb"))
+        {
+            std::fwrite(host.data(), 4, host.size(), f);
+            std::fclose(f);
+        }
+    }
+}
+
 } // namespace
 
 REGISTER_TENSORRT_PLUGIN(Inkling2BlockResidualPluginCreator);
 
 Inkling2BlockResidualPlugin::Inkling2BlockResidualPlugin(
-    std::string const& name, int32_t hidden, int32_t numStates, int32_t numQueries, float eps)
+    std::string const& name, int32_t hidden, int32_t numStates, int32_t numQueries, float eps, int32_t tap)
     : mLayerName(name)
     , mHidden(hidden)
     , mNumStates(numStates)
     , mNumQueries(numQueries)
     , mEps(eps)
+    , mTap(tap)
 {
     if (hidden <= 0 || hidden > kernel::kInkling2MaxResidualHidden || numStates < 1 || numStates > kernel::kInkling2MaxResidualStates || numQueries < 1
         || numQueries > kernel::kInkling2MaxResidualQueries)
@@ -59,6 +143,18 @@ Inkling2BlockResidualPlugin::Inkling2BlockResidualPlugin(
     if (!std::isfinite(eps) || eps <= 0.F)
     {
         throw std::invalid_argument("Inkling2BlockResidualPlugin: eps must be finite and positive");
+    }
+    if (tap >= 0)
+    {
+        tapTrace(hidden); // allocate the capture buffers at load time (not inside a CUDA graph capture)
+    }
+}
+
+Inkling2BlockResidualPlugin::~Inkling2BlockResidualPlugin() noexcept
+{
+    if (mTap >= 0)
+    {
+        dumpTapTrace();
     }
 }
 
@@ -79,7 +175,7 @@ IPluginV3* Inkling2BlockResidualPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Inkling2BlockResidualPlugin(mLayerName, mHidden, mNumStates, mNumQueries, mEps);
+        auto* plugin = new Inkling2BlockResidualPlugin(mLayerName, mHidden, mNumStates, mNumQueries, mEps, mTap);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -223,6 +319,22 @@ int32_t Inkling2BlockResidualPlugin::enqueue(PluginTensorDesc const* inputDesc, 
     }
     bool const haveWorkspace = params.numTokens > 0 && params.numTokens <= 65535;
     kernel::launchInkling2BlockResidual(params, static_cast<float const*>(inputs[mNumStates]), stream, haveWorkspace ? workspace : nullptr);
+    if (mTap >= 0)
+    {
+        TapTrace& t = tapTrace(mHidden);
+        if (t.stepLog != nullptr)
+        {
+            int64_t const rows = params.numTokens;
+            // slots 0-2: the stream entering the tapped visit (the last state input); slot 3: the stream after the last visit, slot 4: the final mixed output
+            int32_t const inSlot = mTap;
+            kernel::launchTapCapture(static_cast<float const*>(inputs[mNumStates - 1]), rows, mHidden, t.rows[inSlot], t.counter[inSlot], TapTrace::kCapacityRows,
+                inSlot == 0 ? t.stepLog : nullptr, inSlot == 0 ? t.stepCounter : nullptr, TapTrace::kCapacitySteps, stream);
+            if (mTap == 3)
+            {
+                kernel::launchTapCapture(static_cast<float const*>(outputs[0]), rows, mHidden, t.rows[4], t.counter[4], TapTrace::kCapacityRows, nullptr, nullptr, 0, stream);
+            }
+        }
+    }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -244,6 +356,7 @@ PluginFieldCollection const* Inkling2BlockResidualPlugin::getFieldsToSerialize()
     mData.emplace_back("num_states", &mNumStates, PluginFieldType::kINT32, 1);
     mData.emplace_back("num_queries", &mNumQueries, PluginFieldType::kINT32, 1);
     mData.emplace_back("eps", &mEps, PluginFieldType::kFLOAT32, 1);
+    mData.emplace_back("tap", &mTap, PluginFieldType::kINT32, 1);
     mFields.nbFields = static_cast<int32_t>(mData.size());
     mFields.fields = mData.data();
     return &mFields;
@@ -261,6 +374,7 @@ Inkling2BlockResidualPluginCreator::Inkling2BlockResidualPluginCreator()
         mAttributes.emplace_back(name, nullptr, PluginFieldType::kINT32, 1);
     }
     mAttributes.emplace_back("eps", nullptr, PluginFieldType::kFLOAT32, 1);
+    mAttributes.emplace_back("tap", nullptr, PluginFieldType::kINT32, 1);
     mFields.nbFields = static_cast<int32_t>(mAttributes.size());
     mFields.fields = mAttributes.data();
 }
@@ -310,7 +424,8 @@ IPluginV3* Inkling2BlockResidualPluginCreator::createPlugin(
                 throw std::invalid_argument("Inkling2BlockResidualPlugin: attributes must be unique named scalars");
             }
         }
-        if (byName.size() != 4)
+        // tap is optional (absent in engines built before the capture option)
+        if (byName.size() != (byName.count("tap") != 0 ? 5 : 4))
         {
             throw std::invalid_argument("Inkling2BlockResidualPlugin: unknown or missing attributes");
         }
@@ -327,8 +442,9 @@ IPluginV3* Inkling2BlockResidualPluginCreator::createPlugin(
         {
             throw std::invalid_argument("Inkling2BlockResidualPlugin: missing FLOAT32 attribute eps");
         }
+        int32_t const tap = byName.count("tap") != 0 ? intField("tap") : -1;
         auto* plugin = new Inkling2BlockResidualPlugin(name, intField("hidden"), intField("num_states"),
-            intField("num_queries"), *static_cast<float const*>(epsIt->second->data));
+            intField("num_queries"), *static_cast<float const*>(epsIt->second->data), tap);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
