@@ -173,6 +173,71 @@ size_t stagedExpertBytes(nvinfer1::Dims const* const dims[4], nvinfer1::DataType
 //! private pair instead of the TRT workspace, so the pair replaces the workspace head (net cost: one layer of INT4 experts, ~386 MB for the 26B).
 constexpr int32_t kPrefetchMinTokens = 128;
 
+//! EDGELLM_MOE_TRACE=<file>: the fused routing kernel appends the 8 routed experts of every decode step (one row per layer visit, in call order) to a device
+//! buffer that is written to <file> at exit (int32 [rows, 8]); analysis tool for expert unions across consecutive tokens. Debug only.
+struct RouteTrace
+{
+    int32_t* rows{nullptr};
+    int32_t* counter{nullptr};
+    int32_t capacity{0};
+    std::string path;
+};
+
+RouteTrace& routeTrace()
+{
+    static RouteTrace trace = []
+    {
+        RouteTrace t;
+        char const* const value = std::getenv("EDGELLM_MOE_TRACE");
+        if (value != nullptr && value[0] != '\0')
+        {
+            t.path = value;
+            t.capacity = 48 * 8192;
+            cudaError_t const e1 = cudaMalloc(&t.rows, static_cast<size_t>(t.capacity) * 8 * 4);
+            cudaError_t const e2 = cudaMalloc(&t.counter, 4);
+            cudaError_t const e3 = cudaMemset(t.counter, 0, 4);
+            (void) e1;
+            (void) e2;
+            (void) e3;
+        }
+        return t;
+    }();
+    return trace;
+}
+
+//! Writes the trace file (rewritten when more rows arrived since the last dump); called from plugin destructors, while the CUDA context is still alive.
+void dumpRouteTrace()
+{
+    RouteTrace& r = routeTrace();
+    static int32_t lastRows = 0;
+    if (r.rows == nullptr)
+    {
+        return;
+    }
+    int32_t n = 0;
+    cudaDeviceSynchronize();
+    if (cudaMemcpy(&n, r.counter, 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+    {
+        return;
+    }
+    n = std::min(n, r.capacity);
+    if (n == lastRows)
+    {
+        return;
+    }
+    lastRows = n;
+    std::vector<int32_t> host(static_cast<size_t>(n) * 8);
+    if (cudaMemcpy(host.data(), r.rows, host.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+    {
+        return;
+    }
+    if (FILE* f = std::fopen(r.path.c_str(), "wb"))
+    {
+        std::fwrite(host.data(), 4, host.size(), f);
+        std::fclose(f);
+    }
+}
+
 //! EDGELLM_MOE_FUSED_ROUTING=0 disables the single-kernel routing preparation of small decode / verify steps (default on).
 bool fusedRoutingEnabled()
 {
@@ -1607,6 +1672,7 @@ bool cacheShareFromEnv()
 
 Int4MoePlugin::~Int4MoePlugin() noexcept
 {
+    dumpRouteTrace();
     unregisterLiveCache(this);
     if (mCacheShared && mCacheHold)
     {
@@ -2926,7 +2992,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         {
             kernel::launchFusedDecodeRouting(tileTopkIdx, tileTopkW, tileSlots, mNumExperts, moeBlockSize, paddedCountsPtr, paddedOffsetsPtr,
                 numTokensPostPaddedPtr, sortedTokenIdsPtr, topkWeightsFlatPtr, expertIdsPtr, topkWeightsPaddedPtr, tilePadded,
-                marlinWorkspacePtr, 4 * numSmsForLocks(), stream);
+                marlinWorkspacePtr, 4 * numSmsForLocks(), stream, routeTrace().rows, routeTrace().counter, routeTrace().capacity);
         }
         else
         {

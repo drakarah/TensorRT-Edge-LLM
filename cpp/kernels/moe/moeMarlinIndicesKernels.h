@@ -65,7 +65,8 @@ bool canUseFusedDecodeRouting(int32_t numSlots, int32_t numExperts, int32_t moeB
  */
 void launchFusedDecodeRouting(int32_t const* topkIndices, float const* topkWeights, int32_t numSlots, int32_t numExperts, int32_t moeBlockSize,
     int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds, float* topkWeightsFlat, int32_t* expertIds,
-    float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks, cudaStream_t stream);
+    float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks, cudaStream_t stream, int32_t* trace = nullptr,
+    int32_t* traceCounter = nullptr, int32_t traceCapacity = 0);
 
 /**
  * @brief Build the trivial Marlin routing arrays for a dense (single-expert, topK=1) GEMM.
@@ -155,6 +156,11 @@ void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExp
 //! Inkling 2 router: scores = sigmoid(logits); experts = top-k of scores + selectionBias[e] + cacheBias * [resident in `cache`] (cache may be null);
 //! weights = the plain scores of the chosen experts divided by their sum. Writes expert ids and fp32 weights. topK <= kRouterMaxTopK.
 void launchSigmoidBiasTopk(float const* logits, float const* selectionBias, int32_t numTokens, int32_t numExperts, int32_t topK, float cacheBias,
+    ExpertCacheState const* cache, int32_t tailSkip, int32_t tailRenorm, float tailMaxWeight, int32_t* topkIndices, float* topkWeights, cudaStream_t stream);
+
+//! The one-block-per-token reference of launchSigmoidBiasTopk (also the path for cache bias and tail skip); launchSigmoidBiasTopk itself takes a one-warp-per-token
+//! kernel without barriers for cacheBias == 0, tailSkip == 0, topK <= 8 and up to 256 experts (EDGELLM_MOE_WARP_TOPK=0 turns that off).
+void launchSigmoidBiasTopkBlock(float const* logits, float const* selectionBias, int32_t numTokens, int32_t numExperts, int32_t topK, float cacheBias,
     ExpertCacheState const* cache, int32_t tailSkip, int32_t tailRenorm, float tailMaxWeight, int32_t* topkIndices, float* topkWeights, cudaStream_t stream);
 
 //! CPU miss path. Run after the router, before the cache lookup. A routed expert that is not in the cache is computed on the host unless its miss counter

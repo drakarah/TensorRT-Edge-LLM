@@ -19,6 +19,8 @@
 #include "moeMarlinIndicesKernels.h"
 
 #include <algorithm>
+#include <string>
+#include <cstdlib>
 #include <stdexcept>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -106,7 +108,8 @@ constexpr int32_t kFusedRoutingMaxExperts = 128;
 //! an expert are listed in slot order (deterministic). Replaces count, scan, list and index kernels plus 3 memsets and a memcpy (about 40 us of kernels and gaps per layer visit).
 __global__ void __launch_bounds__(kFusedRoutingThreads) fusedDecodeRoutingKernel(int32_t const* topkIndices, float const* topkWeights, int32_t numSlots,
     int32_t numExperts, int32_t moeBlockSize, int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds,
-    float* topkWeightsFlat, int32_t* expertIds, float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks)
+    float* topkWeightsFlat, int32_t* expertIds, float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks,
+    int32_t* trace, int32_t* traceCounter, int32_t traceCapacity)
 {
     __shared__ int32_t slotExpert[kFusedRoutingMaxSlots];
     __shared__ int32_t counts[kFusedRoutingMaxExperts];
@@ -229,6 +232,20 @@ __global__ void __launch_bounds__(kFusedRoutingThreads) fusedDecodeRoutingKernel
     {
         locks[i] = 0;
     }
+    if (trace != nullptr && numSlots == 8)
+    {
+        // debug trace of the routed experts of decode steps (EDGELLM_MOE_TRACE): call c writes its 8 expert ids at row c
+        if (tid == 0)
+        {
+            slotExpert[0] = atomicAdd(traceCounter, 1);
+        }
+        __syncthreads();
+        int32_t const row = slotExpert[0];
+        if (row < traceCapacity && tid < 8)
+        {
+            trace[static_cast<int64_t>(row) * 8 + tid] = topkIndices[tid];
+        }
+    }
 }
 } // namespace
 
@@ -240,10 +257,12 @@ bool canUseFusedDecodeRouting(int32_t numSlots, int32_t numExperts, int32_t moeB
 
 void launchFusedDecodeRouting(int32_t const* topkIndices, float const* topkWeights, int32_t numSlots, int32_t numExperts, int32_t moeBlockSize,
     int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds, float* topkWeightsFlat, int32_t* expertIds,
-    float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks, cudaStream_t stream)
+    float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks, cudaStream_t stream, int32_t* trace, int32_t* traceCounter,
+    int32_t traceCapacity)
 {
     fusedDecodeRoutingKernel<<<1, kFusedRoutingThreads, 0, stream>>>(topkIndices, topkWeights, numSlots, numExperts, moeBlockSize, paddedCounts,
-        paddedOffsets, numTokensPostPadded, sortedTokenIds, topkWeightsFlat, expertIds, topkWeightsPadded, paddedWeightsLen, locks, numLocks);
+        paddedOffsets, numTokensPostPadded, sortedTokenIds, topkWeightsFlat, expertIds, topkWeightsPadded, paddedWeightsLen, locks, numLocks, trace,
+        traceCounter, traceCapacity);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1140,11 +1159,138 @@ void launchCacheAwareTopk(float const* logits, int32_t numTokens, int32_t numExp
     }
 }
 
-void launchSigmoidBiasTopk(float const* logits, float const* selectionBias, int32_t numTokens, int32_t numExperts, int32_t topK, float cacheBias,
+namespace
+{
+//! One warp per token, the experts of a lane in registers (lane l holds experts l, l + 32, ...): the same selection as sigmoidBiasTopkKernel (ties go to the
+//! lower expert id, a NaN or huge logit is clamped, the weights are the plain sigmoid scores of the chosen experts divided by their sum taken in selection order)
+//! without a single barrier. Only for cacheBias == 0 and tailSkip == 0, topK <= 8.
+template <int32_t kPerLane>
+__global__ void __launch_bounds__(32) sigmoidBiasTopkWarpKernel(
+    float const* logits, float const* selectionBias, int32_t numExperts, int32_t topK, int32_t* topkIndices, float* topkWeights)
+{
+    float const* row = logits + static_cast<size_t>(blockIdx.x) * numExperts;
+    int32_t const lane = threadIdx.x;
+    float score[kPerLane];
+    float selection[kPerLane];
+#pragma unroll
+    for (int32_t j = 0; j < kPerLane; ++j)
+    {
+        int32_t const e = lane + 32 * j;
+        if (e < numExperts)
+        {
+            float const z = sanitizeRouterLogit(row[e]);
+            float const sc = fmaxf(1.0f / (1.0f + __expf(-z)), 1e-30f);
+            score[j] = sc;
+            selection[j] = sc + selectionBias[e];
+        }
+        else
+        {
+            score[j] = 0.0f;
+            selection[j] = -3.4e38f;
+        }
+    }
+    float chosenScore[8];
+    int32_t chosenIdx[8];
+#pragma unroll
+    for (int32_t k = 0; k < 8; ++k)
+    {
+        chosenScore[k] = 0.0f;
+        chosenIdx[k] = 0;
+        if (k < topK)
+        {
+            float best = -3.0e38f;
+            int32_t bestIdx = 0x7fffffff;
+#pragma unroll
+            for (int32_t j = 0; j < kPerLane; ++j)
+            {
+                int32_t const e = lane + 32 * j;
+                if (e < numExperts)
+                {
+                    float const v = selection[j];
+                    if (bestIdx == 0x7fffffff || v > best || (v == best && e < bestIdx))
+                    {
+                        best = v;
+                        bestIdx = e;
+                    }
+                }
+            }
+#pragma unroll
+            for (int32_t off = 16; off > 0; off >>= 1)
+            {
+                float const ov = __shfl_xor_sync(0xffffffffu, best, off);
+                int32_t const oi = __shfl_xor_sync(0xffffffffu, bestIdx, off);
+                if (ov > best || (ov == best && oi < bestIdx))
+                {
+                    best = ov;
+                    bestIdx = oi;
+                }
+            }
+            int32_t const pick = bestIdx < numExperts ? bestIdx : 0;
+            float mine = 0.0f;
+#pragma unroll
+            for (int32_t j = 0; j < kPerLane; ++j)
+            {
+                if (lane + 32 * j == pick)
+                {
+                    mine = score[j];
+                    selection[j] = -3.4e38f;
+                }
+            }
+            chosenIdx[k] = pick;
+            chosenScore[k] = __shfl_sync(0xffffffffu, mine, pick & 31);
+            // every lane must see the removal on the owner's register only; the owner already cleared it above
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int32_t k = 0; k < 8; ++k)
+    {
+        if (k < topK)
+        {
+            sum += chosenScore[k];
+        }
+    }
+    float const denom = sum + 1e-20f;
+#pragma unroll
+    for (int32_t k = 0; k < 8; ++k)
+    {
+        if (k < topK && lane == k)
+        {
+            topkIndices[static_cast<size_t>(blockIdx.x) * topK + k] = chosenIdx[k];
+            topkWeights[static_cast<size_t>(blockIdx.x) * topK + k] = chosenScore[k] / denom;
+        }
+    }
+}
+} // namespace
+
+void launchSigmoidBiasTopkBlock(float const* logits, float const* selectionBias, int32_t numTokens, int32_t numExperts, int32_t topK, float cacheBias,
     ExpertCacheState const* cache, int32_t tailSkip, int32_t tailRenorm, float tailMaxWeight, int32_t* topkIndices, float* topkWeights, cudaStream_t stream)
 {
     sigmoidBiasTopkKernel<<<numTokens, 128, 2 * static_cast<size_t>(numExperts) * sizeof(float), stream>>>(logits, selectionBias, numExperts,
         topK, cacheBias, cache != nullptr ? cache->slotOf : nullptr, tailSkip, tailRenorm, tailMaxWeight, topkIndices, topkWeights);
+}
+
+void launchSigmoidBiasTopk(float const* logits, float const* selectionBias, int32_t numTokens, int32_t numExperts, int32_t topK, float cacheBias,
+    ExpertCacheState const* cache, int32_t tailSkip, int32_t tailRenorm, float tailMaxWeight, int32_t* topkIndices, float* topkWeights, cudaStream_t stream)
+{
+    bool const plain = tailSkip == 0 && (cache == nullptr || cacheBias == 0.0f) && topK >= 1 && topK <= 8 && numExperts >= 1;
+    static bool const warpEnabled = []
+    {
+        char const* const value = std::getenv("EDGELLM_MOE_WARP_TOPK");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    if (warpEnabled && plain && numExperts <= 128)
+    {
+        sigmoidBiasTopkWarpKernel<4><<<numTokens, 32, 0, stream>>>(logits, selectionBias, numExperts, topK, topkIndices, topkWeights);
+        return;
+    }
+    if (warpEnabled && plain && numExperts <= 256)
+    {
+        sigmoidBiasTopkWarpKernel<8><<<numTokens, 32, 0, stream>>>(logits, selectionBias, numExperts, topK, topkIndices, topkWeights);
+        return;
+    }
+    launchSigmoidBiasTopkBlock(
+        logits, selectionBias, numTokens, numExperts, topK, cacheBias, cache, tailSkip, tailRenorm, tailMaxWeight, topkIndices, topkWeights, stream);
 }
 
 namespace
