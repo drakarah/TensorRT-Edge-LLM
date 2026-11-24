@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -42,7 +43,14 @@ struct Inkling2BlockResidualParams
 //! Per token: normalise each state row to unit RMS (x / sqrt(mean(x^2) + eps)), score it against every query row
 //! (dot product scaled by hidden^-0.5), softmax over the states, and write the probability-weighted sum of the
 //! normalised states, one output [T, hidden] per query. All FP32.
-void launchInkling2BlockResidual(Inkling2BlockResidualParams const& params, float const* queries, cudaStream_t stream);
+//! With a workspace (inkling2BlockResidualWorkspaceBytes(numTokens) bytes) the hidden dimension is split over kInkling2ResidualSplit blocks per token in two
+//! kernels (partial reductions, then softmax and weighted sums), so decode no longer runs on a single SM; without one a single block per token is used.
+void launchInkling2BlockResidual(
+    Inkling2BlockResidualParams const& params, float const* queries, cudaStream_t stream, void* workspace = nullptr);
+
+constexpr int32_t kInkling2ResidualSplit = 8;
+
+size_t inkling2BlockResidualWorkspaceBytes(int64_t numTokens);
 
 } // namespace kernel
 } // namespace trt_edgellm

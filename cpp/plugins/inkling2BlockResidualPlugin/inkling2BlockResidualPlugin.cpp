@@ -178,14 +178,19 @@ int32_t Inkling2BlockResidualPlugin::configurePlugin(
     return 0;
 }
 
-size_t Inkling2BlockResidualPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */,
-    int32_t /* nbInputs */, DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
+size_t Inkling2BlockResidualPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs,
+    int32_t nbInputs, DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
-    return 0;
+    if (inputs == nullptr || nbInputs < 1)
+    {
+        return 0;
+    }
+    int64_t const maxTokens = inputs[0].max.d[0];
+    return maxTokens > 0 && maxTokens <= 65535 ? kernel::inkling2BlockResidualWorkspaceBytes(maxTokens) : 0;
 }
 
 int32_t Inkling2BlockResidualPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* /* outputDesc */,
-    void const* const* inputs, void* const* outputs, void* /* workspace */, cudaStream_t stream) noexcept
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     if (inputDesc == nullptr || inputs == nullptr || outputs == nullptr)
     {
@@ -216,7 +221,8 @@ int32_t Inkling2BlockResidualPlugin::enqueue(PluginTensorDesc const* inputDesc, 
         }
         params.outputs[i] = static_cast<float*>(outputs[i]);
     }
-    kernel::launchInkling2BlockResidual(params, static_cast<float const*>(inputs[mNumStates]), stream);
+    bool const haveWorkspace = params.numTokens > 0 && params.numTokens <= 65535;
+    kernel::launchInkling2BlockResidual(params, static_cast<float const*>(inputs[mNumStates]), stream, haveWorkspace ? workspace : nullptr);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 

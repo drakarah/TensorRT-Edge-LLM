@@ -95,7 +95,7 @@ void reference(Case const& c, std::vector<std::vector<float>> const& states, std
     }
 }
 
-void runCase(Case const& c)
+void runCaseImpl(Case const& c, bool useWorkspace)
 {
     float const eps = 1e-6F;
     std::mt19937 gen(static_cast<uint32_t>(c.tokens * 131 + c.hidden + c.states * 7 + c.queries));
@@ -144,7 +144,12 @@ void runCase(Case const& c)
         p.outputs[i] = bases[i] + kGuardRows * c.hidden;
     }
 
-    launchInkling2BlockResidual(p, dq, nullptr);
+    void* workspace = nullptr;
+    if (useWorkspace)
+    {
+        ASSERT_EQ(cudaMalloc(&workspace, inkling2BlockResidualWorkspaceBytes(c.tokens)), cudaSuccess);
+    }
+    launchInkling2BlockResidual(p, dq, nullptr, workspace);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
     std::vector<std::vector<double>> ref;
@@ -172,10 +177,18 @@ void runCase(Case const& c)
         cudaFree(const_cast<float*>(p.states[j]));
     }
     cudaFree(dq);
+    cudaFree(workspace);
     for (auto* b : bases)
     {
         cudaFree(b);
     }
+}
+
+// every case runs on the single-block path and on the split path (workspace)
+void runCase(Case const& c)
+{
+    runCaseImpl(c, false);
+    runCaseImpl(c, true);
 }
 } // namespace
 

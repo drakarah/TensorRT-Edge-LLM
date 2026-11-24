@@ -17,6 +17,7 @@
 #include "inkling2BlockResidualKernels.h"
 
 #include <cmath>
+#include <cstdint>
 
 namespace trt_edgellm
 {
@@ -148,12 +149,357 @@ __global__ void __launch_bounds__(kThreads) blockResidualKernel(Inkling2BlockRes
         }
     }
 }
+
+constexpr int32_t kThreadsV2 = 256;
+
+//! One block of 8 warps per token. Phase 1: warp j reduces state j (sum of squares and the dot products with every query row) with float4 loads;
+//! phase 2: one thread per query turns the scores into softmax weights (scaled by the state's inverse RMS) in shared memory; phase 3: all threads
+//! write the weighted sums, re-reading the states from L1. No per-thread arrays indexed by runtime bounds, so nothing spills (the 1,024-thread
+//! kernel above is limited to 64 registers and kept about 90 live floats per thread).
+__global__ void __launch_bounds__(kThreadsV2) blockResidualKernelV2(Inkling2BlockResidualParams const p, float const* queries)
+{
+    __shared__ float total[kMaxReduce];
+    __shared__ float weight[kInkling2MaxResidualQueries][kInkling2MaxResidualStates];
+
+    int64_t const token = blockIdx.x;
+    int32_t const hidden = p.hidden;
+    int32_t const hidden4 = hidden >> 2;
+    int32_t const numStates = p.numStates;
+    int32_t const numQueries = p.numQueries;
+    int32_t const warp = threadIdx.x >> 5;
+    int32_t const lane = threadIdx.x & 31;
+
+    if (warp < numStates)
+    {
+        float4 const* state = reinterpret_cast<float4 const*>(p.states[warp] + token * hidden);
+        float sq = 0.F;
+        float dot[kInkling2MaxResidualQueries] = {0.F, 0.F, 0.F, 0.F};
+        for (int32_t h = lane; h < hidden4; h += 32)
+        {
+            float4 const v = state[h];
+            sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+            for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+            {
+                if (i < numQueries)
+                {
+                    float4 const qv = reinterpret_cast<float4 const*>(queries + static_cast<int64_t>(i) * hidden)[h];
+                    dot[i] += v.x * qv.x + v.y * qv.y + v.z * qv.z + v.w * qv.w;
+                }
+            }
+        }
+#pragma unroll
+        for (int32_t off = 16; off > 0; off >>= 1)
+        {
+            sq += __shfl_xor_sync(0xffffffffU, sq, off);
+#pragma unroll
+            for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+            {
+                dot[i] += __shfl_xor_sync(0xffffffffU, dot[i], off);
+            }
+        }
+        if (lane == 0)
+        {
+            total[warp] = sq;
+#pragma unroll
+            for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+            {
+                if (i < numQueries)
+                {
+                    total[numStates + i * numStates + warp] = dot[i];
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < numQueries)
+    {
+        int32_t const i = threadIdx.x;
+        float const scale = rsqrtf(static_cast<float>(hidden));
+        float score[kInkling2MaxResidualStates];
+        float inv[kInkling2MaxResidualStates];
+        float top = -INFINITY;
+#pragma unroll
+        for (int32_t j = 0; j < kInkling2MaxResidualStates; ++j)
+        {
+            if (j < numStates)
+            {
+                inv[j] = 1.F / sqrtf(total[j] / static_cast<float>(hidden) + p.eps);
+                score[j] = inv[j] * total[numStates + i * numStates + j] * scale;
+                top = fmaxf(top, score[j]);
+            }
+        }
+        float denom = 0.F;
+#pragma unroll
+        for (int32_t j = 0; j < kInkling2MaxResidualStates; ++j)
+        {
+            if (j < numStates)
+            {
+                score[j] = expf(score[j] - top);
+                denom += score[j];
+            }
+        }
+#pragma unroll
+        for (int32_t j = 0; j < kInkling2MaxResidualStates; ++j)
+        {
+            if (j < numStates)
+            {
+                weight[i][j] = score[j] / denom * inv[j];
+            }
+        }
+    }
+    __syncthreads();
+    for (int32_t h = threadIdx.x; h < hidden4; h += kThreadsV2)
+    {
+        float4 acc[kInkling2MaxResidualQueries];
+#pragma unroll
+        for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+        {
+            acc[i] = make_float4(0.F, 0.F, 0.F, 0.F);
+        }
+#pragma unroll
+        for (int32_t j = 0; j < kInkling2MaxResidualStates; ++j)
+        {
+            if (j < numStates)
+            {
+                float4 const v = reinterpret_cast<float4 const*>(p.states[j] + token * hidden)[h];
+#pragma unroll
+                for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+                {
+                    float const w = weight[i][j];
+                    acc[i].x += w * v.x;
+                    acc[i].y += w * v.y;
+                    acc[i].z += w * v.z;
+                    acc[i].w += w * v.w;
+                }
+            }
+        }
+#pragma unroll
+        for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+        {
+            if (i < numQueries)
+            {
+                reinterpret_cast<float4*>(p.outputs[i] + token * hidden)[h] = acc[i];
+            }
+        }
+    }
+}
+
+constexpr int32_t kSplit = kInkling2ResidualSplit;
+
+//! Split version, stage 1: grid (kSplit, tokens). Block s of a token reduces its slice of the hidden dimension: warp j handles state j (sum of squares and the
+//! dot products with every query) and writes the partial sums to the workspace.
+__global__ void __launch_bounds__(kThreadsV2) blockResidualPartialKernel(
+    Inkling2BlockResidualParams const p, float const* queries, float* partials)
+{
+    int64_t const token = blockIdx.y;
+    int32_t const slice = blockIdx.x;
+    int32_t const hidden = p.hidden;
+    int32_t const hidden4 = hidden >> 2;
+    int32_t const perSlice = (hidden4 + kSplit - 1) / kSplit;
+    int32_t const lo = slice * perSlice;
+    int32_t const hi = min(hidden4, lo + perSlice);
+    int32_t const numStates = p.numStates;
+    int32_t const numQueries = p.numQueries;
+    int32_t const warp = threadIdx.x >> 5;
+    int32_t const lane = threadIdx.x & 31;
+    if (warp >= numStates)
+    {
+        return;
+    }
+    float4 const* state = reinterpret_cast<float4 const*>(p.states[warp] + token * hidden);
+    float sq = 0.F;
+    float dot[kInkling2MaxResidualQueries] = {0.F, 0.F, 0.F, 0.F};
+    for (int32_t h = lo + lane; h < hi; h += 32)
+    {
+        float4 const v = state[h];
+        sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+        for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+        {
+            if (i < numQueries)
+            {
+                float4 const qv = reinterpret_cast<float4 const*>(queries + static_cast<int64_t>(i) * hidden)[h];
+                dot[i] += v.x * qv.x + v.y * qv.y + v.z * qv.z + v.w * qv.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int32_t off = 16; off > 0; off >>= 1)
+    {
+        sq += __shfl_xor_sync(0xffffffffU, sq, off);
+#pragma unroll
+        for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+        {
+            dot[i] += __shfl_xor_sync(0xffffffffU, dot[i], off);
+        }
+    }
+    if (lane == 0)
+    {
+        float* out = partials + (token * kSplit + slice) * kMaxReduce;
+        out[warp] = sq;
+#pragma unroll
+        for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+        {
+            if (i < numQueries)
+            {
+                out[numStates + i * numStates + warp] = dot[i];
+            }
+        }
+    }
+}
+
+//! Stage 2: grid (kSplit, tokens). Every block sums the kSplit partials of its token, derives the softmax weights and writes its slice of the outputs.
+__global__ void __launch_bounds__(kThreadsV2) blockResidualApplyKernel(
+    Inkling2BlockResidualParams const p, float const* partials)
+{
+    __shared__ float total[kMaxReduce];
+    __shared__ float weight[kInkling2MaxResidualQueries][kInkling2MaxResidualStates];
+
+    int64_t const token = blockIdx.y;
+    int32_t const slice = blockIdx.x;
+    int32_t const hidden = p.hidden;
+    int32_t const hidden4 = hidden >> 2;
+    int32_t const numStates = p.numStates;
+    int32_t const numQueries = p.numQueries;
+    int32_t const count = numStates + numStates * numQueries;
+    if (threadIdx.x < count)
+    {
+        float v = 0.F;
+#pragma unroll
+        for (int32_t s = 0; s < kSplit; ++s)
+        {
+            v += partials[(token * kSplit + s) * kMaxReduce + threadIdx.x];
+        }
+        total[threadIdx.x] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < numQueries)
+    {
+        int32_t const i = threadIdx.x;
+        float const scale = rsqrtf(static_cast<float>(hidden));
+        float score[kInkling2MaxResidualStates];
+        float inv[kInkling2MaxResidualStates];
+        float top = -INFINITY;
+#pragma unroll
+        for (int32_t j = 0; j < kInkling2MaxResidualStates; ++j)
+        {
+            if (j < numStates)
+            {
+                inv[j] = 1.F / sqrtf(total[j] / static_cast<float>(hidden) + p.eps);
+                score[j] = inv[j] * total[numStates + i * numStates + j] * scale;
+                top = fmaxf(top, score[j]);
+            }
+        }
+        float denom = 0.F;
+#pragma unroll
+        for (int32_t j = 0; j < kInkling2MaxResidualStates; ++j)
+        {
+            if (j < numStates)
+            {
+                score[j] = expf(score[j] - top);
+                denom += score[j];
+            }
+        }
+#pragma unroll
+        for (int32_t j = 0; j < kInkling2MaxResidualStates; ++j)
+        {
+            if (j < numStates)
+            {
+                weight[i][j] = score[j] / denom * inv[j];
+            }
+        }
+    }
+    __syncthreads();
+    int32_t const perSlice = (hidden4 + kSplit - 1) / kSplit;
+    int32_t const lo = slice * perSlice;
+    int32_t const hi = min(hidden4, lo + perSlice);
+    for (int32_t h = lo + threadIdx.x; h < hi; h += kThreadsV2)
+    {
+        float4 acc[kInkling2MaxResidualQueries];
+#pragma unroll
+        for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+        {
+            acc[i] = make_float4(0.F, 0.F, 0.F, 0.F);
+        }
+#pragma unroll
+        for (int32_t j = 0; j < kInkling2MaxResidualStates; ++j)
+        {
+            if (j < numStates)
+            {
+                float4 const v = reinterpret_cast<float4 const*>(p.states[j] + token * hidden)[h];
+#pragma unroll
+                for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+                {
+                    float const w = weight[i][j];
+                    acc[i].x += w * v.x;
+                    acc[i].y += w * v.y;
+                    acc[i].z += w * v.z;
+                    acc[i].w += w * v.w;
+                }
+            }
+        }
+#pragma unroll
+        for (int32_t i = 0; i < kInkling2MaxResidualQueries; ++i)
+        {
+            if (i < numQueries)
+            {
+                reinterpret_cast<float4*>(p.outputs[i] + token * hidden)[h] = acc[i];
+            }
+        }
+    }
+}
+
+bool aligned16(void const* ptr)
+{
+    return (reinterpret_cast<uintptr_t>(ptr) & 15U) == 0U;
+}
+
+bool canUseV2(Inkling2BlockResidualParams const& p, float const* queries)
+{
+    if (p.hidden % 4 != 0 || p.numStates > kThreadsV2 / 32 || !aligned16(queries))
+    {
+        return false;
+    }
+    for (int32_t j = 0; j < p.numStates; ++j)
+    {
+        if (!aligned16(p.states[j]))
+        {
+            return false;
+        }
+    }
+    for (int32_t i = 0; i < p.numQueries; ++i)
+    {
+        if (!aligned16(p.outputs[i]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
 } // namespace
 
-void launchInkling2BlockResidual(Inkling2BlockResidualParams const& params, float const* queries, cudaStream_t stream)
+size_t inkling2BlockResidualWorkspaceBytes(int64_t numTokens)
+{
+    return static_cast<size_t>(numTokens) * kSplit * kMaxReduce * sizeof(float);
+}
+
+void launchInkling2BlockResidual(Inkling2BlockResidualParams const& params, float const* queries, cudaStream_t stream, void* workspace)
 {
     if (params.numTokens <= 0)
     {
+        return;
+    }
+    if (workspace != nullptr && canUseV2(params, queries) && params.numTokens <= 0x7fffffffLL && params.numTokens <= 65535)
+    {
+        dim3 const grid(kSplit, static_cast<unsigned int>(params.numTokens));
+        blockResidualPartialKernel<<<grid, kThreadsV2, 0, stream>>>(params, queries, static_cast<float*>(workspace));
+        blockResidualApplyKernel<<<grid, kThreadsV2, 0, stream>>>(params, static_cast<float const*>(workspace));
+        return;
+    }
+    if (canUseV2(params, queries))
+    {
+        blockResidualKernelV2<<<static_cast<unsigned int>(params.numTokens), kThreadsV2, 0, stream>>>(params, queries);
         return;
     }
     blockResidualKernel<<<static_cast<unsigned int>(params.numTokens), kThreads, 0, stream>>>(params, queries);
