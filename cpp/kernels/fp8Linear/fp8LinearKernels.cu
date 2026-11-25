@@ -431,16 +431,18 @@ __global__ void __launch_bounds__(kWarps * 32) gemm(__half const* __restrict__ x
     {
         int32_t const kc = min(kStageK, k - k0);
         __syncthreads();
-        for (int32_t idx = threadIdx.x; idx < kTokens * kc / 8; idx += blockDim.x)
+        // row-outer, column-inner: no runtime integer division per element (kc / 8 is not a compile-time constant; the division was 27-41% of the executed instructions, METRICS 230)
+        for (int32_t r = 0; r < kTokens; ++r)
         {
-            int32_t const r = idx / (kc / 8);
-            int32_t const cc = idx % (kc / 8);
-            uint4 v = make_uint4(0, 0, 0, 0);
-            if (token0 + r < numTokens)
+            for (int32_t cc = threadIdx.x; cc < kc / 8; cc += blockDim.x)
             {
-                v = *reinterpret_cast<uint4 const*>(x + static_cast<size_t>(token0 + r) * k + k0 + cc * 8);
+                uint4 v = make_uint4(0, 0, 0, 0);
+                if (token0 + r < numTokens)
+                {
+                    v = *reinterpret_cast<uint4 const*>(x + static_cast<size_t>(token0 + r) * k + k0 + cc * 8);
+                }
+                *reinterpret_cast<uint4*>(&xs[r * kStride + cc * 8]) = v;
             }
-            *reinterpret_cast<uint4*>(&xs[r * kStride + cc * 8]) = v;
         }
         __syncthreads();
         if (active)
@@ -530,16 +532,17 @@ __global__ void __launch_bounds__(kWarps * 32) gemmSplit(__half const* __restric
     {
         int32_t const kc = min(kStageSmall, k - k0);
         __syncthreads();
-        for (int32_t idx = threadIdx.x; idx < 8 * kc / 8; idx += blockDim.x)
+        for (int32_t r = 0; r < 8; ++r) // row-outer, column-inner: no runtime division (METRICS 230)
         {
-            int32_t const r = idx / (kc / 8);
-            int32_t const cc = idx % (kc / 8);
-            uint4 v = make_uint4(0, 0, 0, 0);
-            if (r < numTokens)
+            for (int32_t cc = threadIdx.x; cc < kc / 8; cc += blockDim.x)
             {
-                v = *reinterpret_cast<uint4 const*>(x + static_cast<size_t>(r) * k + k0 + cc * 8);
+                uint4 v = make_uint4(0, 0, 0, 0);
+                if (r < numTokens)
+                {
+                    v = *reinterpret_cast<uint4 const*>(x + static_cast<size_t>(r) * k + k0 + cc * 8);
+                }
+                *reinterpret_cast<uint4*>(&xs[r * kStride + cc * 8]) = v;
             }
-            *reinterpret_cast<uint4*>(&xs[r * kStride + cc * 8]) = v;
         }
         __syncthreads();
         if (active)

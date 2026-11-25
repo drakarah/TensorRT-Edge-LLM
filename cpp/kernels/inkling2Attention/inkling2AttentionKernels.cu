@@ -1506,21 +1506,18 @@ __global__ void __launch_bounds__(kMmaThreads, std::is_same_v<KvT, int8_t> ? 2 :
         {
             half* const kDst = warpSlices + st * kMmaSliceHalves;
             half* const vDst = kDst + kMmaWarpKeys * kMmaKP;
+            // One cp.async per key for the whole warp: lanes 0-15 copy the 16 chunks of the K row, lanes 16-31 those of the V row (the former two divergent half-warp branches
+            // issued every copy twice and recomputed a 64-bit address per key: about 630 of the 1,040 instructions per tile, METRICS 230). Two row pointers, one per page: row kk is
+            // row (row0 + kk) of the first page, or row (kk - n0) of the next one.
+            bool const isV = lane >= 16;
+            int32_t const chunk = (lane & 15) * 8;
+            KvT const* const p0 = (isV ? vBase0 : kBase0) + int64_t(row0) * rowElems + chunk;
+            KvT const* const p1 = (isV ? vBase1 : kBase1) - int64_t(n0) * rowElems + chunk;
+            half* const dst = (isV ? vDst : kDst) + chunk;
 #pragma unroll
             for (int32_t kk = 0; kk < kMmaWarpKeys; ++kk)
             {
-                bool const second = kk >= n0;
-                int64_t const idx = (second ? kk - n0 : row0 + kk) * rowElems;
-                bool const ok = ((okMask >> kk) & 1U) != 0U;
-                // lanes 0-15 copy the 16 chunks of the K row, lanes 16-31 those of the V row
-                if (lane < 16)
-                {
-                    cpAsync16(kDst + kk * kMmaKP + lane * 8, (second ? kBase1 : kBase0) + idx + lane * 8, ok);
-                }
-                else
-                {
-                    cpAsync16(vDst + kk * kMmaKP + (lane - 16) * 8, (second ? vBase1 : vBase0) + idx + (lane - 16) * 8, ok);
-                }
+                cpAsync16(dst + kk * kMmaKP, (kk >= n0 ? p1 : p0) + int64_t(kk) * rowElems, ((okMask >> kk) & 1U) != 0U);
             }
             if (lane < kMmaWarpKeys)
             {
