@@ -219,6 +219,57 @@ __global__ void __launch_bounds__(128) gateLowRowKernel(
     }
 }
 
+constexpr int32_t kGateMaxMultiTokens = 8;
+
+//! Multi-token decode variant of stage 2: grid (hidden / kApplyWarps), one warp per output channel; the channel's forget and gain rows are loaded once and every token's low vector is
+//! applied to them (the one-token-per-block kernel re-read both rows per token over 5x more blocks, 29.5 us per launch for a 5-token window against 8 us for one token).
+template <int32_t kPairsPerLane>
+__global__ void __launch_bounds__(kApplyWarps * 32) gateApplyMultiKernel(float const* __restrict__ hidden, float const* __restrict__ message,
+    uint32_t const* __restrict__ forgetW, uint32_t const* __restrict__ gainW, float const* __restrict__ low, float* __restrict__ out, int32_t hiddenSize,
+    int32_t rank, int32_t numTokens)
+{
+    int32_t const warp = threadIdx.x >> 5;
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const c = blockIdx.x * kApplyWarps + warp;
+    if (c >= hiddenSize)
+    {
+        return;
+    }
+    int32_t const wordsPerRow = rank / 2;
+    uint32_t fw[kPairsPerLane], gw[kPairsPerLane];
+#pragma unroll
+    for (int32_t p = 0; p < kPairsPerLane; ++p)
+    {
+        fw[p] = forgetW[static_cast<int64_t>(c) * wordsPerRow + lane + 32 * p];
+        gw[p] = gainW[static_cast<int64_t>(c) * wordsPerRow + lane + 32 * p];
+    }
+#pragma unroll
+    for (int32_t t = 0; t < kGateMaxMultiTokens; ++t)
+    {
+        if (t < numTokens)
+        {
+            float f = 0.F;
+            float g = 0.F;
+#pragma unroll
+            for (int32_t p = 0; p < kPairsPerLane; ++p)
+            {
+                float const l0 = low[static_cast<int64_t>(t) * rank + 2 * (lane + 32 * p)];
+                float const l1 = low[static_cast<int64_t>(t) * rank + 2 * (lane + 32 * p) + 1];
+                f += bf16Lo(fw[p]) * l0 + bf16Hi(fw[p]) * l1;
+                g += bf16Lo(gw[p]) * l0 + bf16Hi(gw[p]) * l1;
+            }
+            f = warpSum(f);
+            g = warpSum(g);
+            if (lane == 0)
+            {
+                float const hv = hidden[static_cast<int64_t>(t) * hiddenSize + c];
+                float const mv = message[static_cast<int64_t>(t) * hiddenSize + c];
+                out[static_cast<int64_t>(t) * hiddenSize + c] = (1.F - tanhf(f)) * hv + tanhf(g) * mv;
+            }
+        }
+    }
+}
+
 //! Stage 2, grid (hidden / kApplyWarps, tokens): one warp per output channel c; lane l holds low[2l], low[2l + 1] (rank 64) and the matching BF16 pair of the
 //! forget and gain rows; shuffle reductions, tanh and the gated mix.
 template <int32_t kPairsPerLane>
@@ -497,6 +548,27 @@ void launchInkling2MessageGate(float const* hidden, float const* message, uint32
         gateLowGemmKernel<<<static_cast<unsigned int>((numTokens + 63) / 64), 128, 0, stream>>>(hidden, message, down, norms, low, numTokens, hiddenSize);
         dim3 const gemmGrid(hiddenSize / 64, static_cast<unsigned int>((numTokens + 63) / 64));
         gateApplyGemmKernel<<<gemmGrid, 128, 0, stream>>>(hidden, message, forgetW, gainW, low, out, numTokens, hiddenSize);
+        return;
+    }
+    // 2 to 8 tokens (verification windows): stage 2 reads each channel's forget and gain rows once for all tokens (EDGELLM_INKLING_GATE_MULTI=0 restores the one-token-per-block kernel)
+    static bool const multiOff = std::getenv("EDGELLM_INKLING_GATE_MULTI") != nullptr && std::getenv("EDGELLM_INKLING_GATE_MULTI")[0] == '0';
+    if (!multiOff && numTokens >= 2 && numTokens <= kGateMaxMultiTokens && hiddenSize / 4 <= 128 * 8 && (rank == 64 || rank == 128))
+    {
+        // stage 1 stays one block per (row, token): its 5x more blocks beat reusing the row (the multi-token low kernel was 34.7 us against 26.0 us for 5 tokens, METRICS 230)
+        static bool const prefetchOffMulti = std::getenv("EDGELLM_INKLING_GATE_PREFETCH") != nullptr && std::getenv("EDGELLM_INKLING_GATE_PREFETCH")[0] == '0';
+        gateLowRowKernel<<<dim3(static_cast<unsigned int>(rank), static_cast<unsigned int>(numTokens)), 128, 0, stream>>>(
+            hidden, message, down, low, hiddenSize, rank, eps, prefetchOffMulti ? nullptr : forgetW, prefetchOffMulti ? nullptr : gainW);
+        unsigned int const applyBlocks = static_cast<unsigned int>((hiddenSize + kApplyWarps - 1) / kApplyWarps);
+        if (rank == 64)
+        {
+            gateApplyMultiKernel<1><<<applyBlocks, kApplyWarps * 32, 0, stream>>>(
+                hidden, message, forgetW, gainW, low, out, hiddenSize, rank, static_cast<int32_t>(numTokens));
+        }
+        else
+        {
+            gateApplyMultiKernel<2><<<applyBlocks, kApplyWarps * 32, 0, stream>>>(
+                hidden, message, forgetW, gainW, low, out, hiddenSize, rank, static_cast<int32_t>(numTokens));
+        }
         return;
     }
     dim3 const lowGrid((rank + kLowWarps - 1) / kLowWarps, static_cast<unsigned int>(numTokens));
