@@ -502,6 +502,11 @@ __global__ void __launch_bounds__(kWarps * 32) gemm(__half const* __restrict__ x
 
 //! Up to 8 tokens, small and medium output sizes: kSplit warps share one group of 8 output rows (split-K: warp s takes the k64 blocks s, s + kSplit, ...), so a block of kWarps warps covers
 //! kWarps / kSplit groups and a small n still fills the GPU; four weight loads are issued before they are used. The partial sums are reduced through shared memory.
+#ifndef EDGELLM_GEMV_LOAD_BATCH
+#define EDGELLM_GEMV_LOAD_BATCH 4
+#endif
+constexpr int32_t kLoadBatch = EDGELLM_GEMV_LOAD_BATCH; //!< weight loads issued before they are used
+
 template <int32_t kSplit>
 __global__ void __launch_bounds__(kWarps * 32) gemmSplit(__half const* __restrict__ x, uint4 const* __restrict__ wShuf, void const* scale, __half* __restrict__ y,
     int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32)
@@ -541,17 +546,17 @@ __global__ void __launch_bounds__(kWarps * 32) gemmSplit(__half const* __restric
             int32_t const nkb = kc / 64;
             int32_t const kbBase = k0 / 64;
 #pragma unroll 1
-            for (int32_t b = split; b < nkb; b += 4 * kSplit)
+            for (int32_t b = split; b < nkb; b += kLoadBatch * kSplit)
             {
-                uint4 w[4];
+                uint4 w[kLoadBatch];
 #pragma unroll
-                for (int32_t u = 0; u < 4; ++u)
+                for (int32_t u = 0; u < kLoadBatch; ++u)
                 {
                     int32_t const kb = b + u * kSplit;
                     w[u] = kb < nkb ? __ldg(wp + static_cast<size_t>(kbBase + kb) * 32) : make_uint4(0, 0, 0, 0);
                 }
 #pragma unroll
-                for (int32_t u = 0; u < 4; ++u)
+                for (int32_t u = 0; u < kLoadBatch; ++u)
                 {
                     int32_t const kb = b + u * kSplit;
                     if (kb < nkb)
@@ -681,8 +686,9 @@ void launchFp8Linear(void const* x, void const* weightWords, void const* scale, 
         // tensor cores for every token count: up to 8 tokens one half-filled m16 group, then 64-token tiles
         if (numTokens <= 8)
         {
-            // split-K over two warps for the small output sizes (k, v, o projections), one warp per group of 8 rows for the large ones (fused q, head): METRICS 208
-            if (n < 3000)
+            // split-K over two warps for the small output sizes with a short k (k, v, o projections), one warp per group of 8 rows for the large ones (fused q, head) and for a long k
+            // (the 6,912 / 9,216 wide projections of the DFlash2 drafter: split 1 is 20-25% faster there): METRICS 208, 209
+            if (n < 3000 && k <= 4096)
             {
                 i8mma::launchSplit<2>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
             }

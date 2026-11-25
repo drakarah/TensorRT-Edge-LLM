@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "runtime/decoding/inklingDrafter.h"
+#include "runtime/decoding/inklingDflash2Drafter.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -228,6 +229,10 @@ std::unique_ptr<IDraftSource> createDraftSource(
     if (type == "inkling2_dspark_int8")
     {
         return std::make_unique<InklingDrafter>(weightsFile, capacity, maxAppendRows, stream);
+    }
+    if (type == "inkling2_dflash2_int8")
+    {
+        return std::make_unique<InklingDflash2Drafter>(weightsFile, capacity, maxAppendRows, stream);
     }
     throw std::runtime_error("Unknown draft source type '" + type + "' in " + sidecar.string());
 }

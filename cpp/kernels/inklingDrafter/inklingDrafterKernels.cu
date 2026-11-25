@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "inklingDrafterKernels.h"
+#include "kernels/fp8Linear/fp8LinearKernels.h"
+
+#include <cstdlib>
 
 #include <cfloat>
 #include <algorithm>
@@ -584,6 +587,13 @@ __global__ void __launch_bounds__(128) gemv(__half const* __restrict__ x, uint4 
 
 void launchDrafterGemv(void const* x, void const* wShuf, void const* scale, void* y, int32_t tokens, int32_t n, int32_t k, cudaStream_t stream)
 {
+    // the fork's mma-ordered INT8 GEMV (split-K, batched weight loads; METRICS 208): same weight order and FP32 per-row scales as the drafter file
+    static bool const legacy = std::getenv("EDGELLM_INKLING_DRAFTER_LEGACY_GEMV") != nullptr;
+    if (!legacy)
+    {
+        launchFp8Linear(x, wShuf, scale, y, tokens, n, k, /*scaleIsFp32=*/true, stream, kLinearWeightInt8Mma);
+        return;
+    }
     i8mma::gemv<<<(n / 8 + i8mma::kWarps - 1) / i8mma::kWarps, 128, 0, stream>>>(
         static_cast<__half const*>(x), static_cast<uint4 const*>(wShuf), static_cast<float const*>(scale), static_cast<__half*>(y), tokens, n, k);
 }
