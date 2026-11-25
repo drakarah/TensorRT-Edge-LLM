@@ -121,6 +121,104 @@ __global__ void __launch_bounds__(kLowWarps * 32) gateLowKernel(
     }
 }
 
+//! Decode variant of stage 1 (EDGELLM_INKLING_GATE_LOW_ROWS=1, default): grid (rank, tokens), one row of `down` per block and all 128 threads share it, so 64 blocks and every
+//! weight load of the row is in flight at once (the 16-block, one-warp-per-row version was latency-bound at about 47 GB/s, METRICS 225).
+__global__ void __launch_bounds__(128) gateLowRowKernel(
+    float const* __restrict__ hidden, float const* __restrict__ message, uint32_t const* __restrict__ down, float* __restrict__ low, int32_t hiddenSize,
+    int32_t rank, float eps, uint32_t const* forgetW, uint32_t const* gainW)
+{
+    int64_t const token = blockIdx.y;
+    int32_t const warp = threadIdx.x >> 5;
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const j = blockIdx.x;
+    float const* h = hidden + token * hiddenSize;
+    float const* m = message + token * hiddenSize;
+    uint4 const* row = reinterpret_cast<uint4 const*>(down + static_cast<int64_t>(j) * hiddenSize);
+    int32_t const chunks = hiddenSize / 4; // uint4 of 8 BF16 weights; the 2 * hidden concatenation is h then m
+    constexpr int32_t kMaxPer = 8;         // hidden <= kInkling2GateMaxHidden = 2,304 + slack: chunks / 128 <= 8
+    uint4 w[kMaxPer];
+#pragma unroll
+    for (int32_t i = 0; i < kMaxPer; ++i)
+    {
+        int32_t const c = threadIdx.x + 128 * i;
+        if (c < chunks)
+        {
+            w[i] = row[c];
+        }
+    }
+    // L2 prefetch of the stage 2 weights (forget and gain rows, 1.18 MB, otherwise cold DRAM reads of the next kernel): 64 blocks share it
+    if (forgetW != nullptr)
+    {
+        int64_t const bytes = static_cast<int64_t>(hiddenSize) * (rank / 2) * 4; // one matrix: hidden rows of rank BF16
+        int64_t const lines = bytes / 128;
+        for (int64_t l = static_cast<int64_t>(blockIdx.x) * 128 + threadIdx.x; l < lines; l += static_cast<int64_t>(gridDim.x) * 128)
+        {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(reinterpret_cast<char const*>(forgetW) + l * 128));
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(reinterpret_cast<char const*>(gainW) + l * 128));
+        }
+    }
+    float sh = 0.F;
+    float sm = 0.F;
+    for (int32_t k = threadIdx.x * 4; k < hiddenSize; k += 128 * 4)
+    {
+        float4 const a = *reinterpret_cast<float4 const*>(h + k);
+        float4 const b = *reinterpret_cast<float4 const*>(m + k);
+        sh += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
+        sm += b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+    }
+    float dotH = 0.F;
+    float dotM = 0.F;
+#pragma unroll
+    for (int32_t i = 0; i < kMaxPer; ++i)
+    {
+        int32_t const c = threadIdx.x + 128 * i;
+        if (c < chunks)
+        {
+            int32_t const k = c * 8;
+            float const* src = k < hiddenSize ? h + k : m + (k - hiddenSize);
+            float4 const x0 = *reinterpret_cast<float4 const*>(src);
+            float4 const x1 = *reinterpret_cast<float4 const*>(src + 4);
+            float const d = bf16Lo(w[i].x) * x0.x + bf16Hi(w[i].x) * x0.y + bf16Lo(w[i].y) * x0.z + bf16Hi(w[i].y) * x0.w + bf16Lo(w[i].z) * x1.x
+                + bf16Hi(w[i].z) * x1.y + bf16Lo(w[i].w) * x1.z + bf16Hi(w[i].w) * x1.w;
+            if (k < hiddenSize)
+            {
+                dotH += d;
+            }
+            else
+            {
+                dotM += d;
+            }
+        }
+    }
+    sh = warpSum(sh);
+    sm = warpSum(sm);
+    dotH = warpSum(dotH);
+    dotM = warpSum(dotM);
+    __shared__ float red[4][4];
+    if (lane == 0)
+    {
+        red[warp][0] = sh;
+        red[warp][1] = sm;
+        red[warp][2] = dotH;
+        red[warp][3] = dotM;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        float th = 0.F, tm = 0.F, dh = 0.F, dm = 0.F;
+        for (int32_t w2 = 0; w2 < 4; ++w2)
+        {
+            th += red[w2][0];
+            tm += red[w2][1];
+            dh += red[w2][2];
+            dm += red[w2][3];
+        }
+        float const invH = 1.F / sqrtf(th / static_cast<float>(hiddenSize) + eps);
+        float const invM = 1.F / sqrtf(tm / static_cast<float>(hiddenSize) + eps);
+        low[token * rank + j] = invH * dh + invM * dm;
+    }
+}
+
 //! Stage 2, grid (hidden / kApplyWarps, tokens): one warp per output channel c; lane l holds low[2l], low[2l + 1] (rank 64) and the matching BF16 pair of the
 //! forget and gain rows; shuffle reductions, tanh and the gated mix.
 template <int32_t kPairsPerLane>
@@ -402,7 +500,17 @@ void launchInkling2MessageGate(float const* hidden, float const* message, uint32
         return;
     }
     dim3 const lowGrid((rank + kLowWarps - 1) / kLowWarps, static_cast<unsigned int>(numTokens));
-    gateLowKernel<<<lowGrid, kLowWarps * 32, 0, stream>>>(hidden, message, down, low, hiddenSize, rank, eps);
+    static bool const rowsOff = std::getenv("EDGELLM_INKLING_GATE_LOW_ROWS") != nullptr && std::getenv("EDGELLM_INKLING_GATE_LOW_ROWS")[0] == '0';
+    if (!rowsOff && hiddenSize / 4 <= 128 * 8)
+    {
+        static bool const prefetchOff = std::getenv("EDGELLM_INKLING_GATE_PREFETCH") != nullptr && std::getenv("EDGELLM_INKLING_GATE_PREFETCH")[0] == '0';
+        gateLowRowKernel<<<dim3(static_cast<unsigned int>(rank), static_cast<unsigned int>(numTokens)), 128, 0, stream>>>(
+            hidden, message, down, low, hiddenSize, rank, eps, prefetchOff ? nullptr : forgetW, prefetchOff ? nullptr : gainW);
+    }
+    else
+    {
+        gateLowKernel<<<lowGrid, kLowWarps * 32, 0, stream>>>(hidden, message, down, low, hiddenSize, rank, eps);
+    }
     dim3 const applyGrid((hiddenSize + kApplyWarps - 1) / kApplyWarps, static_cast<unsigned int>(numTokens));
     if (rank == 64)
     {
