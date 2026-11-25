@@ -48,7 +48,7 @@ struct Inkling2BlockResidualParams
 void launchInkling2BlockResidual(
     Inkling2BlockResidualParams const& params, float const* queries, cudaStream_t stream, void* workspace = nullptr);
 
-constexpr int32_t kInkling2ResidualSplit = 8;
+constexpr int32_t kInkling2ResidualSplit = 9; //!< 576 float4 of a hidden-2304 row = 9 slices of 64: every warp iteration is full (METRICS 217)
 
 //! Debug capture of a [rows, hidden] tensor into a device ring (rows appended at the device-side counter; the step size is logged when stepLog is not null).
 void launchTapCapture(float const* src, int64_t rows, int32_t hidden, float* dst, int32_t* counter, int32_t capacityRows, int32_t* stepLog, int32_t* stepCounter,

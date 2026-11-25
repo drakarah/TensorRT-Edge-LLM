@@ -16,6 +16,7 @@
  */
 #include "inkling2BlockResidualKernels.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -286,6 +287,8 @@ __global__ void __launch_bounds__(kThreadsV2) blockResidualKernelV2(Inkling2Bloc
 }
 
 constexpr int32_t kSplit = kInkling2ResidualSplit;
+constexpr int32_t kMaxSlice4 = 128;   //!< float4 per block slice the staged query tile can hold
+constexpr int32_t kApplyThreads = 64; //!< apply kernel block: one float4 per thread of a 64-float4 slice
 
 //! Split version, stage 1: grid (kSplit, tokens). Block s of a token reduces its slice of the hidden dimension: warp j handles state j (sum of squares and the
 //! dot products with every query) and writes the partial sums to the workspace.
@@ -303,10 +306,15 @@ __global__ void __launch_bounds__(kThreadsV2) blockResidualPartialKernel(
     int32_t const numQueries = p.numQueries;
     int32_t const warp = threadIdx.x >> 5;
     int32_t const lane = threadIdx.x & 31;
-    if (warp >= numStates)
+    // the query slice of this block is shared by all state warps: load it once (the block has one warp per state)
+    __shared__ float4 queryTile[kInkling2MaxResidualQueries][kMaxSlice4];
+    for (int32_t idx = threadIdx.x; idx < numQueries * perSlice; idx += blockDim.x)
     {
-        return;
+        int32_t const i = idx / perSlice;
+        int32_t const hh = idx % perSlice;
+        queryTile[i][hh] = lo + hh < hi ? reinterpret_cast<float4 const*>(queries + static_cast<int64_t>(i) * hidden)[lo + hh] : make_float4(0.F, 0.F, 0.F, 0.F);
     }
+    __syncthreads();
     float4 const* state = reinterpret_cast<float4 const*>(p.states[warp] + token * hidden);
     float sq = 0.F;
     float dot[kInkling2MaxResidualQueries] = {0.F, 0.F, 0.F, 0.F};
@@ -319,7 +327,7 @@ __global__ void __launch_bounds__(kThreadsV2) blockResidualPartialKernel(
         {
             if (i < numQueries)
             {
-                float4 const qv = reinterpret_cast<float4 const*>(queries + static_cast<int64_t>(i) * hidden)[h];
+                float4 const qv = queryTile[i][h - lo];
                 dot[i] += v.x * qv.x + v.y * qv.y + v.z * qv.z + v.w * qv.w;
             }
         }
@@ -350,7 +358,7 @@ __global__ void __launch_bounds__(kThreadsV2) blockResidualPartialKernel(
 }
 
 //! Stage 2: grid (kSplit, tokens). Every block sums the kSplit partials of its token, derives the softmax weights and writes its slice of the outputs.
-__global__ void __launch_bounds__(kThreadsV2) blockResidualApplyKernel(
+__global__ void __launch_bounds__(kApplyThreads) blockResidualApplyKernel(
     Inkling2BlockResidualParams const p, float const* partials)
 {
     __shared__ float total[kMaxReduce];
@@ -414,7 +422,7 @@ __global__ void __launch_bounds__(kThreadsV2) blockResidualApplyKernel(
     int32_t const perSlice = (hidden4 + kSplit - 1) / kSplit;
     int32_t const lo = slice * perSlice;
     int32_t const hi = min(hidden4, lo + perSlice);
-    for (int32_t h = lo + threadIdx.x; h < hi; h += kThreadsV2)
+    for (int32_t h = lo + threadIdx.x; h < hi; h += kApplyThreads)
     {
         float4 acc[kInkling2MaxResidualQueries];
 #pragma unroll
@@ -457,7 +465,7 @@ bool aligned16(void const* ptr)
 
 bool canUseV2(Inkling2BlockResidualParams const& p, float const* queries)
 {
-    if (p.hidden % 4 != 0 || p.numStates > kThreadsV2 / 32 || !aligned16(queries))
+    if (p.hidden % 4 != 0 || p.numStates > kThreadsV2 / 32 || !aligned16(queries) || ((p.hidden / 4) + kSplit - 1) / kSplit > kMaxSlice4)
     {
         return false;
     }
@@ -493,8 +501,8 @@ void launchInkling2BlockResidual(Inkling2BlockResidualParams const& params, floa
     if (workspace != nullptr && canUseV2(params, queries) && params.numTokens <= 0x7fffffffLL && params.numTokens <= 65535)
     {
         dim3 const grid(kSplit, static_cast<unsigned int>(params.numTokens));
-        blockResidualPartialKernel<<<grid, kThreadsV2, 0, stream>>>(params, queries, static_cast<float*>(workspace));
-        blockResidualApplyKernel<<<grid, kThreadsV2, 0, stream>>>(params, static_cast<float const*>(workspace));
+        blockResidualPartialKernel<<<grid, 32 * std::max(1, params.numStates), 0, stream>>>(params, queries, static_cast<float*>(workspace));
+        blockResidualApplyKernel<<<grid, kApplyThreads, 0, stream>>>(params, static_cast<float const*>(workspace));
         return;
     }
     if (canUseV2(params, queries))
