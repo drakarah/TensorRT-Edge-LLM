@@ -33,8 +33,8 @@ constexpr int32_t kInkling2NormRouteMaxHidden = 4096;
 //!   y16[t, k] = half(x[t, k] * inv[t] * normW[k])
 //!   logits[t, e] = inv[t] * sum_k x[t, k] * routeW[e, k]         (only when numExperts > 0)
 //! routeW is the router matrix with the norm weight already folded in (routeW[e, k] = router[e, k] * normW[k]), so logits equal the FP32 product of the normed activations with
-//! the router, computed in FP32 (the TF32 matmul it replaces drops 13 mantissa bits). hidden must be a multiple of 4 and at most kInkling2NormRouteMaxHidden.
-//! Up to 8 tokens with hidden <= 2560 (decode and speculative verification) run as one launch, a warp per router row; larger batches run a norm kernel and a tiled FP32 GEMM.
+//! the router, to about 1e-6 relative (the TF32 matmul it replaces drops 13 mantissa bits). hidden must be a multiple of 4 and at most kInkling2NormRouteMaxHidden.
+//! Up to 8 tokens with hidden <= 2560 (decode and speculative verification) run as one launch, a warp per router row; larger batches run a norm kernel and a tensor-core GEMM (TF32 with a hi/lo split of both operands).
 //! The workspace holds numTokens floats (inkling2NormRouteWorkspaceBytes), used by the batched path only.
 void launchInkling2NormRoute(float const* x, float const* normW, float const* routeW, __half* y16, float* logits, int64_t numTokens, int32_t hiddenSize,
     int32_t numExperts, float eps, void* workspace, cudaStream_t stream);

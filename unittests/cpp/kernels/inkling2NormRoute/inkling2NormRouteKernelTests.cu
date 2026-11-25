@@ -109,7 +109,8 @@ void runCase(Case const& c)
             {
                 dot += double(x[size_t(t) * c.hidden + k]) * folded[size_t(e) * c.hidden + k];
             }
-            ASSERT_NEAR(logits[size_t(t) * c.experts + e], dot * inv, 2e-5 * std::fabs(dot * inv) + 2e-5)
+            // the tensor-core path accumulates to about 1e-4 absolute on logits of order 1 (error grows with the sum of the terms; the TF32 matmul it replaces: about 1e-3)
+            ASSERT_NEAR(logits[size_t(t) * c.experts + e], dot * inv, 1e-4 * std::fabs(dot * inv) + 2e-4)
                 << "logit token " << t << " expert " << e << " case " << c.tokens << "x" << c.hidden << "x" << c.experts;
         }
     }

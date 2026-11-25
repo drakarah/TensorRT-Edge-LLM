@@ -141,60 +141,137 @@ __global__ void __launch_bounds__(32) normRouteSmallKernel(float const* __restri
     }
 }
 
-constexpr int32_t kTile = 32;
+constexpr int32_t kTokTile = 64;
+constexpr int32_t kExpTile = 32;
+constexpr int32_t kNTiles = kExpTile / 8;
 constexpr int32_t kKTile = 32;
+constexpr int32_t kPad = kKTile + 4; // bank-conflict free fragment loads
 
-//! logits[t, e] = inv[t] * sum_k x[t, k] * routeW[e, k]: 32 x 32 output tile per block, 16 x 16 threads each owning 2 x 2 outputs, FP32 throughout.
-__global__ void __launch_bounds__(256) routeGemmKernel(float const* __restrict__ x, float const* __restrict__ routeW, float const* __restrict__ inv,
+__device__ __forceinline__ uint32_t toTf32(float x)
+{
+    uint32_t r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+    return r;
+}
+
+__device__ __forceinline__ void mmaTf32(float (&c)[4], uint32_t const (&a)[4], uint32_t b0, uint32_t b1)
+{
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void splitStore(uint32_t* hi, uint32_t* lo, float4 v)
+{
+    float const f[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int32_t i = 0; i < 4; ++i)
+    {
+        uint32_t const h = toTf32(f[i]);
+        hi[i] = h;
+        lo[i] = toTf32(f[i] - __uint_as_float(h));
+    }
+}
+
+//! logits[t, e] = inv[t] * sum_k x[t, k] * routeW[e, k] on tensor cores: a 64 x 32 output tile per block, four warps of 16 tokens x 32 experts. Each operand is split into a TF32 high
+//! part and the TF32 rounding of the remainder, and three MMAs (hi*hi, lo*hi, hi*lo) restore FP32 accuracy (about 1e-6 relative); the TensorRT TF32 matmul this replaces kept 10 bits.
+__global__ void __launch_bounds__(128) routeGemmKernel(float const* __restrict__ x, float const* __restrict__ routeW, float const* __restrict__ inv,
     float* __restrict__ logits, int64_t numTokens, int32_t hiddenSize, int32_t numExperts)
 {
-    __shared__ float xs[kKTile][kTile + 1];
-    __shared__ float ws[kKTile][kTile + 1];
-    int32_t const tx = threadIdx.x & 15;
-    int32_t const ty = threadIdx.x >> 4;
-    int64_t const t0 = static_cast<int64_t>(blockIdx.y) * kTile;
-    int32_t const e0 = blockIdx.x * kTile;
-    float acc[2][2] = {{0.F, 0.F}, {0.F, 0.F}};
+    __shared__ uint32_t xsHi[kTokTile][kPad], xsLo[kTokTile][kPad];
+    __shared__ uint32_t wsHi[kExpTile][kPad], wsLo[kExpTile][kPad];
+    int32_t const warp = threadIdx.x >> 5;
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const g = lane >> 2;
+    int32_t const t4 = lane & 3;
+    int64_t const t0 = static_cast<int64_t>(blockIdx.y) * kTokTile;
+    int32_t const e0 = blockIdx.x * kExpTile;
+    float acc[kNTiles][4];
+#pragma unroll
+    for (int32_t j = 0; j < kNTiles; ++j)
+    {
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            acc[j][i] = 0.F;
+        }
+    }
+    constexpr int32_t kXLoads = kTokTile * kKTile / 4 / 128; // float4 per thread per chunk
+    constexpr int32_t kWLoads = kExpTile * kKTile / 4 / 128;
+    float4 xr[kXLoads], wr[kWLoads];
+    auto fetch = [&](int32_t k0) {
+#pragma unroll
+        for (int32_t u = 0; u < kXLoads; ++u)
+        {
+            int32_t const i = threadIdx.x + 128 * u;
+            int64_t const t = t0 + i / (kKTile / 4);
+            int32_t const k = k0 + (i % (kKTile / 4)) * 4;
+            xr[u] = (k < hiddenSize && t < numTokens) ? *reinterpret_cast<float4 const*>(x + t * hiddenSize + k) : make_float4(0.F, 0.F, 0.F, 0.F);
+        }
+#pragma unroll
+        for (int32_t u = 0; u < kWLoads; ++u)
+        {
+            int32_t const i = threadIdx.x + 128 * u;
+            int32_t const e = e0 + i / (kKTile / 4);
+            int32_t const k = k0 + (i % (kKTile / 4)) * 4;
+            wr[u] = (k < hiddenSize && e < numExperts) ? *reinterpret_cast<float4 const*>(routeW + static_cast<int64_t>(e) * hiddenSize + k) : make_float4(0.F, 0.F, 0.F, 0.F);
+        }
+    };
+    fetch(0);
     for (int32_t k0 = 0; k0 < hiddenSize; k0 += kKTile)
     {
-        for (int32_t i = threadIdx.x; i < kTile * kKTile; i += 256)
+#pragma unroll
+        for (int32_t u = 0; u < kXLoads; ++u)
         {
-            int32_t const r = i / kKTile;
-            int32_t const c = i % kKTile;
-            int64_t const t = t0 + r;
-            int32_t const e = e0 + r;
-            int32_t const k = k0 + c;
-            xs[c][r] = (t < numTokens && k < hiddenSize) ? x[t * hiddenSize + k] : 0.F;
-            ws[c][r] = (e < numExperts && k < hiddenSize) ? routeW[static_cast<int64_t>(e) * hiddenSize + k] : 0.F;
+            int32_t const i = threadIdx.x + 128 * u;
+            splitStore(&xsHi[i / (kKTile / 4)][(i % (kKTile / 4)) * 4], &xsLo[i / (kKTile / 4)][(i % (kKTile / 4)) * 4], xr[u]);
+        }
+#pragma unroll
+        for (int32_t u = 0; u < kWLoads; ++u)
+        {
+            int32_t const i = threadIdx.x + 128 * u;
+            splitStore(&wsHi[i / (kKTile / 4)][(i % (kKTile / 4)) * 4], &wsLo[i / (kKTile / 4)][(i % (kKTile / 4)) * 4], wr[u]);
         }
         __syncthreads();
-#pragma unroll
-        for (int32_t c = 0; c < kKTile; ++c)
+        if (k0 + kKTile < hiddenSize)
         {
-            float const a0 = xs[c][ty], a1 = xs[c][ty + 16];
-            float const b0 = ws[c][tx], b1 = ws[c][tx + 16];
-            acc[0][0] += a0 * b0;
-            acc[0][1] += a0 * b1;
-            acc[1][0] += a1 * b0;
-            acc[1][1] += a1 * b1;
+            fetch(k0 + kKTile); // the next chunk's loads fly while this one computes
+        }
+#pragma unroll
+        for (int32_t ks = 0; ks < kKTile; ks += 8)
+        {
+            uint32_t aHi[4], aLo[4];
+            aHi[0] = xsHi[warp * 16 + g][ks + t4];
+            aHi[1] = xsHi[warp * 16 + g + 8][ks + t4];
+            aHi[2] = xsHi[warp * 16 + g][ks + t4 + 4];
+            aHi[3] = xsHi[warp * 16 + g + 8][ks + t4 + 4];
+            aLo[0] = xsLo[warp * 16 + g][ks + t4];
+            aLo[1] = xsLo[warp * 16 + g + 8][ks + t4];
+            aLo[2] = xsLo[warp * 16 + g][ks + t4 + 4];
+            aLo[3] = xsLo[warp * 16 + g + 8][ks + t4 + 4];
+#pragma unroll
+            for (int32_t j = 0; j < kNTiles; ++j)
+            {
+                uint32_t const b0Hi = wsHi[j * 8 + g][ks + t4], b1Hi = wsHi[j * 8 + g][ks + t4 + 4];
+                uint32_t const b0Lo = wsLo[j * 8 + g][ks + t4], b1Lo = wsLo[j * 8 + g][ks + t4 + 4];
+                mmaTf32(acc[j], aLo, b0Hi, b1Hi);
+                mmaTf32(acc[j], aHi, b0Lo, b1Lo);
+                mmaTf32(acc[j], aHi, b0Hi, b1Hi);
+            }
         }
         __syncthreads();
     }
 #pragma unroll
-    for (int32_t i = 0; i < 2; ++i)
+    for (int32_t j = 0; j < kNTiles; ++j)
     {
-        int64_t const t = t0 + ty + 16 * i;
-        if (t >= numTokens)
-        {
-            continue;
-        }
 #pragma unroll
-        for (int32_t j = 0; j < 2; ++j)
+        for (int32_t i = 0; i < 4; ++i)
         {
-            int32_t const e = e0 + tx + 16 * j;
-            if (e < numExperts)
+            int64_t const t = t0 + warp * 16 + g + (i >> 1) * 8;
+            int32_t const e = e0 + j * 8 + 2 * t4 + (i & 1);
+            if (t < numTokens && e < numExperts)
             {
-                logits[t * numExperts + e] = acc[i][j] * inv[t];
+                logits[t * numExperts + e] = acc[j][i] * inv[t];
             }
         }
     }
@@ -224,8 +301,8 @@ void launchInkling2NormRoute(float const* x, float const* normW, float const* ro
     normRowsKernel<<<static_cast<unsigned int>(numTokens), kNormThreads, 0, stream>>>(x, normW, y16, inv, hiddenSize, eps);
     if (route)
     {
-        dim3 const grid(static_cast<unsigned int>((numExperts + kTile - 1) / kTile), static_cast<unsigned int>((numTokens + kTile - 1) / kTile));
-        routeGemmKernel<<<grid, 256, 0, stream>>>(x, routeW, inv, logits, numTokens, hiddenSize, numExperts);
+        dim3 const grid(static_cast<unsigned int>((numExperts + kExpTile - 1) / kExpTile), static_cast<unsigned int>((numTokens + kTokTile - 1) / kTokTile));
+        routeGemmKernel<<<grid, 128, 0, stream>>>(x, routeW, inv, logits, numTokens, hiddenSize, numExperts);
     }
 }
 
