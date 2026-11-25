@@ -325,8 +325,10 @@ class Inkling2Layer(Module):
         parts = [l.int8_rows() for l in linears]
         if any(p is None for p in parts) or self.nh * 273 != sum(p[0].shape[0] for p in parts):
             return None
+        # EDGELLM_INT8_MMA=1: the fused projection (6,552 rows) takes the tensor-core path like the other INT8 projections (METRICS 210)
+        mma = os.environ.get("EDGELLM_INT8_MMA") == "1" and parts[0][0].shape[1] % 64 == 0
         return F.int8_linear(hq, np.ascontiguousarray(np.concatenate([p[0] for p in parts])),
-                             np.ascontiguousarray(np.concatenate([p[1] for p in parts])), name=self.wq.prefix.rsplit(".", 1)[0] + ".qrsg")
+                             np.ascontiguousarray(np.concatenate([p[1] for p in parts])), name=self.wq.prefix.rsplit(".", 1)[0] + ".qrsg", mma=mma)
 
     def attention(self, hq, hk, hv, past_kv, conv_state,
                   ragged: RaggedDecoderInputs):
