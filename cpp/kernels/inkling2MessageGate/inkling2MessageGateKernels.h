@@ -35,7 +35,7 @@ constexpr int32_t kInkling2GateMaxRank = 128;
 //!   out[c]  = (1 - forget[c]) * h[c] + gain[c] * m[c]
 //! The weights arrive as BF16 bit pairs packed in 32-bit words: down [rank, 2 * hidden / 2], forgetW and gainW [hidden, rank / 2]. BF16 widens to FP32 exactly, so the
 //! result equals an FP32 evaluation of the checkpoint's BF16 weights. hidden must be a multiple of 8 and rank a multiple of 64, rank <= kInkling2GateMaxRank. The
-//! workspace holds numTokens * rank floats (inkling2MessageGateWorkspaceBytes).
+//! workspace holds numTokens * (rank + 2) floats (inkling2MessageGateWorkspaceBytes). Rank 64 with 32 or more tokens (prefill) runs as tensor-core GEMMs (TF32, FP32-accurate through a two-term split of the activations), EDGELLM_INKLING_GATE_GEMM=0 turns that off.
 void launchInkling2MessageGate(float const* hidden, float const* message, uint32_t const* down, uint32_t const* forgetW, uint32_t const* gainW, float* out,
     int64_t numTokens, int32_t hiddenSize, int32_t rank, float eps, void* workspace, cudaStream_t stream);
 

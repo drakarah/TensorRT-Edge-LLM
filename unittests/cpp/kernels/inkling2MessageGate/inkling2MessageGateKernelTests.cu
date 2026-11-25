@@ -151,7 +151,7 @@ void runCase(int64_t tokens, int32_t hidden, int32_t rank, float magnitude, uint
 
 TEST(Inkling2MessageGate, DecodeAndPrefillTokenCounts)
 {
-    for (int64_t tokens : {1, 2, 3, 5, 17, 64, 300})
+    for (int64_t tokens : {1, 2, 3, 5, 17, 31, 32, 33, 64, 100, 300, 1464})
     {
         runCase(tokens, 2304, 64, 1.F, 10 + tokens);
     }
