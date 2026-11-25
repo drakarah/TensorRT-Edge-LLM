@@ -518,12 +518,21 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
               getTopKtopPSamplingWorkspaceSize(mtpSamplingRows, mDeployment.base.outputVocabSize,
                   SamplingParams(mtpSamplingRows, mDeployment.base.outputVocabSize, 1.0f, 20, 0.95f)))
         : 0U;
+    // Inkling chain verification samples every row of its verify window when the request samples (see VanillaDecoder::decodeStepChain)
+    int32_t const inklingSamplingRows = mDeployment.base.inklingVerifyTokens > 1
+        ? mMaxRuntimeBatchSize * mDeployment.base.inklingVerifyTokens : 0;
+    size_t const inklingSamplingWorkspaceSize = inklingSamplingRows > 0
+        ? std::max(getTopKtopPSamplingWorkspaceSize(inklingSamplingRows, mDeployment.base.outputVocabSize,
+                       SamplingParams(inklingSamplingRows, mDeployment.base.outputVocabSize, 1.0f, 0, 0.9f)),
+              getTopKtopPSamplingWorkspaceSize(inklingSamplingRows, mDeployment.base.outputVocabSize,
+                  SamplingParams(inklingSamplingRows, mDeployment.base.outputVocabSize, 1.0f, 20, 0.95f)))
+        : 0U;
     size_t const maxSamplingWorkspaceSize = hasDraft
         ? std::max({vanillaSamplingWorkspaceSize, mtpSamplingWorkspaceSize,
               getSelectAllTopKWorkspaceSize(vanillaSamplingRows, mDeployment.base.outputVocabSize, 1),
               getSelectAllTopKWorkspaceSize(draftSamplingRows, mDeployment.draft->outputVocabSize, draftSamplingTopK),
               dsparkBaseTopKWorkspaceSize, dflash2TopPWorkspaceSize, logprobsWorkspaceSize})
-        : std::max(vanillaSamplingWorkspaceSize, logprobsWorkspaceSize);
+        : std::max({vanillaSamplingWorkspaceSize, logprobsWorkspaceSize, inklingSamplingWorkspaceSize});
     check::check(maxSamplingWorkspaceSize <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
         "Sampling workspace size exceeds tensor dimension range");
     int64_t const maxSamplingWorkspaceLen = static_cast<int64_t>(std::max<size_t>(maxSamplingWorkspaceSize, 1U));

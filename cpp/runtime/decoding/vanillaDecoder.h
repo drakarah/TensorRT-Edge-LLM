@@ -117,6 +117,9 @@ private:
     std::unique_ptr<LookupDraftPolicy> mLookupPolicy;
     Tensor mChainArgmax;          //!< GPU [maxWindow, 1] INT32
     Tensor mChainHostArgmax;      //!< CPU [maxWindow]
+    Tensor mChainUniforms;        //!< GPU [maxWindow] FP32, request-stable uniforms of the sampled verify rows
+    Tensor mChainHostUniforms;    //!< CPU [maxWindow]
+    uint64_t mChainSamplingOffset{0}; //!< device RNG offset of the sampled verify rows when sampling is not request-stable
     Tensor mChainAcceptLength;    //!< GPU [1]
     Tensor mChainAcceptedIds;     //!< GPU [1, maxWindow]
     Tensor mChainHostAcceptLength;

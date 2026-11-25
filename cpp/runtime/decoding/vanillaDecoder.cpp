@@ -99,6 +99,8 @@ void VanillaDecoder::prepareChainTensors()
     int32_t const w = mChainWindow;
     mChainArgmax = Tensor({w, 1}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "VanillaDecoder::chainArgmax");
     mChainHostArgmax = Tensor({w}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "VanillaDecoder::chainHostArgmax");
+    mChainUniforms = Tensor({w}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "VanillaDecoder::chainUniforms");
+    mChainHostUniforms = Tensor({w}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "VanillaDecoder::chainHostUniforms");
     mChainAcceptLength = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "VanillaDecoder::chainAcceptLength");
     mChainAcceptedIds = Tensor({1, w}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "VanillaDecoder::chainAcceptedIds");
     mChainHostAcceptLength
@@ -111,8 +113,7 @@ bool VanillaDecoder::chainApplies(DecodingInferenceContext const& context) const
 {
     return mChainWindow > 1 && context.activeBatchSize == 1 && context.generationRound > 0 && !context.hasGuidedDecoding
         && context.numLogprobs == 0 && !context.hasLogitBias && context.presencePenalty == 0.0f
-        && !context.reasoningBudget.enabled()
-        && !shouldUseNonGreedySampling(context.temperature, context.topK, context.topP);
+        && !context.reasoningBudget.enabled();
 }
 
 void VanillaDecoder::indexLookupTokens(DecodingInferenceContext& context)
@@ -404,7 +405,38 @@ bool VanillaDecoder::decodeStepChain(DecodingInferenceContext& context)
     }
     auto& io = mRuntime.base.pipelineIO;
     check::check(mChainArgmax.reshape({window, 1}), "Tensor reshape failed");
-    selectAllTopK(io.outputLogits, std::nullopt, mChainArgmax, 1, mRuntime.sampling.workspace, stream);
+    if (shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
+    {
+        // Sampling with a chain draft: the draft distribution is a point mass, so sample the target's token for every row
+        // and accept a draft exactly when the sample equals it. The first mismatch commits the sample, which keeps the output
+        // distribution the target's. With request-stable sampling the row at position p uses the uniform plain decoding would use at p.
+        constexpr uint64_t kChainSamplingSeed = 0x1E7C4A11U;
+        constexpr uint64_t kRandomLane = 0U;
+        auto const vocab = static_cast<int32_t>(io.outputLogits.getShape()[1]);
+        SamplingParams params(window, vocab, context.temperature, static_cast<int32_t>(context.topK), context.topP);
+        rt::Tensor const* rowUniforms{nullptr};
+        if (context.useRequestStableSampling)
+        {
+            check::check(mChainHostUniforms.reshape({window}), "Tensor reshape failed");
+            check::check(mChainUniforms.reshape({window}), "Tensor reshape failed");
+            uint64_t const first = requestStableNextAbsolutePosition(
+                context.rawBatchedInputIds[0].size(), context.currentGenerateLengths[0]);
+            for (int32_t row = 0; row < window; ++row)
+            {
+                mChainHostUniforms.dataPointer<float>()[row]
+                    = requestStableUniform(context.samplingSeeds[0], first + row, SpecRandomPurpose::kTarget, kRandomLane);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(mChainUniforms.rawPointer(), mChainHostUniforms.rawPointer(),
+                window * sizeof(float), cudaMemcpyHostToDevice, stream));
+            rowUniforms = &mChainUniforms;
+        }
+        topKtopPSamplingFromLogits(io.outputLogits, mChainArgmax, params, mRuntime.sampling.workspace, stream,
+            kChainSamplingSeed, mChainSamplingOffset++, rowUniforms);
+    }
+    else
+    {
+        selectAllTopK(io.outputLogits, std::nullopt, mChainArgmax, 1, mRuntime.sampling.workspace, stream);
+    }
     check::check(mChainHostArgmax.reshape({window}), "Tensor reshape failed");
     CUDA_CHECK(cudaMemcpyAsync(mChainHostArgmax.rawPointer(), mChainArgmax.rawPointer(), window * sizeof(int32_t),
         cudaMemcpyDeviceToHost, stream));
