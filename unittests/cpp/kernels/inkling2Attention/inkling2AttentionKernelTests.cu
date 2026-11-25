@@ -1015,6 +1015,46 @@ TEST(Inkling2Attention, Int8KvErrorAgainstUnquantisedFp16IsSmall)
     EXPECT_LT(std::sqrt(err / std::max(norm, 1e-12)), 0.015);
 }
 
+TEST(Inkling2Attention, VerificationWindowsOfOneSequenceMatchTheReference)
+{
+    // 2 to 8 consecutive query tokens of one sequence (the multi-token decode kernel streams each key tile once for all of them), full and windowed attention, GQA groups 1, 2, 3 and 8
+    int32_t seed = 70;
+    for (int32_t tokens : {2, 3, 5, 8})
+    {
+        for (int32_t window : {0, 150})
+        {
+            for (auto [nh, nkv] : {std::pair<int32_t, int32_t>{24, 8}, {8, 4}, {8, 1}, {4, 4}})
+            {
+                Case c;
+                c.nh = nh;
+                c.nkv = nkv;
+                c.window = window;
+                c.maxPages = 6;
+                c.numPages = 16;
+                Data d = makeData(c, {300}, {tokens}, 0, seed);
+                Pool pool = poolWithHistory(c, d, {300}, seed + 1);
+                expectMatches(c, d, pool);
+                seed += 2;
+            }
+        }
+    }
+}
+
+TEST(Inkling2Attention, Int8KvVerificationWindowsMatchFp16)
+{
+    for (int32_t tokens : {2, 5, 8})
+    {
+        Case c;
+        c.nh = 24;
+        c.nkv = 8;
+        c.maxPages = 6;
+        c.numPages = 16;
+        Data d = makeData(c, {300}, {tokens}, 0, 90 + tokens);
+        Pool pool = poolWithHistory(c, d, {300}, 91 + tokens);
+        expectInt8MatchesFp16(c, d, pool);
+    }
+}
+
 TEST(Inkling2Attention, GroupSizesAndKeySplits)
 {
     // GQA group 1, 2, 3, 4, 8 (query tile 24, 12, 8, 6, 3) with a decode step deep enough for several key splits
