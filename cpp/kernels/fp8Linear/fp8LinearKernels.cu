@@ -637,20 +637,36 @@ void launch(void const* x, void const* w, void const* scale, void* y, int32_t nu
 }
 //! Prefill tiles of 64 tokens with kNTiles groups of 8 output rows per warp (kWarps x kNTiles x 8 rows per block): the activation fragments of a k16 step are loaded from shared memory
 //! once and used for kNTiles weight tiles (the one-group kernel above needs 4 shared-memory loads per MMA, this one 1 per kNTiles MMAs); the weights are dequantised in registers as before.
+#ifndef EDGELLM_WIDE_GROUP_Y
+#define EDGELLM_WIDE_GROUP_Y 8
+#endif
+constexpr int32_t kWideStage = 128; //!< k per pipeline stage of gemmWide
+constexpr int32_t kWideGroupY = EDGELLM_WIDE_GROUP_Y; //!< token blocks launched together per weight tile column (L2 reuse of the weights)
+
 template <int32_t kNTiles>
 __global__ void __launch_bounds__(kWarps * 32) gemmWide(__half const* __restrict__ x, uint4 const* __restrict__ wShuf, void const* scale, __half* __restrict__ y,
-    int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32)
+    int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32, int32_t numX, int32_t numY)
 {
     constexpr int32_t kGroups = 4; // m16 groups: 64 tokens
     constexpr int32_t kTokens = 16 * kGroups;
-    constexpr int32_t kStride = kStageTile + 8;
-    extern __shared__ __align__(16) __half xs[]; // [kTokens][kStride]
+    constexpr int32_t kStride = kWideStage + 8;
+    extern __shared__ __align__(16) __half xs[]; // two stages of [kTokens][kStride]
     int32_t const lane = threadIdx.x & 31;
     int32_t const warp = threadIdx.x >> 5;
     int32_t const g = lane >> 2;
     int32_t const t = lane & 3;
-    int32_t const group0 = (blockIdx.x * kWarps + warp) * kNTiles;
-    int32_t const token0 = blockIdx.y * kTokens;
+    // grouped launch order: kWideGroupY consecutive token blocks run together over the same weight tiles, so the weights are read from DRAM once per group and the activations
+    // of the group stay in L2 (the plain x-fastest order re-reads every weight tile from DRAM for each token block when the weights exceed the L2)
+    int32_t const linear = blockIdx.x;
+    int32_t const perGroup = kWideGroupY * numX;
+    int32_t const grp = linear / perGroup;
+    int32_t const firstY = grp * kWideGroupY;
+    int32_t const groupY = min(numY - firstY, kWideGroupY);
+    int32_t const inGroup = linear % perGroup;
+    int32_t const tileX = inGroup / groupY;
+    int32_t const tileY = firstY + inGroup % groupY;
+    int32_t const group0 = (tileX * kWarps + warp) * kNTiles;
+    int32_t const token0 = tileY * kTokens;
     int32_t const kb64 = k / 64;
     float c[kGroups][kNTiles][4];
 #pragma unroll
@@ -670,22 +686,34 @@ __global__ void __launch_bounds__(kWarps * 32) gemmWide(__half const* __restrict
         active[nt] = (group0 + nt) * 8 < n;
         wp[nt] = wShuf + static_cast<size_t>(active[nt] ? group0 + nt : 0) * kb64 * 32 + lane;
     }
-    for (int32_t k0 = 0; k0 < k; k0 += kStageTile)
+    // two-stage cp.async pipeline of the activation tile: the chunk k0 + kWideStage loads while the MMAs of chunk k0 run
+    auto issue = [&](int32_t buf, int32_t k0)
     {
-        int32_t const kc = min(kStageTile, k - k0);
-        __syncthreads();
-        for (int32_t idx = threadIdx.x; idx < kTokens * kc / 8; idx += blockDim.x)
+        int32_t const kc = min(kWideStage, k - k0);
+        int32_t const chunks = kc / 8;
+        for (int32_t idx = threadIdx.x; idx < kTokens * chunks; idx += blockDim.x)
         {
-            int32_t const r = idx / (kc / 8);
-            int32_t const cc = idx % (kc / 8);
-            uint4 v = make_uint4(0, 0, 0, 0);
-            if (token0 + r < numTokens)
-            {
-                v = *reinterpret_cast<uint4 const*>(x + static_cast<size_t>(token0 + r) * k + k0 + cc * 8);
-            }
-            *reinterpret_cast<uint4*>(&xs[r * kStride + cc * 8]) = v;
+            int32_t const r = idx / chunks;
+            int32_t const cc = idx % chunks;
+            bool const valid = token0 + r < numTokens;
+            __half const* src = x + static_cast<size_t>(valid ? token0 + r : 0) * k + k0 + cc * 8;
+            uint32_t const dst = static_cast<uint32_t>(__cvta_generic_to_shared(&xs[buf * kTokens * kStride + r * kStride + cc * 8]));
+            int32_t const bytes = valid ? 16 : 0;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(bytes));
         }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    issue(0, 0);
+    for (int32_t k0 = 0, cur = 0; k0 < k; k0 += kWideStage, cur ^= 1)
+    {
+        int32_t const kc = min(kWideStage, k - k0);
+        asm volatile("cp.async.wait_group 0;\n" ::);
         __syncthreads();
+        if (k0 + kWideStage < k)
+        {
+            issue(cur ^ 1, k0 + kWideStage);
+        }
+        __half const* xcur = xs + cur * kTokens * kStride;
         int32_t const nkb = kc / 64;
         int32_t const kbBase = k0 / 64;
 #pragma unroll 1
@@ -713,10 +741,10 @@ __global__ void __launch_bounds__(kWarps * 32) gemmWide(__half const* __restrict
                 for (int32_t i = 0; i < kGroups; ++i)
                 {
                     int32_t const r0 = 16 * i + g;
-                    uint32_t const a0 = *reinterpret_cast<uint32_t const*>(&xs[r0 * kStride + kk + 2 * t]);
-                    uint32_t const a2 = *reinterpret_cast<uint32_t const*>(&xs[r0 * kStride + kk + 8 + 2 * t]);
-                    uint32_t const a1 = *reinterpret_cast<uint32_t const*>(&xs[(r0 + 8) * kStride + kk + 2 * t]);
-                    uint32_t const a3 = *reinterpret_cast<uint32_t const*>(&xs[(r0 + 8) * kStride + kk + 8 + 2 * t]);
+                    uint32_t const a0 = *reinterpret_cast<uint32_t const*>(&xcur[r0 * kStride + kk + 2 * t]);
+                    uint32_t const a2 = *reinterpret_cast<uint32_t const*>(&xcur[r0 * kStride + kk + 8 + 2 * t]);
+                    uint32_t const a1 = *reinterpret_cast<uint32_t const*>(&xcur[(r0 + 8) * kStride + kk + 2 * t]);
+                    uint32_t const a3 = *reinterpret_cast<uint32_t const*>(&xcur[(r0 + 8) * kStride + kk + 8 + 2 * t]);
 #pragma unroll
                     for (int32_t nt = 0; nt < kNTiles; ++nt)
                     {
@@ -757,12 +785,13 @@ __global__ void __launch_bounds__(kWarps * 32) gemmWide(__half const* __restrict
 template <int32_t kNTiles>
 void launchWide(void const* x, void const* w, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32, cudaStream_t stream)
 {
-    constexpr int32_t kStride = kStageTile + 8;
-    size_t const smem = static_cast<size_t>(64) * kStride * sizeof(__half);
+    constexpr int32_t kStride = kWideStage + 8;
+    size_t const smem = static_cast<size_t>(2) * 64 * kStride * sizeof(__half);
     int32_t const groups = n / 8;
-    dim3 const grid((groups + kWarps * kNTiles - 1) / (kWarps * kNTiles), (numTokens + 63) / 64);
-    gemmWide<kNTiles><<<grid, kWarps * 32, smem, stream>>>(
-        static_cast<__half const*>(x), static_cast<uint4 const*>(w), scale, static_cast<__half*>(y), numTokens, n, k, scaleIsFp32);
+    int32_t const numX = (groups + kWarps * kNTiles - 1) / (kWarps * kNTiles);
+    int32_t const numY = (numTokens + 63) / 64;
+    gemmWide<kNTiles><<<numX * numY, kWarps * 32, smem, stream>>>(
+        static_cast<__half const*>(x), static_cast<uint4 const*>(w), scale, static_cast<__half*>(y), numTokens, n, k, scaleIsFp32, numX, numY);
 }
 } // namespace i8mma
 
