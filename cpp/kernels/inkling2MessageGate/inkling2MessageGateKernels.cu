@@ -270,6 +270,52 @@ __global__ void __launch_bounds__(kApplyWarps * 32) gateApplyMultiKernel(float c
     }
 }
 
+//! Rank-64 stage 2 with one thread per output channel (1 to 8 tokens): the channel's forget and gain rows (32 words each) are loaded once into registers and every token's low vector is
+//! read from shared memory (all threads read the same address, a broadcast). The warp-per-channel kernels spend about 100 warp-instructions per (channel, token) on a 64-element dot
+//! product (shuffle reductions, two tanh per lane); this one about 5, and they were instruction bound: 22.6 us for 5 tokens, 8 us for one (METRICS 230).
+__global__ void __launch_bounds__(64) gateApplyThreadKernel(float const* __restrict__ hidden, float const* __restrict__ message, uint32_t const* __restrict__ forgetW,
+    uint32_t const* __restrict__ gainW, float const* __restrict__ low, float* __restrict__ out, int32_t hiddenSize, int32_t numTokens)
+{
+    constexpr int32_t kWords = 32; // rank 64 = 32 words of two BF16
+    __shared__ __align__(16) float lows[kGateMaxMultiTokens][2 * kWords];
+    for (int32_t i = threadIdx.x; i < numTokens * 2 * kWords; i += blockDim.x)
+    {
+        lows[i / (2 * kWords)][i % (2 * kWords)] = low[i];
+    }
+    __syncthreads();
+    int32_t const c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= hiddenSize)
+    {
+        return;
+    }
+    uint4 fw[kWords / 4], gw[kWords / 4];
+    uint4 const* frow = reinterpret_cast<uint4 const*>(forgetW + static_cast<int64_t>(c) * kWords);
+    uint4 const* grow = reinterpret_cast<uint4 const*>(gainW + static_cast<int64_t>(c) * kWords);
+#pragma unroll
+    for (int32_t i = 0; i < kWords / 4; ++i)
+    {
+        fw[i] = frow[i];
+        gw[i] = grow[i];
+    }
+    for (int32_t t = 0; t < numTokens; ++t)
+    {
+        float f = 0.F;
+        float g = 0.F;
+#pragma unroll
+        for (int32_t i = 0; i < kWords / 4; ++i)
+        {
+            float4 const l0 = *reinterpret_cast<float4 const*>(&lows[t][8 * i]);
+            float4 const l1 = *reinterpret_cast<float4 const*>(&lows[t][8 * i + 4]);
+            f += bf16Lo(fw[i].x) * l0.x + bf16Hi(fw[i].x) * l0.y + bf16Lo(fw[i].y) * l0.z + bf16Hi(fw[i].y) * l0.w + bf16Lo(fw[i].z) * l1.x + bf16Hi(fw[i].z) * l1.y
+                + bf16Lo(fw[i].w) * l1.z + bf16Hi(fw[i].w) * l1.w;
+            g += bf16Lo(gw[i].x) * l0.x + bf16Hi(gw[i].x) * l0.y + bf16Lo(gw[i].y) * l0.z + bf16Hi(gw[i].y) * l0.w + bf16Lo(gw[i].z) * l1.x + bf16Hi(gw[i].z) * l1.y
+                + bf16Lo(gw[i].w) * l1.z + bf16Hi(gw[i].w) * l1.w;
+        }
+        size_t const o = static_cast<size_t>(t) * hiddenSize + c;
+        out[o] = (1.F - tanhf(f)) * hidden[o] + tanhf(g) * message[o];
+    }
+}
+
 //! Stage 2, grid (hidden / kApplyWarps, tokens): one warp per output channel c; lane l holds low[2l], low[2l + 1] (rank 64) and the matching BF16 pair of the
 //! forget and gain rows; shuffle reductions, tanh and the gated mix.
 template <int32_t kPairsPerLane>
@@ -552,6 +598,17 @@ void launchInkling2MessageGate(float const* hidden, float const* message, uint32
     }
     // 2 to 8 tokens (verification windows): stage 2 reads each channel's forget and gain rows once for all tokens (EDGELLM_INKLING_GATE_MULTI=0 restores the one-token-per-block kernel)
     static bool const multiOff = std::getenv("EDGELLM_INKLING_GATE_MULTI") != nullptr && std::getenv("EDGELLM_INKLING_GATE_MULTI")[0] == '0';
+    static bool const threadOff = std::getenv("EDGELLM_INKLING_GATE_THREAD") != nullptr && std::getenv("EDGELLM_INKLING_GATE_THREAD")[0] == '0';
+    if (!threadOff && numTokens <= kGateMaxMultiTokens && rank == 64 && hiddenSize / 4 <= 128 * 8)
+    {
+        // one thread per output channel, 1 to 8 tokens (EDGELLM_INKLING_GATE_THREAD=0 restores the warp-per-channel kernels)
+        static bool const prefetchOffThread = std::getenv("EDGELLM_INKLING_GATE_PREFETCH") != nullptr && std::getenv("EDGELLM_INKLING_GATE_PREFETCH")[0] == '0';
+        gateLowRowKernel<<<dim3(static_cast<unsigned int>(rank), static_cast<unsigned int>(numTokens)), 128, 0, stream>>>(
+            hidden, message, down, low, hiddenSize, rank, eps, prefetchOffThread ? nullptr : forgetW, prefetchOffThread ? nullptr : gainW);
+        gateApplyThreadKernel<<<static_cast<unsigned int>((hiddenSize + 63) / 64), 64, 0, stream>>>(
+            hidden, message, forgetW, gainW, low, out, hiddenSize, static_cast<int32_t>(numTokens));
+        return;
+    }
     if (!multiOff && numTokens >= 2 && numTokens <= kGateMaxMultiTokens && hiddenSize / 4 <= 128 * 8 && (rank == 64 || rank == 128))
     {
         // stage 1 stays one block per (row, token): its 5x more blocks beat reusing the row (the multi-token low kernel was 34.7 us against 26.0 us for 5 tokens, METRICS 230)
