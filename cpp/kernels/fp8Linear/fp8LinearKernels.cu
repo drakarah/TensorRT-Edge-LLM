@@ -500,6 +500,125 @@ __global__ void __launch_bounds__(kWarps * 32) gemm(__half const* __restrict__ x
     }
 }
 
+//! Up to 8 tokens, small and medium output sizes: kSplit warps share one group of 8 output rows (split-K: warp s takes the k64 blocks s, s + kSplit, ...), so a block of kWarps warps covers
+//! kWarps / kSplit groups and a small n still fills the GPU; four weight loads are issued before they are used. The partial sums are reduced through shared memory.
+template <int32_t kSplit>
+__global__ void __launch_bounds__(kWarps * 32) gemmSplit(__half const* __restrict__ x, uint4 const* __restrict__ wShuf, void const* scale, __half* __restrict__ y,
+    int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32)
+{
+    constexpr int32_t kStride = kStageSmall + 8;
+    constexpr int32_t kGroupsPerBlock = kWarps / kSplit;
+    extern __shared__ __align__(16) __half xs[]; // [8][kStride]
+    __shared__ float red[kSplit > 1 ? kWarps : 1][32][4];
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const warp = threadIdx.x >> 5;
+    int32_t const g = lane >> 2;
+    int32_t const t = lane & 3;
+    int32_t const split = warp % kSplit;
+    int32_t const group = blockIdx.x * kGroupsPerBlock + warp / kSplit;
+    bool const active = group * 8 < n;
+    int32_t const kb64 = k / 64;
+    float c[4] = {0.F, 0.F, 0.F, 0.F};
+    uint4 const* wp = wShuf + static_cast<size_t>(active ? group : 0) * kb64 * 32 + lane;
+    for (int32_t k0 = 0; k0 < k; k0 += kStageSmall)
+    {
+        int32_t const kc = min(kStageSmall, k - k0);
+        __syncthreads();
+        for (int32_t idx = threadIdx.x; idx < 8 * kc / 8; idx += blockDim.x)
+        {
+            int32_t const r = idx / (kc / 8);
+            int32_t const cc = idx % (kc / 8);
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (r < numTokens)
+            {
+                v = *reinterpret_cast<uint4 const*>(x + static_cast<size_t>(r) * k + k0 + cc * 8);
+            }
+            *reinterpret_cast<uint4*>(&xs[r * kStride + cc * 8]) = v;
+        }
+        __syncthreads();
+        if (active)
+        {
+            int32_t const nkb = kc / 64;
+            int32_t const kbBase = k0 / 64;
+#pragma unroll 1
+            for (int32_t b = split; b < nkb; b += 4 * kSplit)
+            {
+                uint4 w[4];
+#pragma unroll
+                for (int32_t u = 0; u < 4; ++u)
+                {
+                    int32_t const kb = b + u * kSplit;
+                    w[u] = kb < nkb ? __ldg(wp + static_cast<size_t>(kbBase + kb) * 32) : make_uint4(0, 0, 0, 0);
+                }
+#pragma unroll
+                for (int32_t u = 0; u < 4; ++u)
+                {
+                    int32_t const kb = b + u * kSplit;
+                    if (kb < nkb)
+                    {
+                        uint32_t const ws[4] = {w[u].x, w[u].y, w[u].z, w[u].w};
+#pragma unroll
+                        for (int32_t j = 0; j < 4; ++j)
+                        {
+                            int32_t const kk = kb * 64 + j * 16;
+                            uint32_t b0, b1;
+                            int8Pairs(ws[j], b0, b1);
+                            uint32_t const a0 = *reinterpret_cast<uint32_t const*>(&xs[g * kStride + kk + 2 * t]);
+                            uint32_t const a2 = *reinterpret_cast<uint32_t const*>(&xs[g * kStride + kk + 8 + 2 * t]);
+                            mma16816(c, a0, 0U, a2, 0U, b0, b1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if constexpr (kSplit > 1)
+    {
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            red[warp][lane][i] = c[i];
+        }
+        __syncthreads();
+        if (split != 0)
+        {
+            return;
+        }
+#pragma unroll
+        for (int32_t s2 = 1; s2 < kSplit; ++s2)
+        {
+#pragma unroll
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                c[i] += red[warp + s2][lane][i];
+            }
+        }
+    }
+    if (!active)
+    {
+        return;
+    }
+    int32_t const n0 = group * 8 + 2 * t;
+    float const s0 = loadScale(scale, n0, scaleIsFp32);
+    float const s1 = loadScale(scale, n0 + 1, scaleIsFp32);
+    if (g < numTokens)
+    {
+        y[static_cast<size_t>(g) * n + n0] = __float2half_rn(c[0] * s0);
+        y[static_cast<size_t>(g) * n + n0 + 1] = __float2half_rn(c[1] * s1);
+    }
+}
+
+template <int32_t kSplit>
+void launchSplit(void const* x, void const* w, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32, cudaStream_t stream)
+{
+    constexpr int32_t kStride = kStageSmall + 8;
+    size_t const smem = static_cast<size_t>(8) * kStride * sizeof(__half);
+    constexpr int32_t kGroupsPerBlock = kWarps / kSplit;
+    dim3 const grid((n / 8 + kGroupsPerBlock - 1) / kGroupsPerBlock);
+    gemmSplit<kSplit><<<grid, kWarps * 32, smem, stream>>>(
+        static_cast<__half const*>(x), static_cast<uint4 const*>(w), scale, static_cast<__half*>(y), numTokens, n, k, scaleIsFp32);
+}
+
 template <int32_t kGroups, bool kSmall>
 void launch(void const* x, void const* w, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32, cudaStream_t stream)
 {
@@ -562,7 +681,15 @@ void launchFp8Linear(void const* x, void const* weightWords, void const* scale, 
         // tensor cores for every token count: up to 8 tokens one half-filled m16 group, then 64-token tiles
         if (numTokens <= 8)
         {
-            i8mma::launch<1, true>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
+            // split-K over two warps for the small output sizes (k, v, o projections), one warp per group of 8 rows for the large ones (fused q, head): METRICS 208
+            if (n < 3000)
+            {
+                i8mma::launchSplit<2>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
+            }
+            else
+            {
+                i8mma::launchSplit<1>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
+            }
         }
         else
         {
