@@ -48,6 +48,15 @@ public:
     {
         mCtxLen = 0;
     }
+    bool truncateContext(int32_t length) noexcept override
+    {
+        if (length < 0 || length > mCtxLen)
+        {
+            return false;
+        }
+        mCtxLen = length;
+        return true;
+    }
     void reset() noexcept
     {
         mCtxLen = 0;

@@ -28,6 +28,13 @@ public:
     //! Positions whose taps the drafter has seen (the next position observeTaps() expects).
     virtual int32_t contextLength() const noexcept = 0;
     virtual void beginRequest() noexcept = 0;
+    //! Keeps only the first `length` positions of the context (a request that reuses a cached prefix resumes from an earlier request's rows); false when
+    //! the source cannot (it then starts the request without context).
+    virtual bool truncateContext(int32_t length) noexcept
+    {
+        (void) length;
+        return false;
+    }
     //! Taps [rows, tapWidth()] (device FP32) of positions pos0 .. pos0 + rows - 1; pos0 must equal contextLength().
     virtual void observeTaps(float const* taps, int32_t rows, int32_t pos0, cudaStream_t stream) = 0;
     //! Draft tokens after the anchor at position contextLength(); anchorEmbedding is the target's embedding of the anchor token (device FP16 [hidden]).

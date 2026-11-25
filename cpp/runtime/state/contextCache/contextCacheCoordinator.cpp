@@ -1912,7 +1912,8 @@ void ContextCacheCoordinator::validateVanillaDecodeAdvances(RequestHandle::Impl 
 {
     ELLM_CHECK(commonStateLengths == nullptr || commonStateLengths->empty(),
         "Vanilla decode supplied speculative common-state lengths");
-    validateCommittedLookaheadAdvances(request, advances, /*tokensPerStep=*/TokensPerDecodeStep::kExactlyOne);
+    validateCommittedLookaheadAdvances(request, advances,
+        mProfile.multiTokenDecodeSteps ? TokensPerDecodeStep::kAcceptedCount : TokensPerDecodeStep::kExactlyOne);
 }
 
 void ContextCacheCoordinator::validateFullyCommittedDecodeAdvances(RequestHandle::Impl const& request,

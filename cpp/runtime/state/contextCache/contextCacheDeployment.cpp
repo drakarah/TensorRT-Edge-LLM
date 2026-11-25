@@ -141,7 +141,9 @@ ContextCacheDeploymentProfile validateContextCacheDeployment(DeploymentConfig co
             "Vanilla context-cache deployment requires an llm-role base and no draft/speculative configuration.");
         ELLM_CHECK(deployment.base.numAttentionLayers > 0 || deployment.base.numLinearAttnLayers > 0,
             "Context-cache deployment has no stateful layers.");
-        return ContextCacheDeploymentProfile{classifyBaseState(deployment.base), std::nullopt};
+        ContextCacheDeploymentProfile profile{classifyBaseState(deployment.base), std::nullopt};
+        profile.multiTokenDecodeSteps = deployment.base.inklingVerifyTokens > 1;
+        return profile;
     }
 
     validateSpecDeploymentTuple(deployment);

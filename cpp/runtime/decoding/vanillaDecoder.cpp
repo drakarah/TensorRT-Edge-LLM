@@ -202,20 +202,70 @@ bool VanillaDecoder::feedDrafterPrefill(DecodingInferenceContext& context, bool 
         rows = context.committedLengths[0] - pos0;
         mDrafterPrefillOpen = false;
     }
-    if (pos0 == 0)
+    // the first prefill pass of a request starts where its reused prefix ends (request ids are not unique: every single request is id 1)
+    bool const firstPass = pos0 == context.prefillStartLengths[0];
+    if (firstPass)
     {
-        mDrafter->beginRequest();
-        mDrafterValid = true;
+        mDrafterValid = false;
+        if (pos0 == 0)
+        {
+            mDrafter->beginRequest();
+            mDrafterTokens.clear();
+            mDrafterValid = true;
+        }
+        else if (static_cast<size_t>(pos0) <= mDrafterTokens.size() && drafterContextMatches(context, pos0) && mDrafter->truncateContext(pos0))
+        {
+            // the request reuses a cached prefix and the drafter holds the rows of the same tokens (the taps of a position depend only on the tokens before it)
+            mDrafterTokens.resize(static_cast<size_t>(pos0));
+            mDrafterValid = true;
+            LOG_INFO("Inkling drafter resumed from %d reused positions", pos0);
+        }
     }
     if (!mDrafterValid || mDrafter->contextLength() != pos0 || rows <= 0 || rows > mRuntime.deployment.base.maxPhysicalTokens)
     {
         // a reused prefix (or an unexpected pass layout): the drafter lacks those positions, so this request runs without it
-        LOG_WARNING("Inkling drafter prefill feed skipped: rows %d, pos0 %d, drafter context %d", rows, pos0, mDrafter->contextLength());
+        LOG_WARNING("Inkling drafter prefill feed skipped: rows %d, pos0 %d, drafter context %d (first pass %d, prefill start %d, drafter tokens %zu, request tokens %zu, raw prompt %zu)", rows, pos0,
+            mDrafter->contextLength(), static_cast<int>(firstPass), context.prefillStartLengths[0], mDrafterTokens.size(), context.tokenIds[0].size(), context.rawBatchedInputIds[0].size());
         mDrafterValid = false;
         return true;
     }
     dumpTaps(mRuntime.base.pipelineIO.inklingTaps.dataPointer<float>(), rows, context.stream);
     mDrafter->observeTaps(mRuntime.base.pipelineIO.inklingTaps.dataPointer<float>(), rows, pos0, context.stream);
+    noteDrafterTokens(context, pos0, rows);
+    return true;
+}
+
+void VanillaDecoder::noteDrafterTokens(DecodingInferenceContext const& context, int32_t pos0, int32_t rows)
+{
+    // remember which tokens the drafter's rows come from: the next request resumes from them when its reused prefix matches
+    mDrafterTokens.resize(static_cast<size_t>(pos0));
+    for (int32_t i = 0; i < rows; ++i)
+    {
+        mDrafterTokens.push_back(sequenceToken(context, pos0 + i));
+    }
+}
+
+int32_t VanillaDecoder::sequenceToken(DecodingInferenceContext const& context, int32_t position)
+{
+    // the full prompt is in rawBatchedInputIds; tokenIds holds the part after the reused prefix (the suffix being prefilled, then the generated tokens)
+    std::vector<int32_t> const& prompt = context.rawBatchedInputIds[0];
+    if (static_cast<size_t>(position) < prompt.size())
+    {
+        return prompt[static_cast<size_t>(position)];
+    }
+    int64_t const index = static_cast<int64_t>(position) - context.prefillStartLengths[0];
+    return index >= 0 && index < static_cast<int64_t>(context.tokenIds[0].size()) ? context.tokenIds[0][static_cast<size_t>(index)] : -1;
+}
+
+bool VanillaDecoder::drafterContextMatches(DecodingInferenceContext const& context, int32_t length) const
+{
+    for (int32_t i = 0; i < length; ++i)
+    {
+        if (mDrafterTokens[static_cast<size_t>(i)] != sequenceToken(context, i))
+        {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -241,6 +291,7 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
         {
             dumpTaps(mRuntime.base.pipelineIO.inklingTaps.dataPointer<float>(), rows, context.stream);
             mDrafter->observeTaps(mRuntime.base.pipelineIO.inklingTaps.dataPointer<float>(), rows, first, context.stream);
+            noteDrafterTokens(context, first, rows);
         }
         else if (rows > 0)
         {

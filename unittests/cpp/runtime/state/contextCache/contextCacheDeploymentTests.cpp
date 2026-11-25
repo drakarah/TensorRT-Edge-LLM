@@ -142,6 +142,21 @@ TEST(ContextCacheDeploymentTests, ClassifiesSupportedVanillaHybridAndPureRecurre
     EXPECT_FALSE(recurrentProfile.specReuseContract.has_value());
 }
 
+TEST(ContextCacheDeploymentTests, VanillaDecodeCommitsOneTokenUnlessTheEngineHasAnInklingVerifyWindow)
+{
+    DeploymentConfig hybrid{makeHybridConfig(), std::nullopt, std::nullopt};
+    EXPECT_FALSE(validateContextCacheDeployment(hybrid).multiTokenDecodeSteps);
+
+    hybrid.base.inklingVerifyTokens = 1;
+    EXPECT_FALSE(validateContextCacheDeployment(hybrid).multiTokenDecodeSteps);
+
+    hybrid.base.inklingVerifyTokens = 8;
+    ContextCacheDeploymentProfile const profile = validateContextCacheDeployment(hybrid);
+    EXPECT_TRUE(profile.multiTokenDecodeSteps);
+    EXPECT_EQ(profile.baseStateKind, ContextCacheModelStateKind::kHybrid);
+    EXPECT_FALSE(profile.specReuseContract.has_value());
+}
+
 TEST(ContextCacheDeploymentTests, AdmitsPromptOnlyBlockDiffusionAndRejectsUnsupportedVariants)
 {
     DeploymentConfig deployment{makeAttentionConfig(), std::nullopt, std::nullopt};

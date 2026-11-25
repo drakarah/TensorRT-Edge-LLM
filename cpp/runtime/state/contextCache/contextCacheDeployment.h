@@ -39,6 +39,8 @@ struct ContextCacheDeploymentProfile
 {
     ContextCacheModelStateKind baseStateKind{};
     std::optional<SpecReuseContract> specReuseContract;
+    //! A non-speculative deployment whose decode step may commit several tokens (the Inkling chain verification): the vanilla advance check accepts a count.
+    bool multiTokenDecodeSteps{false};
 
     bool hasAttention() const noexcept
     {

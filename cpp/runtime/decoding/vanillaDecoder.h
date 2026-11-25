@@ -63,6 +63,9 @@ public:
     {
         return mDrafter != nullptr;
     }
+    static int32_t sequenceToken(DecodingInferenceContext const& context, int32_t position);
+    bool drafterContextMatches(DecodingInferenceContext const& context, int32_t length) const;
+    void noteDrafterTokens(DecodingInferenceContext const& context, int32_t pos0, int32_t rows);
     bool absorbPrefillPass(DecodingInferenceContext& context) override;
     bool initializeForGeneration(DecodingInferenceContext& context) override;
 
@@ -126,6 +129,7 @@ private:
     Tensor mChainHostAcceptedIds;
     std::unique_ptr<IDraftSource> mDrafter;
     bool mDrafterPrefillOpen{false}; //!< a chunked prefill has fed passes and awaits its last one
+    std::vector<int32_t> mDrafterTokens; //!< token ids whose taps the drafter holds (positions 0..size-1): a request with a reused prefix resumes from them
     bool mDrafterValid{false};   //!< the drafter has the taps of every position of this request
     bool mAutoK{false};          //!< EDGELLM_INKLING_DRAFT_K=auto: the verified draft count follows the running acceptance
     std::array<double, 7> mPrefixAcceptance{0.70, 0.47, 0.33, 0.24, 0.18, 0.14, 0.10}; //!< P(at least j + 1 drafts accepted), offline prior
