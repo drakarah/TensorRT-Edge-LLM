@@ -17,6 +17,7 @@
 
 #include "fp8LinearKernels.h"
 
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <mma.h>
@@ -634,6 +635,135 @@ void launch(void const* x, void const* w, void const* scale, void* y, int32_t nu
     gemm<kGroups, kSmall><<<grid, kWarps * 32, smem, stream>>>(
         static_cast<__half const*>(x), static_cast<uint4 const*>(w), scale, static_cast<__half*>(y), numTokens, n, k, scaleIsFp32);
 }
+//! Prefill tiles of 64 tokens with kNTiles groups of 8 output rows per warp (kWarps x kNTiles x 8 rows per block): the activation fragments of a k16 step are loaded from shared memory
+//! once and used for kNTiles weight tiles (the one-group kernel above needs 4 shared-memory loads per MMA, this one 1 per kNTiles MMAs); the weights are dequantised in registers as before.
+template <int32_t kNTiles>
+__global__ void __launch_bounds__(kWarps * 32) gemmWide(__half const* __restrict__ x, uint4 const* __restrict__ wShuf, void const* scale, __half* __restrict__ y,
+    int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32)
+{
+    constexpr int32_t kGroups = 4; // m16 groups: 64 tokens
+    constexpr int32_t kTokens = 16 * kGroups;
+    constexpr int32_t kStride = kStageTile + 8;
+    extern __shared__ __align__(16) __half xs[]; // [kTokens][kStride]
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const warp = threadIdx.x >> 5;
+    int32_t const g = lane >> 2;
+    int32_t const t = lane & 3;
+    int32_t const group0 = (blockIdx.x * kWarps + warp) * kNTiles;
+    int32_t const token0 = blockIdx.y * kTokens;
+    int32_t const kb64 = k / 64;
+    float c[kGroups][kNTiles][4];
+#pragma unroll
+    for (int32_t i = 0; i < kGroups; ++i)
+    {
+#pragma unroll
+        for (int32_t nt = 0; nt < kNTiles; ++nt)
+        {
+            c[i][nt][0] = c[i][nt][1] = c[i][nt][2] = c[i][nt][3] = 0.F;
+        }
+    }
+    uint4 const* wp[kNTiles];
+    bool active[kNTiles];
+#pragma unroll
+    for (int32_t nt = 0; nt < kNTiles; ++nt)
+    {
+        active[nt] = (group0 + nt) * 8 < n;
+        wp[nt] = wShuf + static_cast<size_t>(active[nt] ? group0 + nt : 0) * kb64 * 32 + lane;
+    }
+    for (int32_t k0 = 0; k0 < k; k0 += kStageTile)
+    {
+        int32_t const kc = min(kStageTile, k - k0);
+        __syncthreads();
+        for (int32_t idx = threadIdx.x; idx < kTokens * kc / 8; idx += blockDim.x)
+        {
+            int32_t const r = idx / (kc / 8);
+            int32_t const cc = idx % (kc / 8);
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (token0 + r < numTokens)
+            {
+                v = *reinterpret_cast<uint4 const*>(x + static_cast<size_t>(token0 + r) * k + k0 + cc * 8);
+            }
+            *reinterpret_cast<uint4*>(&xs[r * kStride + cc * 8]) = v;
+        }
+        __syncthreads();
+        int32_t const nkb = kc / 64;
+        int32_t const kbBase = k0 / 64;
+#pragma unroll 1
+        for (int32_t kb = 0; kb < nkb; ++kb)
+        {
+            uint4 w[kNTiles];
+#pragma unroll
+            for (int32_t nt = 0; nt < kNTiles; ++nt)
+            {
+                w[nt] = active[nt] ? __ldg(wp[nt] + static_cast<size_t>(kbBase + kb) * 32) : make_uint4(0, 0, 0, 0);
+            }
+#pragma unroll
+            for (int32_t j = 0; j < 4; ++j)
+            {
+                int32_t const kk = kb * 64 + j * 16;
+                uint32_t b0[kNTiles];
+                uint32_t b1[kNTiles];
+#pragma unroll
+                for (int32_t nt = 0; nt < kNTiles; ++nt)
+                {
+                    uint32_t const word = j == 0 ? w[nt].x : (j == 1 ? w[nt].y : (j == 2 ? w[nt].z : w[nt].w));
+                    int8Pairs(word, b0[nt], b1[nt]);
+                }
+#pragma unroll
+                for (int32_t i = 0; i < kGroups; ++i)
+                {
+                    int32_t const r0 = 16 * i + g;
+                    uint32_t const a0 = *reinterpret_cast<uint32_t const*>(&xs[r0 * kStride + kk + 2 * t]);
+                    uint32_t const a2 = *reinterpret_cast<uint32_t const*>(&xs[r0 * kStride + kk + 8 + 2 * t]);
+                    uint32_t const a1 = *reinterpret_cast<uint32_t const*>(&xs[(r0 + 8) * kStride + kk + 2 * t]);
+                    uint32_t const a3 = *reinterpret_cast<uint32_t const*>(&xs[(r0 + 8) * kStride + kk + 8 + 2 * t]);
+#pragma unroll
+                    for (int32_t nt = 0; nt < kNTiles; ++nt)
+                    {
+                        mma16816(c[i][nt], a0, a1, a2, a3, b0[nt], b1[nt]);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int32_t nt = 0; nt < kNTiles; ++nt)
+    {
+        if (!active[nt])
+        {
+            continue;
+        }
+        int32_t const n0 = (group0 + nt) * 8 + 2 * t;
+        float const s0 = loadScale(scale, n0, scaleIsFp32);
+        float const s1 = loadScale(scale, n0 + 1, scaleIsFp32);
+#pragma unroll
+        for (int32_t i = 0; i < kGroups; ++i)
+        {
+            int32_t const row0 = token0 + 16 * i + g;
+            if (row0 < numTokens)
+            {
+                y[static_cast<size_t>(row0) * n + n0] = __float2half_rn(c[i][nt][0] * s0);
+                y[static_cast<size_t>(row0) * n + n0 + 1] = __float2half_rn(c[i][nt][1] * s1);
+            }
+            if (row0 + 8 < numTokens)
+            {
+                y[static_cast<size_t>(row0 + 8) * n + n0] = __float2half_rn(c[i][nt][2] * s0);
+                y[static_cast<size_t>(row0 + 8) * n + n0 + 1] = __float2half_rn(c[i][nt][3] * s1);
+            }
+        }
+    }
+}
+
+template <int32_t kNTiles>
+void launchWide(void const* x, void const* w, void const* scale, void* y, int32_t numTokens, int32_t n, int32_t k, bool scaleIsFp32, cudaStream_t stream)
+{
+    constexpr int32_t kStride = kStageTile + 8;
+    size_t const smem = static_cast<size_t>(64) * kStride * sizeof(__half);
+    int32_t const groups = n / 8;
+    dim3 const grid((groups + kWarps * kNTiles - 1) / (kWarps * kNTiles), (numTokens + 63) / 64);
+    gemmWide<kNTiles><<<grid, kWarps * 32, smem, stream>>>(
+        static_cast<__half const*>(x), static_cast<uint4 const*>(w), scale, static_cast<__half*>(y), numTokens, n, k, scaleIsFp32);
+}
 } // namespace i8mma
 
 template <int32_t kM, bool kInt8>
@@ -699,7 +829,15 @@ void launchFp8Linear(void const* x, void const* weightWords, void const* scale, 
         }
         else
         {
-            i8mma::launch<4, false>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
+            static bool const wideOff = std::getenv("EDGELLM_INT8_MMA_WIDE") != nullptr && std::getenv("EDGELLM_INT8_MMA_WIDE")[0] == '0';
+            if (wideOff)
+            {
+                i8mma::launch<4, false>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
+            }
+            else
+            {
+                i8mma::launchWide<4>(x, weightWords, scale, y, numTokens, n, k, scaleIsFp32, stream);
+            }
         }
         return;
     }
