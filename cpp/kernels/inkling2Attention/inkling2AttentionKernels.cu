@@ -938,11 +938,15 @@ constexpr int32_t kMmaRows = 32; // fragment rows (the 24 query rows padded)
 constexpr int32_t kKLd = kInkling2HeadDim + 8; // K tile and Q leading dimension (multiple of 8 halves)
 constexpr int32_t kPLd = kKeyTile + 8;
 constexpr int32_t kSLd = kKeyTile + 4;
+// relative-position bias of a key tile as one WMMA product: bias[row][dist - dmin] = rs[row] . relProj[dist] for the 80 distances (16-wide tiles) a tile of 64 keys and up to 10 query positions spans
+constexpr int32_t kRsLd = 24;   // leading dimension of the half copy of the row vectors and of the half relative projections (16 used)
+constexpr int32_t kRelN = 80;   // distances per tile (at least kKeyTile + qTile - 1 = 71)
+constexpr int32_t kBiasLd = 84; // leading dimension of the FP32 bias matrix (a multiple of 4)
 
 constexpr size_t mmaSmemBytes()
 {
-    return sizeof(half) * (kKeyTile * kKLd + kKeyTile * kInkling2HeadDim + kMmaRows * kKLd + kMmaRows * kPLd)
-        + sizeof(float) * (kMmaRows * kSLd + kMmaRows * kInkling2HeadDim + kMaxRows * kInkling2HeadDim + kMaxRows * kInkling2RelDim + 3 * kMaxRows)
+    return sizeof(half) * (kKeyTile * kKLd + kKeyTile * kInkling2HeadDim + kMmaRows * kKLd + kMmaRows * kPLd + kMmaRows * kRsLd + kRelN * kRsLd)
+        + sizeof(float) * (kMmaRows * kBiasLd + kMmaRows * kSLd + kMmaRows * kInkling2HeadDim + kMaxRows * kInkling2HeadDim + kMaxRows * kInkling2RelDim + 3 * kMaxRows)
         + sizeof(int32_t) * 2 * kMaxRows;
 }
 
@@ -959,7 +963,10 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionMmaKernel(Inkling2
     half* Vsm = Ksm + kKeyTile * kKLd;
     half* Qh = Vsm + kKeyTile * kInkling2HeadDim;
     half* Ph = Qh + kMmaRows * kKLd;
-    float* Ssm = reinterpret_cast<float*>(Ph + kMmaRows * kPLd);
+    half* RSh = Ph + kMmaRows * kPLd;
+    half* RelB = RSh + kMmaRows * kRsLd;
+    float* BiasS = reinterpret_cast<float*>(RelB + kRelN * kRsLd);
+    float* Ssm = BiasS + kMmaRows * kBiasLd;
     float* Tmp = Ssm + kMmaRows * kSLd;
     float* Oacc = Tmp + kMmaRows * kInkling2HeadDim;
     float* RSsm = Oacc + kMaxRows * kInkling2HeadDim;
@@ -1051,15 +1058,23 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionMmaKernel(Inkling2
     }
     __syncthreads();
 
-    int32_t kLo = INT32_MAX, kHi = -1;
+    int32_t kLo = INT32_MAX, kHi = -1, minQ = INT32_MAX;
     for (int32_t row = 0; row < rows; ++row)
     {
         if (rowQpos[row] >= 0)
         {
             kLo = min(kLo, rowLo[row]);
             kHi = max(kHi, rowQpos[row]);
+            minQ = min(minQ, rowQpos[row]);
         }
     }
+    // half copy of the (clipped, scaled) relative row vectors for the bias product; padded rows and columns are zero
+    for (int32_t i = tid; i < kMmaRows * kRsLd; i += kTileThreads)
+    {
+        int32_t const r = i / kRsLd, j = i % kRsLd;
+        RSh[i] = (r < rows && j < kInkling2RelDim) ? __float2half(RSsm[r * kInkling2RelDim + j]) : __float2half(0.F);
+    }
+    __syncthreads();
     int32_t const nTiles = kHi >= kLo ? (kHi - kLo + kKeyTile) / kKeyTile : 0;
     int32_t const perSplit = (nTiles + splits - 1) / splits;
     int32_t const tBegin = min(nTiles, split * perSplit), tEnd = min(nTiles, tBegin + perSplit);
@@ -1067,6 +1082,7 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionMmaKernel(Inkling2
     for (int32_t ti = tBegin; ti < tEnd; ++ti)
     {
         int32_t const keyBase = kLo + ti * kKeyTile;
+        int32_t const dmin = minQ - (keyBase + kKeyTile - 1);
         for (int32_t item = tid; item < kKeyTile * 16; item += kTileThreads)
         {
             int32_t const key = item >> 4, part = item & 15;
@@ -1103,6 +1119,28 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionMmaKernel(Inkling2
         }
         __syncthreads();
 
+        // relative-position bias of this tile: bias [row][dist - dmin] = rs [row] . relProj [dist] as 10 WMMA tiles (2 row tiles x 5 distance tiles)
+        for (int32_t i = tid; i < kRelN * kInkling2RelDim; i += kTileThreads)
+        {
+            int32_t const n = i >> 4, jj = i & 15;
+            int32_t const dist = dmin + n;
+            RelB[n * kRsLd + jj] = __float2half((dist >= 0 && dist < p.relExtent) ? relProjT[int64_t(dist) * kInkling2RelDim + jj] : 0.F);
+        }
+        __syncthreads();
+        for (int32_t tIdx = w; tIdx < 10; tIdx += kTileWarps)
+        {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+            wmma::fill_fragment(c, 0.F);
+            int32_t const mi = tIdx / 5, ni = tIdx % 5;
+            wmma::load_matrix_sync(a, RSh + mi * 16 * kRsLd, kRsLd);
+            wmma::load_matrix_sync(b, RelB + ni * 16 * kRsLd, kRsLd);
+            wmma::mma_sync(c, a, b, c);
+            wmma::store_matrix_sync(BiasS + mi * 16 * kBiasLd + ni * 16, c, kBiasLd, wmma::mem_row_major);
+        }
+        __syncthreads();
+
         // scale, relative bias and masks
         for (int32_t e = tid; e < rows * kKeyTile; e += kTileThreads)
         {
@@ -1117,18 +1155,7 @@ __global__ void __launch_bounds__(kTileThreads) tiledAttentionMmaKernel(Inkling2
             if (mapped && qpos >= 0 && s <= qpos && s >= rowLo[row])
             {
                 int32_t const dist = qpos - s;
-                float bias = 0.F;
-                if (dist < p.relExtent)
-                {
-                    float const* rp = relProjT + int64_t(dist) * kInkling2RelDim;
-                    float const* rsr = RSsm + row * kInkling2RelDim;
-#pragma unroll
-                    for (int32_t jj = 0; jj < kInkling2RelDim; jj += 4)
-                    {
-                        float4 const a4 = *reinterpret_cast<float4 const*>(rp + jj);
-                        bias += rsr[jj] * a4.x + rsr[jj + 1] * a4.y + rsr[jj + 2] * a4.z + rsr[jj + 3] * a4.w;
-                    }
-                }
+                float const bias = dist < p.relExtent ? BiasS[row * kBiasLd + (dist - dmin)] : 0.F;
                 score = Ssm[row * kSLd + kj] * p.scaling + bias;
             }
             Ssm[row * kSLd + kj] = score;
