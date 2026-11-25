@@ -42,6 +42,8 @@ _FUSED_RESIDUAL = os.environ.get("EDGELLM_INKLING_FUSED_RESIDUAL") == "1"
 _FUSED_GATE = os.environ.get("EDGELLM_INKLING_FUSED_GATE") == "1"
 # EDGELLM_INKLING_TAPS=1 at build: the block-residual plugins that see the stream entering visits 5, 23, 41 and the final mix carry a debug capture slot (drafter study)
 _TAPS = os.environ.get("EDGELLM_INKLING_TAPS") == "1"
+# EDGELLM_INKLING_NORM_ROUTE=1 at build: the weighted RMS norms that feed the INT8 projections and the MoE run as one plugin each (FP16 out), the MoE one with the FP32 router matmul folded in
+_NORM_ROUTE = os.environ.get("EDGELLM_INKLING_NORM_ROUTE") == "1"
 _TAP_VISITS = {5: 0, 23: 1, 41: 2}
 # EDGELLM_INKLING_VERIFY=N at build: the generation profile takes 1..N tokens per step (chain verification of N - 1 drafted tokens). Every short convolution
 # then also emits its per-token states (the rollback source after a partly accepted window) and the engine outputs the drafter's four taps.
@@ -120,6 +122,14 @@ def rms_unweighted(x, eps: float = _EPS):
 def rms_weighted(x, weight: np.ndarray, eps: float = _EPS):
     return rms_unweighted(x, eps) * F.constant(
         weight.astype(np.float32).reshape(1, -1), "norm_w")
+
+
+def norm16(x, weight: np.ndarray, eps: float = _EPS):
+    """rms_weighted(x, weight, eps).cast(float16); one plugin under EDGELLM_INKLING_NORM_ROUTE=1."""
+    if not _NORM_ROUTE:
+        return rms_weighted(x, weight, eps).cast(trt.float16)
+    flat = np.ascontiguousarray(weight.astype(np.float32).reshape(-1))
+    return F.inkling2_norm_route(x, F.constant(flat, "norm_w"), None, int(flat.size), 0, eps)
 
 
 def l2_clip_rows(x, threshold: float):
@@ -488,9 +498,12 @@ class Inkling2Layer(Module):
                             weight_format="nvfp4")
         return routed * float(text["route_scale"])
 
-    def moe(self, x32, conv_state, ragged):
-        logits = _matmul_const(x32, self.router_w, "router_w")
-        hidden16 = x32.cast(trt.float16)
+    def moe(self, x32, conv_state, ragged, pre=None):
+        if pre is None:
+            logits = _matmul_const(x32, self.router_w, "router_w")
+            hidden16 = x32.cast(trt.float16)
+        else:
+            hidden16, logits = pre
         if self.nvfp4_off:
             # predicted prefetch (EDGELLM_INKLING_PREFETCH=1 at build): this visit's router input run through the NEXT visit's router
             next_w = getattr(self, "prefetch_next_w", None)
@@ -548,22 +561,18 @@ class Inkling2Layer(Module):
                               gates["k"](ki,
                                          messages[1]), gates["v"](vi,
                                                                   messages[2]))
-            hq = rms_weighted(qi, self.q_norm, self.eps).cast(trt.float16)
-            hk = rms_weighted(ki, self.k_norm, self.eps).cast(trt.float16)
-            hv = rms_weighted(vi, self.v_norm, self.eps).cast(trt.float16)
+            hq = norm16(qi, self.q_norm, self.eps)
+            hk = norm16(ki, self.k_norm, self.eps)
+            hv = norm16(vi, self.v_norm, self.eps)
         else:
             x = h if self.attn_input_query is None else block_attention_residual(
                 bs + [h], self.attn_input_query, hidden, self._tap())[0]
             if messages is None:
-                hq = hk = hv = rms_weighted(x, self.in_norm,
-                                            self.eps).cast(trt.float16)
+                hq = hk = hv = norm16(x, self.in_norm, self.eps)
             else:
-                hq = rms_weighted(gates["attn"](x, messages[0]), self.in_norm,
-                                  self.eps).cast(trt.float16)
-                hk = rms_weighted(gates["k"](x, messages[1]), self.in_norm,
-                                  self.eps).cast(trt.float16)
-                hv = rms_weighted(gates["v"](x, messages[2]), self.in_norm,
-                                  self.eps).cast(trt.float16)
+                hq = norm16(gates["attn"](x, messages[0]), self.in_norm, self.eps)
+                hk = norm16(gates["k"](x, messages[1]), self.in_norm, self.eps)
+                hv = norm16(gates["v"](x, messages[2]), self.in_norm, self.eps)
         a, present_kv, conv_state = self.attention(hq, hk, hv, past_kv,
                                                    conv_state, ragged)
         if self.boundary:
@@ -576,8 +585,14 @@ class Inkling2Layer(Module):
                                      hidden)[0]
         if messages is not None:
             x = gates["mlp"](x, messages[3])
-        mo, conv_state = self.moe(rms_weighted(x, self.mlp_norm, self.eps),
-                                  conv_state, ragged)
+        if _NORM_ROUTE and getattr(self, "prefetch_next_w", None) is None and getattr(self, "prefetch_self_pred", None) is None:
+            folded = np.ascontiguousarray((self.router_w * self.mlp_norm.astype(np.float32).reshape(-1, 1)).T, dtype=np.float32)
+            norm_w = np.ascontiguousarray(self.mlp_norm.astype(np.float32).reshape(-1))
+            pre = F.inkling2_norm_route(x, F.constant(norm_w, "mlp_norm_w"), F.constant(folded, "router_wn"), self.hidden, int(folded.shape[0]), self.eps)
+            mo, conv_state = self.moe(None, conv_state, ragged, pre=pre)
+        else:
+            mo, conv_state = self.moe(rms_weighted(x, self.mlp_norm, self.eps),
+                                      conv_state, ragged)
         return res + mo, present_kv, conv_state
 
 

@@ -243,6 +243,17 @@ def inkling2_message_gate(hidden: Tensor, message: Tensor, down: Tensor, forget:
     return operation("inkling2_message_gate", [hidden, message, down, forget, gain], hidden=hidden_size, rank=rank, eps=eps)
 
 
+def inkling2_norm_route(x: Tensor, norm_w: Tensor, route_w: Optional[Tensor], hidden_size: int, experts: int, eps: float):
+    """Weighted RMS norm of a layer input in one plugin, optionally with the MoE router matmul folded in.
+
+    ``x`` is [tokens, hidden] FP32, ``norm_w`` [hidden] FP32 and, with ``experts`` > 0, ``route_w`` [experts, hidden] FP32 holds the router matrix times the norm weight
+    (column-wise). Returns the normed activations [tokens, hidden] FP16, and with a router also the FP32 logits [tokens, experts].
+    """
+    inputs = [x, norm_w] + ([route_w] if experts > 0 else [])
+    outputs = operation("inkling2_norm_route", inputs, output_count=2 if experts > 0 else 1, hidden=hidden_size, experts=experts, eps=eps)
+    return list(outputs) if experts > 0 else outputs
+
+
 def inkling2_hessian_tap(x: Tensor, dim: int, slot: int) -> Tensor:
     """Calibration identity: returns ``x`` ([tokens, dim] FP16) unchanged and, when EDGELLM_HESSIAN_DIR is set at run time, accumulates X^T X per ``slot``."""
     return operation("inkling2_hessian_tap", [x], dim=dim, slot=slot)
