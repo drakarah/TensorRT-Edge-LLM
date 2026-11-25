@@ -60,15 +60,23 @@ bool linear(PluginTensorDesc const& d, DataType type, int32_t rank)
 REGISTER_TENSORRT_PLUGIN(Inkling2ShortConvPluginCreator);
 
 Inkling2ShortConvPlugin::Inkling2ShortConvPlugin(
-    std::string const& name, int32_t channels, int32_t kernelSize, int32_t groups, float scale, int32_t stateOffset, int32_t intermediate)
+    std::string const& name, int32_t channels, int32_t kernelSize, int32_t groups, float scale, int32_t stateOffset, int32_t intermediate,
+    int32_t postOp, int32_t headDim, float postParam)
     : mLayerName(name)
     , mChannels(channels)
     , mKernelSize(kernelSize)
     , mGroups(groups)
     , mScale(scale)
     , mStateOffset(stateOffset)
+    , mPostOp(postOp)
+    , mHeadDim(headDim)
+    , mPostParam(postParam)
     , mIntermediate(intermediate)
 {
+    if (postOp < 0 || postOp > 2 || (postOp != 0 && (headDim != 128 || channels % 128 != 0 || !std::isfinite(postParam) || postParam <= 0.F)))
+    {
+        throw std::invalid_argument("Inkling2ShortConvPlugin: post_op needs head_dim 128, channels divisible by 128 and a positive post_param");
+    }
     if (stateOffset < 0)
     {
         throw std::invalid_argument("Inkling2ShortConvPlugin: state_offset must be non-negative");
@@ -113,7 +121,7 @@ IPluginV3* Inkling2ShortConvPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Inkling2ShortConvPlugin(mLayerName, mChannels, mKernelSize, mGroups, mScale, mStateOffset, mIntermediate);
+        auto* plugin = new Inkling2ShortConvPlugin(mLayerName, mChannels, mKernelSize, mGroups, mScale, mStateOffset, mIntermediate, mPostOp, mHeadDim, mPostParam);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -273,6 +281,9 @@ int32_t Inkling2ShortConvPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
     params.kernelSize = mKernelSize;
     params.groups = mGroups;
     params.scale = mScale;
+    params.postOp = mPostOp;
+    params.headDim = mHeadDim;
+    params.postParam = mPostParam;
     if (inputDesc[kQueryStartOffsets].dims.d[0] != params.batchSize + 1
         || inputDesc[kQueryLengths].dims.d[0] != params.batchSize)
     {
@@ -314,6 +325,12 @@ PluginFieldCollection const* Inkling2ShortConvPlugin::getFieldsToSerialize() noe
     {
         mData.emplace_back("intermediate", &mIntermediate, PluginFieldType::kINT32, 1);
     }
+    if (mPostOp != 0)
+    {
+        mData.emplace_back("post_op", &mPostOp, PluginFieldType::kINT32, 1);
+        mData.emplace_back("head_dim", &mHeadDim, PluginFieldType::kINT32, 1);
+        mData.emplace_back("post_param", &mPostParam, PluginFieldType::kFLOAT32, 1);
+    }
     mFields.nbFields = static_cast<int32_t>(mData.size());
     mFields.fields = mData.data();
     return &mFields;
@@ -326,11 +343,12 @@ Inkling2ShortConvPluginCreator::Inkling2ShortConvPluginCreator()
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     mAttributes.clear();
-    for (char const* name : {"channels", "kernel_size", "groups", "state_offset", "intermediate"})
+    for (char const* name : {"channels", "kernel_size", "groups", "state_offset", "intermediate", "post_op", "head_dim"})
     {
         mAttributes.emplace_back(name, nullptr, PluginFieldType::kINT32, 1);
     }
     mAttributes.emplace_back("scale", nullptr, PluginFieldType::kFLOAT32, 1);
+    mAttributes.emplace_back("post_param", nullptr, PluginFieldType::kFLOAT32, 1);
     mFields.nbFields = static_cast<int32_t>(mAttributes.size());
     mFields.fields = mAttributes.data();
 }
@@ -383,7 +401,8 @@ IPluginV3* Inkling2ShortConvPluginCreator::createPlugin(
                 throw std::invalid_argument(std::string("Inkling2ShortConvPlugin: duplicate attribute ") + field.name);
             }
         }
-        size_t const expected = byName.count("intermediate") != 0 ? 6 : 5; // intermediate is optional (absent in engines built before speculative verification)
+        // intermediate is optional (absent in engines built before speculative verification); post_op, head_dim and post_param come together and are optional (METRICS 227)
+        size_t const expected = 5 + (byName.count("intermediate") != 0 ? 1 : 0) + (byName.count("post_op") != 0 ? 3 : 0);
         if (byName.size() != expected)
         {
             throw std::invalid_argument("Inkling2ShortConvPlugin: unknown or missing attributes");
@@ -403,7 +422,9 @@ IPluginV3* Inkling2ShortConvPluginCreator::createPlugin(
         }
         auto* plugin = new Inkling2ShortConvPlugin(name, intField("channels"), intField("kernel_size"),
             intField("groups"), *static_cast<float const*>(scaleIt->second->data), intField("state_offset"),
-            byName.count("intermediate") != 0 ? intField("intermediate") : 0);
+            byName.count("intermediate") != 0 ? intField("intermediate") : 0, byName.count("post_op") != 0 ? intField("post_op") : 0,
+            byName.count("post_op") != 0 ? intField("head_dim") : 0,
+            byName.count("post_op") != 0 ? *static_cast<float const*>(byName.at("post_param")->data) : 0.F);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }

@@ -40,6 +40,44 @@ __device__ __forceinline__ bool locate(
     return local >= 0 && local < lengths[seq];
 }
 
+//! Sum over the 128 threads of a block (one head); every thread of the block must call it.
+__device__ __forceinline__ float blockSum128(float v, float* smem)
+{
+#pragma unroll
+    for (int32_t off = 16; off > 0; off >>= 1)
+    {
+        v += __shfl_xor_sync(0xffffffffU, v, off);
+    }
+    if ((threadIdx.x & 31) == 0)
+    {
+        smem[threadIdx.x >> 5] = v;
+    }
+    __syncthreads();
+    float const total = smem[0] + smem[1] + smem[2] + smem[3];
+    __syncthreads();
+    return total;
+}
+
+//! The convolution output as FP16, with the optional per-head epilogue of the K and V paths (METRICS 227): the clip or norm of the FP16-rounded values in FP32, as the
+//! graph computed it with separate cast, reduce and multiply kernels before.
+__device__ __forceinline__ half finishOutput(Inkling2ShortConvParams const& p, float value)
+{
+    half const rounded = __float2half(value);
+    if (p.postOp == 0)
+    {
+        return rounded;
+    }
+    __shared__ float smem[4];
+    float const f = __half2float(rounded);
+    float const sumSq = blockSum128(f * f, smem);
+    if (p.postOp == 1)
+    {
+        float const factor = fminf(p.postParam / (sqrtf(sumSq) + 1e-6F), 1.F);
+        return __float2half(f * factor);
+    }
+    return __float2half(f / sqrtf(sumSq / static_cast<float>(p.headDim) + p.postParam));
+}
+
 __global__ void shortConvKernel(Inkling2ShortConvParams p, half const* __restrict__ x, float const* __restrict__ taps,
     half const* __restrict__ dyn, half const* __restrict__ state, int32_t const* __restrict__ offsets,
     int32_t const* __restrict__ lengths, int32_t const* __restrict__ stateIndices, half* __restrict__ y, half* __restrict__ inter)
@@ -112,7 +150,7 @@ __global__ void shortConvKernel(Inkling2ShortConvParams p, half const* __restric
         acc += tap * xv;
     }
     acc += __half2float(x[outIdx]);
-    y[outIdx] = __float2half(acc * p.scale);
+    y[outIdx] = finishOutput(p, acc * p.scale);
 }
 
 //! One thread per (sequence, channel): reads the old state and the input tail into registers, then rewrites the state.
@@ -194,7 +232,7 @@ __global__ void shortConvDecodeKernel(Inkling2ShortConvParams p, half const* __r
         acc += tap * xv;
     }
     acc += xCur;
-    y[c] = __float2half(acc * p.scale);
+    y[c] = finishOutput(p, acc * p.scale);
     if (haveState)
     {
         // length 1: the new state is the old one shifted by one with the current input appended

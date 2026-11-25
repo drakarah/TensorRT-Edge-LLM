@@ -40,7 +40,7 @@ class Inkling2ShortConvPlugin : public nvinfer1::IPluginV3,
 {
 public:
     Inkling2ShortConvPlugin(std::string const& name, int32_t channels, int32_t kernelSize, int32_t groups, float scale,
-        int32_t stateOffset, int32_t intermediate = 0);
+        int32_t stateOffset, int32_t intermediate = 0, int32_t postOp = 0, int32_t headDim = 0, float postParam = 0.F);
 
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
     nvinfer1::IPluginV3* clone() noexcept override;
@@ -80,6 +80,9 @@ private:
     int32_t mGroups;
     float mScale;
     int32_t mStateOffset;
+    int32_t mPostOp;       //!< 0 none, 1 per-head L2 clip, 2 per-head unweighted RMS norm of the output (K and V paths); optional attributes post_op, head_dim, post_param.
+    int32_t mHeadDim;
+    float mPostParam;
     int32_t mIntermediate; //!< > 0: third output [min(T, mIntermediate), C, k] with the state after each token of a step of at most mIntermediate tokens (speculative verification).
     std::vector<nvinfer1::PluginField> mData;
     nvinfer1::PluginFieldCollection mFields{};

@@ -182,6 +182,9 @@ def inkling2_short_conv(
     groups: int = 0,
     state_offset: int = 0,
     intermediate: int = 0,
+    post_op: int = 0,
+    head_dim: int = 0,
+    post_param: float = 0.0,
 ) -> Tuple[Tensor, ...]:
     """Run one Inkling 2 short convolution with residual and return output plus present state.
 
@@ -189,7 +192,8 @@ def inkling2_short_conv(
     ``dynamic_taps`` [tokens, groups * kernel_size] adds per-token taps shared
     by ``channels / groups`` consecutive channels. The convolution uses state
     channels ``state_offset .. state_offset + channels``. With ``intermediate`` a third output [tokens, channels, kernel_size] holds the state after
-    every token (speculative verification restores the last accepted one).
+    every token (speculative verification restores the last accepted one). ``post_op`` 1 applies a per-head L2 clip to ``post_param`` and 2 a per-head unweighted
+    RMS norm with eps ``post_param`` to the FP16 output (heads of ``head_dim`` = 128 channels; the K and V paths of the attention blocks), instead of separate graph ops.
     """
     if (dynamic_taps is None) != (groups == 0):
         raise ValueError("dynamic_taps and groups must be given together")
@@ -207,7 +211,8 @@ def inkling2_short_conv(
                      groups=groups,
                      scale=scale,
                      state_offset=state_offset,
-                     **({"intermediate": int(intermediate)} if intermediate else {}))
+                     **({"intermediate": int(intermediate)} if intermediate else {}),
+                     **({"post_op": int(post_op), "head_dim": int(head_dim), "post_param": float(post_param)} if post_op else {}))
 
 
 def inkling2_block_residual(states: List[Tensor], queries: Tensor,

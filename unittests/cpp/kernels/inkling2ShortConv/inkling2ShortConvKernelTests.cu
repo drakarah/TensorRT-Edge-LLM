@@ -502,3 +502,93 @@ TEST(Inkling2ShortConv, ConvolutionsSharingOneStateRowUseDisjointChannelRanges)
         first += count;
     }
 }
+
+//! The per-head epilogue (post_op 1: L2 clip, 2: unweighted RMS norm) against the same launch without it, post-processed on the CPU from the FP16-rounded outputs: decode (1 token)
+//! and multi-token launches, two heads, one head scaled up so the clip is active.
+TEST(Inkling2ShortConv, HeadEpilogueMatchesCpuPostProcessing)
+{
+    Cfg c;
+    c.channels = 256;
+    c.stateChannels = 256;
+    c.kernelSize = 4;
+    c.groups = 0;
+    c.scale = 1.0F / std::sqrt(5.0F);
+    auto taps = makeTaps(c, 3);
+    for (int32_t postOp : {1, 2})
+    {
+        for (int32_t tokens : {1, 5})
+        {
+            Stream s = makeStream(c, tokens, 7 + tokens);
+            for (int32_t t = 0; t < tokens; ++t)
+            {
+                for (int32_t ch = 128; ch < 256; ++ch)
+                {
+                    s.x[size_t(t) * c.channels + ch] *= 6.0F; // second head: large norm, so the clip engages
+                }
+            }
+            std::vector<half> outs[2];
+            for (int32_t variant = 0; variant < 2; ++variant)
+            {
+                auto state = zeroState(c);
+                half* dx = upload(toHalf(s.x));
+                float* dtaps = upload(taps);
+                half* dstate = upload(state);
+                std::vector<int32_t> offsets{0, tokens}, lengths{tokens}, rows{0};
+                int32_t* doff = upload(offsets);
+                int32_t* dlen = upload(lengths);
+                int32_t* drows = upload(rows);
+                half* dy{};
+                CUDA_CHECK(cudaMalloc(&dy, size_t(tokens) * c.channels * sizeof(half)));
+                Inkling2ShortConvParams p{};
+                p.numTokens = tokens;
+                p.batchSize = 1;
+                p.channels = c.channels;
+                p.stateStride = c.stateChannels;
+                p.stateRows = c.stateRows;
+                p.kernelSize = c.kernelSize;
+                p.scale = c.scale;
+                if (variant == 1)
+                {
+                    p.postOp = postOp;
+                    p.headDim = 128;
+                    p.postParam = postOp == 1 ? 3.0F : 1e-6F;
+                }
+                launchInkling2ShortConv(p, dx, dtaps, nullptr, dstate, doff, dlen, drows, dy, nullptr);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                outs[variant].resize(size_t(tokens) * c.channels);
+                CUDA_CHECK(cudaMemcpy(outs[variant].data(), dy, outs[variant].size() * sizeof(half), cudaMemcpyDeviceToHost));
+                for (void* ptr : {(void*) dx, (void*) dtaps, (void*) dstate, (void*) doff, (void*) dlen, (void*) drows, (void*) dy})
+                {
+                    CUDA_CHECK(cudaFree(ptr));
+                }
+            }
+            bool clipped = false;
+            for (int32_t t = 0; t < tokens; ++t)
+            {
+                for (int32_t head = 0; head < 2; ++head)
+                {
+                    double sumSq = 0;
+                    for (int32_t d = 0; d < 128; ++d)
+                    {
+                        double const v = __half2float(outs[0][size_t(t) * c.channels + head * 128 + d]);
+                        sumSq += v * v;
+                    }
+                    double const factor = postOp == 1 ? std::min(3.0 / (std::sqrt(sumSq) + 1e-6), 1.0) : 1.0 / std::sqrt(sumSq / 128.0 + 1e-6);
+                    clipped = clipped || (postOp == 1 && factor < 1.0);
+                    for (int32_t d = 0; d < 128; ++d)
+                    {
+                        size_t const i = size_t(t) * c.channels + head * 128 + d;
+                        double const want = double(__half2float(outs[0][i])) * factor;
+                        double const got = __half2float(outs[1][i]);
+                        ASSERT_NEAR(got, want, 2e-3 * std::max(1.0, std::abs(want))) << "postOp " << postOp << " token " << t << " channel " << head * 128 + d;
+                    }
+                }
+            }
+            if (postOp == 1)
+            {
+                EXPECT_TRUE(clipped) << "the clip never engaged: the test would not see a wrong norm";
+            }
+        }
+    }
+}

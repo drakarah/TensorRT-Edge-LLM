@@ -39,6 +39,9 @@ struct Inkling2ShortConvParams
     int32_t kernelSize; //!< k, at most kInkling2MaxConvKernel.
     int32_t groups;     //!< 0: static taps only; otherwise channels / groups consecutive channels share dynamic taps.
     float scale;        //!< Applied to the sum of the convolution and the residual input.
+    int32_t postOp{0};  //!< 0: none; 1: per-head L2 clip of the (FP16-rounded) output to postParam; 2: per-head unweighted RMS norm with eps postParam. Needs headDim == 128 and channels % 128 == 0.
+    int32_t headDim{0}; //!< Channels per head for postOp (128: one thread block per head).
+    float postParam{0.F};
 };
 
 //! Inkling 2 short convolution over each sequence's token history:

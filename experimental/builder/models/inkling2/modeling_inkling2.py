@@ -349,31 +349,38 @@ class Inkling2Layer(Module):
         k_lin = self.wk(hk)
         v_lin = self.wv(hv)
         kv_ch = nkv * hd
+        # EDGELLM_INKLING_CONV_POST=1 (build time, METRICS 227): the K clip and the V RMS norm run in the short-conv plugin's epilogue instead of cast, reduce and multiply graph ops
+        post = os.environ.get("EDGELLM_INKLING_CONV_POST") == "1" and hd == 128 and kv_ch % 128 == 0
+        kpost = dict(post_op=1, head_dim=hd, post_param=float(self.qk_clip)) if post else {}
+        vpost = dict(post_op=2, head_dim=hd, post_param=float(self.eps)) if post else {}
         if self.full:
             k_conv, _, *ik = F.inkling2_short_conv(
                 k_lin, F.constant(self.k_taps, "k_taps"), state_in, ragged,
                 kv_ch, 4, 1.0 / math.sqrt(9.0),
                 hk.matmul(F.constant(self.k_dyn_w,
-                                     "k_dyn_w")), self.k_dyn_groups, 0, _VERIFY)
+                                     "k_dyn_w")), self.k_dyn_groups, 0, _VERIFY, **kpost)
             v_conv, _, *iv = F.inkling2_short_conv(
                 v_lin, F.constant(self.v_taps, "v_taps"), state_in, ragged,
                 kv_ch, 4, 1.0 / math.sqrt(9.0),
                 hv.matmul(F.constant(self.v_dyn_w,
-                                     "v_dyn_w")), self.k_dyn_groups, kv_ch, _VERIFY)
+                                     "v_dyn_w")), self.k_dyn_groups, kv_ch, _VERIFY, **vpost)
         else:
             k_conv, _, *ik = F.inkling2_short_conv(
                 k_lin, F.constant(self.k_taps, "k_taps"), state_in, ragged,
-                kv_ch, 4, 1.0 / math.sqrt(5.0), None, 0, 0, _VERIFY)
+                kv_ch, 4, 1.0 / math.sqrt(5.0), None, 0, 0, _VERIFY, **kpost)
             v_conv, _, *iv = F.inkling2_short_conv(
                 v_lin, F.constant(self.v_taps, "v_taps"), state_in, ragged,
-                kv_ch, 4, 1.0 / math.sqrt(5.0), None, 0, kv_ch, _VERIFY)
-        k32 = k_conv.cast(trt.float32).reshape([-1, nkv, hd])
-        k_new = l2_clip_rows(k32,
-                             self.qk_clip).reshape([-1,
-                                                    kv_ch]).cast(trt.float16)
-        v32 = v_conv.cast(trt.float32).reshape([-1, nkv, hd])
-        v_new = rms_unweighted(v32,
-                               self.eps).reshape([-1, kv_ch]).cast(trt.float16)
+                kv_ch, 4, 1.0 / math.sqrt(5.0), None, 0, kv_ch, _VERIFY, **vpost)
+        if post:
+            k_new, v_new = k_conv, v_conv
+        else:
+            k32 = k_conv.cast(trt.float32).reshape([-1, nkv, hd])
+            k_new = l2_clip_rows(k32,
+                                 self.qk_clip).reshape([-1,
+                                                        kv_ch]).cast(trt.float16)
+            v32 = v_conv.cast(trt.float32).reshape([-1, nkv, hd])
+            v_new = rms_unweighted(v32,
+                                   self.eps).reshape([-1, kv_ch]).cast(trt.float16)
         attn, present_kv = F.inkling2_attention(
             q_lin, rel_lin, sink_lin, gate_lin, k_new, v_new,
             F.constant(self.q_scale, "q_scale"),
