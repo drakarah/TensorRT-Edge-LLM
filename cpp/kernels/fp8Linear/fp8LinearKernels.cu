@@ -431,10 +431,16 @@ __global__ void __launch_bounds__(kWarps * 32) gemm(__half const* __restrict__ x
     {
         int32_t const kc = min(kStageK, k - k0);
         __syncthreads();
-        // row-outer, column-inner: no runtime integer division per element (kc / 8 is not a compile-time constant; the division was 27-41% of the executed instructions, METRICS 230)
-        for (int32_t r = 0; r < kTokens; ++r)
+        // flat (row, column) walk over all threads with incremental counters: one division per thread and chunk instead of one per element (METRICS 230), and every
+        // thread loads (a row-outer loop leaves most of the block idle when a row has fewer 16-byte pieces than threads, which slowed 6-8 tokens, METRICS 241)
         {
-            for (int32_t cc = threadIdx.x; cc < kc / 8; cc += blockDim.x)
+            int32_t const cols = kc / 8;
+            int32_t const total = kTokens * cols;
+            int32_t r = threadIdx.x / cols;
+            int32_t cc = threadIdx.x - r * cols;
+            int32_t const stepR = blockDim.x / cols;
+            int32_t const stepC = blockDim.x - stepR * cols;
+            for (int32_t idx = threadIdx.x; idx < total; idx += blockDim.x)
             {
                 uint4 v = make_uint4(0, 0, 0, 0);
                 if (token0 + r < numTokens)
@@ -442,6 +448,13 @@ __global__ void __launch_bounds__(kWarps * 32) gemm(__half const* __restrict__ x
                     v = *reinterpret_cast<uint4 const*>(x + static_cast<size_t>(token0 + r) * k + k0 + cc * 8);
                 }
                 *reinterpret_cast<uint4*>(&xs[r * kStride + cc * 8]) = v;
+                r += stepR;
+                cc += stepC;
+                if (cc >= cols)
+                {
+                    cc -= cols;
+                    ++r;
+                }
             }
         }
         __syncthreads();
@@ -532,9 +545,15 @@ __global__ void __launch_bounds__(kWarps * 32) gemmSplit(__half const* __restric
     {
         int32_t const kc = min(kStageSmall, k - k0);
         __syncthreads();
-        for (int32_t r = 0; r < 8; ++r) // row-outer, column-inner: no runtime division (METRICS 230)
         {
-            for (int32_t cc = threadIdx.x; cc < kc / 8; cc += blockDim.x)
+            // flat walk, see the gemm kernel above
+            int32_t const cols = kc / 8;
+            int32_t const total = 8 * cols;
+            int32_t r = threadIdx.x / cols;
+            int32_t cc = threadIdx.x - r * cols;
+            int32_t const stepR = blockDim.x / cols;
+            int32_t const stepC = blockDim.x - stepR * cols;
+            for (int32_t idx = threadIdx.x; idx < total; idx += blockDim.x)
             {
                 uint4 v = make_uint4(0, 0, 0, 0);
                 if (r < numTokens)
@@ -542,6 +561,13 @@ __global__ void __launch_bounds__(kWarps * 32) gemmSplit(__half const* __restric
                     v = *reinterpret_cast<uint4 const*>(x + static_cast<size_t>(r) * k + k0 + cc * 8);
                 }
                 *reinterpret_cast<uint4*>(&xs[r * kStride + cc * 8]) = v;
+                r += stepR;
+                cc += stepC;
+                if (cc >= cols)
+                {
+                    cc -= cols;
+                    ++r;
+                }
             }
         }
         __syncthreads();
