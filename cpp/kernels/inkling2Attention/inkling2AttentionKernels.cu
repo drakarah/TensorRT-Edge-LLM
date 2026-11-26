@@ -1833,45 +1833,6 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
     __syncthreads();
     int32_t const* const table = pageTable + int64_t(seq0) * 2 * p.maxPagesPerSeq;
 
-    // Query rows: warp w prepares rows w, w + 4, ... (same scaling and clipping as the other decode kernels).
-    for (int32_t r = w; r < kMultiRows; r += kMmaWarps)
-    {
-        if (rowHi[r] < rowLo[r])
-        {
-            continue;
-        }
-        int32_t const tl = r / group, hh = r - tl * group;
-        int32_t const slot = slot0 + tl;
-        int32_t const h = kvh * group + hh;
-        int32_t const qpos = rowQpos[r];
-        float const logScale = p.window == 0 ? 1.F + p.logAlpha * logf(fmaxf((qpos + 1.F) / p.logNFloor, 1.F)) : 1.F;
-        float q[4];
-        float ss = 0.F;
-#pragma unroll
-        for (int32_t i = 0; i < 4; ++i)
-        {
-            int32_t const d = lane * 4 + i;
-            q[i] = __half2float(qLin[int64_t(slot) * p.qLd + h * kInkling2HeadDim + d]) * qScale[h * kInkling2HeadDim + d];
-            ss += q[i] * q[i];
-        }
-        ss = warpSum(ss);
-        float const qFactor = fminf(p.qClip / (sqrtf(ss) + 1e-6F), 1.F) * logScale;
-#pragma unroll
-        for (int32_t i = 0; i < 4; ++i)
-        {
-            Qsm[r * kInkling2HeadDim + lane * 4 + i] = q[i] * qFactor;
-        }
-        int32_t const j = lane & 15;
-        float rs = __half2float(relLin[int64_t(slot) * p.relLd + h * kInkling2RelDim + j]) * relScale[h * kInkling2RelDim + j];
-        float const rss = halfWarpSum(rs * rs);
-        rs *= fminf(p.relClip / (sqrtf(rss) + 1e-6F), 1.F) * logScale;
-        if (lane < 16)
-        {
-            RSsm[r * kInkling2RelDim + j] = rs;
-        }
-    }
-    __syncthreads();
-
     // union of the rows' key ranges (consecutive tokens: the earliest window start to the latest position)
     int32_t lo = 0x7fffffff, hi = -1;
 #pragma unroll
@@ -1890,32 +1851,6 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
     int32_t const nTiles = hi >= lo ? (hi - lo + kMmaTile) / kMmaTile : 0;
     int32_t const perSplit = (nTiles + splits - 1) / splits;
     int32_t const tBegin = min(nTiles, split * perSplit), tEnd = min(nTiles, tBegin + perSplit);
-
-    // this lane's two accumulator rows (gid and gid + 8)
-    int32_t const myLo[2] = {rowLo[gid], rowLo[gid + 8]};
-    int32_t const myHi[2] = {rowHi[gid], rowHi[gid + 8]};
-    bool const live[2] = {myHi[0] >= myLo[0], myHi[1] >= myLo[1]};
-
-    // Q as the A operand of the score product: a0 (row gid, k), a1 (row gid + 8, k), a2 (row gid, k + 8), a3 (row gid + 8, k + 8)
-    uint32_t qa[8][4];
-#pragma unroll
-    for (int32_t ks = 0; ks < 8; ++ks)
-    {
-        float const* row0 = Qsm + gid * kInkling2HeadDim + ks * 16 + 2 * tig;
-        float const* row1 = Qsm + (gid + 8) * kInkling2HeadDim + ks * 16 + 2 * tig;
-        qa[ks][0] = live[0] ? packHalf2(row0[0], row0[1]) : 0U;
-        qa[ks][1] = live[1] ? packHalf2(row1[0], row1[1]) : 0U;
-        qa[ks][2] = live[0] ? packHalf2(row0[8], row0[9]) : 0U;
-        qa[ks][3] = live[1] ? packHalf2(row1[8], row1[9]) : 0U;
-    }
-
-    float accO[16][4];
-#pragma unroll
-    for (int32_t i = 0; i < 16; ++i)
-    {
-        accO[i][0] = accO[i][1] = accO[i][2] = accO[i][3] = 0.F;
-    }
-    float rowM[2] = {-INFINITY, -INFINITY}, rowL[2] = {0.F, 0.F};
 
     half* const warpSlices = slices + int64_t(w) * kStages * kMmaSliceHalves;
     uint8_t* const warpFlags = flags + w * 2 * kMmaWarpKeys;
@@ -2035,16 +1970,114 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
         }
     };
 
+    // The first key tile's loads (FP16: cp.async, no register staging) go out before the query rows are prepared, so their latency overlaps the prologue.
     TileTable nextTable{-1, -1, -1, -1};
+    if constexpr (!kInt8)
+    {
+        if (tBegin < tEnd)
+        {
+            issueLoads(tBegin, 0, fetchTable(tBegin));
+            if (tBegin + 1 < tEnd)
+            {
+                nextTable = fetchTable(tBegin + 1);
+            }
+        }
+    }
+
+    // Query rows: warp w prepares rows w, w + 4, ... (same scaling and clipping as the other decode kernels).
+    // All four rows of this warp load their inputs first (independent global loads in flight together), then each row is normalised.
+    constexpr int32_t kRowsPerWarp = kMultiRows / kMmaWarps;
+    float qRaw[kRowsPerWarp][4], qSc[kRowsPerWarp][4], rRaw[kRowsPerWarp], rSc[kRowsPerWarp];
+#pragma unroll
+    for (int32_t ri = 0; ri < kRowsPerWarp; ++ri)
+    {
+        int32_t const r = w + ri * kMmaWarps;
+        bool const live = rowHi[r] >= rowLo[r];
+        int32_t const tl = r / group, hh = r - tl * group;
+        int32_t const slot = slot0 + tl;
+        int32_t const h = kvh * group + hh;
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            int32_t const d = lane * 4 + i;
+            qRaw[ri][i] = live ? __half2float(qLin[int64_t(slot) * p.qLd + h * kInkling2HeadDim + d]) : 0.F;
+            qSc[ri][i] = live ? qScale[h * kInkling2HeadDim + d] : 0.F;
+        }
+        int32_t const j = lane & 15;
+        rRaw[ri] = live ? __half2float(relLin[int64_t(slot) * p.relLd + h * kInkling2RelDim + j]) : 0.F;
+        rSc[ri] = live ? relScale[h * kInkling2RelDim + j] : 0.F;
+    }
+#pragma unroll
+    for (int32_t ri = 0; ri < kRowsPerWarp; ++ri)
+    {
+        int32_t const r = w + ri * kMmaWarps;
+        if (rowHi[r] < rowLo[r])
+        {
+            continue;
+        }
+        int32_t const qpos = rowQpos[r];
+        float const logScale = p.window == 0 ? 1.F + p.logAlpha * logf(fmaxf((qpos + 1.F) / p.logNFloor, 1.F)) : 1.F;
+        float q[4];
+        float ss = 0.F;
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            q[i] = qRaw[ri][i] * qSc[ri][i];
+            ss += q[i] * q[i];
+        }
+        ss = warpSum(ss);
+        float const qFactor = fminf(p.qClip / (sqrtf(ss) + 1e-6F), 1.F) * logScale;
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            Qsm[r * kInkling2HeadDim + lane * 4 + i] = q[i] * qFactor;
+        }
+        int32_t const j = lane & 15;
+        float rs = rRaw[ri] * rSc[ri];
+        float const rss = halfWarpSum(rs * rs);
+        rs *= fminf(p.relClip / (sqrtf(rss) + 1e-6F), 1.F) * logScale;
+        if (lane < 16)
+        {
+            RSsm[r * kInkling2RelDim + j] = rs;
+        }
+    }
+    __syncthreads();
+
+    // this lane's two accumulator rows (gid and gid + 8)
+    int32_t const myLo[2] = {rowLo[gid], rowLo[gid + 8]};
+    int32_t const myHi[2] = {rowHi[gid], rowHi[gid + 8]};
+    bool const live[2] = {myHi[0] >= myLo[0], myHi[1] >= myLo[1]};
+
+    // Q as the A operand of the score product: a0 (row gid, k), a1 (row gid + 8, k), a2 (row gid, k + 8), a3 (row gid + 8, k + 8)
+    uint32_t qa[8][4];
+#pragma unroll
+    for (int32_t ks = 0; ks < 8; ++ks)
+    {
+        float const* row0 = Qsm + gid * kInkling2HeadDim + ks * 16 + 2 * tig;
+        float const* row1 = Qsm + (gid + 8) * kInkling2HeadDim + ks * 16 + 2 * tig;
+        qa[ks][0] = live[0] ? packHalf2(row0[0], row0[1]) : 0U;
+        qa[ks][1] = live[1] ? packHalf2(row1[0], row1[1]) : 0U;
+        qa[ks][2] = live[0] ? packHalf2(row0[8], row0[9]) : 0U;
+        qa[ks][3] = live[1] ? packHalf2(row1[8], row1[9]) : 0U;
+    }
+
+    float accO[16][4];
+#pragma unroll
+    for (int32_t i = 0; i < 16; ++i)
+    {
+        accO[i][0] = accO[i][1] = accO[i][2] = accO[i][3] = 0.F;
+    }
+    float rowM[2] = {-INFINITY, -INFINITY}, rowL[2] = {0.F, 0.F};
+
     if (tBegin < tEnd)
     {
-        issueLoads(tBegin, 0, fetchTable(tBegin));
-        if (tBegin + 1 < tEnd)
-        {
-            nextTable = fetchTable(tBegin + 1);
-        }
         if constexpr (kInt8)
         {
+            issueLoads(tBegin, 0, fetchTable(tBegin));
+            if (tBegin + 1 < tEnd)
+            {
+                nextTable = fetchTable(tBegin + 1);
+            }
             storeStage(0);
         }
         else
@@ -2053,6 +2086,7 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
         }
         __syncwarp();
     }
+
 
     for (int32_t ti = tBegin; ti < tEnd; ++ti)
     {
@@ -2220,6 +2254,35 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
             }
         }
     }
+    // The per-row merge factors are the same for all 128 channels: one thread per row computes them once (and the row's partial index), the channels then only multiply.
+    float* const cfS = lS + kMmaWarps * kMultiRows;      // [row][warp] factors
+    float* const mmS = cfS + kMultiRows * kMmaWarps;     // [row] merged max
+    float* const denS = mmS + kMultiRows;                // [row] merged denominator
+    int32_t* const outIdx = reinterpret_cast<int32_t*>(denS + kMultiRows); // [row] (slot * heads + head) of the partial row
+    __syncthreads();
+    if (tid < kMultiRows)
+    {
+        int32_t const row = tid;
+        float mm = -INFINITY;
+#pragma unroll
+        for (int32_t ww = 0; ww < kMmaWarps; ++ww)
+        {
+            mm = fmaxf(mm, mS[ww * kMultiRows + row]);
+        }
+        float den = 0.F;
+#pragma unroll
+        for (int32_t ww = 0; ww < kMmaWarps; ++ww)
+        {
+            float const mw = mS[ww * kMultiRows + row];
+            float const cf = (mm == -INFINITY || mw == -INFINITY) ? 0.F : __expf(mw - mm);
+            cfS[row * kMmaWarps + ww] = cf;
+            den += lS[ww * kMultiRows + row] * cf;
+        }
+        mmS[row] = mm;
+        denS[row] = den;
+        int32_t const tl = row / group, hh2 = row - tl * group;
+        outIdx[row] = (slot0 + tl) * p.numQHeads + kvh * group + hh2;
+    }
     __syncthreads();
     int32_t const d = tid;
     for (int32_t row = 0; row < kMultiRows; ++row)
@@ -2228,29 +2291,18 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
         {
             continue;
         }
-        float mm = -INFINITY;
+        float num = 0.F;
 #pragma unroll
         for (int32_t ww = 0; ww < kMmaWarps; ++ww)
         {
-            mm = fmaxf(mm, mS[ww * kMultiRows + row]);
+            num += accS[(ww * kMultiRows + row) * kInkling2HeadDim + d] * cfS[row * kMmaWarps + ww];
         }
-        float num = 0.F, den = 0.F;
-#pragma unroll
-        for (int32_t ww = 0; ww < kMmaWarps; ++ww)
-        {
-            float const mw = mS[ww * kMultiRows + row];
-            float const cf = (mm == -INFINITY || mw == -INFINITY) ? 0.F : __expf(mw - mm);
-            num += accS[(ww * kMultiRows + row) * kInkling2HeadDim + d] * cf;
-            den += lS[ww * kMultiRows + row] * cf;
-        }
-        int32_t const tl = row / group, hh2 = row - tl * group;
-        int32_t const h = kvh * group + hh2;
-        float* out = partials + ((int64_t(slot0 + tl) * p.numQHeads + h) * splits + split) * kPartialStride;
+        float* out = partials + (int64_t(outIdx[row]) * splits + split) * kPartialStride;
         out[2 + d] = num;
         if (d == 0)
         {
-            out[0] = mm;
-            out[1] = den;
+            out[0] = mmS[row];
+            out[1] = denS[row];
         }
     }
 }
