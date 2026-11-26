@@ -115,7 +115,7 @@ __global__ void ctxMixKernel(float const* taps, int32_t rows, int32_t consumerSt
     }
 }
 
-__global__ void ctxKvKernel(__half const* kRaw, __half const* vRaw, int32_t pos0, float const* kNorm, float theta, __half* ctxK, __half* ctxV)
+__global__ void ctxKvKernel(__half const* kRaw, __half const* vRaw, int32_t pos0, float const* kNorm, float theta, __half* ctxK, __half* ctxV, int32_t ctxCap)
 {
     __shared__ float sm[kDrafterHeadDim];
     __shared__ float red[32];
@@ -123,7 +123,8 @@ __global__ void ctxKvKernel(__half const* kRaw, __half const* vRaw, int32_t pos0
     int const h = blockIdx.y;
     int const d = threadIdx.x;
     size_t const src = static_cast<size_t>(r) * kDrafterKvHeads * kDrafterHeadDim + h * kDrafterHeadDim + d;
-    size_t const dst = static_cast<size_t>(pos0 + r) * kDrafterKvHeads * kDrafterHeadDim + h * kDrafterHeadDim + d;
+    int32_t const dstRow = ctxCap > 0 ? (pos0 + r) % ctxCap : pos0 + r; // ring buffer when the cache holds fewer rows than positions
+    size_t const dst = static_cast<size_t>(dstRow) * kDrafterKvHeads * kDrafterHeadDim + h * kDrafterHeadDim + d;
     float const kv = __half2float(kRaw[src]);
     float ss[1] = {kv * kv};
     blockSumN<1>(ss, red);
@@ -605,9 +606,9 @@ void launchDrafterCtxMix(float const* taps, int32_t rows, int32_t consumerStride
 }
 
 void launchDrafterCtxKv(__half const* kRaw, __half const* vRaw, int32_t rows, int32_t pos0, float const* kNormCtx, float theta, __half* ctxK, __half* ctxV,
-    cudaStream_t stream)
+    cudaStream_t stream, int32_t ctxCap)
 {
-    ctxKvKernel<<<dim3(rows, kDrafterKvHeads), kDrafterHeadDim, 0, stream>>>(kRaw, vRaw, pos0, kNormCtx, theta, ctxK, ctxV);
+    ctxKvKernel<<<dim3(rows, kDrafterKvHeads), kDrafterHeadDim, 0, stream>>>(kRaw, vRaw, pos0, kNormCtx, theta, ctxK, ctxV, ctxCap);
 }
 
 void launchDrafterInitBlock(__half const* embedding, float const* embedNorm, float const* maskEmbed, float* x, cudaStream_t stream)

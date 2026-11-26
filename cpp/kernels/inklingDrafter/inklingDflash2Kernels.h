@@ -38,7 +38,8 @@ void launchDfl2QkvPrep(__half const* qRaw, __half const* kRaw, __half const* vRa
 //! Attention of the 8 block rows (positions qpos0 + row) over context keys [lo, lo + nCtx) plus the 8 block keys. A context key at position p is visible to row r when
 //! qpos0 + r - p < window (the block keys are all visible). out [8, 4096] FP16. scores [256 * scoreStride] FP32 (scoreStride >= nCtx + 8), partial [maxSplits * 256 * 128] FP32.
 void launchDfl2Attention(__half const* q, __half const* ctxK, __half const* ctxV, __half const* kb, __half const* vb, int32_t lo, int32_t nCtx, int32_t qpos0, int32_t window,
-    float* scores, int32_t scoreStride, float* partial, int32_t maxSplits, __half* out, cudaStream_t stream);
+    float* scores, int32_t scoreStride, float* partial, int32_t maxSplits, __half* out, cudaStream_t stream, int32_t ctxCap = 0);
+//! ctxCap > 0: ctxK / ctxV are rings of ctxCap rows (position p in row p % ctxCap).
 
 //! out [rows, cols] FP32 = in [rows, cols] FP16 for the first validCols columns, -1e30 for the padding columns.
 //! Sorted top 16 (value descending, ties to the smaller index) of every row of FP16 logits over the first validCols columns: indices and the values as floats.

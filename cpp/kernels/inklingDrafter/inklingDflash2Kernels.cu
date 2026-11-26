@@ -146,7 +146,7 @@ constexpr int kKeysPerBlock = 128;
 constexpr int kQsStride = kDfl2HeadDim + 1;         //!< odd: the four query groups of a warp read distinct banks
 
 //! Register-tiled scores: a thread owns 4 keys x 8 query vectors, so each loaded K value feeds 8 FMAs and each shared-memory q value 4.
-__global__ void attnScoresKernel(__half const* q, __half const* ctxK, __half const* kb, int32_t lo, int32_t nCtx, int32_t qpos0, int32_t window, float* scores, int32_t stride)
+__global__ void attnScoresKernel(__half const* q, __half const* ctxK, __half const* kb, int32_t lo, int32_t nCtx, int32_t qpos0, int32_t window, float* scores, int32_t stride, int32_t ctxCap)
 {
     __shared__ float qs[kDfl2QueryRows][kQsStride];
     int const g = blockIdx.y;
@@ -171,7 +171,7 @@ __global__ void attnScoresKernel(__half const* q, __half const* ctxK, __half con
     for (int j = 0; j < 4; ++j)
     {
         int const kk = min(kk0 + j, nk - 1);
-        krow[j] = kk < nCtx ? ctxK + static_cast<size_t>(lo + kk) * kKvStride + g * kDfl2HeadDim : kb + static_cast<size_t>(kk - nCtx) * kKvStride + g * kDfl2HeadDim;
+        krow[j] = kk < nCtx ? ctxK + static_cast<size_t>(ctxCap > 0 ? (lo + kk) % ctxCap : lo + kk) * kKvStride + g * kDfl2HeadDim : kb + static_cast<size_t>(kk - nCtx) * kKvStride + g * kDfl2HeadDim;
     }
     float acc[8][4];
 #pragma unroll
@@ -286,7 +286,7 @@ __global__ void attnSoftmaxKernel(float* scores, int32_t stride, int32_t nk)
 }
 
 //! Register-tiled P x V: thread (tq, td) owns 4 query vectors (4 tq .. 4 tq + 3) x 8 head dimensions (8 td .. 8 td + 7): per key 4 probabilities and one 16-byte V load feed 32 FMAs.
-__global__ void attnPvKernel(float const* scores, int32_t stride, __half const* ctxV, __half const* vb, int32_t lo, int32_t nCtx, int32_t splits, float* partial)
+__global__ void attnPvKernel(float const* scores, int32_t stride, __half const* ctxV, __half const* vb, int32_t lo, int32_t nCtx, int32_t splits, float* partial, int32_t ctxCap)
 {
     int const g = blockIdx.x;
     int const split = blockIdx.y;
@@ -314,7 +314,7 @@ __global__ void attnPvKernel(float const* scores, int32_t stride, __half const* 
     }
     for (int k = k0; k < k1; ++k)
     {
-        __half const* vrow = k < nCtx ? ctxV + static_cast<size_t>(lo + k) * kKvStride + g * kDfl2HeadDim : vb + static_cast<size_t>(k - nCtx) * kKvStride + g * kDfl2HeadDim;
+        __half const* vrow = k < nCtx ? ctxV + static_cast<size_t>(ctxCap > 0 ? (lo + k) % ctxCap : lo + k) * kKvStride + g * kDfl2HeadDim : vb + static_cast<size_t>(k - nCtx) * kKvStride + g * kDfl2HeadDim;
         uint4 const raw = *reinterpret_cast<uint4 const*>(vrow + td * 8);
         __half2 const* h2 = reinterpret_cast<__half2 const*>(&raw);
         float vf[8];
@@ -414,7 +414,7 @@ __device__ __forceinline__ uint32_t aPackHalf2(float lo, float hi)
 }
 
 __global__ void __launch_bounds__(kAThreads, 2) attnFusedKernel(__half const* q, __half const* ctxK, __half const* ctxV, __half const* kb, __half const* vb, int32_t lo,
-    int32_t nCtx, int32_t qpos0, int32_t window, int32_t splits, float* partial)
+    int32_t nCtx, int32_t qpos0, int32_t window, int32_t splits, float* partial, int32_t ctxCap)
 {
     extern __shared__ __align__(16) unsigned char smemRaw[];
     __half* const slices = reinterpret_cast<__half*>(smemRaw);
@@ -465,7 +465,7 @@ __global__ void __launch_bounds__(kAThreads, 2) attnFusedKernel(__half const* q,
             __half const* src = nullptr;
             if (key < nCtx)
             {
-                src = (isV ? ctxV : ctxK) + static_cast<size_t>(lo + key) * kKvStride + g * kDfl2HeadDim + chunk;
+                src = (isV ? ctxV : ctxK) + static_cast<size_t>(ctxCap > 0 ? (lo + key) % ctxCap : lo + key) * kKvStride + g * kDfl2HeadDim + chunk;
             }
             else
             {
@@ -676,7 +676,7 @@ void launchDfl2QkvPrep(__half const* qRaw, __half const* kRaw, __half const* vRa
 }
 
 void launchDfl2Attention(__half const* q, __half const* ctxK, __half const* ctxV, __half const* kb, __half const* vb, int32_t lo, int32_t nCtx, int32_t qpos0, int32_t window,
-    float* scores, int32_t scoreStride, float* partial, int32_t maxSplits, __half* out, cudaStream_t stream)
+    float* scores, int32_t scoreStride, float* partial, int32_t maxSplits, __half* out, cudaStream_t stream, int32_t ctxCap)
 {
     static bool const oldPath = std::getenv("EDGELLM_INKLING_DRAFTER_ATTN_OLD") != nullptr;
     int32_t const nk = nCtx + kDfl2Block;
@@ -695,15 +695,15 @@ void launchDfl2Attention(__half const* q, __half const* ctxK, __half const* ctxV
         }();
         int32_t const tiles = (nk + kATile - 1) / kATile;
         int32_t const splits = std::max(1, std::min(maxFused, (tiles + 1) / 2));
-        attnFusedKernel<<<dim3(kDfl2KvHeads, splits), kAThreads, kASmemBytes, stream>>>(q, ctxK, ctxV, kb, vb, lo, nCtx, qpos0, window, splits, partial);
+        attnFusedKernel<<<dim3(kDfl2KvHeads, splits), kAThreads, kASmemBytes, stream>>>(q, ctxK, ctxV, kb, vb, lo, nCtx, qpos0, window, splits, partial, ctxCap);
         attnFusedReduceKernel<<<kDfl2KvHeads * kDfl2QueryRows, kDfl2HeadDim, 0, stream>>>(partial, splits, out);
         return;
     }
     attnScoresKernel<<<dim3((nk + kKeysPerBlock - 1) / kKeysPerBlock, kDfl2KvHeads), kScoreThreads, 0, stream>>>(
-        q, ctxK, kb, lo, nCtx, qpos0, window, scores, scoreStride);
+        q, ctxK, kb, lo, nCtx, qpos0, window, scores, scoreStride, ctxCap);
     attnSoftmaxKernel<<<kDfl2KvHeads * kDfl2QueryRows, 256, 0, stream>>>(scores, scoreStride, nk);
     int32_t const splits = std::max(1, std::min(maxSplits, nk / 32));
-    attnPvKernel<<<dim3(kDfl2KvHeads, splits), kDfl2HeadDim, 0, stream>>>(scores, scoreStride, ctxV, vb, lo, nCtx, splits, partial);
+    attnPvKernel<<<dim3(kDfl2KvHeads, splits), kDfl2HeadDim, 0, stream>>>(scores, scoreStride, ctxV, vb, lo, nCtx, splits, partial, ctxCap);
     attnReduceKernel<<<kDfl2KvHeads * kDfl2QueryRows, kDfl2HeadDim, 0, stream>>>(partial, splits, out);
 }
 

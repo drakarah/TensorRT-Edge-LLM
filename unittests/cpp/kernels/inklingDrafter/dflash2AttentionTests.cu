@@ -40,7 +40,7 @@ T* upload(std::vector<T> const& v)
     return d;
 }
 
-void runCase(int32_t nCtx, int32_t lo, int32_t window, uint32_t seed)
+void runCase(int32_t nCtx, int32_t lo, int32_t window, uint32_t seed, int32_t ringCap = 0)
 {
     constexpr int32_t kKv = 1024, kQ = 4096, kD = 128, kG = 4, kBlock = 8;
     std::mt19937 rng(seed);
@@ -60,12 +60,24 @@ void runCase(int32_t nCtx, int32_t lo, int32_t window, uint32_t seed)
     std::vector<__half> kb = fill(static_cast<size_t>(kBlock) * kKv, 1.5F), vb = fill(static_cast<size_t>(kBlock) * kKv, 1.F);
     int32_t const scoreStride = ((window + kBlock + 7) / 8) * 8;
     int32_t const nk = nCtx + kBlock;
-    __half *dq = upload(q), *dK = upload(ctxK), *dV = upload(ctxV), *dkb = upload(kb), *dvb = upload(vb), *dOut = nullptr;
+    std::vector<__half> ringK, ringV;
+    if (ringCap > 0)
+    {
+        // ring caches: position p in row p % ringCap (only the positions the block can see are stored)
+        ringK.assign(static_cast<size_t>(ringCap) * kKv, __float2half(7.F));
+        ringV.assign(static_cast<size_t>(ringCap) * kKv, __float2half(7.F));
+        for (int32_t p = lo; p < lo + nCtx; ++p)
+        {
+            std::copy(ctxK.begin() + static_cast<size_t>(p) * kKv, ctxK.begin() + static_cast<size_t>(p + 1) * kKv, ringK.begin() + static_cast<size_t>(p % ringCap) * kKv);
+            std::copy(ctxV.begin() + static_cast<size_t>(p) * kKv, ctxV.begin() + static_cast<size_t>(p + 1) * kKv, ringV.begin() + static_cast<size_t>(p % ringCap) * kKv);
+        }
+    }
+    __half *dq = upload(q), *dK = upload(ringCap > 0 ? ringK : ctxK), *dV = upload(ringCap > 0 ? ringV : ctxV), *dkb = upload(kb), *dvb = upload(vb), *dOut = nullptr;
     float *dScores = nullptr, *dPartial = nullptr;
     ASSERT_EQ(cudaMalloc(&dOut, static_cast<size_t>(kBlock) * kQ * sizeof(__half)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&dScores, static_cast<size_t>(8 * 32) * std::max(scoreStride, nk + 8) * sizeof(float)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&dPartial, static_cast<size_t>(32) * 8 * 32 * 130 * sizeof(float)), cudaSuccess);
-    launchDfl2Attention(dq, dK, dV, dkb, dvb, lo, nCtx, qpos0, window, dScores, std::max(scoreStride, nk + 8), dPartial, 32, dOut, nullptr);
+    launchDfl2Attention(dq, dK, dV, dkb, dvb, lo, nCtx, qpos0, window, dScores, std::max(scoreStride, nk + 8), dPartial, 32, dOut, nullptr, ringCap);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     std::vector<__half> out(static_cast<size_t>(kBlock) * kQ);
     ASSERT_EQ(cudaMemcpy(out.data(), dOut, out.size() * sizeof(__half), cudaMemcpyDeviceToHost), cudaSuccess);
@@ -142,4 +154,13 @@ TEST(DFlash2Attention, WindowedContextHidesOldKeysPerRow)
     runCase(300, 50, 100, 21); // keys older than the window are invisible to the later block rows
     runCase(2047, 900, 2048, 22);
     runCase(500, 0, 64, 23);
+}
+
+TEST(DFlash2Attention, RingCachesGiveTheSameResult)
+{
+    // the window of 2,048 positions starting at lo wraps around a 2,304-row ring (position p in row p % 2,304)
+    runCase(2047, 1500, 2048, 31, 2304);
+    runCase(700, 5000, 2048, 32, 2304);
+    runCase(300, 12345, 100, 33, 2304);
+    runCase(100, 0, 2048, 34, 2304);
 }

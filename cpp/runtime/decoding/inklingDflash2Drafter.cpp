@@ -67,10 +67,19 @@ InklingDflash2Drafter::InklingDflash2Drafter(std::filesystem::path const& weight
     CUDA_CHECK(cudaStreamSynchronize(stream));
     using DT = nvinfer1::DataType;
     mScoreStride = ((kWindow + kBlock + 7) / 8) * 8;
+    // The drafter attends to the last kWindow positions only, so its context K/V caches are rings of window + one update + the block (rounded up) instead of one row per
+    // position of the engine's capacity (five layers x 4 KiB per position: 5.4 GB at 262,144); EDGELLM_INKLING_DRAFTER_CTX_RING=0 keeps one row per position.
+    {
+        int32_t const ring = ((kWindow + mMaxAppendRows + 2 * kBlock + 255) / 256) * 256;
+        char const* const off = std::getenv("EDGELLM_INKLING_DRAFTER_CTX_RING");
+        bool const useRing = !(off != nullptr && std::string(off) == "0") && mCapacity > ring;
+        mCtxRing = useRing ? ring : 0;
+        mCtxRows = useRing ? ring : mCapacity;
+    }
     for (int32_t i = 0; i < kLayers; ++i)
     {
-        mCtxK[i] = make({mCapacity, 1024}, DT::kHALF, "ctxK" + std::to_string(i));
-        mCtxV[i] = make({mCapacity, 1024}, DT::kHALF, "ctxV" + std::to_string(i));
+        mCtxK[i] = make({mCtxRows, 1024}, DT::kHALF, "ctxK" + std::to_string(i));
+        mCtxV[i] = make({mCtxRows, 1024}, DT::kHALF, "ctxV" + std::to_string(i));
     }
     mCtxIn = make({mMaxAppendRows, 4 * kH}, DT::kHALF, "ctxIn");
     mFcOut = make({mMaxAppendRows, kH}, DT::kHALF, "fcOut");
@@ -178,7 +187,7 @@ void InklingDflash2Drafter::observeTaps(float const* taps, int32_t rows, int32_t
         linear(p + "k", mDelta.rawPointer(), mKRaw.rawPointer(), rows, 1024, kH, stream);
         linear(p + "v", mDelta.rawPointer(), mVRaw.rawPointer(), rows, 1024, kH, stream);
         kernel::launchDrafterCtxKv(mKRaw.dataPointer<__half>(), mVRaw.dataPointer<__half>(), rows, pos0, w(p + "k_norm").dataPointer<float>(), kTheta,
-            mCtxK[i].dataPointer<__half>(), mCtxV[i].dataPointer<__half>(), stream);
+            mCtxK[i].dataPointer<__half>(), mCtxV[i].dataPointer<__half>(), stream, mCtxRing);
     }
     mCtxLen = pos0 + rows;
 }
@@ -203,7 +212,7 @@ void InklingDflash2Drafter::draft(void const* anchorEmbedding, int32_t anchorTok
             w(p + "k_norm").dataPointer<float>(), a, kTheta, mQ.dataPointer<__half>(), mKb.dataPointer<__half>(), mVb.dataPointer<__half>(), stream);
         kernel::launchDfl2Attention(mQ.dataPointer<__half>(), mCtxK[i].dataPointer<__half>(), mCtxV[i].dataPointer<__half>(), mKb.dataPointer<__half>(),
             mVb.dataPointer<__half>(), lo, a - lo, a, kWindow, mScores.dataPointer<float>(), mScoreStride, mPartial.dataPointer<float>(), kMaxSplits,
-            mAttn.dataPointer<__half>(), stream);
+            mAttn.dataPointer<__half>(), stream, mCtxRing);
         linear(p + "o", mAttn.rawPointer(), mO.rawPointer(), kBlock, kH, 4096, stream);
         convFinish("ac", i, mO, stream);
         // MLP

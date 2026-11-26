@@ -34,8 +34,9 @@ void launchDrafterCtxMix(float const* taps, int32_t rows, int32_t consumerStride
 
 //! Context K/V of rows at positions pos0..: per KV head RMS norm (kNormCtx [128]) and RoPE (NeoX, theta) of kRaw, plain copy of vRaw, into the caches at
 //! [position, 8, 128].
+//! ctxCap > 0: the caches are rings of ctxCap rows, position p lives in row p % ctxCap (the window drafters never read more than their window back).
 void launchDrafterCtxKv(__half const* kRaw, __half const* vRaw, int32_t rows, int32_t pos0, float const* kNormCtx, float theta, __half* ctxK, __half* ctxV,
-    cudaStream_t stream);
+    cudaStream_t stream, int32_t ctxCap = 0);
 
 //! x row 0 = RMS(embedding) * embedNorm, rows 1..7 = mask embedding (FP32 [8, 2304]).
 void launchDrafterInitBlock(__half const* embedding, float const* embedNorm, float const* maskEmbed, float* x, cudaStream_t stream);

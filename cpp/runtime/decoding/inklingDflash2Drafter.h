@@ -74,6 +74,8 @@ private:
 
     int32_t mCapacity;
     int32_t mMaxAppendRows;
+    int32_t mCtxRows{0}; //!< rows of the context K/V caches: the capacity, or a ring that holds the attention window plus one update
+    int32_t mCtxRing{0}; //!< ring size when the caches are rings (position p in row p % mCtxRing), else 0
     int32_t mCtxLen{0};
     bool mDebugDone{false};
     int32_t mScoreStride{0};
