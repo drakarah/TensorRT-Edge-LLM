@@ -2923,7 +2923,7 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
                     mCacheState + mNumExperts + 2 * mCacheSlots, mCacheState + mNumExperts + 2 * mCacheSlots + 1, mCacheSlots, mCacheTally.load()};
             }
             kernel::launchSigmoidBiasTopk(static_cast<float const*>(inputs[0]), static_cast<float const*>(inputs[inputCount() - 1]), numTokens,
-                mNumExperts, mTopK, useCache ? routeBiasFromEnv() : 0.0f, useCache ? &routeState : nullptr, (useCache && numTokens <= 4) ? tailSkipFromEnv() : ((!useCache && tailAllFromEnv() && numTokens <= 4) ? tailSkipFromEnv() : 0), tailRenormFromEnv(), tailMaxWeightFromEnv(), topkIndicesPtr, topkWeightsPtr, stream);
+                mNumExperts, mTopK, useCache ? routeBiasFromEnv() : 0.0f, useCache ? &routeState : nullptr, (useCache && numTokens <= 4) ? tailSkipFromEnv() : ((!useCache && tailAllFromEnv() && numTokens <= 8) ? tailSkipFromEnv() : 0), tailRenormFromEnv(), tailMaxWeightFromEnv(), topkIndicesPtr, topkWeightsPtr, stream);
         }
         else if (useCache && (cacheBiasFromEnv() > 0.0f || tailSkipFromEnv() > 0) && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
         {
