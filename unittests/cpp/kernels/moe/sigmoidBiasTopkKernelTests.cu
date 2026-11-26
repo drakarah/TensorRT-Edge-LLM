@@ -64,7 +64,7 @@ Result reference(std::vector<float> const& logits, std::vector<float> const& sel
         }
         for (int32_t k = 0; k < topK; ++k)
         {
-            skipped[k] = tailSkip > 0 && k >= tailSkip && !slotOf.empty() && slotOf[order[k]] < 0 && score[order[k]] / (sum + 1e-20F) < maxWeight;
+            skipped[k] = tailSkip > 0 && k >= tailSkip && (slotOf.empty() || slotOf[order[k]] < 0) && score[order[k]] / (sum + 1e-20F) < maxWeight;
             kept += skipped[k] ? 0.0F : score[order[k]];
         }
         float const denom = (renorm ? kept : sum) + 1e-20F;
@@ -252,10 +252,12 @@ TEST(SigmoidBiasTopkTest, TailSkipWithRenormalisationKeepsTheMassAtOne)
     }
 }
 
-TEST(SigmoidBiasTopkTest, TailSkipIsOffWithoutCacheState)
+//! Without cache state every expert is resident: the kernel then skips every expert ranked tailSkip + 1 or lower (the plugin passes tailSkip > 0 only with
+//! EDGELLM_MOE_TAIL_ALL=1, METRICS 195); this test said "off" before that change.
+TEST(SigmoidBiasTopkTest, TailSkipWithoutCacheStateSkipsEveryExpertBeyondTheHead)
 {
     Case c = makeCase(30, 2, 128, 8, 0);
-    expectSame(run(c.logits, c.bias, {}, 2, 128, 8, 0.0F, 3, 0), reference(c.logits, c.bias, {}, 2, 128, 8, 0.0F, 0, false));
+    expectSame(run(c.logits, c.bias, {}, 2, 128, 8, 0.0F, 3, 0), reference(c.logits, c.bias, {}, 2, 128, 8, 0.0F, 3, false));
 }
 
 TEST(SigmoidBiasTopkTest, AllExpertsResidentSkipsNothing)

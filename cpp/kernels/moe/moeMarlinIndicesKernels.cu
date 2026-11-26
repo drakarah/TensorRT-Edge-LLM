@@ -106,7 +106,7 @@ constexpr int32_t kFusedRoutingMaxExperts = 128;
 //! One block does the whole routing preparation of a small decode or verify step: per-expert counts, padded counts and offsets (block scan), the Marlin sorted
 //! slot ids / routing weights / block expert ids, the padded copy of the routing weights for the down projection and the zeroing of the Marlin locks. Slots of
 //! an expert are listed in slot order (deterministic). Replaces count, scan, list and index kernels plus 3 memsets and a memcpy (about 40 us of kernels and gaps per layer visit).
-__global__ void __launch_bounds__(kFusedRoutingThreads) fusedDecodeRoutingKernel(int32_t const* topkIndices, float const* topkWeights, int32_t numSlots,
+__device__ __forceinline__ void fusedDecodeRoutingBody(int32_t const* topkIndices, float const* topkWeights, int32_t numSlots,
     int32_t numExperts, int32_t moeBlockSize, int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds,
     float* topkWeightsFlat, int32_t* expertIds, float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks,
     int32_t* trace, int32_t* traceCounter, int32_t traceCapacity)
@@ -246,6 +246,15 @@ __global__ void __launch_bounds__(kFusedRoutingThreads) fusedDecodeRoutingKernel
             trace[static_cast<int64_t>(row) * 8 + tid] = topkIndices[tid];
         }
     }
+}
+
+__global__ void __launch_bounds__(kFusedRoutingThreads) fusedDecodeRoutingKernel(int32_t const* topkIndices, float const* topkWeights, int32_t numSlots,
+    int32_t numExperts, int32_t moeBlockSize, int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds,
+    float* topkWeightsFlat, int32_t* expertIds, float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks,
+    int32_t* trace, int32_t* traceCounter, int32_t traceCapacity)
+{
+    fusedDecodeRoutingBody(topkIndices, topkWeights, numSlots, numExperts, moeBlockSize, paddedCounts, paddedOffsets, numTokensPostPadded, sortedTokenIds,
+        topkWeightsFlat, expertIds, topkWeightsPadded, paddedWeightsLen, locks, numLocks, trace, traceCounter, traceCapacity);
 }
 } // namespace
 
@@ -1165,11 +1174,11 @@ namespace
 //! lower expert id, a NaN or huge logit is clamped, the weights are the plain sigmoid scores of the chosen experts divided by their sum taken in selection order)
 //! without a single barrier. Only for cacheBias == 0 and tailSkip == 0, topK <= 8.
 template <int32_t kPerLane>
-__global__ void __launch_bounds__(32) sigmoidBiasTopkWarpKernel(
-    float const* logits, float const* selectionBias, int32_t numExperts, int32_t topK, int32_t* topkIndices, float* topkWeights)
+__device__ __forceinline__ void sigmoidTopkWarpBody(
+    float const* logits, float const* selectionBias, int32_t numExperts, int32_t topK, int32_t* topkIndices, float* topkWeights, int32_t token)
 {
-    float const* row = logits + static_cast<size_t>(blockIdx.x) * numExperts;
-    int32_t const lane = threadIdx.x;
+    float const* row = logits + static_cast<size_t>(token) * numExperts;
+    int32_t const lane = threadIdx.x & 31;
     float score[kPerLane];
     float selection[kPerLane];
 #pragma unroll
@@ -1256,10 +1265,34 @@ __global__ void __launch_bounds__(32) sigmoidBiasTopkWarpKernel(
     {
         if (k < topK && lane == k)
         {
-            topkIndices[static_cast<size_t>(blockIdx.x) * topK + k] = chosenIdx[k];
-            topkWeights[static_cast<size_t>(blockIdx.x) * topK + k] = chosenScore[k] / denom;
+            topkIndices[static_cast<size_t>(token) * topK + k] = chosenIdx[k];
+            topkWeights[static_cast<size_t>(token) * topK + k] = chosenScore[k] / denom;
         }
     }
+}
+
+template <int32_t kPerLane>
+__global__ void __launch_bounds__(32) sigmoidBiasTopkWarpKernel(
+    float const* logits, float const* selectionBias, int32_t numExperts, int32_t topK, int32_t* topkIndices, float* topkWeights)
+{
+    sigmoidTopkWarpBody<kPerLane>(logits, selectionBias, numExperts, topK, topkIndices, topkWeights, static_cast<int32_t>(blockIdx.x));
+}
+
+//! Top-k of up to 8 tokens (one warp each) and the routing preparation in one block: one launch instead of two for small decode and verify steps.
+template <int32_t kPerLane>
+__global__ void __launch_bounds__(kFusedRoutingThreads) topkRoutingFusedKernel(float const* logits, float const* selectionBias, int32_t numTokens,
+    int32_t numExperts, int32_t topK, int32_t* topkIndices, float* topkWeights, int32_t moeBlockSize, int32_t* paddedCounts, int32_t* paddedOffsets,
+    int32_t* numTokensPostPadded, int32_t* sortedTokenIds, float* topkWeightsFlat, int32_t* expertIds, float* topkWeightsPadded, int32_t paddedWeightsLen,
+    int32_t* locks, int32_t numLocks, int32_t* trace, int32_t* traceCounter, int32_t traceCapacity)
+{
+    int32_t const warp = threadIdx.x >> 5;
+    if (warp < numTokens)
+    {
+        sigmoidTopkWarpBody<kPerLane>(logits, selectionBias, numExperts, topK, topkIndices, topkWeights, warp);
+    }
+    __syncthreads();
+    fusedDecodeRoutingBody(topkIndices, topkWeights, numTokens * topK, numExperts, moeBlockSize, paddedCounts, paddedOffsets, numTokensPostPadded,
+        sortedTokenIds, topkWeightsFlat, expertIds, topkWeightsPadded, paddedWeightsLen, locks, numLocks, trace, traceCounter, traceCapacity);
 }
 } // namespace
 
@@ -1291,6 +1324,36 @@ void launchSigmoidBiasTopk(float const* logits, float const* selectionBias, int3
     }
     launchSigmoidBiasTopkBlock(
         logits, selectionBias, numTokens, numExperts, topK, cacheBias, cache, tailSkip, tailRenorm, tailMaxWeight, topkIndices, topkWeights, stream);
+}
+
+bool canFuseTopkRouting(int32_t numTokens, int32_t numExperts, int32_t topK)
+{
+    static bool const enabled = []
+    {
+        char const* const value = std::getenv("EDGELLM_MOE_TOPK_ROUTING");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return enabled && numTokens >= 1 && numTokens * 32 <= kFusedRoutingThreads && topK >= 1 && topK <= 8 && numExperts >= 1 && numExperts <= 256;
+}
+
+void launchTopkRoutingFused(float const* logits, float const* selectionBias, int32_t numTokens, int32_t numExperts, int32_t topK, int32_t* topkIndices,
+    float* topkWeights, int32_t moeBlockSize, int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds,
+    float* topkWeightsFlat, int32_t* expertIds, float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks, cudaStream_t stream,
+    int32_t* trace, int32_t* traceCounter, int32_t traceCapacity)
+{
+    if (numExperts <= 128)
+    {
+        topkRoutingFusedKernel<4><<<1, kFusedRoutingThreads, 0, stream>>>(logits, selectionBias, numTokens, numExperts, topK, topkIndices, topkWeights,
+            moeBlockSize, paddedCounts, paddedOffsets, numTokensPostPadded, sortedTokenIds, topkWeightsFlat, expertIds, topkWeightsPadded,
+            paddedWeightsLen, locks, numLocks, trace, traceCounter, traceCapacity);
+    }
+    else
+    {
+        topkRoutingFusedKernel<8><<<1, kFusedRoutingThreads, 0, stream>>>(logits, selectionBias, numTokens, numExperts, topK, topkIndices, topkWeights,
+            moeBlockSize, paddedCounts, paddedOffsets, numTokensPostPadded, sortedTokenIds, topkWeightsFlat, expertIds, topkWeightsPadded,
+            paddedWeightsLen, locks, numLocks, trace, traceCounter, traceCapacity);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 namespace

@@ -63,6 +63,13 @@ bool canUseFusedDecodeRouting(int32_t numSlots, int32_t numExperts, int32_t moeB
  * padded routing weights for the down projection, zeroing of @p numLocks Marlin lock ints at @p locks). Same arrays as the count / scan / list / index
  * kernel chain; slots of one expert are in slot order.
  */
+//! Small decode / verify steps (up to 8 tokens, plain sigmoid routing): the warp top-k of every token and the fused routing preparation in one launch.
+bool canFuseTopkRouting(int32_t numTokens, int32_t numExperts, int32_t topK);
+void launchTopkRoutingFused(float const* logits, float const* selectionBias, int32_t numTokens, int32_t numExperts, int32_t topK, int32_t* topkIndices,
+    float* topkWeights, int32_t moeBlockSize, int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds,
+    float* topkWeightsFlat, int32_t* expertIds, float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks, cudaStream_t stream,
+    int32_t* trace, int32_t* traceCounter, int32_t traceCapacity);
+
 void launchFusedDecodeRouting(int32_t const* topkIndices, float const* topkWeights, int32_t numSlots, int32_t numExperts, int32_t moeBlockSize,
     int32_t* paddedCounts, int32_t* paddedOffsets, int32_t* numTokensPostPadded, int32_t* sortedTokenIds, float* topkWeightsFlat, int32_t* expertIds,
     float* topkWeightsPadded, int32_t paddedWeightsLen, int32_t* locks, int32_t numLocks, cudaStream_t stream, int32_t* trace = nullptr,

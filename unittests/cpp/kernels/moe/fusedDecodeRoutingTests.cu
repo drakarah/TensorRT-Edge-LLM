@@ -200,3 +200,87 @@ TEST(FusedDecodeRouting, LimitsAreChecked)
     EXPECT_FALSE(canUseFusedDecodeRouting(0, 128, 8));
     EXPECT_TRUE(canUseFusedDecodeRouting(64, 128, 8));
 }
+
+//! The warp top-k and the routing preparation in one launch must equal the two separate launches bit for bit (all outputs, including the lock zeroing).
+TEST(FusedDecodeRouting, TopkRoutingInOneLaunchEqualsTheTwoLaunchPath)
+{
+    constexpr int32_t kTopK = 8;
+    constexpr int32_t kBlock = 8;
+    constexpr int32_t kLocks = 56;
+    for (int32_t experts : {128, 64, 100})
+    {
+        for (int32_t tokens : {1, 2, 3, 5, 8})
+        {
+            for (uint32_t seed = 0; seed < 4; ++seed)
+            {
+                std::mt19937 rng(7000 + seed + tokens * 31 + experts);
+                std::normal_distribution<float> dist(0.F, 2.F);
+                std::vector<float> logits(static_cast<size_t>(tokens) * experts), bias(experts);
+                for (auto& v : logits)
+                {
+                    v = dist(rng);
+                }
+                for (auto& v : bias)
+                {
+                    v = 0.05F * dist(rng);
+                }
+                int32_t const slots = tokens * kTopK;
+                int32_t const padded = slots + experts * kBlock;
+                int32_t const blocks = (padded + kBlock - 1) / kBlock;
+                SCOPED_TRACE(::testing::Message() << experts << " experts " << tokens << " tokens seed " << seed);
+                float* dLogits = upload(logits);
+                float* dBias = upload(bias);
+                struct Out
+                {
+                    int32_t *idx, *pc, *off, *post, *sorted, *expert, *locks;
+                    float *w, *flat, *padw;
+                };
+                auto alloc = [&]()
+                {
+                    Out o{};
+                    EXPECT_EQ(cudaMalloc(&o.idx, slots * 4), cudaSuccess);
+                    EXPECT_EQ(cudaMalloc(&o.w, slots * 4), cudaSuccess);
+                    EXPECT_EQ(cudaMalloc(&o.pc, experts * 4), cudaSuccess);
+                    EXPECT_EQ(cudaMalloc(&o.off, experts * 4), cudaSuccess);
+                    EXPECT_EQ(cudaMalloc(&o.post, 4), cudaSuccess);
+                    std::vector<int32_t> fi(padded, -7), fe(blocks, -7), fl(kLocks, 99);
+                    std::vector<float> ff(padded, -7.F);
+                    o.sorted = upload(fi);
+                    o.expert = upload(fe);
+                    o.locks = upload(fl);
+                    o.flat = upload(ff);
+                    o.padw = upload(ff);
+                    return o;
+                };
+                Out a = alloc(), b = alloc();
+                launchSigmoidBiasTopk(dLogits, dBias, tokens, experts, kTopK, 0.F, nullptr, 0, 0, 1e9F, a.idx, a.w, nullptr);
+                launchFusedDecodeRouting(a.idx, a.w, slots, experts, kBlock, a.pc, a.off, a.post, a.sorted, a.flat, a.expert, a.padw, padded, a.locks, kLocks, nullptr);
+                ASSERT_TRUE(canFuseTopkRouting(tokens, experts, kTopK));
+                launchTopkRoutingFused(dLogits, dBias, tokens, experts, kTopK, b.idx, b.w, kBlock, b.pc, b.off, b.post, b.sorted, b.flat, b.expert, b.padw, padded,
+                    b.locks, kLocks, nullptr, nullptr, nullptr, 0);
+                ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+                EXPECT_EQ(download(a.idx, slots), download(b.idx, slots)) << experts << " experts " << tokens << " tokens seed " << seed;
+                EXPECT_EQ(download(a.w, slots), download(b.w, slots));
+                EXPECT_EQ(download(a.pc, experts), download(b.pc, experts));
+                EXPECT_EQ(download(a.off, experts), download(b.off, experts));
+                EXPECT_EQ(download(a.post, 1), download(b.post, 1));
+                EXPECT_EQ(download(a.sorted, padded), download(b.sorted, padded));
+                EXPECT_EQ(download(a.flat, padded), download(b.flat, padded));
+                EXPECT_EQ(download(a.padw, padded), download(b.padw, padded));
+                EXPECT_EQ(download(a.expert, blocks), download(b.expert, blocks));
+                EXPECT_EQ(download(a.locks, kLocks), download(b.locks, kLocks));
+                for (Out o : {a, b})
+                {
+                    for (void* d : {static_cast<void*>(o.idx), static_cast<void*>(o.w), static_cast<void*>(o.pc), static_cast<void*>(o.off),
+                             static_cast<void*>(o.post), static_cast<void*>(o.sorted), static_cast<void*>(o.expert), static_cast<void*>(o.locks),
+                             static_cast<void*>(o.flat), static_cast<void*>(o.padw)})
+                    {
+                        cudaFree(d);
+                    }
+                }
+                cudaFree(dLogits);
+                cudaFree(dBias);
+            }
+        }
+    }
+}

@@ -2909,7 +2909,16 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             }
         }
 
+        // Small plain steps: the warp top-k runs inside the routing-preparation launch (one launch fewer); EDGELLM_MOE_TOPK_ROUTING=0 turns it off.
+        bool topkInRouting = false;
         if (mRouteMode == kRouteModeSigmoidBias)
+        {
+            topkInRouting = !useCache && !stageNow && !routedMode && !chunkMode && fusedRoutingEnabled() && tileTokens == numTokens
+                && !(tailAllFromEnv() && tailSkipFromEnv() > 0) && mTopK <= kernel::kRouterMaxTopK && inputDesc[0].type == nvinfer1::DataType::kFLOAT
+                && kernel::canFuseTopkRouting(numTokens, mNumExperts, mTopK)
+                && kernel::canUseFusedDecodeRouting(numTokens * mTopK, mNumExperts, moeBlockSize) && marlinWorkspaceSize >= 4 * numSmsForLocks();
+        }
+        if (mRouteMode == kRouteModeSigmoidBias && !topkInRouting)
         {
             if (mTopK > kernel::kRouterMaxTopK || inputDesc[0].type != nvinfer1::DataType::kFLOAT)
             {
@@ -2924,6 +2933,10 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             }
             kernel::launchSigmoidBiasTopk(static_cast<float const*>(inputs[0]), static_cast<float const*>(inputs[inputCount() - 1]), numTokens,
                 mNumExperts, mTopK, useCache ? routeBiasFromEnv() : 0.0f, useCache ? &routeState : nullptr, (useCache && numTokens <= 4) ? tailSkipFromEnv() : ((!useCache && tailAllFromEnv() && numTokens <= 8) ? tailSkipFromEnv() : 0), tailRenormFromEnv(), tailMaxWeightFromEnv(), topkIndicesPtr, topkWeightsPtr, stream);
+        }
+        else if (topkInRouting)
+        {
+            // launched with the routing preparation in runTile
         }
         else if (useCache && (cacheBiasFromEnv() > 0.0f || tailSkipFromEnv() > 0) && inputDesc[0].type == nvinfer1::DataType::kFLOAT)
         {
@@ -2999,7 +3012,14 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         // (EDGELLM_MOE_FUSED_ROUTING=0 turns it off). It also zeroes the lock ints of the first Marlin GEMM.
         bool const fusedRouting = !routedMode && !chunkMode && fusedRoutingEnabled() && kernel::canUseFusedDecodeRouting(tileSlots, mNumExperts, moeBlockSize)
             && marlinWorkspaceSize >= 4 * numSmsForLocks();
-        if (fusedRouting)
+        if (fusedRouting && topkInRouting)
+        {
+            kernel::launchTopkRoutingFused(static_cast<float const*>(inputs[0]), static_cast<float const*>(inputs[inputCount() - 1]), tokens, mNumExperts, mTopK,
+                tileTopkIdx, tileTopkW, moeBlockSize, paddedCountsPtr, paddedOffsetsPtr, numTokensPostPaddedPtr, sortedTokenIdsPtr, topkWeightsFlatPtr,
+                expertIdsPtr, topkWeightsPaddedPtr, tilePadded, marlinWorkspacePtr, 4 * numSmsForLocks(), stream, routeTrace().rows, routeTrace().counter,
+                routeTrace().capacity);
+        }
+        else if (fusedRouting)
         {
             kernel::launchFusedDecodeRouting(tileTopkIdx, tileTopkW, tileSlots, mNumExperts, moeBlockSize, paddedCountsPtr, paddedOffsetsPtr,
                 numTokensPostPaddedPtr, sortedTokenIdsPtr, topkWeightsFlatPtr, expertIdsPtr, topkWeightsPaddedPtr, tilePadded,
