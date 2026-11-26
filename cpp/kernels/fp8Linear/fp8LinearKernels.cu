@@ -314,7 +314,7 @@ __global__ void fp8GemvRowsKernel(__half const* __restrict__ x, uint4 const* __r
 #pragma unroll
                 for (int32_t m = 0; m < kM; ++m)
                 {
-                    uint4 const* xp = reinterpret_cast<uint4 const*>(x + static_cast<size_t>(m) * k + c * 16);
+                    uint4 const* xp = reinterpret_cast<uint4 const*>(x + static_cast<size_t>(min(m, numTokens - 1)) * k + c * 16); // rows of the tile beyond numTokens re-read the last token (never stored): no read past the activations
                     uint4 const xa = __ldg(xp);
                     uint4 const xb = __ldg(xp + 1);
                     uint32_t const xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
