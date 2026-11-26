@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 
 namespace trt_edgellm
 {
@@ -359,6 +360,284 @@ __global__ void attnReduceKernel(float const* partial, int32_t splits, __half* o
     out[static_cast<size_t>(row) * kQStride + (g * kDfl2Group + hh) * kDfl2HeadDim + d] = __float2half(s);
 }
 
+
+// ---- Fused tensor-core attention of the drafter block (replaces scores + softmax + P x V + reduce: four launches that were latency bound at the drafter's context sizes) ----
+// One block per (KV head, key split), four warps: warp (rt, kh) owns the 16 query vectors 16 rt .. 16 rt + 15 of the head's 32 (8 block rows x 4 heads) and the keys of
+// 16-key sub-tile kh of every 32-key tile. Each warp streams its keys through a private double-buffered shared-memory slice (cp.async), scores with mma.m16n8k16, keeps a
+// warp-private online softmax and accumulates P x V with FP16 P; the two key halves of a row tile and the splits are merged exactly (m, l, acc) at the end.
+constexpr int kAWarps = 4;
+constexpr int kAThreads = 128;
+constexpr int kAWarpKeys = 16;
+constexpr int kATile = 32;                              //!< keys per block iteration
+constexpr int kAKP = kDfl2HeadDim + 8;                  //!< staged row of 136 halves: conflict-free for ldmatrix
+constexpr int kASlice = 2 * kAWarpKeys * kAKP;          //!< halves of one stage (K then V)
+constexpr int kAPartialStride = kDfl2HeadDim + 2;       //!< m, l, acc[128] per (split, KV head, query vector)
+constexpr int kAMaxSplits = 14;
+constexpr size_t kASmemBytes = sizeof(__half) * kASlice * 2 * kAWarps;
+
+__device__ __forceinline__ void aMma(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1)
+{
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void aLdmatrix(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, void const* p)
+{
+    uint32_t const addr = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+__device__ __forceinline__ void aLdmatrixTrans(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, void const* p)
+{
+    uint32_t const addr = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+__device__ __forceinline__ void aCpAsync16(void* dst, void const* src, bool valid)
+{
+    uint32_t const addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    int32_t const srcSize = valid ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(addr), "l"(src), "r"(srcSize));
+}
+
+__device__ __forceinline__ void aCpAsyncWaitAll()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+__device__ __forceinline__ uint32_t aPackHalf2(float lo, float hi)
+{
+    __half2 const h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<uint32_t const*>(&h);
+}
+
+__global__ void __launch_bounds__(kAThreads, 2) attnFusedKernel(__half const* q, __half const* ctxK, __half const* ctxV, __half const* kb, __half const* vb, int32_t lo,
+    int32_t nCtx, int32_t qpos0, int32_t window, int32_t splits, float* partial)
+{
+    extern __shared__ __align__(16) unsigned char smemRaw[];
+    __half* const slices = reinterpret_cast<__half*>(smemRaw);
+    int32_t const tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    int32_t const gid = lane >> 2, tig = lane & 3;
+    int32_t const g = blockIdx.x, split = blockIdx.y;
+    int32_t const rt = w & 1, kh = w >> 1;
+    int32_t const nk = nCtx + kDfl2Block;
+    int32_t const nTiles = (nk + kATile - 1) / kATile;
+    int32_t const perSplit = (nTiles + splits - 1) / splits;
+    int32_t const tBegin = min(nTiles, split * perSplit), tEnd = min(nTiles, tBegin + perSplit);
+    __half* const warpSlices = slices + static_cast<size_t>(w) * 2 * kASlice;
+
+    // Q fragments of this warp's 16 query vectors (A operand rows gid and gid + 8)
+    uint32_t qa[8][4];
+    {
+        int32_t const qiA = rt * 16 + gid, qiB = qiA + 8;
+        __half const* rowA = q + static_cast<size_t>(qiA / kDfl2Group) * kQStride + (g * kDfl2Group + qiA % kDfl2Group) * kDfl2HeadDim;
+        __half const* rowB = q + static_cast<size_t>(qiB / kDfl2Group) * kQStride + (g * kDfl2Group + qiB % kDfl2Group) * kDfl2HeadDim;
+#pragma unroll
+        for (int32_t ks = 0; ks < 8; ++ks)
+        {
+            qa[ks][0] = *reinterpret_cast<uint32_t const*>(rowA + ks * 16 + 2 * tig);
+            qa[ks][1] = *reinterpret_cast<uint32_t const*>(rowB + ks * 16 + 2 * tig);
+            qa[ks][2] = *reinterpret_cast<uint32_t const*>(rowA + ks * 16 + 8 + 2 * tig);
+            qa[ks][3] = *reinterpret_cast<uint32_t const*>(rowB + ks * 16 + 8 + 2 * tig);
+        }
+    }
+    float accO[16][4];
+#pragma unroll
+    for (int32_t i = 0; i < 16; ++i)
+    {
+        accO[i][0] = accO[i][1] = accO[i][2] = accO[i][3] = 0.F;
+    }
+    float rowM[2] = {-INFINITY, -INFINITY}, rowL[2] = {0.F, 0.F};
+    int32_t const sTok[2] = {(rt * 16 + gid) / kDfl2Group, (rt * 16 + gid + 8) / kDfl2Group}; // block row (token) of the two accumulator rows
+
+    bool const isV = lane >= 16;
+    int32_t const chunk = (lane & 15) * 8;
+    auto issue = [&](int32_t t, int32_t st)
+    {
+        int32_t const base = t * kATile + kh * kAWarpKeys;
+        __half* const dst = warpSlices + st * kASlice + (isV ? kAWarpKeys * kAKP : 0) + chunk;
+#pragma unroll
+        for (int32_t kk = 0; kk < kAWarpKeys; ++kk)
+        {
+            int32_t const key = base + kk;
+            __half const* src = nullptr;
+            if (key < nCtx)
+            {
+                src = (isV ? ctxV : ctxK) + static_cast<size_t>(lo + key) * kKvStride + g * kDfl2HeadDim + chunk;
+            }
+            else
+            {
+                src = (isV ? vb : kb) + static_cast<size_t>(min(key, nk - 1) - nCtx) * kKvStride + g * kDfl2HeadDim + chunk;
+            }
+            aCpAsync16(dst + kk * kAKP, src, key < nk);
+        }
+    };
+    if (tBegin < tEnd)
+    {
+        issue(tBegin, 0);
+        aCpAsyncWaitAll();
+        __syncwarp();
+    }
+    for (int32_t t = tBegin; t < tEnd; ++t)
+    {
+        int32_t const st = (t - tBegin) & 1;
+        bool const hasNext = t + 1 < tEnd;
+        if (hasNext)
+        {
+            issue(t + 1, st ^ 1);
+        }
+        __half const* const kS = warpSlices + st * kASlice;
+        __half const* const vS = kS + kAWarpKeys * kAKP;
+        float c[2][4] = {{0.F, 0.F, 0.F, 0.F}, {0.F, 0.F, 0.F, 0.F}};
+#pragma unroll
+        for (int32_t ks = 0; ks < 8; ++ks)
+        {
+            uint32_t b0, b1, b2, b3;
+            int32_t const key = ((lane >> 4) & 1) * 8 + (lane & 7);
+            int32_t const col = ks * 16 + ((lane >> 3) & 1) * 8;
+            aLdmatrix(b0, b1, b2, b3, kS + key * kAKP + col);
+            aMma(c[0], qa[ks][0], qa[ks][1], qa[ks][2], qa[ks][3], b0, b1);
+            aMma(c[1], qa[ks][0], qa[ks][1], qa[ks][2], qa[ks][3], b2, b3);
+        }
+        int32_t const base = t * kATile + kh * kAWarpKeys;
+        float sc[2][4];
+        float tileMax[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int32_t n = 0; n < 2; ++n)
+        {
+#pragma unroll
+            for (int32_t j = 0; j < 2; ++j)
+            {
+                int32_t const key = base + n * 8 + 2 * tig + j;
+#pragma unroll
+                for (int32_t hh = 0; hh < 2; ++hh)
+                {
+                    bool const visible = key < nk && (key >= nCtx || (qpos0 + sTok[hh] - (lo + key) < window));
+                    float const score = visible ? c[n][hh * 2 + j] * 0.08838834764831845F : -INFINITY;
+                    sc[n][hh * 2 + j] = score;
+                    tileMax[hh] = fmaxf(tileMax[hh], score);
+                }
+            }
+        }
+        float corr[2], e[2][4];
+#pragma unroll
+        for (int32_t hh = 0; hh < 2; ++hh)
+        {
+            tileMax[hh] = fmaxf(tileMax[hh], __shfl_xor_sync(0xFFFFFFFFU, tileMax[hh], 1));
+            tileMax[hh] = fmaxf(tileMax[hh], __shfl_xor_sync(0xFFFFFFFFU, tileMax[hh], 2));
+            float const mNew = fmaxf(rowM[hh], tileMax[hh]);
+            corr[hh] = rowM[hh] == -INFINITY ? 0.F : __expf(rowM[hh] - mNew);
+            float sum = 0.F;
+#pragma unroll
+            for (int32_t n = 0; n < 2; ++n)
+            {
+#pragma unroll
+                for (int32_t j = 0; j < 2; ++j)
+                {
+                    float const sv = sc[n][hh * 2 + j];
+                    e[n][hh * 2 + j] = sv == -INFINITY ? 0.F : __expf(sv - mNew);
+                    sum += e[n][hh * 2 + j];
+                }
+            }
+            sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 1);
+            sum += __shfl_xor_sync(0xFFFFFFFFU, sum, 2);
+            rowL[hh] = rowL[hh] * corr[hh] + sum;
+            rowM[hh] = mNew;
+        }
+#pragma unroll
+        for (int32_t i = 0; i < 16; ++i)
+        {
+            accO[i][0] *= corr[0];
+            accO[i][1] *= corr[0];
+            accO[i][2] *= corr[1];
+            accO[i][3] *= corr[1];
+        }
+        uint32_t const pa0 = aPackHalf2(e[0][0], e[0][1]);
+        uint32_t const pa1 = aPackHalf2(e[0][2], e[0][3]);
+        uint32_t const pa2 = aPackHalf2(e[1][0], e[1][1]);
+        uint32_t const pa3 = aPackHalf2(e[1][2], e[1][3]);
+#pragma unroll
+        for (int32_t dt = 0; dt < 8; ++dt)
+        {
+            uint32_t b0, b1, b2, b3;
+            int32_t const key = ((lane >> 3) & 1) * 8 + (lane & 7);
+            int32_t const col = dt * 16 + ((lane >> 4) & 1) * 8;
+            aLdmatrixTrans(b0, b1, b2, b3, vS + key * kAKP + col);
+            aMma(accO[2 * dt], pa0, pa1, pa2, pa3, b0, b1);
+            aMma(accO[2 * dt + 1], pa0, pa1, pa2, pa3, b2, b3);
+        }
+        if (hasNext)
+        {
+            aCpAsyncWaitAll();
+            __syncwarp();
+        }
+    }
+
+    // merge the two key halves of every row tile, then write one (m, l, acc) per (split, KV head, query vector)
+    __syncthreads();
+    float* const accS = reinterpret_cast<float*>(smemRaw);              // [warp][16 rows][128 + 8]
+    constexpr int kAccStride = kDfl2HeadDim + 8;
+    float* const mS = accS + kAWarps * 16 * kAccStride;                // [warp][16]
+    float* const lS = mS + kAWarps * 16;
+#pragma unroll
+    for (int32_t hh = 0; hh < 2; ++hh)
+    {
+        int32_t const r = gid + 8 * hh;
+#pragma unroll
+        for (int32_t i = 0; i < 16; ++i)
+        {
+            *reinterpret_cast<float2*>(&accS[(w * 16 + r) * kAccStride + i * 8 + 2 * tig]) = make_float2(accO[i][hh * 2], accO[i][hh * 2 + 1]);
+        }
+        if (tig == 0)
+        {
+            mS[w * 16 + r] = rowM[hh];
+            lS[w * 16 + r] = rowL[hh];
+        }
+    }
+    __syncthreads();
+    int32_t const d = tid;
+    for (int32_t qi = 0; qi < kDfl2QueryRows; ++qi)
+    {
+        int32_t const w0 = qi / 16, w1 = w0 + 2, r = qi % 16;
+        float const m0 = mS[w0 * 16 + r], m1 = mS[w1 * 16 + r];
+        float const mm = fmaxf(m0, m1);
+        float const c0 = m0 == -INFINITY ? 0.F : __expf(m0 - mm);
+        float const c1 = m1 == -INFINITY ? 0.F : __expf(m1 - mm);
+        float* const out = partial + (static_cast<size_t>(split * kDfl2KvHeads + g) * kDfl2QueryRows + qi) * kAPartialStride;
+        out[2 + d] = accS[(w0 * 16 + r) * kAccStride + d] * c0 + accS[(w1 * 16 + r) * kAccStride + d] * c1;
+        if (d == 0)
+        {
+            out[0] = mm;
+            out[1] = lS[w0 * 16 + r] * c0 + lS[w1 * 16 + r] * c1;
+        }
+    }
+}
+
+//! Merge of the splits: grid (KV heads x query vectors), one thread per channel.
+__global__ void attnFusedReduceKernel(float const* partial, int32_t splits, __half* out)
+{
+    int32_t const g = blockIdx.x / kDfl2QueryRows;
+    int32_t const qi = blockIdx.x % kDfl2QueryRows;
+    int32_t const d = threadIdx.x;
+    float mm = -INFINITY;
+    for (int32_t sp = 0; sp < splits; ++sp)
+    {
+        mm = fmaxf(mm, partial[(static_cast<size_t>(sp * kDfl2KvHeads + g) * kDfl2QueryRows + qi) * kAPartialStride]);
+    }
+    float num = 0.F, den = 0.F;
+    for (int32_t sp = 0; sp < splits; ++sp)
+    {
+        float const* p = partial + (static_cast<size_t>(sp * kDfl2KvHeads + g) * kDfl2QueryRows + qi) * kAPartialStride;
+        float const cf = p[0] == -INFINITY ? 0.F : __expf(p[0] - mm);
+        num += p[2 + d] * cf;
+        den += p[1] * cf;
+    }
+    int32_t const row = qi / kDfl2Group, hh = qi % kDfl2Group;
+    out[static_cast<size_t>(row) * kQStride + (g * kDfl2Group + hh) * kDfl2HeadDim + d] = __float2half(num / den);
+}
+
 __global__ void logitsToFloatKernel(__half const* in, float* out, int32_t cols, int32_t validCols)
 {
     size_t const row = blockIdx.y;
@@ -399,7 +678,27 @@ void launchDfl2QkvPrep(__half const* qRaw, __half const* kRaw, __half const* vRa
 void launchDfl2Attention(__half const* q, __half const* ctxK, __half const* ctxV, __half const* kb, __half const* vb, int32_t lo, int32_t nCtx, int32_t qpos0, int32_t window,
     float* scores, int32_t scoreStride, float* partial, int32_t maxSplits, __half* out, cudaStream_t stream)
 {
+    static bool const oldPath = std::getenv("EDGELLM_INKLING_DRAFTER_ATTN_OLD") != nullptr;
     int32_t const nk = nCtx + kDfl2Block;
+    if (!oldPath)
+    {
+        static bool const configured = []()
+        {
+            cudaFuncSetAttribute(attnFusedKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kASmemBytes));
+            return true;
+        }();
+        static_cast<void>(configured);
+        static int32_t const maxFused = []()
+        {
+            char const* v = std::getenv("EDGELLM_INKLING_DRAFTER_ATTN_SPLITS");
+            return v != nullptr ? std::max(1, std::min(kAMaxSplits, std::atoi(v))) : 3;
+        }();
+        int32_t const tiles = (nk + kATile - 1) / kATile;
+        int32_t const splits = std::max(1, std::min(maxFused, (tiles + 1) / 2));
+        attnFusedKernel<<<dim3(kDfl2KvHeads, splits), kAThreads, kASmemBytes, stream>>>(q, ctxK, ctxV, kb, vb, lo, nCtx, qpos0, window, splits, partial);
+        attnFusedReduceKernel<<<kDfl2KvHeads * kDfl2QueryRows, kDfl2HeadDim, 0, stream>>>(partial, splits, out);
+        return;
+    }
     attnScoresKernel<<<dim3((nk + kKeysPerBlock - 1) / kKeysPerBlock, kDfl2KvHeads), kScoreThreads, 0, stream>>>(
         q, ctxK, kb, lo, nCtx, qpos0, window, scores, scoreStride);
     attnSoftmaxKernel<<<kDfl2KvHeads * kDfl2QueryRows, 256, 0, stream>>>(scores, scoreStride, nk);
@@ -407,7 +706,6 @@ void launchDfl2Attention(__half const* q, __half const* ctxK, __half const* ctxV
     attnPvKernel<<<dim3(kDfl2KvHeads, splits), kDfl2HeadDim, 0, stream>>>(scores, scoreStride, ctxV, vb, lo, nCtx, splits, partial);
     attnReduceKernel<<<kDfl2KvHeads * kDfl2QueryRows, kDfl2HeadDim, 0, stream>>>(partial, splits, out);
 }
-
 
 // ---- Top-16 of the rows of FP16 logits (replaces the float conversion, the generic top-k and the value gather: 0.66 ms -> a few tens of us per call) ----
 // Ordering key = (order-preserving bits of the value) << 32 | (0xFFFFFFFF - index): the maximum key is the largest value, ties go to the smaller index.
@@ -565,6 +863,7 @@ __global__ void __launch_bounds__(kTop16StageTwoThreads) top16Stage2Kernel(uint6
         __syncthreads();
     }
 }
+
 
 void launchDfl2LogitsToFloat(__half const* in, float* out, int32_t rows, int32_t cols, int32_t validCols, cudaStream_t stream)
 {
