@@ -1806,25 +1806,45 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
     int64_t const rowElems = int64_t(p.numKVHeads) * KvTraits<KvT>::rowStride;
     int64_t const pageElems = int64_t(kInkling2TokensPerPage) * rowElems;
 
-    // Per-row causal limits (threads 0-15 each take a row); a row is dead when its token is outside the batch or belongs to another sequence than the block's first token.
-    int32_t seq0 = 0, qpos0 = 0;
-    bool const valid0 = locateToken(slot0, offsets, lengths, past, p.batchSize, seq0, qpos0);
+    // Everything the kernel needs from global memory without depending on another load is requested at once: the batch-1 sequence descriptor, the query-row inputs
+    // (only the token range is checked here, a row's liveness is decided after the descriptor arrives) -- the latency of these loads overlaps instead of adding up.
+    // This kernel is launched for batchSize == 1 only.
+    int32_t const off0 = offsets[0], len0 = lengths[0], past0 = past[0];
+    constexpr int32_t kRowsPerWarp = kMultiRows / kMmaWarps;
+    float qRaw[kRowsPerWarp][4], qSc[kRowsPerWarp][4], rRaw[kRowsPerWarp], rSc[kRowsPerWarp];
+#pragma unroll
+    for (int32_t ri = 0; ri < kRowsPerWarp; ++ri)
+    {
+        int32_t const r = w + ri * kMmaWarps;
+        int32_t const tl = r / group, hh = r - tl * group;
+        int32_t const slot = slot0 + tl;
+        bool const live = tl < tb && slot < p.numTokens;
+        int32_t const h = kvh * group + hh;
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i)
+        {
+            int32_t const d = lane * 4 + i;
+            qRaw[ri][i] = live ? __half2float(qLin[int64_t(slot) * p.qLd + h * kInkling2HeadDim + d]) : 0.F;
+            qSc[ri][i] = live ? qScale[h * kInkling2HeadDim + d] : 0.F;
+        }
+        int32_t const j = lane & 15;
+        rRaw[ri] = live ? __half2float(relLin[int64_t(slot) * p.relLd + h * kInkling2RelDim + j]) : 0.F;
+        rSc[ri] = live ? relScale[h * kInkling2RelDim + j] : 0.F;
+    }
+
+    // Per-row causal limits (threads 0-15 each take a row); a row is dead when its token is outside the batch.
+    int32_t const seq0 = 0;
+    bool const valid0 = slot0 - off0 >= 0 && slot0 - off0 < len0;
     if (tid < kMultiRows)
     {
         int32_t const tl = tid / group;
         int32_t qp = -1, lo = 0, hi = -1;
-        if (valid0 && tl < tb && slot0 + tl < p.numTokens)
+        int32_t const local = slot0 + tl - off0;
+        if (valid0 && tl < tb && slot0 + tl < p.numTokens && local >= 0 && local < len0)
         {
-            int32_t seq = 0;
-            if (locateToken(slot0 + tl, offsets, lengths, past, p.batchSize, seq, qp) && seq == seq0)
-            {
-                lo = p.window > 0 ? max(0, qp - p.window + 1) : 0;
-                hi = qp;
-            }
-            else
-            {
-                qp = -1;
-            }
+            qp = past0 + local;
+            lo = p.window > 0 ? max(0, qp - p.window + 1) : 0;
+            hi = qp;
         }
         rowQpos[tid] = qp;
         rowLo[tid] = lo;
@@ -1970,7 +1990,7 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
         }
     };
 
-    // The first key tile's loads (FP16: cp.async, no register staging) go out before the query rows are prepared, so their latency overlaps the prologue.
+    // The first key tile's loads (FP16: cp.async, no register staging) go out after the query-row loads are issued (so those are not queued behind the tile), so their latency overlaps the prologue.
     TileTable nextTable{-1, -1, -1, -1};
     if constexpr (!kInt8)
     {
@@ -1985,37 +2005,12 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
     }
 
     // Query rows: warp w prepares rows w, w + 4, ... (same scaling and clipping as the other decode kernels).
-    // All four rows of this warp load their inputs first (independent global loads in flight together), then each row is normalised.
-    constexpr int32_t kRowsPerWarp = kMultiRows / kMmaWarps;
-    float qRaw[kRowsPerWarp][4], qSc[kRowsPerWarp][4], rRaw[kRowsPerWarp], rSc[kRowsPerWarp];
 #pragma unroll
     for (int32_t ri = 0; ri < kRowsPerWarp; ++ri)
     {
         int32_t const r = w + ri * kMmaWarps;
-        bool const live = rowHi[r] >= rowLo[r];
-        int32_t const tl = r / group, hh = r - tl * group;
-        int32_t const slot = slot0 + tl;
-        int32_t const h = kvh * group + hh;
-#pragma unroll
-        for (int32_t i = 0; i < 4; ++i)
-        {
-            int32_t const d = lane * 4 + i;
-            qRaw[ri][i] = live ? __half2float(qLin[int64_t(slot) * p.qLd + h * kInkling2HeadDim + d]) : 0.F;
-            qSc[ri][i] = live ? qScale[h * kInkling2HeadDim + d] : 0.F;
-        }
-        int32_t const j = lane & 15;
-        rRaw[ri] = live ? __half2float(relLin[int64_t(slot) * p.relLd + h * kInkling2RelDim + j]) : 0.F;
-        rSc[ri] = live ? relScale[h * kInkling2RelDim + j] : 0.F;
-    }
-#pragma unroll
-    for (int32_t ri = 0; ri < kRowsPerWarp; ++ri)
-    {
-        int32_t const r = w + ri * kMmaWarps;
-        if (rowHi[r] < rowLo[r])
-        {
-            continue;
-        }
-        int32_t const qpos = rowQpos[r];
+        // dead rows are computed too (their inputs are zero and the result is never read), so the four rows form one straight-line block the scheduler can interleave
+        int32_t const qpos = max(rowQpos[r], 0);
         float const logScale = p.window == 0 ? 1.F + p.logAlpha * logf(fmaxf((qpos + 1.F) / p.logNFloor, 1.F)) : 1.F;
         float q[4];
         float ss = 0.F;
