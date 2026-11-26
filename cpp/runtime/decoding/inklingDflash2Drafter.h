@@ -82,7 +82,7 @@ private:
     Tensor mCtxIn, mFcOut, mDelta, mKRaw, mVRaw;
     Tensor mXf, mH, mCoPre, mCoPost, mHc, mQRaw, mKBRaw, mVBRaw, mQ, mKb, mVb, mAttn, mO, mG, mU, mAct, mDown, mHidN;
     Tensor mScores, mPartial;
-    Tensor mProj, mLogits, mLogitsF, mTopVals, mTopIdx, mTopWorkspace, mCand, mUnary, mProjected;
+    Tensor mProj, mLogits, mLogitsF, mTopVals, mTopIdx, mTopWorkspace, mTopKeys, mCand, mUnary, mProjected;
     Tensor mAnchorTok, mUniforms, mTemperatures, mGreedy, mDraftTok, mProbs;
 };
 

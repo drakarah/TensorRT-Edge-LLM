@@ -408,6 +408,164 @@ void launchDfl2Attention(__half const* q, __half const* ctxK, __half const* ctxV
     attnReduceKernel<<<kDfl2KvHeads * kDfl2QueryRows, kDfl2HeadDim, 0, stream>>>(partial, splits, out);
 }
 
+
+// ---- Top-16 of the rows of FP16 logits (replaces the float conversion, the generic top-k and the value gather: 0.66 ms -> a few tens of us per call) ----
+// Ordering key = (order-preserving bits of the value) << 32 | (0xFFFFFFFF - index): the maximum key is the largest value, ties go to the smaller index.
+constexpr int32_t kTop16 = 16;
+constexpr int32_t kTop16Chunks = 32;
+constexpr int32_t kTop16Threads = 256;
+constexpr int32_t kTop16StageTwoThreads = kTop16Chunks * kTop16;
+
+__device__ __forceinline__ uint64_t top16Key(float v, int32_t idx)
+{
+    if (v != v)
+    {
+        v = -INFINITY;
+    }
+    uint32_t const u = __float_as_uint(v);
+    uint32_t const ordered = (u & 0x80000000U) != 0U ? ~u : (u | 0x80000000U);
+    return (static_cast<uint64_t>(ordered) << 32) | static_cast<uint64_t>(0xFFFFFFFFU - static_cast<uint32_t>(idx));
+}
+
+__device__ __forceinline__ float top16Value(uint64_t key)
+{
+    uint32_t const ordered = static_cast<uint32_t>(key >> 32);
+    uint32_t const u = (ordered & 0x80000000U) != 0U ? (ordered & 0x7FFFFFFFU) : ~ordered;
+    return __uint_as_float(u);
+}
+
+__device__ __forceinline__ uint64_t warpMaxKey(uint64_t k)
+{
+#pragma unroll
+    for (int32_t off = 16; off > 0; off >>= 1)
+    {
+        uint64_t const o = __shfl_xor_sync(0xFFFFFFFFU, k, off);
+        k = o > k ? o : k;
+    }
+    return k;
+}
+
+//! Stage 1: grid (chunks, rows). Each block takes a slice of a row (16-byte loads) and keeps one 32-bit key per element in registers: the order-preserving 16 bits of
+//! the FP16 value above (0xFFFF - the index inside the slice), so the largest key is the largest value and ties go to the smaller index. It extracts its 16 largest
+//! by 16 block-wide maximum rounds; every thread caches its own maximum and only the winner rescans. The 16 results are written as 64-bit stage-2 keys.
+__global__ void __launch_bounds__(kTop16Threads) top16Stage1Kernel(__half const* logits, int32_t cols, int32_t validCols, int32_t perChunk, uint64_t* partial)
+{
+    constexpr int32_t kVecPerThread = 4; // 4 x 8 halves per thread: 8,192 columns per chunk at most
+    __shared__ uint32_t warpBest[kTop16Threads / 32];
+    int32_t const row = blockIdx.y, chunk = blockIdx.x;
+    int32_t const begin = chunk * perChunk;
+    int32_t const end = min(validCols, begin + perChunk);
+    __half const* rowPtr = logits + static_cast<size_t>(row) * cols;
+    uint32_t keys[kVecPerThread * 8];
+#pragma unroll
+    for (int32_t v = 0; v < kVecPerThread; ++v)
+    {
+        int32_t const local0 = (v * kTop16Threads + threadIdx.x) * 8;
+        if (begin + local0 < end)
+        {
+            uint4 const raw = *reinterpret_cast<uint4 const*>(rowPtr + begin + local0);
+            uint32_t const words[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+            for (int32_t j = 0; j < 8; ++j)
+            {
+                uint32_t bits = (words[j >> 1] >> ((j & 1) * 16)) & 0xFFFFU;
+                if ((bits & 0x7FFFU) > 0x7C00U)
+                {
+                    bits = 0xFC00U; // NaN counts as -infinity
+                }
+                uint32_t const ordered = (bits & 0x8000U) != 0U ? (~bits & 0xFFFFU) : (bits | 0x8000U);
+                keys[v * 8 + j] = begin + local0 + j < end ? (ordered << 16) | (0xFFFFU - static_cast<uint32_t>(local0 + j)) : 0U;
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int32_t j = 0; j < 8; ++j)
+            {
+                keys[v * 8 + j] = 0U;
+            }
+        }
+    }
+    int32_t const warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    uint32_t cur = 0U;
+#pragma unroll
+    for (int32_t i = 0; i < kVecPerThread * 8; ++i)
+    {
+        cur = max(cur, keys[i]);
+    }
+    for (int32_t r = 0; r < kTop16; ++r)
+    {
+        uint32_t best = cur;
+#pragma unroll
+        for (int32_t off = 16; off > 0; off >>= 1)
+        {
+            best = max(best, __shfl_xor_sync(0xFFFFFFFFU, best, off));
+        }
+        if (lane == 0)
+        {
+            warpBest[warp] = best;
+        }
+        __syncthreads();
+        uint32_t blockBest = warpBest[0];
+#pragma unroll
+        for (int32_t w = 1; w < kTop16Threads / 32; ++w)
+        {
+            blockBest = max(blockBest, warpBest[w]);
+        }
+        if (threadIdx.x == 0)
+        {
+            // stage-2 key: float value of the FP16 pattern and the global index
+            uint32_t const ordered = blockBest >> 16;
+            uint32_t const bits = (ordered & 0x8000U) != 0U ? (ordered & 0x7FFFU) : (~ordered & 0xFFFFU);
+            float const value = __half2float(__ushort_as_half(static_cast<unsigned short>(bits)));
+            int32_t const globalIdx = begin + static_cast<int32_t>(0xFFFFU - (blockBest & 0xFFFFU));
+            partial[(static_cast<size_t>(row) * kTop16Chunks + chunk) * kTop16 + r] = blockBest == 0U ? 0ULL : top16Key(value, globalIdx);
+        }
+        if (cur == blockBest)
+        {
+            cur = 0U;
+#pragma unroll
+            for (int32_t i = 0; i < kVecPerThread * 8; ++i)
+            {
+                keys[i] = keys[i] == blockBest ? 0U : keys[i];
+                cur = max(cur, keys[i]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+//! Stage 2: one block per row merges the chunks' 16 candidates (one key per thread) into the sorted top 16: indices and the logit values as floats.
+__global__ void __launch_bounds__(kTop16StageTwoThreads) top16Stage2Kernel(uint64_t const* partial, int32_t* indices, float* values)
+{
+    __shared__ uint64_t warpBest[kTop16StageTwoThreads / 32];
+    int32_t const row = blockIdx.x;
+    uint64_t key = partial[static_cast<size_t>(row) * kTop16StageTwoThreads + threadIdx.x];
+    int32_t const warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    for (int32_t r = 0; r < kTop16; ++r)
+    {
+        uint64_t best = warpMaxKey(key);
+        if (lane == 0)
+        {
+            warpBest[warp] = best;
+        }
+        __syncthreads();
+        uint64_t blockBest = warpBest[0];
+#pragma unroll
+        for (int32_t w = 1; w < kTop16StageTwoThreads / 32; ++w)
+        {
+            blockBest = warpBest[w] > blockBest ? warpBest[w] : blockBest;
+        }
+        if (threadIdx.x == 0)
+        {
+            indices[row * kTop16 + r] = static_cast<int32_t>(0xFFFFFFFFU - static_cast<uint32_t>(blockBest & 0xFFFFFFFFULL));
+            values[row * kTop16 + r] = top16Value(blockBest);
+        }
+        key = key == blockBest ? 0ULL : key;
+        __syncthreads();
+    }
+}
+
 void launchDfl2LogitsToFloat(__half const* in, float* out, int32_t rows, int32_t cols, int32_t validCols, cudaStream_t stream)
 {
     logitsToFloatKernel<<<dim3(256, rows), 256, 0, stream>>>(in, out, cols, validCols);
@@ -416,6 +574,19 @@ void launchDfl2LogitsToFloat(__half const* in, float* out, int32_t rows, int32_t
 void launchDfl2GatherValues(float const* logits, int32_t const* indices, int32_t rows, int32_t cols, int32_t k, float* values, cudaStream_t stream)
 {
     gatherValuesKernel<<<rows, 32, 0, stream>>>(logits, indices, cols, k, values);
+}
+
+
+void launchDfl2Top16(__half const* logits, int32_t rows, int32_t cols, int32_t validCols, uint64_t* workspace, int32_t* indices, float* values, cudaStream_t stream)
+{
+    int32_t const perChunk = ((validCols + kTop16Chunks - 1) / kTop16Chunks + 7) / 8 * 8;
+    top16Stage1Kernel<<<dim3(kTop16Chunks, rows), kTop16Threads, 0, stream>>>(logits, cols, validCols, perChunk, workspace);
+    top16Stage2Kernel<<<rows, kTop16StageTwoThreads, 0, stream>>>(workspace, indices, values);
+}
+
+size_t dfl2Top16WorkspaceBytes(int32_t rows)
+{
+    return static_cast<size_t>(rows) * kTop16Chunks * kTop16 * sizeof(uint64_t);
 }
 
 } // namespace kernel

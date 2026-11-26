@@ -163,6 +163,9 @@ edgellm_add_unit_test(NAME unitTestKernelsInkling2Attention DIRS
 edgellm_add_unit_test(NAME unitTestKernelsInkling2ShortConv DIRS
                       cpp/kernels/inkling2ShortConv)
 
+edgellm_add_unit_test(NAME unitTestKernelsInklingDrafter DIRS
+                      cpp/kernels/inklingDrafter)
+
 edgellm_add_unit_test(NAME unitTestKernelsInkling2BlockResidual DIRS
                       cpp/kernels/inkling2BlockResidual)
 

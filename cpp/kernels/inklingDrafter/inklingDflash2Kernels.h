@@ -41,6 +41,11 @@ void launchDfl2Attention(__half const* q, __half const* ctxK, __half const* ctxV
     float* scores, int32_t scoreStride, float* partial, int32_t maxSplits, __half* out, cudaStream_t stream);
 
 //! out [rows, cols] FP32 = in [rows, cols] FP16 for the first validCols columns, -1e30 for the padding columns.
+//! Sorted top 16 (value descending, ties to the smaller index) of every row of FP16 logits over the first validCols columns: indices and the values as floats.
+//! workspace: dfl2Top16WorkspaceBytes(rows) bytes; perChunk is at most 8,192 columns (validCols <= 262,144).
+void launchDfl2Top16(__half const* logits, int32_t rows, int32_t cols, int32_t validCols, uint64_t* workspace, int32_t* indices, float* values, cudaStream_t stream);
+size_t dfl2Top16WorkspaceBytes(int32_t rows);
+
 void launchDfl2LogitsToFloat(__half const* in, float* out, int32_t rows, int32_t cols, int32_t validCols, cudaStream_t stream);
 
 //! values [rows, k] FP32 = logits[row, indices[row, j]] (the top-k values of rows whose indices selectAllTopK returned).

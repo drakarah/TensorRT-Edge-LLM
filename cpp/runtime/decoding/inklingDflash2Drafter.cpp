@@ -107,6 +107,7 @@ InklingDflash2Drafter::InklingDflash2Drafter(std::filesystem::path const& weight
     mUnary = make({1, kDrafts, kTopK}, DT::kFLOAT, "unary");
     size_t const workspace = getSelectAllTopKWorkspaceSize(kDrafts, kVocabPadded, kTopK);
     mTopWorkspace = make({static_cast<int64_t>(std::max<size_t>(workspace, 1))}, DT::kINT8, "topWorkspace");
+    mTopKeys = make({static_cast<int64_t>(kernel::dfl2Top16WorkspaceBytes(kDrafts))}, DT::kINT8, "topKeys");
     mAnchorTok = make({1}, DT::kINT32, "anchorTok");
     mUniforms = make({1, kDrafts}, DT::kFLOAT, "uniforms");
     mTemperatures = make({1}, DT::kFLOAT, "temperatures");
@@ -220,11 +221,21 @@ void InklingDflash2Drafter::draft(void const* anchorEmbedding, int32_t anchorTok
     __half const* rowsOut = mHidN.dataPointer<__half>() + kH; // block rows 1..7 are the proposal rows
     linear("sel_proj", rowsOut, mProjected.rawPointer(), kDrafts, 256, kH, stream);
     linear("U", rowsOut, mLogits.rawPointer(), kDrafts, kVocabPadded, kH, stream);
-    kernel::launchDfl2LogitsToFloat(mLogits.dataPointer<__half>(), mLogitsF.dataPointer<float>(), kDrafts, kVocabPadded, kVocab, stream);
-    check::check(mCand.reshape({kDrafts, kTopK}), "Tensor reshape failed");
-    selectAllTopK(mLogitsF, std::ref(mTopVals), mCand, kTopK, mTopWorkspace, stream);
-    check::check(mCand.reshape({1, kDrafts, kTopK}), "Tensor reshape failed");
-    kernel::launchDfl2GatherValues(mLogitsF.dataPointer<float>(), mCand.dataPointer<int32_t>(), kDrafts, kVocabPadded, kTopK, mUnary.dataPointer<float>(), stream);
+    static bool const oldTopK = std::getenv("EDGELLM_INKLING_DRAFTER_TOPK_OLD") != nullptr;
+    if (!oldTopK)
+    {
+        // one pair of kernels reads the FP16 logits directly (the float conversion, the generic top-k and the value gather took 0.66 ms per call)
+        kernel::launchDfl2Top16(mLogits.dataPointer<__half>(), kDrafts, kVocabPadded, kVocab, reinterpret_cast<uint64_t*>(mTopKeys.rawPointer()),
+            mCand.dataPointer<int32_t>(), mUnary.dataPointer<float>(), stream);
+    }
+    else
+    {
+        kernel::launchDfl2LogitsToFloat(mLogits.dataPointer<__half>(), mLogitsF.dataPointer<float>(), kDrafts, kVocabPadded, kVocab, stream);
+        check::check(mCand.reshape({kDrafts, kTopK}), "Tensor reshape failed");
+        selectAllTopK(mLogitsF, std::ref(mTopVals), mCand, kTopK, mTopWorkspace, stream);
+        check::check(mCand.reshape({1, kDrafts, kTopK}), "Tensor reshape failed");
+        kernel::launchDfl2GatherValues(mLogitsF.dataPointer<float>(), mCand.dataPointer<int32_t>(), kDrafts, kVocabPadded, kTopK, mUnary.dataPointer<float>(), stream);
+    }
     CUDA_CHECK(cudaMemcpyAsync(mAnchorTok.rawPointer(), &anchorToken, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     kernel::launchDFlash2CandidateSelector(mCand, mUnary, mProjected, mAnchorTok, w("cb_pred"), w("cb_succ"), mUniforms, mTemperatures, mGreedy, mDraftTok, mProbs, stream);
     CUDA_CHECK(cudaMemcpyAsync(hostTokens, mDraftTok.rawPointer(), kDrafts * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
