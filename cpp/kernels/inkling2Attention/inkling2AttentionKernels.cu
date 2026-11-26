@@ -2233,7 +2233,8 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
     // Merge the four warps per row: (m, l, acc).
     __syncthreads();
     float* const accS = reinterpret_cast<float*>(smemRaw); // reuses the stage slices
-    float* const mS = accS + kMmaWarps * kMultiRows * kInkling2HeadDim;
+    constexpr int32_t kAccStride = kInkling2HeadDim + 8; // 136 floats: the 8-byte stores of the 8 accumulator rows of a half-warp hit distinct banks
+    float* const mS = accS + kMmaWarps * kMultiRows * kAccStride;
     float* const lS = mS + kMmaWarps * kMultiRows;
 #pragma unroll
     for (int32_t hh = 0; hh < 2; ++hh)
@@ -2244,8 +2245,7 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
 #pragma unroll
             for (int32_t i = 0; i < 16; ++i)
             {
-                accS[(w * kMultiRows + r) * kInkling2HeadDim + i * 8 + 2 * tig] = accO[i][hh * 2];
-                accS[(w * kMultiRows + r) * kInkling2HeadDim + i * 8 + 2 * tig + 1] = accO[i][hh * 2 + 1];
+                *reinterpret_cast<float2*>(&accS[(w * kMultiRows + r) * kAccStride + i * 8 + 2 * tig]) = make_float2(accO[i][hh * 2], accO[i][hh * 2 + 1]);
             }
             if (tig == 0)
             {
@@ -2284,22 +2284,30 @@ __global__ void __launch_bounds__(kMmaThreads, 2) decodeMmaMultiKernel(Inkling2A
         outIdx[row] = (slot0 + tl) * p.numQHeads + kvh * group + hh2;
     }
     __syncthreads();
-    int32_t const d = tid;
-    for (int32_t row = 0; row < kMultiRows; ++row)
+    // Warp w merges rows w, w + 4, ...: a lane takes 4 consecutive channels (16-byte shared-memory reads, two 8-byte stores).
+#pragma unroll
+    for (int32_t ri = 0; ri < kMultiRows / kMmaWarps; ++ri)
     {
+        int32_t const row = w + ri * kMmaWarps;
         if (rowHi[row] < rowLo[row])
         {
             continue;
         }
-        float num = 0.F;
+        float4 num = make_float4(0.F, 0.F, 0.F, 0.F);
 #pragma unroll
         for (int32_t ww = 0; ww < kMmaWarps; ++ww)
         {
-            num += accS[(ww * kMultiRows + row) * kInkling2HeadDim + d] * cfS[row * kMmaWarps + ww];
+            float const cf = cfS[row * kMmaWarps + ww];
+            float4 const a4 = *reinterpret_cast<float4 const*>(&accS[(ww * kMultiRows + row) * kAccStride + lane * 4]);
+            num.x += a4.x * cf;
+            num.y += a4.y * cf;
+            num.z += a4.z * cf;
+            num.w += a4.w * cf;
         }
         float* out = partials + (int64_t(outIdx[row]) * splits + split) * kPartialStride;
-        out[2 + d] = num;
-        if (d == 0)
+        *reinterpret_cast<float2*>(out + 2 + lane * 4) = make_float2(num.x, num.y);
+        *reinterpret_cast<float2*>(out + 2 + lane * 4 + 2) = make_float2(num.z, num.w);
+        if (lane == 0)
         {
             out[0] = mmS[row];
             out[1] = denS[row];
@@ -2397,7 +2405,16 @@ static void launchTyped(Inkling2AttentionParams const& params, half const* qLin,
                     static_cast<void>(multiConfigured);
                     int64_t const tb = kMultiRows / group;
                     int64_t const gridX = (params.numTokens + tb - 1) / tb;
-                    int64_t multiSplits = (int64_t(blocksPerSm) * sms + gridX * params.numKVHeads - 1) / (gridX * params.numKVHeads);
+                    // Few splits suit the usual contexts (the fixed per-block work repeats for every split); the default keeps every block resident in one wave
+                    // (2 resident blocks per SM), INKLING2_MULTI_SPLITS overrides it.
+                    static int32_t const multiSplitsEnv = []()
+                    {
+                        char const* v = std::getenv("INKLING2_MULTI_SPLITS");
+                        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+                    }();
+                    int64_t multiSplits = multiSplitsEnv > 0
+                        ? multiSplitsEnv
+                        : (int64_t(blocksPerSm) * sms + gridX * params.numKVHeads - 1) / (gridX * params.numKVHeads);
                     multiSplits = std::min<int64_t>(multiSplits, std::max<int64_t>(1, int64_t(params.maxPagesPerSeq) * kInkling2TokensPerPage / kMmaTile));
                     multiSplits = std::max<int64_t>(1, std::min<int64_t>(multiSplits, rowCap / (int64_t(params.numTokens) * params.numQHeads)));
                     decodeMmaMultiKernel<KvT><<<dim3(static_cast<unsigned>(gridX), params.numKVHeads, static_cast<unsigned>(multiSplits)), kMmaThreads,
